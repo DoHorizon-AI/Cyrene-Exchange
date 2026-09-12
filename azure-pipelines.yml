@@ -1,0 +1,194 @@
+resources:
+  repositories:
+  - repository: platformGuard
+    type: github
+    name: DoHorizon-AI/Cyrene-Platform
+    endpoint: DoHorizon-AI
+    ref: c59be6f2bd82489fbe933dadff84fc589e00afd9
+  - repository: pluginsGuard
+    type: github
+    name: DoHorizon-AI/Cyrene-Plugins-Official
+    endpoint: DoHorizon-AI
+    ref: c3f75689ebb10b2e07b3816310e768d74ae6cc10
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+parameters:
+- name: runCrossRepoIntegration
+  displayName: 'Run Multi-Repo Platform/Plugins Integration Gate'
+  type: boolean
+  default: false
+
+# GitHub Actions owns automatic public source and contract checks. Keep this
+# Azure definition manual for internal cross-repository or deployment evidence.
+trigger: none
+pr: none
+
+jobs:
+- job: exchange_clean_core
+  displayName: 'Exchange / Product Contract & Core MVP Suite'
+  pool:
+    vmImage: 'ubuntu-latest'
+  timeoutInMinutes: 15
+  variables:
+    UV_CACHE_DIR: '$(Pipeline.Workspace)/.cache/uv'
+  steps:
+  - checkout: self
+    path: s/Cyrene-Exchange
+    displayName: 'Checkout Exchange'
+  - bash: |
+      set -euo pipefail
+      mkdir -p "$(Pipeline.Workspace)/.cache/uv"
+    displayName: 'Prepare uv cache directory'
+  - task: Cache@2
+    inputs:
+      key: 'uv | "$(Agent.OS)" | "$(Build.Repository.Name)" | Cyrene-Exchange/uv.lock'
+      restoreKeys: |
+        uv | "$(Agent.OS)" | "$(Build.Repository.Name)"
+      path: '$(Pipeline.Workspace)/.cache/uv'
+    displayName: 'Restore uv dependency cache'
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.12'
+    displayName: 'Setup Python 3.12'
+
+  - script: |
+      python -m pip install --upgrade pip uv==0.12.3
+      python -m json.tool service.json >/dev/null
+      uv sync --frozen --extra dev
+      uv run --no-sync ruff check --no-cache src tests
+      uv run --no-sync ruff format --check --no-cache src tests
+      uv run --no-sync pytest -p no:cacheprovider -q tests
+      cd product
+      export PYTHONPATH="$(Pipeline.Workspace)/s/Cyrene-Exchange/src:$(Pipeline.Workspace)/s/Cyrene-Exchange/product/src"
+      uv sync --frozen --group dev
+      uv run --no-sync ruff check --no-cache src tests
+      uv run --no-sync ruff format --check --no-cache src tests
+      uv run --no-sync mypy
+      uv run --no-sync pytest -p no:cacheprovider -q
+      uv run --no-sync openapi-spec-validator ../contracts/product/v1/openapi.yaml
+    displayName: 'Run Product Contract & Quality Gate'
+    workingDirectory: $(Pipeline.Workspace)/s/Cyrene-Exchange
+
+- ${{ if eq(parameters.runCrossRepoIntegration, true) }}:
+  - job: exchange_direct_plugin_integration
+    displayName: 'Exchange / Platform Selection / Direct Plugin Integration'
+    pool:
+      vmImage: 'ubuntu-latest'
+    timeoutInMinutes: 30
+    variables:
+      UV_CACHE_DIR: '$(Pipeline.Workspace)/.cache/uv'
+    steps:
+    - checkout: self
+      path: s/Cyrene-Exchange
+      displayName: 'Checkout Exchange'
+    - checkout: platformGuard
+      path: s/Cyrene-Platform
+      displayName: 'Checkout exact Platform resolver'
+    - checkout: pluginsGuard
+      path: s/Cyrene-Plugins-Official
+      displayName: 'Checkout exact Plugins contracts and runtime'
+    - task: Cache@2
+      inputs:
+        key: 'uv | "$(Agent.OS)" | "$(Build.Repository.Name)" | Cyrene-Exchange/uv.lock'
+        restoreKeys: |
+          uv | "$(Agent.OS)" | "$(Build.Repository.Name)"
+        path: '$(Pipeline.Workspace)/.cache/uv'
+      displayName: 'Restore uv dependency cache'
+    - bash: |
+        set -euo pipefail
+        platform_revision="$(git -C "$(Pipeline.Workspace)/s/Cyrene-Platform" rev-parse HEAD)"
+        plugins_revision="$(git -C "$(Pipeline.Workspace)/s/Cyrene-Plugins-Official" rev-parse HEAD)"
+        echo "Platform revision: ${platform_revision}"
+        echo "Plugins revision: ${plugins_revision}"
+        test "${platform_revision}" = "c59be6f2bd82489fbe933dadff84fc589e00afd9"
+        test "${plugins_revision}" = "c3f75689ebb10b2e07b3816310e768d74ae6cc10"
+      displayName: 'Verify exact Platform and Plugins revisions'
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+      displayName: 'Setup Python 3.12'
+    - bash: |
+        set -euo pipefail
+        python -m pip install --upgrade pip uv==0.12.3
+        uv sync --frozen --extra dev
+        uv run --frozen --extra dev ruff check src tests integration_tests
+        uv run --frozen --extra dev ruff format --check src tests integration_tests
+        CYRENE_PLATFORM_WORKTREE="$(Pipeline.Workspace)/s/Cyrene-Platform" \
+        CYRENE_PLUGINS_WORKTREE="$(Pipeline.Workspace)/s/Cyrene-Plugins-Official" \
+        CARGO_TARGET_DIR="$(Agent.TempDirectory)/exchange-platform-target" \
+        PYTHONDONTWRITEBYTECODE=1 \
+          uv run --frozen --extra dev pytest -p no:cacheprovider -q tests
+        uv sync --directory product --frozen --group dev
+        CYRENE_PLATFORM_WORKTREE="$(Pipeline.Workspace)/s/Cyrene-Platform" \
+        CYRENE_PLUGINS_WORKTREE="$(Pipeline.Workspace)/s/Cyrene-Plugins-Official" \
+        CARGO_TARGET_DIR="$(Agent.TempDirectory)/exchange-platform-target" \
+        PYTHONPATH="$PWD/src:$PWD/product/src:$PWD" \
+        PYTHONDONTWRITEBYTECODE=1 \
+          product/.venv/bin/python -m pytest -c product/pyproject.toml -p no:cacheprovider -q integration_tests
+        if git grep -n -i -E \
+          'cyrene-capability-client|cy-capability-execution-service|capability_execution|Platform CES' -- \
+          src product/src scripts product/scripts README.md docs contracts pyproject.toml; then
+          echo 'Platform business data-plane dependency was reintroduced.' >&2
+          exit 1
+        fi
+      workingDirectory: $(Pipeline.Workspace)/s/Cyrene-Exchange
+      displayName: 'Run direct Plugin boundary and integration gates'
+
+- job: publish_evidence
+  displayName: 'Exchange / Assemble Evidence'
+  dependsOn:
+  - exchange_clean_core
+  condition: succeeded()
+  pool:
+    vmImage: 'ubuntu-latest'
+  steps:
+  - script: |
+      mkdir -p ci/evidence
+      cat <<EOT > ci/evidence/summary.json
+      {
+        "suite": "Cyrene-Exchange-Baseline",
+        "commit": "$(Build.SourceVersion)",
+        "pipeline": "$(Build.DefinitionName)",
+        "build_id": "$(Build.BuildId)",
+        "result": "PASS",
+        "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+      }
+      EOT
+    displayName: 'Generate Evidence Ledger'
+
+  - publish: ci/evidence
+    artifact: exchange-evidence
+    displayName: 'Publish Exchange Evidence'
+
+- job: legacy_surface_governance
+  displayName: 'Governance / Exchange Architecture Boundary'
+  pool:
+    vmImage: 'ubuntu-latest'
+  steps:
+  - checkout: self
+    path: s/Cyrene-Exchange
+  - bash: |
+      set -euo pipefail
+      legacy_paths="$(git ls-files 'legacy/**' 'archive/**' '*.legacy.*' '*.bak' '*.backup' || true)"
+      if [[ -n "${legacy_paths}" ]]; then
+        echo 'Legacy or backup source was reintroduced:' >&2
+        printf '%s\n' "${legacy_paths}" >&2
+        exit 1
+      fi
+      if git grep -n -i -E \
+        'cyrene-capability-client|cy-capability-execution-service|capability_execution|Platform CES' -- \
+        src product/src scripts contracts pyproject.toml README.md docs; then
+        echo 'Platform business data-plane dependency was reintroduced.' >&2
+        exit 1
+      fi
+      retired_data_plane="$(git ls-files 'components/coordinator/**' 'proto/ai_service.proto')"
+      if [[ -n "${retired_data_plane}" ]]; then
+        echo 'Retired worker/coordinator data plane was reintroduced:' >&2
+        printf '%s\n' "${retired_data_plane}" >&2
+        exit 1
+      fi
+      echo 'Exchange owns its Product state and calls Plugin contracts directly.'
+    workingDirectory: $(Pipeline.Workspace)/s/Cyrene-Exchange
+    displayName: 'Reject legacy paths and Platform business proxy dependencies'

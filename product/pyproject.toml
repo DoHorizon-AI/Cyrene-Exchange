@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cyrene-exchange-product"
+version = "0.1.0"
+description = "Cyrene Product-owned gateway endpoint and route contract"
+requires-python = ">=3.12"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+  "cyrene-exchange",
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "pydantic==2.13.5",
+  "uvicorn==0.52.4",
+]
+
+[project.urls]
+Repository = "https://github.com/DoHorizon-AI/Cyrene-Exchange"
+Issues = "https://github.com/DoHorizon-AI/Cyrene-Exchange/issues"
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "jsonschema==4.26.0",
+  "mypy==2.3.1",
+  "openapi-spec-validator==0.9.0",
+  "pytest==9.1.1",
+  "ruff==0.16.5",
+]
+
+[tool.uv.sources]
+cyrene-exchange = {path = "..", editable = true}
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cyrene_exchange_product"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF002"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/cyrene_exchange_product"]
+
+[[tool.mypy.overrides]]
+module = ["cyrene_exchange.*"]
+ignore_missing_imports = true

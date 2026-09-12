@@ -1,0 +1,665 @@
+openapi: 3.1.2
+x-cyrene-contract-profile: product-http-v1
+info:
+  title: Cyrene Exchange Product API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+paths:
+  /api/v1/gateway-endpoints:
+    post:
+      operationId: createGatewayEndpoint
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEndpointRequest'
+      responses:
+        '201':
+          description: GatewayEndpoint created or replayed
+          content:
+            application/json:
+              schema:
+                $ref: ./gateway-endpoint.schema.json
+        '409':
+          $ref: '#/components/responses/Problem'
+  /api/v1/gateway-endpoints/{endpointId}:
+    get:
+      operationId: getGatewayEndpoint
+      parameters:
+      - $ref: '#/components/parameters/EndpointId'
+      responses:
+        '200':
+          description: GatewayEndpoint
+          content:
+            application/json:
+              schema:
+                $ref: ./gateway-endpoint.schema.json
+        '404':
+          $ref: '#/components/responses/Problem'
+  /api/v1/gateway-endpoints/{endpointId}/actions/disable:
+    post:
+      operationId: disableGatewayEndpoint
+      parameters:
+      - $ref: '#/components/parameters/EndpointId'
+      responses:
+        '200':
+          description: Disabled GatewayEndpoint
+          content:
+            application/json:
+              schema:
+                $ref: ./gateway-endpoint.schema.json
+        '404':
+          $ref: '#/components/responses/Problem'
+  /api/v1/gateway-routes:
+    post:
+      operationId: createGatewayRoute
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRouteRequest'
+      responses:
+        '201':
+          description: GatewayRoute created or replayed
+          content:
+            application/json:
+              schema:
+                $ref: ./gateway-route.schema.json
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+  /api/v1/gateway-routes/{routeId}:
+    get:
+      operationId: getGatewayRoute
+      parameters:
+      - name: routeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: GatewayRoute
+          content:
+            application/json:
+              schema:
+                $ref: ./gateway-route.schema.json
+        '404':
+          $ref: '#/components/responses/Problem'
+  /v1/chat/completions:
+    post:
+      operationId: createChatCompletion
+      description: Existing OpenAI-compatible Exchange data plane
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - model
+              - messages
+              properties:
+                model:
+                  type: string
+                  minLength: 1
+                messages:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                stream:
+                  type: boolean
+                  default: false
+                tools:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FunctionTool'
+                tool_choice:
+                  oneOf:
+                  - type: string
+                    enum:
+                    - none
+                    - auto
+                    - required
+                  - $ref: '#/components/schemas/NamedToolChoice'
+                parallel_tool_calls:
+                  type: boolean
+                stream_options:
+                  $ref: '#/components/schemas/StreamOptions'
+              additionalProperties: true
+      responses:
+        '200':
+          description: OpenAI-compatible completion or SSE stream
+        '401':
+          description: OpenAI-compatible authentication error
+        '429':
+          description: Product tenant quota exhausted
+        '503':
+          description: No eligible persisted route or quota usage source unavailable
+  /api/v1/gateway-route-drafts:
+    post:
+      summary: Create Draft
+      operationId: create_draft_api_v1_gateway_route_drafts_post
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRouteDraftRequest'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayRoute'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/gateway-route-drafts/{routeId}:
+    patch:
+      summary: Edit Draft
+      operationId: edit_draft_api_v1_gateway_route_drafts__routeId__patch
+      parameters:
+      - name: routeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Routeid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EditRouteDraftRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayRoute'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/gateway-route-drafts/{routeId}/actions/confirm:
+    post:
+      summary: Confirm Draft
+      operationId: confirm_draft_api_v1_gateway_route_drafts__routeId__actions_confirm_post
+      parameters:
+      - name: routeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Routeid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmRouteRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayRoute'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+    EndpointId:
+      name: endpointId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    Problem:
+      description: RFC 9457 control-plane error
+      content:
+        application/problem+json:
+          schema:
+            $ref: ./generated/common/problem-details.schema.json
+  schemas:
+    CreateEndpointRequest:
+      type: object
+      required:
+      - name
+      - publicBaseUrl
+      - authPolicyRef
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        publicBaseUrl:
+          type: string
+          format: uri
+        authPolicyRef:
+          type: string
+          minLength: 1
+          maxLength: 500
+      additionalProperties: false
+    CreateRouteRequest:
+      type: object
+      required:
+      - endpointId
+      - modelPattern
+      - targetBindingId
+      - priority
+      properties:
+        endpointId:
+          type: string
+          format: uuid
+        modelPattern:
+          type: string
+          minLength: 1
+          maxLength: 200
+        targetBindingId:
+          type: string
+          minLength: 1
+          maxLength: 300
+        targetModel:
+          type: string
+          minLength: 1
+          maxLength: 200
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 10000
+      additionalProperties: false
+    FunctionTool:
+      type: object
+      required:
+      - type
+      - function
+      properties:
+        type:
+          type: string
+          const: function
+        function:
+          $ref: '#/components/schemas/FunctionDefinition'
+      additionalProperties: false
+    FunctionDefinition:
+      type: object
+      required:
+      - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+        parameters:
+          type: object
+        strict:
+          type: boolean
+      additionalProperties: false
+    NamedToolChoice:
+      type: object
+      required:
+      - type
+      - function
+      properties:
+        type:
+          type: string
+          const: function
+        function:
+          type: object
+          required:
+          - name
+          properties:
+            name:
+              type: string
+              minLength: 1
+          additionalProperties: false
+      additionalProperties: false
+    StreamOptions:
+      type: object
+      properties:
+        include_usage:
+          type: boolean
+          default: false
+      additionalProperties: false
+    ConfirmRouteRequest:
+      properties:
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+      additionalProperties: false
+      type: object
+      required:
+      - resourceVersion
+      title: ConfirmRouteRequest
+      description: Explicit confirmation of the exact inspected draft version. | 确认草稿版本。
+    CreateRouteDraftRequest:
+      properties:
+        endpointId:
+          type: string
+          format: uuid
+          title: Endpointid
+        modelPattern:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Modelpattern
+        targetBindingId:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Targetbindingid
+        targetModel:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Targetmodel
+        priority:
+          type: integer
+          maximum: 10000.0
+          minimum: 0.0
+          title: Priority
+        source:
+          $ref: '#/components/schemas/RouteSource'
+      additionalProperties: false
+      type: object
+      required:
+      - endpointId
+      - modelPattern
+      - targetBindingId
+      - targetModel
+      - priority
+      - source
+      title: CreateRouteDraftRequest
+      description: Explicit Send to creates a draft, never an active route. | 发送到只创建草稿。
+    EditRouteDraftRequest:
+      properties:
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+        modelPattern:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Modelpattern
+        targetBindingId:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Targetbindingid
+        targetModel:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Targetmodel
+        priority:
+          type: integer
+          maximum: 10000.0
+          minimum: 0.0
+          title: Priority
+      additionalProperties: false
+      type: object
+      required:
+      - resourceVersion
+      - modelPattern
+      - targetBindingId
+      - targetModel
+      - priority
+      title: EditRouteDraftRequest
+      description: Editable route intent with optimistic concurrency. | 草稿修改与版本检查。
+    EndpointState:
+      type: string
+      enum:
+      - ACTIVE
+      - DISABLED
+      title: EndpointState
+      description: External GatewayEndpoint lifecycle. | 外部网关端点生命周期。
+    GatewayEndpoint:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        name:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Name
+        state:
+          $ref: '#/components/schemas/EndpointState'
+          default: ACTIVE
+        publicBaseUrl:
+          type: string
+          pattern: ^https?://
+          title: Publicbaseurl
+        authPolicyRef:
+          type: string
+          maxLength: 500
+          pattern: ^(policy|secret)://
+          title: Authpolicyref
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        updatedAt:
+          type: string
+          format: date-time
+          title: Updatedat
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - name
+      - publicBaseUrl
+      - authPolicyRef
+      - createdAt
+      - updatedAt
+      - resourceVersion
+      title: GatewayEndpoint
+      description: Externally published model API surface. | 对外发布的模型 API 表面。
+    GatewayRoute:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        endpointId:
+          type: string
+          format: uuid
+          title: Endpointid
+        state:
+          $ref: '#/components/schemas/RouteState'
+          default: ACTIVE
+        modelPattern:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Modelpattern
+        targetBindingId:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Targetbindingid
+        targetCapabilityType:
+          type: string
+          const: model.provider.v1
+          title: Targetcapabilitytype
+          default: model.provider.v1
+        targetModel:
+          anyOf:
+          - type: string
+            maxLength: 200
+            minLength: 1
+          - type: 'null'
+          title: Targetmodel
+        priority:
+          type: integer
+          maximum: 10000.0
+          minimum: 0.0
+          title: Priority
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        updatedAt:
+          type: string
+          format: date-time
+          title: Updatedat
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+        source:
+          anyOf:
+          - $ref: '#/components/schemas/RouteSource'
+          - type: 'null'
+        createdBy:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Createdby
+        workspaceId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - endpointId
+      - modelPattern
+      - targetBindingId
+      - priority
+      - createdAt
+      - updatedAt
+      - resourceVersion
+      title: GatewayRoute
+      description: Product route to an opaque provider capability binding. | 指向不透明能力绑定的路由。
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    RouteSource:
+      properties:
+        product:
+          type: string
+          const: reactor
+          title: Product
+          default: reactor
+        resourceUri:
+          type: string
+          maxLength: 2000
+          pattern: ^https?://
+          title: Resourceuri
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+        artifactDigest:
+          type: string
+          pattern: ^sha256:[0-9a-f]{64}$
+          title: Artifactdigest
+        modelVersionId:
+          anyOf:
+          - type: string
+            pattern: ^model-version://sha256/[0-9a-f]{64}$
+          - type: 'null'
+          default: null
+          title: Modelversionid
+      additionalProperties: false
+      type: object
+      required:
+      - resourceUri
+      - resourceVersion
+      - artifactDigest
+      title: RouteSource
+      description: Versioned reference to an existing Reactor Endpoint. | 来源端点引用。
+    RouteState:
+      type: string
+      enum:
+      - ACTIVE
+      - DISABLED
+      - DRAFT
+      title: RouteState
+      description: Persisted GatewayRoute lifecycle. | 持久化网关路由生命周期。
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError

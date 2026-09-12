@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyrene-exchange"
+version = "0.1.0"
+description = "Cyrene Exchange Product Core reference transport adapter"
+requires-python = ">=3.11"
+readme = "README.md"
+license = "Apache-2.0"
+dependencies = [
+    "cyrene-model-provider-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@c3f75689ebb10b2e07b3816310e768d74ae6cc10#subdirectory=sdk/python/cyrene_model_provider_contracts",
+    "cyrene-plugin-runtime @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@c3f75689ebb10b2e07b3816310e768d74ae6cc10#subdirectory=sdk/python/cyrene_plugin_runtime",
+]
+
+[project.urls]
+Repository = "https://github.com/DoHorizon-AI/Cyrene-Exchange"
+Issues = "https://github.com/DoHorizon-AI/Cyrene-Exchange/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.11.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7"]
+ignore = []

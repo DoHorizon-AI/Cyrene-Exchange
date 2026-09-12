@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "com.cyrene.service.exchange",
+  "name": "Exchange",
+  "service": "exchange",
+  "visibility": "public",
+  "distribution": "advanced-service-plugin",
+  "status": "active-product",
+  "core": {
+    "protocol_version": 1,
+    "minimum_core_version": "0.1.0",
+    "extension_points": [
+      "billing.usage.v1",
+      "model.provider.v1",
+      "model.routing.v1"
+    ]
+  },
+  "source_roots": [
+    "src",
+    "product"
+  ]
+}

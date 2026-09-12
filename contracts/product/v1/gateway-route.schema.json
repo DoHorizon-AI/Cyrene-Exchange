@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.cyrene.dev/exchange/product/v1/gateway-route.schema.json",
+  "title": "Exchange GatewayRoute v1",
+  "type": "object",
+  "required": [
+    "id",
+    "endpointId",
+    "state",
+    "modelPattern",
+    "targetBindingId",
+    "targetCapabilityType",
+    "priority",
+    "createdAt",
+    "updatedAt",
+    "resourceVersion"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "endpointId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "state": {
+      "enum": [
+        "ACTIVE",
+        "DISABLED",
+        "DRAFT"
+      ]
+    },
+    "modelPattern": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "targetBindingId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "targetCapabilityType": {
+      "const": "model.provider.v1"
+    },
+    "targetModel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "resourceVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "source": {
+      "properties": {
+        "product": {
+          "type": "string",
+          "const": "reactor",
+          "title": "Product",
+          "default": "reactor"
+        },
+        "resourceUri": {
+          "type": "string",
+          "maxLength": 2000,
+          "pattern": "^https?://",
+          "title": "Resourceuri"
+        },
+        "resourceVersion": {
+          "type": "integer",
+          "minimum": 1.0,
+          "title": "Resourceversion"
+        },
+        "artifactDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Artifactdigest"
+        },
+        "modelVersionId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^model-version://sha256/[0-9a-f]{64}$"
+            },
+            {"type": "null"}
+          ],
+          "default": null,
+          "title": "Modelversionid"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "resourceUri",
+        "resourceVersion",
+        "artifactDigest"
+      ],
+      "title": "RouteSource",
+      "description": "Versioned reference to an existing Reactor Endpoint. | 来源端点引用。"
+    },
+    "createdBy": {
+      "type": "string"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

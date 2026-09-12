@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "cyrene.exchange.reference-routing",
+  "name": "Exchange Reference Routing Capability",
+  "version": "0.1.0",
+  "description": "Product-owned static routing fixture for local acceptance.",
+  "kind": "capability-plugin",
+  "status": "reference-only",
+  "capabilities": [
+    "model.routing.v1"
+  ],
+  "methods": [
+    {
+      "name": "select_route",
+      "interfaceVersion": "1",
+      "executionMode": "inline"
+    }
+  ],
+  "runtime": {
+    "language": "python",
+    "entrypoint": "cyrene_exchange.reference_routing:StaticRoutePlanner"
+  }
+}

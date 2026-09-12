@@ -1,0 +1,31 @@
+name: Product contract and MVP
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main, 'feat/**', 'fix/**']
+
+permissions:
+  contents: read
+
+jobs:
+  product-contract:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}/product/src
+    defaults:
+      run:
+        working-directory: product
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install uv==0.12.3
+      - run: python -m json.tool ../service.json >/dev/null
+      - run: uv sync --frozen --group dev --no-install-local
+      - run: uv run --no-sync ruff check --no-cache src tests
+      - run: uv run --no-sync ruff format --check --no-cache src tests
+      - run: uv run --no-sync mypy
+      - run: uv run --no-sync pytest -p no:cacheprovider -q
+      - run: uv run --no-sync openapi-spec-validator ../contracts/product/v1/openapi.yaml

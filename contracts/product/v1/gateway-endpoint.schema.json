@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.cyrene.dev/exchange/product/v1/gateway-endpoint.schema.json",
+  "title": "Exchange GatewayEndpoint v1",
+  "type": "object",
+  "required": [
+    "id",
+    "name",
+    "state",
+    "publicBaseUrl",
+    "authPolicyRef",
+    "createdAt",
+    "updatedAt",
+    "resourceVersion"
+  ],
+  "properties": {
+    "id": {"type": "string", "format": "uuid"},
+    "name": {"type": "string", "minLength": 1, "maxLength": 200},
+    "state": {"enum": ["ACTIVE", "DISABLED"]},
+    "publicBaseUrl": {"type": "string", "format": "uri"},
+    "authPolicyRef": {"type": "string", "minLength": 1, "maxLength": 500},
+    "createdAt": {"type": "string", "format": "date-time"},
+    "updatedAt": {"type": "string", "format": "date-time"},
+    "resourceVersion": {"type": "integer", "minimum": 1}
+  },
+  "additionalProperties": false
+}
