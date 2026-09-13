@@ -4,9 +4,9 @@ repository:
   lifecycle_class: PUBLIC_PRODUCT
   visibility: public
   source_owner: Cyrene Gateway Team
-  remote_default_branch: main
+  remote_default_branch: develop
   integration_branch: develop
-  release_branch: main
+  release_branch: release
   default_branch: develop
 ownership:
   owns:

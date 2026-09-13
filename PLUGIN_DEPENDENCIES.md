@@ -14,13 +14,13 @@ Exchange 只消费能力契约，不嵌入 Plugin 实现。
 | `cyrene-plugin-runtime` | Direct endpoint client and transport | `Cyrene-Plugins-Official` |
 
 The two SDK packages are pinned in `pyproject.toml` and `uv.lock` to exact Git
-revision `c3f75689ebb10b2e07b3816310e768d74ae6cc10`. Before public release, that
+revision `3afbac4d386eb7a27f6778149187884820c0b7f6`. Before public release, that
 revision must be reachable through an anonymous clone and its own license
 mapping must explicitly cover both SDK directories. A maintainer cache or
 private checkout is not acceptance evidence.
 
 两个 SDK 在 `pyproject.toml` 与 `uv.lock` 中固定到精确 Git revision
-`c3f75689ebb10b2e07b3816310e768d74ae6cc10`。公开前必须验证匿名 clone 可读取该
+`3afbac4d386eb7a27f6778149187884820c0b7f6`。公开前必须验证匿名 clone 可读取该
 revision，且 Plugins 的许可证映射明确覆盖两个 SDK；维护者缓存或私有 checkout
 不能作为验收证据。
 
