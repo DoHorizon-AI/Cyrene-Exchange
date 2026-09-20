@@ -222,6 +222,29 @@ class ExchangeStore:
             ).fetchall()
         return [GatewayRoute.model_validate_json(row["document"]) for row in rows]
 
+    def list_endpoints(self) -> list[GatewayEndpoint]:
+        """Return every persisted gateway endpoint. | 返回全部网关端点。"""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT document FROM gateway_endpoints ORDER BY id ASC"
+            ).fetchall()
+        return [GatewayEndpoint.model_validate_json(row["document"]) for row in rows]
+
+    def list_active_routes(self) -> list[GatewayRoute]:
+        """Return every active route across endpoints. | 返回全部活动路由。"""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT document FROM gateway_routes
+                WHERE state = ?
+                ORDER BY priority ASC, id ASC
+                """,
+                (RouteState.ACTIVE.value,),
+            ).fetchall()
+        return [GatewayRoute.model_validate_json(row["document"]) for row in rows]
+
     def resolve_idempotency(self, scope: str, key: str | None, digest: str) -> str | None:
         """Resolve replay or reject conflicting key reuse. | 解析幂等重放。"""
 
@@ -319,6 +342,16 @@ class ExchangeStore:
                         _unix_ms(),
                     ),
                 )
+
+    def disable_credential(self, credential_ref: str) -> bool:
+        """Revoke one credential reference without deleting its audit trail."""
+
+        with self._mutation() as cursor:
+            cursor.execute(
+                "UPDATE api_credentials SET enabled = 0 WHERE credential_ref = ? AND enabled = 1",
+                (credential_ref,),
+            )
+            return cursor.rowcount > 0
 
     def resolve_credential(self, token: str) -> RequestPrincipal | None:
         """Resolve one bearer token to trusted identity metadata."""

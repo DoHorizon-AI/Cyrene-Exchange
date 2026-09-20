@@ -1,0 +1,505 @@
+"""
+┌─────────────────────────────────────────────────────────────────────┐
+│  📄 server.py                                                       │
+│  Module: cyrene_exchange_product.server                             │
+│  Role: Self-contained Exchange gateway process (control + data).     │
+│                                                                     │
+│  模块职责：Exchange 独立网关进程，融合控制面与数据面并支持 SSE 流式。      │
+└─────────────────────────────────────────────────────────────────────┘
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from threading import Event, Lock
+from typing import Any
+from urllib.parse import urlsplit
+from uuid import UUID
+
+import httpx
+from cyrene_exchange.capabilities import (
+    MODEL_PROVIDER_CAPABILITY,
+    ProviderChunk,
+    ProviderInvocationCancelled,
+    ProviderUsage,
+)
+from cyrene_exchange.gateway import GatewayError
+from cyrene_exchange.protocol import NormalizedInferenceRequest
+from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from cyrene_exchange_product.api import create_app
+from cyrene_exchange_product.domain import EndpointState, ProductPrincipal
+from cyrene_exchange_product.errors import ExchangeProductError
+from cyrene_exchange_product.routing import build_gateway_from_store
+from cyrene_exchange_product.store import ExchangeStore
+
+_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
+_SSE_DATA_PREFIX = "data:"
+
+
+class ProviderUnavailableError(RuntimeError):
+    """The configured provider endpoint could not serve the request.
+
+    The gateway already maps any provider exception onto its own typed failure,
+    so this stays a plain error that the draft validator can also catch.
+    """
+
+
+class OpenAICompatibleProvider:
+    """Provider seam over one operator-configured OpenAI-compatible endpoint.
+
+    The adapter reports only provider facts: it never estimates token usage and
+    never replays a partially streamed response.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        api_key: str | None = None,
+        timeout_seconds: float = 300.0,
+    ) -> None:
+        if not base_url.startswith(("http://", "https://")):
+            raise ValueError("provider base_url must be an http(s) URL")
+        self._base_url = base_url.rstrip("/")
+        self._api_key = api_key
+        self._timeout = timeout_seconds
+
+    def complete(
+        self,
+        request: NormalizedInferenceRequest,
+        *,
+        cancel_event: Event,
+    ) -> Iterable[ProviderChunk]:
+        """Invoke the upstream endpoint and yield ordered provider chunks."""
+
+        payload = request.to_provider_dict()
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = "Bearer " + self._api_key
+        if request.stream:
+            yield from self._stream(payload, headers, cancel_event)
+        else:
+            yield from self._collect(payload, headers, cancel_event)
+
+    def _collect(
+        self,
+        payload: Mapping[str, Any],
+        headers: Mapping[str, str],
+        cancel_event: Event,
+    ) -> Iterable[ProviderChunk]:
+        if cancel_event.is_set():
+            raise ProviderInvocationCancelled("request was cancelled before the provider call")
+        try:
+            with httpx.Client(timeout=self._timeout, trust_env=False) as client:
+                response = client.post(
+                    self._base_url + "/chat/completions", json=payload, headers=headers
+                )
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError(f"provider request failed: {exc}") from exc
+        if response.status_code >= 400:
+            raise ProviderUnavailableError(
+                f"provider returned HTTP {response.status_code}: {response.text[:400]}"
+            )
+        body = response.json()
+        choices = body.get("choices") or []
+        if not choices:
+            raise ProviderUnavailableError("provider returned no choices")
+        choice = choices[0]
+        message = choice.get("message") or {}
+        yield ProviderChunk(
+            role=message.get("role") or "assistant",
+            delta=message.get("content") or "",
+            finish_reason=choice.get("finish_reason") or "stop",
+            usage=_usage(body.get("usage")),
+        )
+
+    def _stream(
+        self,
+        payload: Mapping[str, Any],
+        headers: Mapping[str, str],
+        cancel_event: Event,
+    ) -> Iterable[ProviderChunk]:
+        try:
+            with (
+                httpx.Client(timeout=self._timeout, trust_env=False) as client,
+                client.stream(
+                    "POST",
+                    self._base_url + "/chat/completions",
+                    json=payload,
+                    headers=headers,
+                ) as response,
+            ):
+                if response.status_code >= 400:
+                    response.read()
+                    raise ProviderUnavailableError(f"provider returned HTTP {response.status_code}")
+                for line in response.iter_lines():
+                    if cancel_event.is_set():
+                        raise ProviderInvocationCancelled(
+                            "request was cancelled during provider streaming"
+                        )
+                    chunk = _stream_chunk(line)
+                    if chunk is not None:
+                        yield chunk
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError(f"provider stream failed: {exc}") from exc
+
+
+def _usage(value: Any) -> ProviderUsage | None:
+    """Project an upstream usage object without inventing missing facts."""
+
+    if not isinstance(value, Mapping):
+        return None
+    return ProviderUsage(
+        prompt_tokens=_token(value.get("prompt_tokens")),
+        completion_tokens=_token(value.get("completion_tokens")),
+        total_tokens=_token(value.get("total_tokens")),
+    )
+
+
+def _token(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _stream_chunk(line: str) -> ProviderChunk | None:
+    """Map one upstream SSE line onto a provider chunk."""
+
+    if not line.startswith(_SSE_DATA_PREFIX):
+        return None
+    payload = line[len(_SSE_DATA_PREFIX) :].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        event = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, Mapping):
+        return None
+    choices = event.get("choices") or []
+    if not choices:
+        return ProviderChunk(usage=_usage(event.get("usage")))
+    choice = choices[0]
+    delta = choice.get("delta") or {}
+    return ProviderChunk(
+        role=delta.get("role"),
+        delta=delta.get("content") or "",
+        finish_reason=choice.get("finish_reason"),
+        usage=_usage(event.get("usage")),
+    )
+
+
+class OperatorBindingResolver:
+    """Resolve configured provider bindings from explicit operator configuration."""
+
+    def __init__(self, bindings: Mapping[str, Any]) -> None:
+        self._bindings = dict(bindings)
+
+    def resolve(self, capability_id: str, implementation_ref: str | None = None) -> object:
+        if capability_id != MODEL_PROVIDER_CAPABILITY:
+            raise ProviderUnavailableError(f"unsupported capability: {capability_id}")
+        provider = self._bindings.get(implementation_ref or "")
+        if provider is None:
+            raise ProviderUnavailableError(
+                f"no operator provider is configured for binding {implementation_ref!r}"
+            )
+        return provider
+
+
+class RouteSourceProviderResolver:
+    """Resolve a binding through the persisted route's declared source endpoint.
+
+    A route target carries only an opaque binding id, so the route's own source
+    reference is the authoritative place the upstream URL lives. Following it
+    keeps the gateway configuration free of duplicated endpoint URLs while still
+    failing closed when the source is missing or unreachable.
+    """
+
+    def __init__(
+        self,
+        store: ExchangeStore,
+        *,
+        timeout_seconds: float = 300.0,
+        source_bearer_token: str | None = None,
+        allowed_source_origins: frozenset[str] = frozenset(),
+    ) -> None:
+        self._store = store
+        self._timeout = timeout_seconds
+        self._source_token = source_bearer_token
+        self._allowed_origins = frozenset(
+            origin.rstrip("/") for origin in allowed_source_origins if origin.strip()
+        )
+        self._providers: dict[tuple[str, int], OpenAICompatibleProvider] = {}
+        self._lock = Lock()
+
+    def resolve(self, capability_id: str, implementation_ref: str | None = None) -> object:
+        if capability_id != MODEL_PROVIDER_CAPABILITY:
+            raise ProviderUnavailableError(f"unsupported capability: {capability_id}")
+        binding_id = implementation_ref or ""
+        route = next(
+            (
+                item
+                for item in self._store.list_active_routes()
+                if item.target_binding_id == binding_id
+            ),
+            None,
+        )
+        if route is None or route.source is None:
+            raise ProviderUnavailableError(
+                f"no ACTIVE route declares a source endpoint for binding {binding_id!r}"
+            )
+        return self._provider_for(route.source)
+
+    def validate_route(self, route: Any) -> None:
+        """Verify a draft's own source endpoint before it becomes ACTIVE."""
+
+        if route.source is None:
+            raise ProviderUnavailableError("route declares no source endpoint")
+        self._provider_for(route.source)
+
+    def _provider_for(self, source: Any) -> OpenAICompatibleProvider:
+        cache_key = (source.resource_uri, source.resource_version)
+        with self._lock:
+            cached = self._providers.get(cache_key)
+        if cached is not None:
+            return cached
+        provider = OpenAICompatibleProvider(
+            self._source_endpoint_url(source.resource_uri),
+            timeout_seconds=self._timeout,
+        )
+        with self._lock:
+            self._providers[cache_key] = provider
+        return provider
+
+    def _source_endpoint_url(self, resource_uri: str) -> str:
+        """Read the serving URL the route source publishes, under strict limits.
+
+        The URI arrives from Product state, so Exchange constrains it to the
+        operator-admitted origins, refuses redirects, and never guesses a
+        fallback URL from an untrusted response.
+        """
+
+        origin = _origin(resource_uri)
+        if origin is None:
+            raise ProviderUnavailableError(
+                f"route source URI is not an absolute http(s) URL: {resource_uri}"
+            )
+        if self._allowed_origins and origin not in self._allowed_origins:
+            raise ProviderUnavailableError(f"route source origin is not admitted: {origin}")
+        headers = {"Accept": "application/json"}
+        if self._source_token:
+            headers["Authorization"] = "Bearer " + self._source_token
+        try:
+            with httpx.Client(
+                timeout=self._timeout, trust_env=False, follow_redirects=False
+            ) as client:
+                response = client.get(resource_uri, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise ProviderUnavailableError(
+                f"route source endpoint is unavailable: {resource_uri}"
+            ) from exc
+        url = payload.get("url") if isinstance(payload, Mapping) else None
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            raise ProviderUnavailableError(
+                f"route source endpoint publishes no URL: {resource_uri}"
+            )
+        return url
+
+
+def _origin(resource_uri: str) -> str | None:
+    """Return the scheme://host:port origin of an absolute http(s) URL."""
+
+    parsed = urlsplit(resource_uri)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    port = parsed.port
+    return (
+        f"{parsed.scheme}://{parsed.hostname}:{port}"
+        if port
+        else f"{parsed.scheme}://{parsed.hostname}"
+    )
+
+
+def _route_validator(resolver: Any) -> Callable[[Any], None]:
+    """Verify a draft against the same resolver the data plane will use."""
+
+    def validate(route: Any) -> None:
+        try:
+            validate_route = getattr(resolver, "validate_route", None)
+            if callable(validate_route):
+                validate_route(route)
+                return
+            resolver.resolve(MODEL_PROVIDER_CAPABILITY, route.target_binding_id)
+        except ProviderUnavailableError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_TARGET_UNREACHABLE",
+                title="Route target unreachable",
+                detail=(
+                    "The configured provider binding could not be reached; repair the source "
+                    "endpoint before publishing this draft."
+                ),
+                status=502,
+                retryable=True,
+            ) from exc
+
+    return validate
+
+
+def _select_endpoint(store: ExchangeStore, endpoint_id: UUID | None) -> UUID:
+    """Fail closed unless the data plane owns exactly one serving endpoint."""
+
+    if endpoint_id is not None:
+        return endpoint_id
+    active = [item for item in store.list_endpoints() if item.state is EndpointState.ACTIVE]
+    if len(active) != 1:
+        raise ValueError(
+            "EXCHANGE_ENDPOINT_AMBIGUOUS: select --endpoint-id when the store does not hold "
+            "exactly one ACTIVE gateway endpoint"
+        )
+    return active[0].id
+
+
+def build_product_app(
+    *,
+    database_path: Any,
+    resolver: Any = None,
+    resolver_factory: Callable[[Any], Any] | None = None,
+    control_credentials: Mapping[str, ProductPrincipal] | None = None,
+    allowed_binding_ids: frozenset[str] = frozenset(),
+    endpoint_id: UUID | None = None,
+    validate_route_target: Callable[[Any], None] | None = None,
+    record_requests: bool = True,
+) -> FastAPI:
+    """Fuse the control-plane API with the OpenAI-compatible data plane.
+
+    A ``resolver_factory`` receives the Product store, which lets a resolver
+    follow persisted route sources instead of duplicating endpoint URLs into
+    process configuration. Exactly one of ``resolver``/``resolver_factory`` is
+    required, and the draft validator defaults to the same resolver so a route
+    can only be published when the data plane can actually reach it.
+    """
+
+    if (resolver is None) == (resolver_factory is None):
+        raise ValueError(
+            "EXCHANGE_RESOLVER_INVALID: provide exactly one of resolver or resolver_factory"
+        )
+    store = ExchangeStore(database_path)
+    effective = resolver_factory(store) if resolver_factory is not None else resolver
+    app = create_app(
+        database_path=database_path,
+        control_credentials=control_credentials,
+        allowed_binding_ids=allowed_binding_ids,
+        validate_route_target=validate_route_target or _route_validator(effective),
+        store=store,
+    )
+    gateway = build_gateway_from_store(
+        store,
+        _select_endpoint(store, endpoint_id),
+        effective,
+        credentials=control_credentials or {},
+        record_requests=record_requests,
+    )
+
+    @app.get("/healthz")
+    def healthz() -> dict[str, str]:
+        """Report process liveness for orchestrators and reverse proxies."""
+
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    def readyz() -> JSONResponse:
+        """Report readiness only when the data plane can serve at least one route."""
+
+        routes = store.list_active_routes()
+        if not routes:
+            return JSONResponse(status_code=503, content={"status": "no-active-route"})
+        return JSONResponse(status_code=200, content={"status": "ready", "routes": len(routes)})
+
+    @app.get("/v1/models")
+    def models() -> dict[str, Any]:
+        """List the model patterns currently served by ACTIVE routes."""
+
+        seen: list[str] = []
+        for route in store.list_active_routes():
+            if route.model_pattern not in seen:
+                seen.append(route.model_pattern)
+        return {
+            "object": "list",
+            "data": [
+                {"id": pattern, "object": "model", "owned_by": "cyrene-exchange"}
+                for pattern in seen
+            ],
+        }
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request) -> Any:
+        raw = await request.body()
+        if not raw or len(raw) > _MAX_PAYLOAD_BYTES:
+            return _openai_error(400, "invalid_request_error", "invalid request body")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return _openai_error(400, "invalid_request_error", "request body must be JSON")
+        if not isinstance(payload, Mapping):
+            return _openai_error(400, "invalid_request_error", "request body must be an object")
+        cancel_event = Event()
+        try:
+            # The gateway and its provider adapters are synchronous, so the call
+            # runs on the worker thread instead of stalling the event loop that
+            # also serves probes and concurrent requests.
+            response = await run_in_threadpool(
+                gateway.handle_openai_chat,
+                dict(request.headers.items()),
+                payload,
+                cancel_event=cancel_event,
+            )
+        except GatewayError as exc:
+            return JSONResponse(status_code=exc.status_code, content=exc.to_openai_error())
+        if not response.stream:
+            return JSONResponse(status_code=response.status_code, content=response.body)
+        return StreamingResponse(
+            _sse(response.body, cancel_event),
+            media_type="text/event-stream",
+            headers={"X-Request-Id": response.request_id, "Cache-Control": "no-cache"},
+        )
+
+    return app
+
+
+async def _sse(body: Any, cancel_event: Event) -> AsyncIterator[str]:
+    """Emit structured SSE without blocking the loop while the provider streams.
+
+    Provider chunks are pulled one at a time on the worker thread, and closing
+    the response cancels the in-flight provider call.
+    """
+
+    if not isinstance(body, Iterable):
+        raise TypeError("stream response body must be iterable")
+    iterator = iter(body)
+    sentinel = object()
+    try:
+        while True:
+            item = await run_in_threadpool(next, iterator, sentinel)
+            if item is sentinel:
+                return
+            if cancel_event.is_set():
+                return
+            encoded = item if isinstance(item, str) else json.dumps(item, separators=(",", ":"))
+            yield f"data: {encoded}\n\n"
+    except GatewayError:
+        return
+    finally:
+        cancel_event.set()
+
+
+def _openai_error(status: int, error_type: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"type": error_type, "message": message}},
+    )

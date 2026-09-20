@@ -52,10 +52,16 @@ def create_app(
     control_credentials: Mapping[str, ProductPrincipal] | None = None,
     allowed_binding_ids: frozenset[str] = frozenset(),
     validate_route_target: Callable[[GatewayRoute], None] | None = None,
+    store: ExchangeStore | None = None,
 ) -> FastAPI:
-    """Build the Exchange Product control API. | 创建 Exchange 产品控制 API。"""
+    """Build the Exchange Product control API. | 创建 Exchange 产品控制 API。
 
-    store = ExchangeStore(database_path)
+    A caller that already owns the store (for example a fused gateway that
+    resolves providers from persisted routes) passes it in so control and data
+    plane share exactly one connection and one credential set.
+    """
+
+    store = store or ExchangeStore(database_path)
     service = ExchangeProductService(store)
     if len({p.workspace_id for p in (control_credentials or {}).values()}) > 1:
         raise ValueError("the first route-control profile requires one configured workspace")
@@ -76,7 +82,10 @@ def create_app(
         return ProductPrincipal(identity.actor_id, identity.workspace_id, identity.credential_ref)
 
     def protect_configured_control(request: Request) -> None:
-        if control_credentials is not None:
+        # The control API is the only surface this guard owns. Data-plane
+        # routes authenticate through the gateway, and liveness probes must
+        # stay reachable for orchestrators and reverse proxies.
+        if control_credentials is not None and request.url.path.startswith("/api/"):
             principal(request)
 
     app = FastAPI(
