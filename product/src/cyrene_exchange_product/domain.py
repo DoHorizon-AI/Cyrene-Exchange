@@ -139,6 +139,44 @@ class ConfirmRouteRequest(ContractModel):
     resource_version: int = Field(ge=1)
 
 
+class ApiKeyState(StrEnum):
+    """Gateway API key lifecycle. | 网关 API Key 生命周期。"""
+
+    ACTIVE = "ACTIVE"
+    REVOKED = "REVOKED"
+
+
+class CreateApiKeyRequest(ContractModel):
+    """Server-generated gateway key request. | 服务端生成网关密钥请求。"""
+
+    name: str = Field(min_length=1, max_length=200)
+    expires_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    model_scope: list[str] = Field(default_factory=list, max_length=100)
+
+
+class ApiKey(ContractModel):
+    """Gateway credential metadata; the secret is never persisted. | 密钥元数据。"""
+
+    id: UUID
+    name: str = Field(min_length=1, max_length=200)
+    credential_ref: str = Field(pattern=r"^api-key://[0-9a-f-]{36}$")
+    actor_id: str = Field(min_length=1, max_length=300)
+    workspace_id: str = Field(min_length=1, max_length=300)
+    state: ApiKeyState
+    model_scope: list[str] = Field(default_factory=list, max_length=100)
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    revoked_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    resource_version: int = Field(ge=1)
+
+
+class CreatedApiKey(ApiKey):
+    """Creation response carrying the one-time secret. | 仅创建响应携带一次性密钥。"""
+
+    secret: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
 class ProblemDetails(ContractModel):
     """RFC 9457 control response with stable extensions. | RFC 9457 控制面错误。"""
 

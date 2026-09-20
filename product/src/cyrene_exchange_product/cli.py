@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from uuid import UUID
@@ -21,6 +22,7 @@ from uuid import UUID
 import uvicorn
 
 from cyrene_exchange_product.domain import (
+    CreateApiKeyRequest,
     CreateRouteRequest,
     ProductPrincipal,
 )
@@ -52,6 +54,13 @@ def _principal(arguments: argparse.Namespace) -> ProductPrincipal:
         workspace_id=arguments.workspace_id,
         credential_ref=arguments.credential_ref,
     )
+
+
+def _timestamp(value: str) -> datetime:
+    """Parse an ISO-8601 expiry into an aware UTC timestamp."""
+
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _admitted_bindings(arguments: argparse.Namespace) -> frozenset[str]:
@@ -169,7 +178,62 @@ def _key_create(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _key_issue(arguments: argparse.Namespace) -> int:
+    """Generate one gateway key; the secret is printed exactly once."""
+
+    store = ExchangeStore(arguments.database.resolve())
+    try:
+        service = ExchangeProductService(store)
+        principal = ProductPrincipal(
+            actor_id=arguments.actor_id,
+            workspace_id=arguments.workspace_id,
+            credential_ref="cred://exchange/cli",
+        )
+        created, _ = service.create_api_key(
+            CreateApiKeyRequest(
+                name=arguments.name,
+                expires_at=arguments.expires_at,
+                model_scope=arguments.model_scope or [],
+            ),
+            principal,
+            arguments.idempotency_key,
+        )
+    finally:
+        store.close()
+    payload = created.model_dump(mode="json", exclude_none=True)
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _key_list(arguments: argparse.Namespace) -> int:
+    """List one workspace's key metadata without any secret material."""
+
+    store = ExchangeStore(arguments.database.resolve())
+    try:
+        service = ExchangeProductService(store)
+        principal = ProductPrincipal(
+            actor_id=arguments.actor_id,
+            workspace_id=arguments.workspace_id,
+            credential_ref="cred://exchange/cli",
+        )
+        keys = service.list_api_keys(principal)
+    finally:
+        store.close()
+    print(
+        json.dumps(
+            {
+                "object": "list",
+                "data": [key.model_dump(mode="json", exclude_none=True) for key in keys],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def _key_revoke(arguments: argparse.Namespace) -> int:
+    if arguments.api_key_id is not None:
+        return _key_revoke_api_key(arguments)
     store = ExchangeStore(arguments.database.resolve())
     try:
         revoked = store.disable_credential(arguments.credential_ref)
@@ -179,6 +243,22 @@ def _key_revoke(arguments: argparse.Namespace) -> int:
         print(f"credential not found: {arguments.credential_ref}", file=sys.stderr)
         return 1
     print(json.dumps({"credentialRef": arguments.credential_ref, "enabled": False}))
+    return 0
+
+
+def _key_revoke_api_key(arguments: argparse.Namespace) -> int:
+    store = ExchangeStore(arguments.database.resolve())
+    try:
+        service = ExchangeProductService(store)
+        principal = ProductPrincipal(
+            actor_id=arguments.actor_id,
+            workspace_id=arguments.workspace_id,
+            credential_ref="cred://exchange/cli",
+        )
+        revoked = service.revoke_api_key(arguments.api_key_id, principal)
+    finally:
+        store.close()
+    print(json.dumps({"id": str(revoked.id), "state": revoked.state.value}))
     return 0
 
 
@@ -247,13 +327,25 @@ def parser() -> argparse.ArgumentParser:
     enable.add_argument("--resource-version", type=int, required=True)
     _add_principal_arguments(enable)
 
-    key = commands.add_parser("key", help="Manage Exchange control credentials")
+    key = commands.add_parser("key", help="Manage Exchange gateway credentials")
     key_commands = key.add_subparsers(dest="key_command", required=True)
-    create_key = key_commands.add_parser("create")
+    create_key = key_commands.add_parser("create", help="Install an operator credential")
     create_key.add_argument("--token", required=True)
     _add_principal_arguments(create_key)
-    revoke_key = key_commands.add_parser("revoke")
-    revoke_key.add_argument("--credential-ref", required=True)
+    issue_key = key_commands.add_parser("issue", help="Generate a one-time gateway API key")
+    issue_key.add_argument("--name", required=True)
+    issue_key.add_argument("--expires-at", type=_timestamp)
+    issue_key.add_argument("--model-scope", action="append", default=[])
+    issue_key.add_argument("--idempotency-key")
+    _add_principal_arguments(issue_key)
+    list_keys = key_commands.add_parser("list", help="List gateway API key metadata")
+    _add_principal_arguments(list_keys)
+    revoke_key = key_commands.add_parser("revoke", help="Revoke a credential or API key")
+    revoke_target = revoke_key.add_mutually_exclusive_group(required=True)
+    revoke_target.add_argument("--credential-ref")
+    revoke_target.add_argument("--api-key-id", type=UUID)
+    revoke_key.add_argument("--actor-id", default="cyrene-operator")
+    revoke_key.add_argument("--workspace-id", default="default")
     return value
 
 
@@ -271,6 +363,10 @@ def run(argv: list[str] | None = None) -> int:
         return _route_enable(arguments)
     if arguments.key_command == "create":
         return _key_create(arguments)
+    if arguments.key_command == "issue":
+        return _key_issue(arguments)
+    if arguments.key_command == "list":
+        return _key_list(arguments)
     return _key_revoke(arguments)
 
 

@@ -422,13 +422,26 @@ def build_product_app(
         return JSONResponse(status_code=200, content={"status": "ready", "routes": len(routes)})
 
     @app.get("/v1/models")
-    def models() -> dict[str, Any]:
-        """List the model patterns currently served by ACTIVE routes."""
+    def models(request: Request) -> Any:
+        """List the model patterns the caller's gateway credential may use.
 
+        The data plane authenticates with the same Bearer credential as
+        ``/v1/chat/completions``; a key's model scope filters the projection.
+        """
+
+        principal = None
+        if control_credentials is not None:
+            scheme, _, token = request.headers.get("authorization", "").partition(" ")
+            principal = store.resolve_credential(token) if scheme == "Bearer" else None
+            if principal is None:
+                return _openai_error(401, "authentication_error", "invalid credentials")
         seen: list[str] = []
         for route in store.list_active_routes():
-            if route.model_pattern not in seen:
-                seen.append(route.model_pattern)
+            if route.model_pattern in seen:
+                continue
+            if principal is not None and not principal.permits(route.model_pattern):
+                continue
+            seen.append(route.model_pattern)
         return {
             "object": "list",
             "data": [

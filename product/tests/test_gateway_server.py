@@ -132,7 +132,9 @@ def test_gateway_probes_models_and_both_response_modes(tmp_path: Path) -> None:
 
             ready = client.get("/readyz")
             assert ready.status_code == 200 and ready.json()["routes"] == 1
-            assert client.get("/v1/models").json()["data"][0]["id"] == "qwen-acceptance-lora"
+            models = client.get("/v1/models", headers=CONTROL_HEADERS)
+            assert models.status_code == 200
+            assert models.json()["data"][0]["id"] == "qwen-acceptance-lora"
 
             completion = client.post(
                 "/v1/chat/completions",
@@ -211,6 +213,17 @@ def test_operator_cli_manages_routes_and_keys(tmp_path: Path, capsys) -> None:
     assert cli.run([*base, "route", "list"]) == 0
     listed = json.loads(capsys.readouterr().out)
     assert [item["modelPattern"] for item in listed["data"]] == ["cli-model"]
+
+    assert cli.run([*base, "key", "issue", "--name", "cli-issued", "--model-scope", "cli-*"]) == 0
+    issued = json.loads(capsys.readouterr().out)
+    assert issued["secret"].startswith("cyk_")
+    assert issued["modelScope"] == ["cli-*"]
+    assert cli.run([*base, "key", "list"]) == 0
+    listed_keys = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in listed_keys["data"]] == [issued["id"]]
+    assert "secret" not in listed_keys["data"][0]
+    assert cli.run([*base, "key", "revoke", "--api-key-id", issued["id"]]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "REVOKED"
 
     assert cli.run([*base, "key", "revoke", "--credential-ref", "cred://exchange/control"]) == 0
     assert cli.run([*base, "key", "revoke", "--credential-ref", "cred://exchange/control"]) == 1

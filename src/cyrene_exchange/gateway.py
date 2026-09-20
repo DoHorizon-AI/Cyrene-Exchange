@@ -16,7 +16,8 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from threading import Event
 from typing import Any, Literal, Protocol
 
@@ -66,6 +67,13 @@ class InvalidRequestError(GatewayError):
     error_type = "invalid_request_error"
 
 
+class ModelNotPermittedError(GatewayError):
+    """The credential's model scope excludes the requested model."""
+
+    status_code = 403
+    error_type = "model_not_permitted"
+
+
 class NoRouteError(GatewayError):
     status_code = 503
     error_type = "no_route"
@@ -105,17 +113,30 @@ class RequestPrincipal:
 
     Request payloads never participate in constructing this value.  Product
     adapters may persist only the references, never the credential itself.
+    An empty ``model_scope`` admits every model pattern; a non-empty scope is a
+    set of fnmatch patterns the requested model must match.
     """
 
     actor_id: str
     workspace_id: str
     credential_ref: str
+    model_scope: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         for field_name in ("actor_id", "workspace_id", "credential_ref"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"request principal {field_name} must be non-empty text")
+        for pattern in self.model_scope:
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ValueError("request principal model_scope patterns must be non-empty text")
+
+    def permits(self, model: str) -> bool:
+        """Return whether the requested model is inside this scope."""
+
+        if not self.model_scope:
+            return True
+        return any(fnmatchcase(model, pattern) for pattern in self.model_scope)
 
 
 @dataclass(frozen=True)
@@ -338,6 +359,20 @@ class ExchangeGateway:
                 stream=self._payload_stream(payload),
             )
             raise error from exc
+
+        if not principal.permits(request.model):
+            error = ModelNotPermittedError(
+                f"credential is not permitted to use model {request.model}"
+            )
+            self._observe_rejected(
+                request_id=request_id,
+                principal=principal,
+                status="rejected",
+                error_type=error.error_type,
+                model=request.model,
+                stream=request.stream,
+            )
+            raise error
 
         try:
             router = self._resolve_router()

@@ -22,7 +22,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
 from cyrene_exchange_product.domain import (
+    ApiKey,
     ConfirmRouteRequest,
+    CreateApiKeyRequest,
+    CreatedApiKey,
     CreateEndpointRequest,
     CreateRouteDraftRequest,
     CreateRouteRequest,
@@ -160,6 +163,10 @@ def create_app(
     ) -> GatewayEndpoint:
         return service.get_endpoint(endpoint_id)
 
+    @app.get("/api/v1/gateway-endpoints", response_model=list[GatewayEndpoint])
+    def list_endpoints() -> list[GatewayEndpoint]:
+        return service.list_endpoints()
+
     @app.post(
         "/api/v1/gateway-endpoints/{endpointId}/actions/disable",
         response_model=GatewayEndpoint,
@@ -179,6 +186,10 @@ def create_app(
     @app.get("/api/v1/gateway-routes/{routeId}", response_model=GatewayRoute)
     def get_route(route_id: Annotated[UUID, ApiPath(alias="routeId")]) -> GatewayRoute:
         return service.get_route(route_id)
+
+    @app.get("/api/v1/gateway-routes", response_model=list[GatewayRoute])
+    def list_routes() -> list[GatewayRoute]:
+        return service.list_routes()
 
     def admit_binding(binding_id: str) -> None:
         if binding_id not in allowed_binding_ids:
@@ -229,5 +240,38 @@ def create_app(
         return service.confirm_route_draft(
             route_id, command.resource_version, actor, validate_route_target
         )
+
+    @app.post(
+        "/api/v1/api-keys",
+        response_model=CreatedApiKey,
+        response_model_exclude_none=True,
+        status_code=201,
+    )
+    def create_api_key(
+        command: CreateApiKeyRequest,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
+    ) -> CreatedApiKey:
+        actor = principal(request)
+        created, _ = service.create_api_key(command, actor, idempotency_key)
+        return created
+
+    @app.get("/api/v1/api-keys", response_model=list[ApiKey])
+    def list_api_keys(request: Request) -> list[ApiKey]:
+        return service.list_api_keys(principal(request))
+
+    @app.get("/api/v1/api-keys/{apiKeyId}", response_model=ApiKey)
+    def get_api_key(
+        api_key_id: Annotated[UUID, ApiPath(alias="apiKeyId")],
+        request: Request,
+    ) -> ApiKey:
+        return service.get_api_key(api_key_id, principal(request))
+
+    @app.post("/api/v1/api-keys/{apiKeyId}/actions/revoke", response_model=ApiKey)
+    def revoke_api_key(
+        api_key_id: Annotated[UUID, ApiPath(alias="apiKeyId")],
+        request: Request,
+    ) -> ApiKey:
+        return service.revoke_api_key(api_key_id, principal(request))
 
     return app
