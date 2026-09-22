@@ -51,7 +51,7 @@ jobs:
     env:
       # Pinned to the revisions recorded in Cyrene-Workspace/release-lock.json.
       # Bump both together with that lock, never independently.
-      CYRENE_PLATFORM_REVISION: 06a9bd75edfe0ba0e4cf1c2dad9c9ee4d7dcb48f
+      CYRENE_PLATFORM_REVISION: 06a9bd75edfed1359b09770e749520162d75e242
       CYRENE_PLUGINS_REVISION: 0783ea5e5b722683ed0b75cd6d303039bb5f0241
     steps:
       - uses: actions/checkout@v5
@@ -62,10 +62,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Fetch the pinned sibling checkouts
         run: |
-          git clone --filter=blob:none https://github.com/DoHorizon-AI/Cyrene-Platform.git "$RUNNER_TEMP/Cyrene-Platform"
-          git -C "$RUNNER_TEMP/Cyrene-Platform" checkout --detach "$CYRENE_PLATFORM_REVISION"
-          git clone --filter=blob:none https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git "$RUNNER_TEMP/Cyrene-Plugins-Official"
-          git -C "$RUNNER_TEMP/Cyrene-Plugins-Official" checkout --detach "$CYRENE_PLUGINS_REVISION"
+          for entry in "Cyrene-Platform:$CYRENE_PLATFORM_REVISION" "Cyrene-Plugins-Official:$CYRENE_PLUGINS_REVISION"; do
+            name="${entry%%:*}"
+            revision="${entry#*:}"
+            git init --quiet "$RUNNER_TEMP/$name"
+            git -C "$RUNNER_TEMP/$name" remote add origin "https://github.com/DoHorizon-AI/$name.git"
+            # Fetch the pinned commit directly: it is a branch tip, so the
+            # server can serve it, and a wrong pin fails here with the ref name
+            # rather than half-way through the test run.
+            git -C "$RUNNER_TEMP/$name" fetch --quiet --depth 1 origin "$revision"
+            git -C "$RUNNER_TEMP/$name" checkout --quiet --detach FETCH_HEAD
+          done
       - name: Install exact locked dependencies
         run: uv sync --frozen --extra dev
       - name: Run the cross-repository acceptance lane
