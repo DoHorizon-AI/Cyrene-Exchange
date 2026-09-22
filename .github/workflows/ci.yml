@@ -44,6 +44,36 @@ jobs:
             exit 1
           fi
 
+  exchange-cross-repository:
+    name: ci / exchange-cross-repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Pinned to the revisions recorded in Cyrene-Workspace/release-lock.json.
+      # Bump both together with that lock, never independently.
+      CYRENE_PLATFORM_REVISION: 8c0bc8186da7a6d394cf701303540ab833bdbebd
+      CYRENE_PLUGINS_REVISION: 0783ea5e5b722683ed0b75cd6d303039bb5f0241
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch the pinned sibling checkouts
+        run: |
+          git clone --filter=blob:none https://github.com/DoHorizon-AI/Cyrene-Platform.git "$RUNNER_TEMP/Cyrene-Platform"
+          git -C "$RUNNER_TEMP/Cyrene-Platform" checkout --detach "$CYRENE_PLATFORM_REVISION"
+          git clone --filter=blob:none https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git "$RUNNER_TEMP/Cyrene-Plugins-Official"
+          git -C "$RUNNER_TEMP/Cyrene-Plugins-Official" checkout --detach "$CYRENE_PLUGINS_REVISION"
+      - name: Install exact locked dependencies
+        run: uv sync --frozen --extra dev
+      - name: Run the cross-repository acceptance lane
+        env:
+          CYRENE_PLATFORM_WORKTREE: ${{ runner.temp }}/Cyrene-Platform
+          CYRENE_PLUGINS_WORKTREE: ${{ runner.temp }}/Cyrene-Plugins-Official
+        run: uv run --no-sync pytest -p no:cacheprovider -q tests/test_platform_integration.py
+
   publish-artifact:
     name: ci / immutable-artifact
     if: github.event_name != 'pull_request'
