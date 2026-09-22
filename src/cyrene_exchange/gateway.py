@@ -361,9 +361,7 @@ class ExchangeGateway:
             raise error from exc
 
         if not principal.permits(request.model):
-            error = ModelNotPermittedError(
-                f"credential is not permitted to use model {request.model}"
-            )
+            error = ModelNotPermittedError(f"credential is not permitted to use model {request.model}")
             self._observe_rejected(
                 request_id=request_id,
                 principal=principal,
