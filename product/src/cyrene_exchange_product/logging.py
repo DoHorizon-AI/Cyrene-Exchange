@@ -11,11 +11,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import sys
-from datetime import datetime, timezone
-from typing import Any, Mapping
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 _TRACEPARENT_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
@@ -45,7 +44,8 @@ _INSTANCE_ID = str(uuid4())
 def is_sensitive_key(key: str) -> bool:
     """Check whether a field name matches secret key patterns."""
     lower = key.lower().replace("-", "_")
-    # Exclude usage metric counts like "tokens", "prompt_tokens", "completion_tokens", "total_tokens"
+    # Exclude usage metric counts like "tokens", "prompt_tokens",
+    # "completion_tokens", "total_tokens"
     if lower == "tokens" or lower.endswith("_tokens") or lower == "token_count":
         return False
     return any(sub in lower for sub in _SENSITIVE_KEY_SUBSTRINGS)
@@ -59,10 +59,7 @@ def sanitize_correlation_id(raw: str | None, max_len: int = 128) -> str | None:
     if not trimmed:
         return None
     # Strip control characters, newlines, tabs, quotes, carriage returns
-    filtered = "".join(
-        c for c in trimmed
-        if c.isalnum() or c in ("-", "_", ".", "/", ":")
-    )
+    filtered = "".join(c for c in trimmed if c.isalnum() or c in ("-", "_", ".", "/", ":"))
     if not filtered:
         return None
     return filtered[:max_len]
@@ -105,8 +102,7 @@ def redact_attributes(attrs: Mapping[str, Any]) -> dict[str, Any]:
             result[k] = redact_attributes(v)
         elif isinstance(v, (list, tuple)):
             result[k] = [
-                redact_attributes(item) if isinstance(item, Mapping) else item
-                for item in v
+                redact_attributes(item) if isinstance(item, Mapping) else item for item in v
             ]
         else:
             result[k] = v
@@ -124,7 +120,7 @@ def format_cyrene_log(
     attributes: Mapping[str, Any] | None = None,
 ) -> str:
     """Format a single UTF-8 NDJSON log record conforming to Cyrene specification."""
-    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now_utc = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     truncated_msg = message[:MAX_MESSAGE_BYTES] if len(message) > MAX_MESSAGE_BYTES else message
 

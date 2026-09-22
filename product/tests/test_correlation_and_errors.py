@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from cyrene_exchange_product.api import create_app
 from cyrene_exchange_product.domain import ProductPrincipal
 from cyrene_exchange_product.errors import (
-    EXCHANGE_ERROR_MAPPINGS,
-    ExchangeProductError,
     map_exchange_error,
 )
 from cyrene_exchange_product.logging import (
@@ -129,7 +126,9 @@ def test_api_correlation_headers_and_error_response(tmp_path: Path) -> None:
     app = create_app(
         database_path=tmp_path / "exchange.db",
         control_credentials={
-            "ctrl-key": ProductPrincipal("actor-1", "ws-1", "api-key://11111111-1111-1111-1111-111111111111")
+            "ctrl-key": ProductPrincipal(
+                "actor-1", "ws-1", "api-key://11111111-1111-1111-1111-111111111111"
+            )
         },
     )
     client = TestClient(app)
@@ -145,7 +144,9 @@ def test_api_correlation_headers_and_error_response(tmp_path: Path) -> None:
         },
     )
     assert response.status_code == 200
-    assert response.headers["traceparent"] == "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000001-01"
+    assert (
+        response.headers["traceparent"] == "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000001-01"
+    )
     # Malicious newlines stripped from x-request-id
     assert response.headers["x-request-id"] == "client-req-001Injected:True"
 

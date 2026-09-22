@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Annotated
@@ -43,7 +44,6 @@ from cyrene_exchange_product.logging import (
 )
 from cyrene_exchange_product.service import ExchangeProductService
 from cyrene_exchange_product.store import ExchangeStore
-import sys
 
 _TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
 

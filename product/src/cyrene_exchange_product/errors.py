@@ -47,7 +47,10 @@ class ErrorMapping:
         self.status = status
 
     def __repr__(self) -> str:
-        return f"ErrorMapping({self.canonical_code!r}, {self.cause_kind!r}, {self.recovery_action!r}, {self.status})"
+        return (
+            f"ErrorMapping({self.canonical_code!r}, {self.cause_kind!r}, "
+            f"{self.recovery_action!r}, {self.status})"
+        )
 
 
 EXCHANGE_ERROR_MAPPINGS: dict[str, ErrorMapping] = {
@@ -107,4 +110,3 @@ def map_exchange_error(code: str) -> ErrorMapping:
             status=500,
         ),
     )
-
