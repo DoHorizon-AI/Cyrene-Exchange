@@ -52,7 +52,7 @@ jobs:
       # Pinned to the revisions recorded in Cyrene-Workspace/release-lock.json.
       # Bump both together with that lock, never independently.
       CYRENE_PLATFORM_REVISION: 06a9bd75edfed1359b09770e749520162d75e242
-      CYRENE_PLUGINS_REVISION: 5caacb700b3cd8f5758d2715bb426f30ba0c57f7
+      CYRENE_PLUGINS_REVISION: a41284c2ffe71a7412f556841f9ccc4a91864138
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
