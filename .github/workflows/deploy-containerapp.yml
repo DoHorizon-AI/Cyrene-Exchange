@@ -1,0 +1,96 @@
+name: cd-containerapp
+
+on:
+  push:
+    branches: [main, release]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (defaults to git sha)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-deploy:
+    name: cd / build, push & deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Pinned sibling revisions recorded in Cyrene-Workspace
+      CYRENE_PLATFORM_REVISION: 06a9bd75edfed1359b09770e749520162d75e242
+      CYRENE_PLUGINS_REVISION: a41284c2ffe71a7412f556841f9ccc4a91864138
+      AZURE_RESOURCE_GROUP: Container-APP
+      AZURE_APP_NAME: cyrene-exchange
+
+    steps:
+      - name: Checkout Cyrene-Exchange
+        uses: actions/checkout@v5
+        with:
+          path: Cyrene-Services/Cyrene-Exchange
+
+      - name: Fetch sibling repositories (Cyrene-Platform & Cyrene-Plugins-Official)
+        run: |
+          for entry in "Cyrene-Platform:$CYRENE_PLATFORM_REVISION" "Cyrene-Plugins-Official:$CYRENE_PLUGINS_REVISION"; do
+            name="${entry%%:*}"
+            revision="${entry#*:}"
+            git init --quiet "$name"
+            git -C "$name" remote add origin "https://github.com/DoHorizon-AI/$name.git"
+            git -C "$name" fetch --quiet --depth 1 origin "$revision"
+            git -C "$name" checkout --quiet --detach FETCH_HEAD
+          done
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${REPO_OWNER}/cyrene-exchange"
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="sha-${GITHUB_SHA::7}"
+          fi
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "full_image=${IMAGE}:${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Cyrene-Services/Cyrene-Exchange/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+
+      - name: Log in to Azure (if AZURE_CREDENTIALS configured)
+        if: env.AZURE_CREDENTIALS != ''
+        uses: azure/login@v2
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update Azure Container App revision
+        if: env.AZURE_CREDENTIALS != ''
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+        run: |
+          az containerapp update \
+            --name "$AZURE_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --image "${{ steps.meta.outputs.full_image }}"
