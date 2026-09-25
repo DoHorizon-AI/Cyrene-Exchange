@@ -325,7 +325,7 @@ class ExchangeProductService:
 
         中文:列出当前 workspace 的 key,不包含任何 secret。
         """
-    # 中文:列出此工作区的密钥,不返回任何秘密材料。
+        # 中文:列出此工作区的密钥,不返回任何秘密材料。
 
         return [
             key for key in self.store.list_api_keys() if key.workspace_id == principal.workspace_id
@@ -336,7 +336,7 @@ class ExchangeProductService:
 
         中文:读取一把由调用者 workspace 所有的 key。
         """
-    # 中文:读取一条属于调用方工作区的密钥。
+        # 中文:读取一条属于调用方工作区的密钥。
 
         return self._owned_api_key(api_key_id, principal)
 

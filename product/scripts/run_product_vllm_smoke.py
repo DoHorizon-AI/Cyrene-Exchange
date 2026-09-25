@@ -393,7 +393,7 @@ def main() -> int:
         assert endpoint_id is not None
         # Reopen the same Product database before composing the data plane.
         # This keeps the proof tied to persisted endpoint/route state.
-                # 中文:在组合数据平面前重新打开同一个 Product 数据库,使该证明仍绑定到已持久化的端点/路由状态。
+        # 中文:在组合数据平面前重新打开同一个 Product 数据库,使该证明仍绑定到已持久化的端点/路由状态。
         store.close()
         store = ExchangeStore(database)
         connection_ref = _wait_for_ready(plugin_process, args.ready_timeout)

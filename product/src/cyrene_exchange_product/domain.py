@@ -197,7 +197,8 @@ class ProductPrincipal:
 
     中文:绑定到一个凭据引用的已配置 Exchange 身份。
     """
-# 中文:绑定到一个凭据引用的 Exchange 配置身份。
+
+    # 中文:绑定到一个凭据引用的 Exchange 配置身份。
 
     actor_id: str
     workspace_id: str
@@ -224,7 +225,8 @@ class RequestAuditStatus(StrEnum):
 
     中文:由 Exchange Product 持有的持久化 request 生命周期状态。
     """
-# 中文:由 Exchange Product 拥有的持久化请求生命周期状态。
+
+    # 中文:由 Exchange Product 拥有的持久化请求生命周期状态。
 
     STARTED = "started"
     COMPLETED = "completed"
@@ -238,7 +240,8 @@ class UsageState(StrEnum):
 
     中文:Provider 观测到的精确用量事实的完整性。
     """
-# 中文:提供方观测到的准确用量事实是否完整。
+
+    # 中文:提供方观测到的准确用量事实是否完整。
 
     UNKNOWN = "unknown"
     PARTIAL = "partial"
@@ -250,7 +253,8 @@ class RequestAuditRecord(ContractModel):
 
     中文:不含内容正文的持久化请求、结果与 provider 用量记录。
     """
-# 中文:不含内容的持久化请求、结果和提供方用量记录。
+
+    # 中文:不含内容的持久化请求、结果和提供方用量记录。
 
     request_id: str = Field(min_length=1, max_length=200)
     route_id: str | None = Field(default=None, min_length=1, max_length=300)

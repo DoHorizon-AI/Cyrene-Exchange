@@ -34,7 +34,8 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     中文:供参考 provider adapter 使用的本地真实模型 HTTP peer。
     """
-# 中文:参考提供方适配器使用的真实本地模型 HTTP 对端。
+
+    # 中文:参考提供方适配器使用的真实本地模型 HTTP 对端。
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -65,7 +66,8 @@ class LocalHttpProvider:
 
     中文:仅用于验证持久化路由流程的小型真实 HTTP provider。
     """
-# 中文:仅用于覆盖持久化路由路径的小型真实 HTTP 提供方。
+
+    # 中文:仅用于覆盖持久化路由路径的小型真实 HTTP 提供方。
 
     def __init__(self, server: ThreadingHTTPServer) -> None:
         self._server = server
@@ -96,7 +98,8 @@ class ProviderResolver:
 
     中文:仅暴露不透明、已绑定 provider capability 的委托对象。
     """
-# 中文:只公开不透明已绑定提供方能力的委托对象。
+
+    # 中文:只公开不透明已绑定提供方能力的委托对象。
 
     def __init__(self, binding_id: str, provider: LocalHttpProvider) -> None:
         self._binding_id = binding_id

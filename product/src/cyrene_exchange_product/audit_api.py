@@ -27,7 +27,8 @@ class RequestAuditList(BaseModel):
 
     中文:只读审计接口的有界列表响应。
     """
-# 中文:只读审计接口使用的有界列表响应。
+
+    # 中文:只读审计接口使用的有界列表响应。
 
     items: list[RequestAuditRecord]
 
@@ -37,7 +38,7 @@ def create_audit_app(*, database_path: Path) -> FastAPI:
 
     中文:构建独立的只读审计 API,不更改 control OpenAPI。
     """
-# 中文:构建独立的只读审计 API,不修改控制 API 的 OpenAPI 定义。
+    # 中文:构建独立的只读审计 API,不修改控制 API 的 OpenAPI 定义。
 
     store = ExchangeStore(database_path)
     app = FastAPI(title="Cyrene Exchange Usage Audit API", version="1.0.0")
@@ -48,7 +49,7 @@ def create_audit_app(*, database_path: Path) -> FastAPI:
 
         中文:仅从已持久化的受控凭据中解析身份。
         """
-    # 中文:仅从已持久化的受控凭据解析身份。
+        # 中文:仅从已持久化的受控凭据解析身份。
 
         if authorization is None or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Authorization must use a Bearer token")
@@ -67,7 +68,7 @@ def create_audit_app(*, database_path: Path) -> FastAPI:
 
         中文:仅列出调用者自己的 workspace 和 actor 记录。
         """
-    # 中文:只列出调用方所属工作区和主体的记录。
+        # 中文:只列出调用方所属工作区和主体的记录。
 
         principal = principal_for(authorization)
         return RequestAuditList(
@@ -90,7 +91,7 @@ def create_audit_app(*, database_path: Path) -> FastAPI:
 
         中文:仅当 workspace 和 actor 都匹配时读取一条审计记录。
         """
-    # 中文:仅当工作区和主体均匹配时读取一条审计记录。
+        # 中文:仅当工作区和主体均匹配时读取一条审计记录。
 
         principal = principal_for(authorization)
         record = store.get_request_audit(request_id)

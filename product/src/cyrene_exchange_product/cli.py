@@ -41,7 +41,7 @@ def _bindings(entries: list[str]) -> dict[str, OpenAICompatibleProvider]:
 
     中文:解析 operator 提供的 binding=url provider 声明。
     """
-# 中文:解析操作员提供的 ``binding=url`` 形式的提供方声明。
+    # 中文:解析操作员提供的 ``binding=url`` 形式的提供方声明。
 
     resolved: dict[str, OpenAICompatibleProvider] = {}
     for entry in entries:
@@ -65,7 +65,7 @@ def _timestamp(value: str) -> datetime:
 
     中文:将 ISO-8601 过期时间解析为带时区的 UTC 时间戳。
     """
-# 中文:将 ISO-8601 到期时间解析为带时区的 UTC 时间戳。
+    # 中文:将 ISO-8601 到期时间解析为带时区的 UTC 时间戳。
 
     parsed = datetime.fromisoformat(value)
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
@@ -191,7 +191,7 @@ def _key_issue(arguments: argparse.Namespace) -> int:
 
     中文:生成一个 gateway key;secret 仅打印一次。
     """
-# 中文:生成一个网关密钥;秘密值只打印一次。
+    # 中文:生成一个网关密钥;秘密值只打印一次。
 
     store = ExchangeStore(arguments.database.resolve())
     try:
@@ -222,7 +222,7 @@ def _key_list(arguments: argparse.Namespace) -> int:
 
     中文:列出一个 workspace 的 key 元数据,不包含 secret 材料。
     """
-# 中文:列出一个工作区的密钥元数据,不包含任何秘密材料。
+    # 中文:列出一个工作区的密钥元数据,不包含任何秘密材料。
 
     store = ExchangeStore(arguments.database.resolve())
     try:
@@ -370,7 +370,7 @@ def run(argv: list[str] | None = None) -> int:
 
     中文:执行一条 operator 命令并返回进程退出码。
     """
-# 中文:执行一条操作员命令并返回其进程退出码。
+    # 中文:执行一条操作员命令并返回其进程退出码。
 
     arguments = parser().parse_args(argv)
     if arguments.command == "serve":

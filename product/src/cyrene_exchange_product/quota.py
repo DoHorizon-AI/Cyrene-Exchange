@@ -25,7 +25,8 @@ class ProductQuotaGuard:
 
     中文:评估已持久化的 Product 策略,不负责用量聚合。
     """
-# 中文:评估已持久化的 Product 策略,但不拥有用量汇总职责。
+
+    # 中文:评估已持久化的 Product 策略,但不拥有用量汇总职责。
 
     def __init__(
         self,
@@ -40,7 +41,7 @@ class ProductQuotaGuard:
 
         中文:拒绝已耗尽或 workspace 不匹配的 quota 分配。
         """
-    # 中文:拒绝已耗尽或工作区不匹配的配额分配。
+        # 中文:拒绝已耗尽或工作区不匹配的配额分配。
 
         quota = self._store.get_tenant_quota(principal.actor_id)
         if quota is None:
