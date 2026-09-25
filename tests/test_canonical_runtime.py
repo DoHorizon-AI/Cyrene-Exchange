@@ -51,7 +51,7 @@ def resolve_test_principal(token: str) -> RequestPrincipal | None:
 
     中文:仅将明确指定的测试凭据解析为可信身份。
     """
-# 中文:只将显式测试凭据解析为可信身份。
+    # 中文:只将显式测试凭据解析为可信身份.
 
     return TEST_PRINCIPAL if token == "test-token" else None
 
@@ -125,7 +125,7 @@ def tool_payload(*, stream: bool = False, include_usage: bool = False) -> dict[s
 
     中文:构造仅含文本、一个 function tool 及其调用历史的请求。
     """
-# 中文:构造一个包含函数工具和工具历史记录的纯文本请求。
+    # 中文:构造一个包含函数工具和工具历史记录的纯文本请求.
 
     value: dict[str, Any] = {
         "model": "requested-model",

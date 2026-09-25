@@ -22,7 +22,8 @@ class BillingHandler(BaseHTTPRequestHandler):
 
     中文:能够捕获 adapter wire payload 的最小契约 peer。
     """
-    # 中文:捕获适配器线协议负载的最小契约对端。
+
+    # 中文:捕获适配器线协议负载的最小契约对端.
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         length = int(self.headers["Content-Length"])

@@ -516,7 +516,7 @@ def build_product_app(
             # The gateway and its provider adapters are synchronous, so the call
             # runs on the worker thread instead of stalling the event loop that
             # also serves probes and concurrent requests.
-            # 中文：Gateway 及其提供方适配器是同步的,因此调用会在线程池工作线程中执行,
+            # 中文:Gateway 及其提供方适配器是同步的,因此调用会在线程池工作线程中执行,
             # 避免阻塞同时处理探测和并发请求的事件循环。
             response = await run_in_threadpool(
                 gateway.handle_openai_chat,
