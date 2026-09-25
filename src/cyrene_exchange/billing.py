@@ -24,7 +24,7 @@ from .gateway import RequestAuditTerminalStatus, RequestMetadata
 class BillingUsageError(RuntimeError):
     """The billing plugin rejected a request or returned an invalid response.
 
-    账单插件拒绝了请求，或返回了无效响应。
+    账单插件拒绝了请求,或返回了无效响应。
     """
 
 
@@ -48,7 +48,7 @@ class TokenUsageEvent:
     def to_wire(self) -> dict[str, str | int]:
         """Serialize contract field names while preserving missing token facts.
 
-        序列化契约字段名，同时保留缺失的 token 事实。
+        序列化契约字段名,同时保留缺失的 token 事实。
         """
 
         wire: dict[str, str | int] = {
@@ -72,7 +72,7 @@ class TokenUsageEvent:
 class BillingUsageClient(Protocol):
     """Consumer port for the Plugins-owned `billing.usage.v1` capability.
 
-    供消费者使用的 `billing.usage.v1` 能力接口，该能力由 Plugins 所有。
+    供消费者使用的 `billing.usage.v1` 能力接口,该能力由 Plugins 所有。
     """
 
     def record_token_usage(self, event: TokenUsageEvent) -> None:

@@ -43,7 +43,7 @@ from cyrene_exchange_product.store import ExchangeStore
 class Router:
     """Return one opaque Product route for the core gateway.
 
-    中文：为核心 Gateway 返回一条不透明的 Product 路由。"""
+    中文:为核心 Gateway 返回一条不透明的 Product 路由。"""
 
     def plan(self, _request):
         return [RouteTarget(provider_ref="binding:unit", route_id="route:unit")]
@@ -52,7 +52,7 @@ class Router:
 class Provider:
     """Yield exact provider usage facts for unary or streamed requests.
 
-    中文：为一元或流式请求产出提供方报告的精确用量事实。"""
+    中文:为一元或流式请求产出提供方报告的精确用量事实。"""
 
     def __init__(self, chunks: Iterable[ProviderChunk]) -> None:
         self.chunks = list(chunks)
@@ -68,7 +68,7 @@ class Provider:
 class Resolver:
     """Expose the fake router and provider through canonical capability ids.
 
-    中文：通过规范能力 ID 暴露模拟路由器和提供方。"""
+    中文:通过规范能力 ID 暴露模拟路由器和提供方。"""
 
     def __init__(self, provider: Provider) -> None:
         self.provider = provider
@@ -84,7 +84,7 @@ class Resolver:
 class RecordingBillingClient:
     """Capture Product-to-plugin usage events without duplicating ledger logic.
 
-    中文：捕获 Product 到 Plugin 的用量事件，不重复实现台账逻辑。"""
+    中文:捕获 Product 到 Plugin 的用量事件,不重复实现台账逻辑。"""
 
     def __init__(self) -> None:
         self.events: list[TokenUsageEvent] = []
@@ -223,7 +223,7 @@ def test_stream_audit_records_observed_usage_once_and_unknown_is_not_zero(tmp_pa
         principal=RequestPrincipal("actor-unit", "workspace-unit", "credential-unit"),
     )
     # A duplicate terminal callback is a no-op and cannot overwrite usage.
-    # 中文：重复的最终回调不执行操作，也不能覆盖用量。
+    # 中文:重复的最终回调不执行操作,也不能覆盖用量。
     store.finish_request(
         metadata,
         status="completed",
@@ -291,7 +291,7 @@ def test_read_only_audit_api_enforces_credential_scope(tmp_path: Path) -> None:
 def test_stream_completion_is_durable_before_done_reaches_the_consumer(tmp_path: Path) -> None:
     """A client may stop reading at DONE without losing the terminal audit.
 
-    中文：客户端可以在 DONE 处停止读取，但最终审计记录仍会保留。"""
+    中文:客户端可以在 DONE 处停止读取,但最终审计记录仍会保留。"""
 
     store = ExchangeStore(tmp_path / "exchange.sqlite3")
     provider = Provider([ProviderChunk(delta="answer", finish_reason="stop")])
@@ -317,7 +317,7 @@ def test_stream_completion_is_durable_before_done_reaches_the_consumer(tmp_path:
 def test_failed_terminal_commit_never_emits_done(tmp_path: Path, monkeypatch) -> None:
     """A storage failure after model output must not claim durable completion.
 
-    中文：模型输出后若发生存储故障，不得声称请求已持久完成。"""
+    中文:模型输出后若发生存储故障,不得声称请求已持久完成。"""
 
     store = ExchangeStore(tmp_path / "exchange.sqlite3")
     provider = Provider([ProviderChunk(delta="answer", finish_reason="stop")])
@@ -349,7 +349,7 @@ def test_failed_terminal_commit_never_emits_done(tmp_path: Path, monkeypatch) ->
 def test_audit_requires_trusted_identity_and_one_provider_attempt(tmp_path: Path) -> None:
     """The V1 ledger cannot invent identity or hide a second provider request.
 
-    中文：V1 台账不能虚构身份，也不能隐藏第二次提供方请求。"""
+    中文:V1 台账不能虚构身份,也不能隐藏第二次提供方请求。"""
 
     store = ExchangeStore(tmp_path / "exchange.sqlite3")
     provider = Provider([ProviderChunk(delta="must not run")])
@@ -375,7 +375,7 @@ def test_audit_requires_trusted_identity_and_one_provider_attempt(tmp_path: Path
 def test_product_quota_is_persisted_and_uses_plugin_owned_total(tmp_path: Path) -> None:
     """Product owns the limit while the billing capability owns usage aggregation.
 
-    中文：Product 负责限额，计费能力负责用量汇总。"""
+    中文:Product 负责限额,计费能力负责用量汇总。"""
 
     database = tmp_path / "exchange.sqlite3"
     store = ExchangeStore(database)

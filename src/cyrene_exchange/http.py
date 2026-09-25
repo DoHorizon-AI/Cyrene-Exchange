@@ -32,7 +32,7 @@ from .gateway import ExchangeGateway, GatewayError
 def _watch_client_disconnect(connection: socket.socket, cancel_event: Event, stop_event: Event) -> None:
     """Set ``cancel_event`` when the peer closes while Product work is running.
 
-    Product 工作进行期间，如果对端关闭连接则设置 ``cancel_event``。
+    Product 工作进行期间,如果对端关闭连接则设置 ``cancel_event``。
     """
 
     peek_flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
@@ -70,7 +70,7 @@ def create_reference_server(
 ) -> ThreadingHTTPServer:
     """Create an HTTP adapter without starting or owning the server thread.
 
-    创建 HTTP adapter，但不启动或拥有服务线程。
+    创建 HTTP adapter,但不启动或拥有服务线程。
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -159,7 +159,7 @@ def create_reference_server(
                 # Headers are already committed, so a second JSON response
                 # would corrupt the SSE stream. The client observes a
                 # truncated stream and the request is not retried.
-                # 响应标头已经提交，再发送 JSON 响应会破坏 SSE 流。客户端会观察到流被截断，且请求不会重试。
+                # 响应标头已经提交,再发送 JSON 响应会破坏 SSE 流。客户端会观察到流被截断,且请求不会重试。
                 cancel_event.set()
 
         def log_message(self, format: str, *args: Any) -> None:

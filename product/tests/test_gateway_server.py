@@ -35,9 +35,9 @@ CONTROL_PRINCIPAL = ProductPrincipal("actor", "workspace", "cred://exchange/cont
 class UpstreamHandler(BaseHTTPRequestHandler):
     """Real OpenAI-compatible peer that supports both response modes.
 
-    中文：支持两种响应模式的真实 OpenAI 兼容 peer。
+    中文:支持两种响应模式的真实 OpenAI 兼容 peer。
     """
-# 中文：支持两种响应模式的真实 OpenAI 兼容对端。
+# 中文:支持两种响应模式的真实 OpenAI 兼容对端。
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -80,9 +80,9 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 def _seed_endpoint(database: Path, name: str) -> str:
     """Create one ACTIVE gateway endpoint before the data plane starts.
 
-    中文：在 data plane 启动前创建一个状态为 ACTIVE 的 gateway endpoint。
+    中文:在 data plane 启动前创建一个状态为 ACTIVE 的 gateway endpoint。
     """
-# 中文：在数据平面启动前创建一个 ACTIVE 网关端点。
+# 中文:在数据平面启动前创建一个 ACTIVE 网关端点。
 
     with TestClient(
         create_app(database_path=database, control_credentials={"control-token": CONTROL_PRINCIPAL})
@@ -93,9 +93,9 @@ def _seed_endpoint(database: Path, name: str) -> str:
 def _gateway_app(tmp_path: Path, upstream: ThreadingHTTPServer):
     """Build the fused control and data plane against one real upstream peer.
 
-    中文：基于一个真实上游 peer 构建融合式 control plane 和 data plane。
+    中文:基于一个真实上游 peer 构建融合式 control plane 和 data plane。
     """
-# 中文：基于同一个真实上游对端构建组合的控制面和数据平面。
+# 中文:基于同一个真实上游对端构建组合的控制面和数据平面。
 
     provider = OpenAICompatibleProvider(f"http://127.0.0.1:{upstream.server_port}/v1")
     return build_product_app(
@@ -316,9 +316,9 @@ def test_route_enable_activates_a_reactor_handoff_draft(tmp_path: Path) -> None:
 class SourceHandler(BaseHTTPRequestHandler):
     """Stand-in Reactor endpoint that publishes its serving URL.
 
-    中文：会发布自身 serving URL 的 Reactor endpoint 替身。
+    中文:会发布自身 serving URL 的 Reactor endpoint 替身。
     """
-# 中文：发布其服务 URL 的 Reactor 代用端点。
+# 中文:发布其服务 URL 的 Reactor 代用端点。
 
     serving_url = ""
 

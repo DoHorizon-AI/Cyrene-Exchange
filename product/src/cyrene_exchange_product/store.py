@@ -330,7 +330,7 @@ class ExchangeStore:
     def _mutation(self) -> Iterator[sqlite3.Cursor]:
         """Run one durable mutation under SQLite's immediate write lock.
 
-        中文：在 SQLite 的 immediate 写锁下执行一次持久化变更。"""
+        中文:在 SQLite 的 immediate 写锁下执行一次持久化变更。"""
 
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -346,7 +346,7 @@ class ExchangeStore:
     def configure_credentials(self, credentials: Mapping[str, ProductPrincipal]) -> None:
         """Persist controlled token mappings without storing bearer secrets.
 
-        中文：持久化受控令牌映射，不存储 bearer 密钥。"""
+        中文:持久化受控令牌映射,不存储 bearer 密钥。"""
 
         prepared: list[tuple[str, ProductPrincipal, str]] = []
         for token, principal in credentials.items():
@@ -396,7 +396,7 @@ class ExchangeStore:
     def disable_credential(self, credential_ref: str) -> bool:
         """Revoke one credential reference without deleting its audit trail.
 
-        中文：撤销一个凭据引用，但不删除其审计记录。"""
+        中文:撤销一个凭据引用,但不删除其审计记录。"""
 
         with self._mutation() as cursor:
             cursor.execute(
@@ -418,9 +418,9 @@ class ExchangeStore:
         returns the existing metadata without the secret, which is only ever
         shown by the creation response.
 
-        中文：原子持久化一个由服务器生成的密钥及其重放标识。
+        中文:原子持久化一个由服务器生成的密钥及其重放标识。
 
-                中文：返回已存储的密钥及本次调用是否创建了该密钥。重放请求会返回现有元数据而不返回密钥；密钥只会在创建响应中展示一次。
+                中文:返回已存储的密钥及本次调用是否创建了该密钥。重放请求会返回现有元数据而不返回密钥;密钥只会在创建响应中展示一次。
         """
 
         with self._mutation() as cursor:
@@ -503,7 +503,7 @@ class ExchangeStore:
     def resolve_credential(self, token: str) -> RequestPrincipal | None:
         """Resolve one bearer token to trusted identity metadata.
 
-        中文：将一个 bearer token 解析为可信的身份元数据。"""
+        中文:将一个 bearer token 解析为可信的身份元数据。"""
 
         if not isinstance(token, str) or not token:
             return None
@@ -531,7 +531,7 @@ class ExchangeStore:
     def save_tenant_quota(self, quota: TenantQuota) -> None:
         """Persist Product quota policy without duplicating usage totals.
 
-        中文：持久化 Product 配额策略，不重复存储用量总数。"""
+        中文:持久化 Product 配额策略,不重复存储用量总数。"""
 
         with self._mutation() as cursor:
             cursor.execute(
@@ -555,7 +555,7 @@ class ExchangeStore:
     def get_tenant_quota(self, tenant_id: str) -> TenantQuota | None:
         """Read Product quota policy; usage remains Plugins-owned.
 
-        中文：读取 Product 配额策略；用量仍由 Plugins 所有。"""
+        中文:读取 Product 配额策略;用量仍由 Plugins 所有。"""
 
         with self._lock:
             row = self._connection.execute(
@@ -570,7 +570,7 @@ class ExchangeStore:
     def begin_request(self, metadata: RequestMetadata) -> None:
         """Persist trusted request admission before provider invocation.
 
-        中文：在调用提供方之前持久化可信的请求准入记录。"""
+        中文:在调用提供方之前持久化可信的请求准入记录。"""
 
         principal = metadata.principal
         try:
@@ -618,7 +618,7 @@ class ExchangeStore:
     ) -> None:
         """Persist an authenticated rejection without request content.
 
-        中文：持久化经过认证的拒绝结果，不记录请求内容。"""
+        中文:持久化经过认证的拒绝结果,不记录请求内容。"""
 
         with self._mutation() as cursor:
             cursor.execute(
@@ -654,7 +654,7 @@ class ExchangeStore:
     ) -> None:
         """Record one terminal outcome; repeated callbacks cannot add usage.
 
-        中文：记录一次最终结果；重复回调不能增加用量。"""
+        中文:记录一次最终结果;重复回调不能增加用量。"""
 
         usage_state, prompt_tokens, completion_tokens, total_tokens, source = _usage_values(usage)
         with self._mutation() as cursor:
@@ -697,7 +697,7 @@ class ExchangeStore:
     def get_request_audit(self, request_id: str) -> RequestAuditRecord | None:
         """Read one content-free durable request audit record.
 
-        中文：读取一条不含内容的持久化请求审计记录。"""
+        中文:读取一条不含内容的持久化请求审计记录。"""
 
         with self._lock:
             row = self._connection.execute(
@@ -714,7 +714,7 @@ class ExchangeStore:
     ) -> list[RequestAuditRecord]:
         """List durable audit rows with bounded workspace/actor filters.
 
-        中文：使用有界的 workspace/actor 条件列出持久化审计记录。"""
+        中文:使用有界的 workspace/actor 条件列出持久化审计记录。"""
 
         bounded_limit = max(1, min(limit, 500))
         clauses: list[str] = []
@@ -738,7 +738,7 @@ class ExchangeStore:
 def _unix_ms() -> int:
     """Return current Unix wall-clock time in milliseconds.
 
-    中文：返回当前 Unix 墙上时钟时间，单位为毫秒。"""
+    中文:返回当前 Unix 墙上时钟时间,单位为毫秒。"""
 
     import time
 
@@ -748,7 +748,7 @@ def _unix_ms() -> int:
 def _to_unix_ms(value: datetime | None) -> int | None:
     """Convert an optional aware timestamp to Unix milliseconds.
 
-    中文：将可选的带时区时间戳转换为 Unix 毫秒时间。"""
+    中文:将可选的带时区时间戳转换为 Unix 毫秒时间。"""
 
     return None if value is None else int(value.timestamp() * 1000)
 
@@ -756,7 +756,7 @@ def _to_unix_ms(value: datetime | None) -> int | None:
 def _from_unix_ms(value: int | None) -> datetime | None:
     """Convert optional Unix milliseconds to an aware UTC timestamp.
 
-    中文：将可选的 Unix 毫秒时间转换为带时区的 UTC 时间戳。"""
+    中文:将可选的 Unix 毫秒时间转换为带时区的 UTC 时间戳。"""
 
     return None if value is None else datetime.fromtimestamp(value / 1000, tz=UTC)
 
@@ -764,7 +764,7 @@ def _from_unix_ms(value: int | None) -> datetime | None:
 def _api_key_from_row(row: sqlite3.Row) -> ApiKey:
     """Project one api_credentials row onto the public ApiKey metadata.
 
-    中文：将一条 api_credentials 记录投影为公开 ApiKey 元数据。"""
+    中文:将一条 api_credentials 记录投影为公开 ApiKey 元数据。"""
 
     scope = json.loads(str(row["model_scope"])) if row["model_scope"] else []
     return ApiKey(
@@ -788,7 +788,7 @@ def _usage_values(
 ) -> tuple[UsageState, int | None, int | None, int | None, str | None]:
     """Classify only provider facts; never infer missing token counts.
 
-    中文：只对提供方事实进行分类；绝不推断缺失的 token 计数。"""
+    中文:只对提供方事实进行分类;绝不推断缺失的 token 计数。"""
 
     if usage is None:
         return UsageState.UNKNOWN, None, None, None, None
@@ -806,7 +806,7 @@ def _usage_values(
 def _audit_from_row(row: sqlite3.Row) -> RequestAuditRecord:
     """Convert a SQLite row into the public content-free audit model.
 
-    中文：将 SQLite 记录转换为公开的无内容审计模型。"""
+    中文:将 SQLite 记录转换为公开的无内容审计模型。"""
 
     values = dict(row)
     values["stream"] = None if values["stream"] is None else bool(values["stream"])

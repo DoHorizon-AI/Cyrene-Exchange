@@ -1,11 +1,11 @@
 ###############################################################################
 # 📄 File: src/cyrene_exchange/__init__.py
-# 中文：文件：src/cyrene_exchange/__init__.py；模块：Cyrene Exchange；职责：Exchange Product 实现。
+# 中文:文件:src/cyrene_exchange/__init__.py;模块:Cyrene Exchange;职责:Exchange Product 实现。
 # Module: Cyrene Exchange
 # Role: Exchange Product implementation.
 #
 # This header documents ownership; runtime behavior is unchanged.
-# 中文：此文件头说明模块所有权；运行时行为保持不变。
+# 中文:此文件头说明模块所有权;运行时行为保持不变。
 #
 # 模块：Cyrene Exchange
 # 职责：Exchange Product 实现。
@@ -17,9 +17,9 @@ The package deliberately depends on capability protocols instead of concrete
 plugin implementations.  The HTTP server is a replaceable reference adapter;
 the Product semantics live in :class:`ExchangeGateway`.
 
-中文：Exchange Product Core 与参考传输 adapter。package 刻意依赖 capability protocol，而不依赖具体 plugin 实现。HTTP server 是可替换的参考 adapter；Product 语义由 ExchangeGateway 承载。
+中文:Exchange Product Core 与参考传输 adapter。package 刻意依赖 capability protocol,而不依赖具体 plugin 实现。HTTP server 是可替换的参考 adapter;Product 语义由 ExchangeGateway 承载。
 """
-# 中文：Exchange Product 核心与参考传输适配器。本包依赖能力协议，而不依赖具体插件实现。HTTP 服务器是可替换的参考适配器；Product 语义由 :class:`ExchangeGateway` 承载。
+# 中文:Exchange Product 核心与参考传输适配器。本包依赖能力协议,而不依赖具体插件实现。HTTP 服务器是可替换的参考适配器;Product 语义由 :class:`ExchangeGateway` 承载。
 
 from .capabilities import (
     MODEL_PROVIDER_CAPABILITY,
@@ -69,9 +69,9 @@ _ADAPTER_EXPORTS = {
 def __getattr__(name: str) -> object:
     """Load Platform-dependent adapters only when a caller requests them.
 
-    中文：只有调用方请求时才加载依赖 Platform 的 adapter。
+    中文:只有调用方请求时才加载依赖 Platform 的 adapter。
     """
-# 中文：仅在调用方请求时加载依赖 Platform 的适配器。
+# 中文:仅在调用方请求时加载依赖 Platform 的适配器。
 
     target = _ADAPTER_EXPORTS.get(name)
     if target is None:

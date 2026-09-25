@@ -212,7 +212,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
     def _serve_slow_tool_stream(self) -> None:
         """Emit one tool fragment, then wait for cancellation or release.
 
-        中文：发出一个工具调用片段，然后等待取消或释放。"""
+        中文:发出一个工具调用片段,然后等待取消或释放。"""
 
         first = {
             "choices": [
@@ -265,7 +265,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
     def _serve_role_only_stream(self) -> None:
         """Emit an empty-content assistant preamble before real text.
 
-        中文：在实际文本之前发出一个空内容的助手前导消息。"""
+        中文:在实际文本之前发出一个空内容的助手前导消息。"""
 
         events = [
             {
@@ -302,7 +302,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
     def _peer_disconnected(self) -> bool:
         """Probe the upstream connector socket without consuming request data.
 
-        中文：探测上游连接器套接字，不消费请求数据。"""
+        中文:探测上游连接器套接字,不消费请求数据。"""
 
         try:
             readable, _, _ = select.select([self.connection], [], [], 0.05)
@@ -323,7 +323,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 def platform_binaries():
     """Build only the generic Platform capability resolver.
 
-    中文：只构建通用 Platform 能力解析器。"""
+    中文:只构建通用 Platform 能力解析器。"""
 
     package = "cy-platform-api"
     binary = "cyrene-capability-resolver"
@@ -373,7 +373,7 @@ def upstream():
 def plugin_runtime(upstream, tmp_path_factory):
     """Start one independent Plugins-owned endpoint per Product provider ref.
 
-    中文：为每个 Product provider ref 启动一个独立的 Plugins 所有端点。"""
+    中文:为每个 Product provider ref 启动一个独立的 Plugins 所有端点。"""
 
     runtime_dir = tmp_path_factory.mktemp("exchange-direct-plugins")
     upstream_root = f"http://127.0.0.1:{upstream.server_port}"
@@ -563,7 +563,7 @@ def test_real_platform_resolver_and_direct_plugin_non_stream(platform_binaries, 
 def test_real_canonical_provider_forwards_tool_call_and_usage(platform_binaries, plugin_runtime, upstream):
     """Exercise v2 tools through resolver, direct Plugin endpoint, and HTTP.
 
-    中文：通过 resolver、直连 Plugin 端点和 HTTP 测试 v2 工具调用。"""
+    中文:通过 resolver、直连 Plugin 端点和 HTTP 测试 v2 工具调用。"""
 
     request_count = len(upstream_requests(upstream))
     gateway, _ = make_gateway(
@@ -703,7 +703,7 @@ def test_real_plugin_sse_stream(platform_binaries, plugin_runtime):
 def test_real_canonical_provider_preserves_role_only_first_stream_chunk(platform_binaries, plugin_runtime, upstream):
     """Keep a role-only empty-content preamble and all following stream facts.
 
-    中文：保留仅包含角色的空内容前导消息及其后的所有流式事实。"""
+    中文:保留仅包含角色的空内容前导消息及其后的所有流式事实。"""
 
     provider_ref = "model-provider-role-only-stream"
     request_count = len(upstream_requests(upstream))
@@ -875,7 +875,7 @@ def test_real_provider_cancellation_is_cooperative(platform_binaries, plugin_run
 def test_real_canonical_sse_tool_disconnect_cancels_upstream_without_retry(platform_binaries, plugin_runtime, upstream):
     """Verify an HTTP disconnect cancels a real tool SSE before terminal usage.
 
-    中文：验证 HTTP 断开会在最终用量事件之前取消真实工具 SSE。"""
+    中文:验证 HTTP 断开会在最终用量事件之前取消真实工具 SSE。"""
 
     provider_ref = "model-provider-cancelled-tool-stream"
     request_count = len(upstream_requests(upstream))
@@ -929,7 +929,7 @@ def test_real_canonical_sse_tool_disconnect_cancels_upstream_without_retry(platf
         # The direct Plugin invocation is still active while the provider is
         # consuming this SSE. Closing the client must reach the HTTP watcher,
         # direct gRPC cancellation and finally the upstream socket.
-        # 中文：提供方正在消费此 SSE 时，直连 Plugin 调用仍处于活动状态。关闭客户端必须依次触发 HTTP watcher、直连 gRPC 取消，最终关闭上游套接字。
+        # 中文:提供方正在消费此 SSE 时,直连 Plugin 调用仍处于活动状态。关闭客户端必须依次触发 HTTP watcher、直连 gRPC 取消,最终关闭上游套接字。
         response = client.getresponse()
         assert response.status == 200
         first_line = response.fp.readline() if response.fp is not None else b""
@@ -958,7 +958,7 @@ def test_real_canonical_sse_tool_disconnect_cancels_upstream_without_retry(platf
 
     # A subsequent direct Plugin invocation proves the cancelled worker was cleaned
     # up enough for the service to activate and complete another provider.
-    # 中文：后续的直连 Plugin 调用可证明取消后的工作进程已清理到足以重新激活服务，并完成另一项提供方请求。
+    # 中文:后续的直连 Plugin 调用可证明取消后的工作进程已清理到足以重新激活服务,并完成另一项提供方请求。
     next_gateway, _ = make_gateway(
         platform_binaries,
         plugin_runtime,
@@ -976,7 +976,7 @@ def test_real_canonical_sse_exposes_first_tool_fragment_before_upstream_terminal
 ):
     """Prove the first typed chunk reaches HTTP while the provider is blocked.
 
-    中文：证明提供方被阻塞期间，第一个有类型数据块仍能到达 HTTP。"""
+    中文:证明提供方被阻塞期间,第一个有类型数据块仍能到达 HTTP。"""
 
     provider_ref = "model-provider-cancelled-tool-stream"
     gateway, _ = make_gateway(

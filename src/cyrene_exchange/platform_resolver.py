@@ -16,7 +16,7 @@ intentionally does not import, instantiate, or proxy plugin business APIs.
 This Product adapter binds INLINE reference implementations locally and pairs
 WORKER or SERVICE results with Product-composed direct Plugin clients.
 
-从 Exchange 的 Product 接口接入 Platform 通用 resolver 的 adapter。Platform resolver 负责 manifest 规范化和能力选择；它不会导入、实例化或代理插件业务 API。此 Product adapter 会在本地绑定 INLINE 参考实现，并将 WORKER 或 SERVICE 结果与 Product 组合的 Direct Plugin 客户端配对。
+从 Exchange 的 Product 接口接入 Platform 通用 resolver 的 adapter。Platform resolver 负责 manifest 规范化和能力选择;它不会导入、实例化或代理插件业务 API。此 Product adapter 会在本地绑定 INLINE 参考实现,并将 WORKER 或 SERVICE 结果与 Product 组合的 Direct Plugin 客户端配对。
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ _DIRECT_EXECUTION_MODES = frozenset({"WORKER", "SERVICE"})
 def load_entrypoint(entrypoint: str, config: Mapping[str, Any]) -> object:
     """Load a manifest entrypoint without naming a concrete plugin in Exchange.
 
-    加载 manifest entrypoint，同时不在 Exchange 中指定具体插件。
+    加载 manifest entrypoint,同时不在 Exchange 中指定具体插件。
     """
 
     module_name, separator, attribute = entrypoint.partition(":")
@@ -80,7 +80,7 @@ def load_entrypoint(entrypoint: str, config: Mapping[str, Any]) -> object:
 class PlatformResolverAdapter:
     """Use the actual Platform registry/resolver and bind its result generically.
 
-    使用真实的 Platform registry/resolver，并以通用方式绑定其结果。
+    使用真实的 Platform registry/resolver,并以通用方式绑定其结果。
     """
 
     def __init__(
@@ -133,7 +133,7 @@ class PlatformResolverAdapter:
                     # The reference adapter can bind any canonical manifest
                     # entrypoint; Platform remains authoritative for selecting
                     # the execution mode declared by that manifest.
-                    # 参考 adapter 可以绑定任意规范 manifest entrypoint；manifest 声明的执行模式仍由 Platform 负责选择。
+                    # 参考 adapter 可以绑定任意规范 manifest entrypoint;manifest 声明的执行模式仍由 Platform 负责选择。
                     "execution_modes": list(_REFERENCE_EXECUTION_MODES),
                 }
             ],
@@ -226,7 +226,7 @@ class PlatformResolverAdapter:
     def _plugin_id(manifest: Mapping[str, Any]) -> object:
         """Read identity only; Platform remains the manifest-shape authority.
 
-        仅读取身份信息；manifest 结构仍由 Platform 负责判定。
+        仅读取身份信息;manifest 结构仍由 Platform 负责判定。
         """
 
         platform_plugin = manifest.get("plugin")
@@ -238,7 +238,7 @@ class PlatformResolverAdapter:
     def _plugin_version(manifest: Mapping[str, Any]) -> object:
         """Read release identity without normalizing the manifest in Product.
 
-        读取发布身份，不在 Product 中规范化 manifest。
+        读取发布身份,不在 Product 中规范化 manifest。
         """
 
         platform_plugin = manifest.get("plugin")

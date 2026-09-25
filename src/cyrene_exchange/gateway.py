@@ -59,7 +59,7 @@ class GatewayError(Exception):
 class GatewayLifecycleError(GatewayError):
     """A durable request lifecycle callback failed before the request was safe.
 
-    请求达到安全执行条件之前，持久化生命周期回调失败。
+    请求达到安全执行条件之前,持久化生命周期回调失败。
     """
 
     status_code = 500
@@ -128,7 +128,7 @@ class RequestPrincipal:
     An empty ``model_scope`` admits every model pattern; a non-empty scope is a
     set of fnmatch patterns the requested model must match.
 
-    根据 Exchange 凭据解析出的可信身份。请求载荷不会参与构造此值。Product adapter 只能持久化这些引用，不能持久化凭据本身。空的 ``model_scope`` 表示允许所有模型模式；非空范围是一组 fnmatch 模式，请求的模型必须匹配其中之一。
+    根据 Exchange 凭据解析出的可信身份。请求载荷不会参与构造此值。Product adapter 只能持久化这些引用,不能持久化凭据本身。空的 ``model_scope`` 表示允许所有模型模式;非空范围是一组 fnmatch 模式,请求的模型必须匹配其中之一。
     """
 
     actor_id: str
@@ -250,7 +250,7 @@ class _ToolCallAccumulator:
     def merge(self, delta: ToolCallDelta) -> None:
         """Append one fragment while rejecting conflicting call identity.
 
-        追加一个片段，并拒绝调用身份冲突的情况。
+        追加一个片段,并拒绝调用身份冲突的情况。
         """
 
         if delta.index != self.index:
@@ -283,7 +283,7 @@ class _ToolCallAccumulator:
             function["arguments"] = self.function_arguments
         # ``index`` orders streamed fragments; OpenAI's completed message
         # schema represents that order by the list position and omits it.
-        # ``index`` 用于排列流式片段；OpenAI 完成消息的 schema 通过列表顺序表达该顺序，因此省略此字段。
+        # ``index`` 用于排列流式片段;OpenAI 完成消息的 schema 通过列表顺序表达该顺序,因此省略此字段。
         result: dict[str, Any] = {}
         if self.call_id is not None:
             result["id"] = self.call_id
@@ -304,7 +304,7 @@ class ExchangeGateway:
     implementations.  Exchange owns candidate lifecycle and fallback policy;
     the routing capability owns candidate selection/scoring.
 
-    围绕 Platform 解析出的模型能力执行 Product 所有的策略。此类只能通过 resolver 获取路由和提供方实现。Exchange 拥有候选项生命周期和 fallback 策略；路由能力拥有候选项选择与评分。
+    围绕 Platform 解析出的模型能力执行 Product 所有的策略。此类只能通过 resolver 获取路由和提供方实现。Exchange 拥有候选项生命周期和 fallback 策略;路由能力拥有候选项选择与评分。
     """
 
     def __init__(
@@ -353,7 +353,7 @@ class ExchangeGateway:
         response begins.  Once a stream has emitted a chunk, Exchange cannot
         safely replay a partial response through another route.
 
-        处理一个 OpenAI 兼容的 chat 请求。Fallback 仅用于可用的提供方响应开始之前发生的故障。流一旦发出数据块，Exchange 就无法安全地通过另一条路由重放部分响应。
+        处理一个 OpenAI 兼容的 chat 请求。Fallback 仅用于可用的提供方响应开始之前发生的故障。流一旦发出数据块,Exchange 就无法安全地通过另一条路由重放部分响应。
         """
 
         request_id = request_id or f"chatcmpl-{uuid.uuid4().hex}"
@@ -494,7 +494,7 @@ class ExchangeGateway:
             try:
                 # Admission is deliberately before provider resolution and
                 # invocation, so failed bindings remain auditable too.
-                # 准入必须在解析和调用提供方之前完成，因此绑定失败也能留下审计记录。
+                # 准入必须在解析和调用提供方之前完成,因此绑定失败也能留下审计记录。
                 self._observe_started(metadata)
                 started = True
                 provider = self._resolve_provider(target)
@@ -677,7 +677,7 @@ class ExchangeGateway:
     def _audit_error_type(exc: Exception) -> str:
         """Prefer stable Gateway error types over implementation class names.
 
-        优先使用稳定的 Gateway 错误类型，而不是实现类名称。
+        优先使用稳定的 Gateway 错误类型,而不是实现类名称。
         """
 
         return exc.error_type if isinstance(exc, GatewayError) else type(exc).__name__
@@ -722,7 +722,7 @@ class ExchangeGateway:
         except Exception as exc:
             # No bytes have reached the client in non-stream mode, so Product
             # fallback may safely be attempted by the caller's next request.
-            # 非流式模式尚未向客户端发送任何字节，因此调用方可以安全地在下一次请求中尝试 Product fallback。
+            # 非流式模式尚未向客户端发送任何字节,因此调用方可以安全地在下一次请求中尝试 Product fallback。
             raise ProviderFailureError(
                 f"{target.route_id or target.provider_ref}: {exc}",
                 usage=self._merge_chunk_usage(collected),
@@ -885,7 +885,7 @@ class ExchangeGateway:
     ) -> ProviderUsage | None:
         """Merge provider-reported usage facts without estimating missing data.
 
-        合并提供方报告的用量事实，不估算缺失数据。
+        合并提供方报告的用量事实,不估算缺失数据。
         """
 
         if observed is None:

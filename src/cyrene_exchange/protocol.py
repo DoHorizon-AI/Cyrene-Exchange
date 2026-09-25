@@ -15,9 +15,9 @@ The transport-facing protocol keeps structured tool metadata intact so a
 provider adapter can decide whether its canonical capability contract carries
 it.  Exchange must not silently discard fields that change an agent turn.
 
-中文：针对 Exchange Product 语义的 OpenAI 兼容请求规范化。
+中文:针对 Exchange Product 语义的 OpenAI 兼容请求规范化。
 
-中文：面向传输的协议会保留结构化工具元数据，以便提供方适配器判断其规范能力契约是否支持。Exchange 不得静默丢弃会改变 Agent 轮次的字段。
+中文:面向传输的协议会保留结构化工具元数据,以便提供方适配器判断其规范能力契约是否支持。Exchange 不得静默丢弃会改变 Agent 轮次的字段。
 """
 
 from __future__ import annotations
@@ -30,13 +30,13 @@ from typing import Any
 class ProtocolError(ValueError):
     """An incoming request cannot be normalized.
 
-    中文：传入请求无法规范化。"""
+    中文:传入请求无法规范化。"""
 
 
 def _require_non_empty_string(value: Any, field_name: str) -> str:
     """Validate and return a required non-empty JSON string.
 
-    中文：验证并返回必需的非空 JSON 字符串。"""
+    中文:验证并返回必需的非空 JSON 字符串。"""
 
     if not isinstance(value, str) or not value.strip():
         raise ProtocolError(f"{field_name} must be a non-empty string")
@@ -46,7 +46,7 @@ def _require_non_empty_string(value: Any, field_name: str) -> str:
 def _normalize_tool(raw_tool: Any, index: int) -> dict[str, Any]:
     """Validate one OpenAI function tool while preserving its JSON schema.
 
-    中文：验证一个 OpenAI function 工具，同时保留其 JSON schema。"""
+    中文:验证一个 OpenAI function 工具,同时保留其 JSON schema。"""
 
     if not isinstance(raw_tool, Mapping):
         raise ProtocolError(f"tools[{index}] must be an object")
@@ -70,7 +70,7 @@ def _normalize_tool(raw_tool: Any, index: int) -> dict[str, Any]:
             raise ProtocolError(f"tools[{index}].function.parameters must be an object")
         # The JSON Schema is provider-owned.  Preserve it byte-for-byte at
         # the object level instead of attempting to interpret schema keywords.
-        # 中文：JSON Schema 由提供方所有；应在对象层面逐字节保留，不要尝试解释其中的 schema 关键字。
+        # 中文:JSON Schema 由提供方所有;应在对象层面逐字节保留,不要尝试解释其中的 schema 关键字。
         function["parameters"] = dict(parameters)
     strict = raw_function.get("strict")
     if strict is not None:
@@ -87,7 +87,7 @@ def _normalize_tool(raw_tool: Any, index: int) -> dict[str, Any]:
 def _normalize_tool_choice(value: Any) -> str | dict[str, Any]:
     """Validate an OpenAI tool choice without reducing named choices to text.
 
-    中文：验证 OpenAI 工具选择，不将具名选择简化为文本。"""
+    中文:验证 OpenAI 工具选择,不将具名选择简化为文本。"""
 
     if isinstance(value, str):
         if value not in {"none", "auto", "required"}:
@@ -107,7 +107,7 @@ def _normalize_tool_choice(value: Any) -> str | dict[str, Any]:
 def _normalize_stream_options(value: Any) -> dict[str, Any]:
     """Validate the deliberately small streaming option surface.
 
-    中文：验证刻意保持精简的流式选项接口。"""
+    中文:验证刻意保持精简的流式选项接口。"""
 
     if not isinstance(value, Mapping):
         raise ProtocolError("stream_options must be an object")
@@ -124,7 +124,7 @@ def _normalize_stream_options(value: Any) -> dict[str, Any]:
 def _normalize_tool_calls(raw_tool_calls: Any, message_index: int) -> list[dict[str, Any]]:
     """Validate assistant tool calls and retain argument fragments exactly.
 
-    中文：验证助手工具调用，并原样保留参数片段。"""
+    中文:验证助手工具调用,并原样保留参数片段。"""
 
     if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, (str, bytes)):
         raise ProtocolError(f"messages[{message_index}].tool_calls must be an array")
@@ -161,7 +161,7 @@ def _normalize_tool_calls(raw_tool_calls: Any, message_index: int) -> list[dict[
 def _normalize_message(raw_message: Mapping[str, Any], index: int) -> dict[str, Any]:
     """Validate one text chat message, including tool result history.
 
-    中文：验证一条文本聊天消息，包括工具结果历史。"""
+    中文:验证一条文本聊天消息,包括工具结果历史。"""
 
     role = raw_message.get("role")
     if role not in {"system", "user", "assistant", "tool"}:
@@ -196,7 +196,7 @@ def _normalize_message(raw_message: Mapping[str, Any], index: int) -> dict[str, 
 class NormalizedInferenceRequest:
     """The provider-neutral request owned by Exchange Product Core.
 
-    中文：由 Exchange Product Core 所有的提供方无关请求。"""
+    中文:由 Exchange Product Core 所有的提供方无关请求。"""
 
     model: str
     messages: tuple[dict[str, Any], ...]
@@ -285,7 +285,7 @@ class NormalizedInferenceRequest:
     def to_provider_dict(self) -> dict[str, Any]:
         """Return only normalized request data for a capability implementation.
 
-        中文：只向能力实现返回规范化后的请求数据。"""
+        中文:只向能力实现返回规范化后的请求数据。"""
 
         result: dict[str, Any] = {
             "model": self.model,

@@ -67,7 +67,7 @@ _MESSAGE_FIELDS = frozenset({"role", "content", "name", "tool_call_id", "tool_ca
 class DirectPluginInvoker(Protocol):
     """Product-facing subset of the Plugins-owned direct endpoint client.
 
-    面向 Product 的接口子集，底层客户端归 Plugins 所有并直接访问端点。
+    面向 Product 的接口子集,底层客户端归 Plugins 所有并直接访问端点。
     """
 
     def invoke(
@@ -106,7 +106,7 @@ class DirectPluginInvoker(Protocol):
 class ModelProviderExecutionError(RuntimeError):
     """The model-provider invocation or contract projection failed.
 
-    模型提供方调用失败，或契约投影失败。
+    模型提供方调用失败,或契约投影失败。
     """
 
 
@@ -135,7 +135,7 @@ class DirectPluginModelProvider:
     ) -> Iterable[ProviderChunk]:
         """Invoke the negotiated chat method and return ordered provider chunks.
 
-        调用协商后的 chat 方法，并按顺序返回提供方数据块。
+        调用协商后的 chat 方法,并按顺序返回提供方数据块。
         """
 
         typed_request = _to_chat_request(request)
@@ -179,7 +179,7 @@ class DirectPluginModelProvider:
     ) -> Iterable[ProviderChunk]:
         """Forward Plugin-owned typed chunks without local materialization.
 
-        转发 Plugins 所有的类型化数据块，不在本地物化完整结果。
+        转发 Plugins 所有的类型化数据块,不在本地物化完整结果。
         """
 
         method = CHAT_COMPLETION_V2_METHOD if structured else CHAT_COMPLETION_METHOD
