@@ -30,7 +30,11 @@ from tests.test_platform_integration import (
 
 
 def _provision_route(database: Path, *, binding_id: str) -> UUID:
-    """Create the Product endpoint and route through its real control API."""
+    """Create the Product endpoint and route through its real control API.
+
+    中文:通过实际 control API 创建 Product endpoint 和 route。
+    """
+# 中文:通过真实控制 API 创建 Product 端点和路由。
 
     control = create_app(database_path=database)
     try:
@@ -64,7 +68,11 @@ def _provision_route(database: Path, *, binding_id: str) -> UUID:
 
 
 def _platform_delegate(platform_binaries: dict[str, Path], plugin_runtime: dict[str, Any]):
-    """Resolve Product bindings through the actual Platform resolver and direct Plugin runtime."""
+    """Resolve Product bindings through the actual Platform resolver and direct Plugin runtime.
+
+    中文:通过实际 Platform resolver 和 Direct Plugin runtime 解析 Product binding。
+    """
+# 中文:通过实际的 Platform 解析器和直接 Plugin 运行时解析 Product 绑定。
 
     return PlatformResolverAdapter(
         [str(platform_binaries["cyrene-capability-resolver"])],
@@ -77,7 +85,11 @@ def _platform_delegate(platform_binaries: dict[str, Path], plugin_runtime: dict[
 
 @contextmanager
 def _running_gateway(gateway: ExchangeGateway):
-    """Run and close a real loopback Exchange HTTP server."""
+    """Run and close a real loopback Exchange HTTP server.
+
+    中文:运行真实 loopback Exchange HTTP server 并关闭 listener。
+    """
+# 中文:运行并关闭真实的 loopback Exchange HTTP 服务器。
 
     server = create_reference_server(gateway)
     thread = Thread(target=server.serve_forever, daemon=True)
@@ -95,7 +107,11 @@ def _stream_first_event(
     server: ThreadingHTTPServer,
     payload: dict[str, Any],
 ) -> tuple[HTTPConnection, HTTPResponse, str]:
-    """Open one stream and return its first event id before the client closes."""
+    """Open one stream and return its first event id before the client closes.
+
+    中文:打开一条 stream,并在 client 关闭前返回其第一个 event ID。
+    """
+# 中文:打开一个流,并在客户端关闭前返回其首个事件 ID。
 
     client = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
     body = json.dumps(payload).encode("utf-8")
@@ -125,7 +141,11 @@ def test_real_product_usage_audit_records_tool_stream_and_survives_restart(
     plugin_runtime: dict[str, Any],
     upstream: ThreadingHTTPServer,
 ) -> None:
-    """Record exact tool usage after a real Product→direct Plugin request."""
+    """Record exact tool usage after a real Product→direct Plugin request.
+
+    中文:在一次真实 Product→Direct Plugin 请求后记录精确的 tool 使用情况。
+    """
+# 中文:在真实的 Product→直接 Plugin 请求后记录准确的工具用量。
 
     database = tmp_path / "exchange.sqlite3"
     endpoint_id = _provision_route(database, binding_id="model-provider-stream")
@@ -274,7 +294,11 @@ def test_real_product_cancelled_stream_is_audited_and_recovers_after_restart(
     plugin_runtime: dict[str, Any],
     upstream: ThreadingHTTPServer,
 ) -> None:
-    """Cancellation produces one terminal audit row with no fabricated usage."""
+    """Cancellation produces one terminal audit row with no fabricated usage.
+
+    中文:取消操作只生成一条终态审计记录,不虚构用量。
+    """
+# 中文:取消操作会生成一条终态审计记录,且不会伪造用量。
 
     database = tmp_path / "exchange.sqlite3"
     endpoint_id = _provision_route(database, binding_id="model-provider-cancelled-tool-stream")

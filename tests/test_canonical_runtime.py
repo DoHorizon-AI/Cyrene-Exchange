@@ -47,7 +47,11 @@ TEST_PRINCIPAL = RequestPrincipal("actor-test", "workspace-test", "credential-te
 
 
 def resolve_test_principal(token: str) -> RequestPrincipal | None:
-    """Resolve only the explicit test credential to a trusted identity."""
+    """Resolve only the explicit test credential to a trusted identity.
+
+    中文:仅将明确指定的测试凭据解析为可信身份。
+    """
+    # 中文:只将显式测试凭据解析为可信身份.
 
     return TEST_PRINCIPAL if token == "test-token" else None
 
@@ -117,7 +121,11 @@ def payload(*, stream: bool = False) -> dict[str, Any]:
 
 
 def tool_payload(*, stream: bool = False, include_usage: bool = False) -> dict[str, Any]:
-    """Build a text-only request with one function tool and tool history."""
+    """Build a text-only request with one function tool and tool history.
+
+    中文:构造仅含文本、一个 function tool 及其调用历史的请求。
+    """
+    # 中文:构造一个包含函数工具和工具历史记录的纯文本请求.
 
     value: dict[str, Any] = {
         "model": "requested-model",
@@ -188,7 +196,11 @@ def http_json_request(gateway, request_payload, headers=HEADERS):
 
 
 def http_stream_request(gateway, request_payload, headers=HEADERS):
-    """Send one real HTTP request and return its status, headers, and SSE body."""
+    """Send one real HTTP request and return its status, headers, and SSE body.
+
+    中文:发送一次真实 HTTP 请求,并返回状态码、headers 与 SSE 正文。
+    """
+    # 中文:发送一条真实 HTTP 请求,并返回其状态码、标头和 SSE 正文。
 
     server = create_reference_server(gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

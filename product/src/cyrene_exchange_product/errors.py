@@ -32,7 +32,12 @@ class ExchangeProductError(RuntimeError):
 
 
 class ErrorMapping:
-    """Canonical error metadata mapping conforming to Cyrene specification."""
+    """Canonical error metadata mapping conforming to Cyrene specification.
+
+    中文:符合 Cyrene 规范的标准错误元数据映射。
+    """
+
+    # 中文:符合 Cyrene 规范的规范错误元数据映射。
 
     def __init__(
         self,
@@ -100,7 +105,11 @@ EXCHANGE_ERROR_MAPPINGS: dict[str, ErrorMapping] = {
 
 
 def map_exchange_error(code: str) -> ErrorMapping:
-    """Map an Exchange Product error code onto canonical Platform/Product error fields."""
+    """Map an Exchange Product error code onto canonical Platform/Product error fields.
+
+    中文:将 Exchange Product 错误码映射到标准 Platform/Product 错误字段。
+    """
+    # 中文:将 Exchange Product 错误代码映射为规范 Platform/Product 错误字段。
     return EXCHANGE_ERROR_MAPPINGS.get(
         code,
         ErrorMapping(

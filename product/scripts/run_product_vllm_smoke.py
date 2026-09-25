@@ -5,6 +5,10 @@ The proof provisions ``GatewayEndpoint`` and ``GatewayRoute`` in the Product
 SQLite authority, asks Platform's generic resolver to select an implementation,
 and calls the Plugins-owned endpoint directly. It prints only credential-free
 outcome metadata.
+
+中文:通过直连 Plugin 和 vLLM 运行一条真实持久化 Product 路由。
+
+中文:此证明流程会在 Product SQLite 权威存储中创建 ``GatewayEndpoint`` 和 ``GatewayRoute``,请求 Platform 通用 resolver 选择实现,并直接调用 Plugins 所有的端点。输出仅包含不带凭据的结果元数据。
 """
 
 from __future__ import annotations
@@ -45,13 +49,17 @@ _PRODUCT_BINDING_ID = "vllm-product"
 
 
 def _default_root(name: str) -> Path:
-    """Resolve sibling repositories from the Cyrene umbrella directory."""
+    """Resolve sibling repositories from the Cyrene umbrella directory.
+
+    中文:从 Cyrene 总仓目录解析同级仓库。"""
 
     return Path(__file__).resolve().parents[4] / name
 
 
 def _wait_for_ready(process: subprocess.Popen[str], timeout: float) -> str:
-    """Read one credential-free direct Plugin readiness document."""
+    """Read one credential-free direct Plugin readiness document.
+
+    中文:读取一份不含凭据的直连 Plugin 就绪文档。"""
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -69,7 +77,9 @@ def _wait_for_ready(process: subprocess.Popen[str], timeout: float) -> str:
 
 
 def _post(port: int, payload: dict[str, Any], token: str) -> tuple[int, str]:
-    """Call the Product-composed data plane without printing message content."""
+    """Call the Product-composed data plane without printing message content.
+
+    中文:调用 Product 组合的数据平面,不打印消息内容。"""
 
     connection = HTTPConnection("127.0.0.1", port, timeout=180)
     try:
@@ -89,7 +99,9 @@ def _post(port: int, payload: dict[str, Any], token: str) -> tuple[int, str]:
 
 
 def _request_id(body: str, *, stream: bool = False) -> str | None:
-    """Extract only the Exchange request id from a response."""
+    """Extract only the Exchange request id from a response.
+
+    中文:从响应中只提取 Exchange 请求 ID。"""
 
     try:
         if stream:
@@ -108,7 +120,9 @@ def _request_id(body: str, *, stream: bool = False) -> str | None:
 
 
 def _tool_from_response(body: str) -> list[dict[str, Any]]:
-    """Validate a non-stream tool response without retaining its text."""
+    """Validate a non-stream tool response without retaining its text.
+
+    中文:验证非流式工具响应,不保留其文本内容。"""
 
     document = json.loads(body)
     calls = document["choices"][0]["message"]["tool_calls"]
@@ -118,7 +132,9 @@ def _tool_from_response(body: str) -> list[dict[str, Any]]:
 
 
 def _provision_product_route(store: ExchangeStore, binding_id: str) -> tuple[UUID, UUID]:
-    """Create or replay one stable Product endpoint and route."""
+    """Create or replay one stable Product endpoint and route.
+
+    中文:创建或重放一组稳定的 Product 端点和路由。"""
 
     service = ExchangeProductService(store)
     endpoint = service.create_endpoint(
@@ -143,7 +159,9 @@ def _provision_product_route(store: ExchangeStore, binding_id: str) -> tuple[UUI
 
 
 def _publish_readiness(readiness_file: Path | None, document: dict[str, Any]) -> None:
-    """Publish credential-free readiness metadata to stdout and an optional file."""
+    """Publish credential-free readiness metadata to stdout and an optional file.
+
+    中文:将不含凭据的就绪元数据写入 stdout 和可选文件。"""
 
     encoded = json.dumps(document, separators=(",", ":"))
     if readiness_file is not None:
@@ -156,7 +174,9 @@ def _publish_readiness(readiness_file: Path | None, document: dict[str, Any]) ->
 
 
 def _wait_for_stop() -> None:
-    """Wait for SIGINT/SIGTERM while the reference server runs in its thread."""
+    """Wait for SIGINT/SIGTERM while the reference server runs in its thread.
+
+    中文:参考服务器在线程中运行时等待 SIGINT/SIGTERM。"""
 
     stop_event = Event()
     previous_handlers: dict[int, Any] = {}
@@ -177,7 +197,9 @@ def _wait_for_stop() -> None:
 
 
 def _stop_process(process: subprocess.Popen[str], *, timeout: float = 8.0) -> None:
-    """Terminate a child process and escalate if it does not exit."""
+    """Terminate a child process and escalate if it does not exit.
+
+    中文:终止子进程;若进程未退出则升级为强制终止。"""
 
     if process.poll() is not None:
         return
@@ -190,7 +212,9 @@ def _stop_process(process: subprocess.Popen[str], *, timeout: float = 8.0) -> No
 
 
 def main() -> int:
-    """Compose Product persistence, Platform selection, and direct Plugin execution."""
+    """Compose Product persistence, Platform selection, and direct Plugin execution.
+
+    中文:组合 Product 持久化、Platform 选择和直连 Plugin 执行。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform-root", type=Path, default=_default_root("Cyrene-Platform"))
@@ -369,6 +393,7 @@ def main() -> int:
         assert endpoint_id is not None
         # Reopen the same Product database before composing the data plane.
         # This keeps the proof tied to persisted endpoint/route state.
+        # 中文:在组合数据平面前重新打开同一个 Product 数据库,使该证明仍绑定到已持久化的端点/路由状态。
         store.close()
         store = ExchangeStore(database)
         connection_ref = _wait_for_ready(plugin_process, args.ready_timeout)

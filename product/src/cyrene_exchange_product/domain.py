@@ -193,7 +193,12 @@ class ProblemDetails(ContractModel):
 
 @dataclass(frozen=True)
 class ProductPrincipal:
-    """Configured Exchange identity bound to one credential reference."""
+    """Configured Exchange identity bound to one credential reference.
+
+    中文:绑定到一个凭据引用的已配置 Exchange 身份。
+    """
+
+    # 中文:绑定到一个凭据引用的 Exchange 配置身份。
 
     actor_id: str
     workspace_id: str
@@ -216,7 +221,12 @@ class TenantQuota(ContractModel):
 
 
 class RequestAuditStatus(StrEnum):
-    """Durable request lifecycle state owned by Exchange Product."""
+    """Durable request lifecycle state owned by Exchange Product.
+
+    中文:由 Exchange Product 持有的持久化 request 生命周期状态。
+    """
+
+    # 中文:由 Exchange Product 拥有的持久化请求生命周期状态。
 
     STARTED = "started"
     COMPLETED = "completed"
@@ -226,7 +236,12 @@ class RequestAuditStatus(StrEnum):
 
 
 class UsageState(StrEnum):
-    """Completeness of exact usage facts observed from a provider."""
+    """Completeness of exact usage facts observed from a provider.
+
+    中文:Provider 观测到的精确用量事实的完整性。
+    """
+
+    # 中文:提供方观测到的准确用量事实是否完整。
 
     UNKNOWN = "unknown"
     PARTIAL = "partial"
@@ -234,7 +249,12 @@ class UsageState(StrEnum):
 
 
 class RequestAuditRecord(ContractModel):
-    """Content-free persisted request, outcome, and provider usage record."""
+    """Content-free persisted request, outcome, and provider usage record.
+
+    中文:不含内容正文的持久化请求、结果与 provider 用量记录。
+    """
+
+    # 中文:不含内容的持久化请求、结果和提供方用量记录。
 
     request_id: str = Field(min_length=1, max_length=200)
     route_id: str | None = Field(default=None, min_length=1, max_length=300)
@@ -257,4 +277,5 @@ class RequestAuditRecord(ContractModel):
 
 # Keep the vocabulary explicit for callers that describe this record as usage
 # audit rather than request audit. | 为 usage audit 调用方保留明确别名。
+# 中文:明确保留这一术语,供将此记录称为 usage audit 而不是 request audit 的调用方使用。
 RequestUsageAudit = RequestAuditRecord
