@@ -71,7 +71,7 @@ def __getattr__(name: str) -> object:
 
     中文:只有调用方请求时才加载依赖 Platform 的 adapter。
     """
-# 中文:仅在调用方请求时加载依赖 Platform 的适配器。
+    # 中文:仅在调用方请求时加载依赖 Platform 的适配器。
 
     target = _ADAPTER_EXPORTS.get(name)
     if target is None:

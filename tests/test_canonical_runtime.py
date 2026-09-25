@@ -200,7 +200,7 @@ def http_stream_request(gateway, request_payload, headers=HEADERS):
 
     中文:发送一次真实 HTTP 请求,并返回状态码、headers 与 SSE 正文。
     """
-# 中文:发送一条真实 HTTP 请求,并返回其状态码、标头和 SSE 正文。
+    # 中文:发送一条真实 HTTP 请求,并返回其状态码、标头和 SSE 正文。
 
     server = create_reference_server(gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

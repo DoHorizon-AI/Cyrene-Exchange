@@ -48,7 +48,8 @@ class ProviderUnavailableError(RuntimeError):
 
     中文:已配置的提供方端点无法处理该请求。
 
-        中文:Gateway 会将任何提供方异常映射为自身的有类型失败,因此这里保留为普通错误,草稿验证器也可以捕获它。
+        中文：Gateway 会将任何提供方异常映射为自身的有类型失败,因此这里保留为普通错误,
+        草稿验证器也可以捕获它。
     """
 
 
@@ -234,7 +235,8 @@ class RouteSourceProviderResolver:
 
     中文:通过持久化路由声明的源端点解析绑定。
 
-        中文:路由目标只携带不透明的绑定 ID,因此路由自己的源引用是上游 URL 所在的权威位置。沿此引用解析可避免在 Gateway 配置中重复保存端点 URL;若源缺失或无法访问,则按失败即拒绝处理。
+        中文：路由目标只携带不透明的绑定 ID,因此路由自己的源引用是上游 URL 所在的权威位置。
+        沿此引用解析可避免在 Gateway 配置中重复保存端点 URL;若源缺失或无法访问,则按失败即拒绝处理。
     """
 
     def __init__(
@@ -304,7 +306,8 @@ class RouteSourceProviderResolver:
 
         中文:在严格限制下读取路由源发布的服务 URL。
 
-                中文:URI 来自 Product 状态,因此 Exchange 会将其限制在操作者准入的 origin 范围内、拒绝重定向,并且不会根据不可信响应猜测回退 URL。
+                中文：URI 来自 Product 状态,因此 Exchange 会将其限制在操作者准入的 origin 范围内、
+                拒绝重定向,并且不会根据不可信响应猜测回退 URL。
         """
 
         origin = _origin(resource_uri)
@@ -418,7 +421,9 @@ def build_product_app(
 
     中文:将控制平面 API 与 OpenAI 兼容数据平面组合起来。
 
-        中文:``resolver_factory`` 接收 Product store,使解析器能够跟随持久化路由源,而无需将端点 URL 重复写入进程配置。必须且只能提供 ``resolver`` 或 ``resolver_factory`` 其中之一。草稿验证器默认使用同一解析器,因此只有数据平面确实可达时才能发布路由。
+        中文：``resolver_factory`` 接收 Product store,使解析器能够跟随持久化路由源,
+        而无需将端点 URL 重复写入进程配置。必须且只能提供 ``resolver`` 或 ``resolver_factory``
+        其中之一。草稿验证器默认使用同一解析器,因此只有数据平面确实可达时才能发布路由。
     """
 
     if (resolver is None) == (resolver_factory is None):
@@ -470,7 +475,8 @@ def build_product_app(
 
         中文:列出调用方 Gateway 凭据可使用的模型模式。
 
-                中文:数据平面使用与 ``/v1/chat/completions`` 相同的 Bearer 凭据进行认证;ApiKey 的模型范围会筛选此投影结果。
+                中文：数据平面使用与 ``/v1/chat/completions`` 相同的 Bearer 凭据进行认证;
+                ApiKey 的模型范围会筛选此投影结果。
         """
 
         principal = None
@@ -510,7 +516,8 @@ def build_product_app(
             # The gateway and its provider adapters are synchronous, so the call
             # runs on the worker thread instead of stalling the event loop that
             # also serves probes and concurrent requests.
-            # 中文:Gateway 及其提供方适配器是同步的,因此调用会在线程池工作线程中执行,避免阻塞同时处理探测和并发请求的事件循环。
+            # 中文：Gateway 及其提供方适配器是同步的,因此调用会在线程池工作线程中执行,
+            # 避免阻塞同时处理探测和并发请求的事件循环。
             response = await run_in_threadpool(
                 gateway.handle_openai_chat,
                 dict(request.headers.items()),

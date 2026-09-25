@@ -94,7 +94,8 @@ def create_app(
         # The control API is the only surface this guard owns. Data-plane
         # routes authenticate through the gateway, and liveness probes must
         # stay reachable for orchestrators and reverse proxies.
-        # 中文:此守卫只负责控制 API;数据平面路由通过网关进行身份验证,且必须保持可访问,以供编排器和反向代理使用。
+        # 中文：此守卫只负责控制 API;数据平面路由通过网关进行身份验证,且必须保持可访问,
+        # 以供编排器和反向代理使用。
         if control_credentials is not None and request.url.path.startswith("/api/"):
             principal(request)
 
