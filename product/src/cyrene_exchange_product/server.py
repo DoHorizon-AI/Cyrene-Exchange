@@ -45,6 +45,10 @@ class ProviderUnavailableError(RuntimeError):
 
     The gateway already maps any provider exception onto its own typed failure,
     so this stays a plain error that the draft validator can also catch.
+
+    中文：已配置的提供方端点无法处理该请求。
+
+        中文：Gateway 会将任何提供方异常映射为自身的有类型失败，因此这里保留为普通错误，草稿验证器也可以捕获它。
     """
 
 
@@ -53,6 +57,10 @@ class OpenAICompatibleProvider:
 
     The adapter reports only provider facts: it never estimates token usage and
     never replays a partially streamed response.
+
+    中文：面向一个由操作者配置的 OpenAI 兼容端点的提供方接口。
+
+        中文：适配器只报告提供方事实：不会估算 token 用量，也不会重放部分流式响应。
     """
 
     def __init__(
@@ -74,7 +82,9 @@ class OpenAICompatibleProvider:
         *,
         cancel_event: Event,
     ) -> Iterable[ProviderChunk]:
-        """Invoke the upstream endpoint and yield ordered provider chunks."""
+        """Invoke the upstream endpoint and yield ordered provider chunks.
+
+        中文：调用上游端点，并按顺序产出提供方数据块。"""
 
         payload = request.to_provider_dict()
         headers = {"Content-Type": "application/json"}
@@ -149,7 +159,9 @@ class OpenAICompatibleProvider:
 
 
 def _usage(value: Any) -> ProviderUsage | None:
-    """Project an upstream usage object without inventing missing facts."""
+    """Project an upstream usage object without inventing missing facts.
+
+    中文：映射上游用量对象，不虚构缺失事实。"""
 
     if not isinstance(value, Mapping):
         return None
@@ -165,7 +177,9 @@ def _token(value: Any) -> int | None:
 
 
 def _stream_chunk(line: str) -> ProviderChunk | None:
-    """Map one upstream SSE line onto a provider chunk."""
+    """Map one upstream SSE line onto a provider chunk.
+
+    中文：将一行上游 SSE 数据映射为一个提供方数据块。"""
 
     if not line.startswith(_SSE_DATA_PREFIX):
         return None
@@ -192,7 +206,9 @@ def _stream_chunk(line: str) -> ProviderChunk | None:
 
 
 class OperatorBindingResolver:
-    """Resolve configured provider bindings from explicit operator configuration."""
+    """Resolve configured provider bindings from explicit operator configuration.
+
+    中文：从操作者显式配置中解析提供方绑定。"""
 
     def __init__(self, bindings: Mapping[str, Any]) -> None:
         self._bindings = dict(bindings)
@@ -215,6 +231,10 @@ class RouteSourceProviderResolver:
     reference is the authoritative place the upstream URL lives. Following it
     keeps the gateway configuration free of duplicated endpoint URLs while still
     failing closed when the source is missing or unreachable.
+
+    中文：通过持久化路由声明的源端点解析绑定。
+
+        中文：路由目标只携带不透明的绑定 ID，因此路由自己的源引用是上游 URL 所在的权威位置。沿此引用解析可避免在 Gateway 配置中重复保存端点 URL；若源缺失或无法访问，则按失败即拒绝处理。
     """
 
     def __init__(
@@ -253,7 +273,9 @@ class RouteSourceProviderResolver:
         return self._provider_for(route.source)
 
     def validate_route(self, route: Any) -> None:
-        """Verify a draft's own source endpoint before it becomes ACTIVE."""
+        """Verify a draft's own source endpoint before it becomes ACTIVE.
+
+        中文：草稿进入 ACTIVE 前验证其自身的源端点。"""
 
         if route.source is None:
             raise ProviderUnavailableError("route declares no source endpoint")
@@ -279,6 +301,10 @@ class RouteSourceProviderResolver:
         The URI arrives from Product state, so Exchange constrains it to the
         operator-admitted origins, refuses redirects, and never guesses a
         fallback URL from an untrusted response.
+
+        中文：在严格限制下读取路由源发布的服务 URL。
+
+                中文：URI 来自 Product 状态，因此 Exchange 会将其限制在操作者准入的 origin 范围内、拒绝重定向，并且不会根据不可信响应猜测回退 URL。
         """
 
         origin = _origin(resource_uri)
@@ -311,7 +337,9 @@ class RouteSourceProviderResolver:
 
 
 def _origin(resource_uri: str) -> str | None:
-    """Return the scheme://host:port origin of an absolute http(s) URL."""
+    """Return the scheme://host:port origin of an absolute http(s) URL.
+
+    中文：返回绝对 http(s) URL 的 scheme://host:port origin。"""
 
     parsed = urlsplit(resource_uri)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -327,7 +355,9 @@ def _origin(resource_uri: str) -> str | None:
 
 
 def _route_validator(resolver: Any) -> Callable[[Any], None]:
-    """Verify a draft against the same resolver the data plane will use."""
+    """Verify a draft against the same resolver the data plane will use.
+
+    中文：使用数据平面将采用的同一解析器验证草稿。"""
 
     def validate(route: Any) -> None:
         try:
@@ -352,7 +382,9 @@ def _route_validator(resolver: Any) -> Callable[[Any], None]:
 
 
 def _select_endpoint(store: ExchangeStore, endpoint_id: UUID | None) -> UUID:
-    """Fail closed unless the data plane owns exactly one serving endpoint."""
+    """Fail closed unless the data plane owns exactly one serving endpoint.
+
+    中文：除非数据平面恰好拥有一个服务端点，否则按失败即拒绝处理。"""
 
     if endpoint_id is not None:
         return endpoint_id
@@ -383,6 +415,10 @@ def build_product_app(
     process configuration. Exactly one of ``resolver``/``resolver_factory`` is
     required, and the draft validator defaults to the same resolver so a route
     can only be published when the data plane can actually reach it.
+
+    中文：将控制平面 API 与 OpenAI 兼容数据平面组合起来。
+
+        中文：``resolver_factory`` 接收 Product store，使解析器能够跟随持久化路由源，而无需将端点 URL 重复写入进程配置。必须且只能提供 ``resolver`` 或 ``resolver_factory`` 其中之一。草稿验证器默认使用同一解析器，因此只有数据平面确实可达时才能发布路由。
     """
 
     if (resolver is None) == (resolver_factory is None):
@@ -408,13 +444,17 @@ def build_product_app(
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
-        """Report process liveness for orchestrators and reverse proxies."""
+        """Report process liveness for orchestrators and reverse proxies.
+
+        中文：向编排器和反向代理报告进程存活状态。"""
 
         return {"status": "ok"}
 
     @app.get("/readyz")
     def readyz() -> JSONResponse:
-        """Report readiness only when the data plane can serve at least one route."""
+        """Report readiness only when the data plane can serve at least one route.
+
+        中文：只有数据平面至少能服务一条路由时才报告就绪。"""
 
         routes = store.list_active_routes()
         if not routes:
@@ -427,6 +467,10 @@ def build_product_app(
 
         The data plane authenticates with the same Bearer credential as
         ``/v1/chat/completions``; a key's model scope filters the projection.
+
+        中文：列出调用方 Gateway 凭据可使用的模型模式。
+
+                中文：数据平面使用与 ``/v1/chat/completions`` 相同的 Bearer 凭据进行认证；ApiKey 的模型范围会筛选此投影结果。
         """
 
         principal = None
@@ -466,6 +510,7 @@ def build_product_app(
             # The gateway and its provider adapters are synchronous, so the call
             # runs on the worker thread instead of stalling the event loop that
             # also serves probes and concurrent requests.
+            # 中文：Gateway 及其提供方适配器是同步的，因此调用会在线程池工作线程中执行，避免阻塞同时处理探测和并发请求的事件循环。
             response = await run_in_threadpool(
                 gateway.handle_openai_chat,
                 dict(request.headers.items()),
@@ -490,6 +535,10 @@ async def _sse(body: Any, cancel_event: Event) -> AsyncIterator[str]:
 
     Provider chunks are pulled one at a time on the worker thread, and closing
     the response cancels the in-flight provider call.
+
+    中文：提供方进行流式输出时，以非阻塞方式发送结构化 SSE。
+
+        中文：提供方数据块会在工作线程中逐个读取；关闭响应会取消正在执行的提供方调用。
     """
 
     if not isinstance(body, Iterable):

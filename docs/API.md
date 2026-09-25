@@ -96,3 +96,26 @@ part of the current API.
 
 Anthropic Messages、WebSocket streaming、`GatewayFilterService`、MCP、Worker
 健康/控制、调度遥测、训练与自定义脚本 RPC 均不属于当前 API。
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 控制面操作中文对照
+
+| 操作 | 说明 |
+| --- | --- |
+| `POST /api/v1/gateway-endpoints` | 使用 `Idempotency-Key` 创建或重放一个 `GatewayEndpoint`。 |
+| `GET /api/v1/gateway-endpoints` | 列出已持久化的 Endpoint。 |
+| `GET /api/v1/gateway-endpoints/{endpointId}` | 读取一个 Endpoint。 |
+| `POST /api/v1/gateway-endpoints/{endpointId}/actions/disable` | 禁用一个 Endpoint。 |
+| `POST /api/v1/gateway-routes` | 创建或重放一条活动 Route。 |
+| `GET /api/v1/gateway-routes` | 按优先级列出已持久化的 Route。 |
+| `GET /api/v1/gateway-routes/{routeId}` | 读取一条 Route 或草稿。 |
+| `POST /api/v1/gateway-route-drafts` | 根据显式 Product 交接信息创建 DRAFT。 |
+| `PATCH /api/v1/gateway-route-drafts/{routeId}` | 编辑已检查版本的 DRAFT。 |
+| `POST /api/v1/gateway-route-drafts/{routeId}/actions/confirm` | 重新校验并启用精确版本的 DRAFT。 |
+| `POST /api/v1/api-keys` | 生成网关 API key；秘密值只返回一次。 |
+| `GET /api/v1/api-keys` | 列出当前 workspace 的密钥元数据，不含秘密值。 |
+| `GET /api/v1/api-keys/{apiKeyId}` | 读取一条密钥的元数据。 |
+| `POST /api/v1/api-keys/{apiKeyId}/actions/revoke` | 撤销一条密钥。 |
+
+控制 API 会把 `TenantQuota` 与 Plugins 用量账本中完整、实际观测到的 Token 总量比较。若没有可用用量来源，已配置的配额将以 HTTP 503 失败关闭。Anthropic Messages、WebSocket streaming、`GatewayFilterService`、MCP、Worker 健康/控制、调度遥测、训练和自定义脚本 RPC 均不属于当前 API。

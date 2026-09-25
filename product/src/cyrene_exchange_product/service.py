@@ -258,6 +258,7 @@ class ExchangeProductService:
         return route
 
     # ── API keys ────────────────────────────────────────────────────────
+    # 中文：API 密钥。
 
     def create_api_key(
         self,
@@ -320,14 +321,22 @@ class ExchangeProductService:
         return response, created
 
     def list_api_keys(self, principal: ProductPrincipal) -> list[ApiKey]:
-        """List this workspace's keys without any secret material."""
+        """List this workspace's keys without any secret material.
+
+        中文：列出当前 workspace 的 key，不包含任何 secret。
+        """
+    # 中文：列出此工作区的密钥，不返回任何秘密材料。
 
         return [
             key for key in self.store.list_api_keys() if key.workspace_id == principal.workspace_id
         ]
 
     def get_api_key(self, api_key_id: UUID, principal: ProductPrincipal) -> ApiKey:
-        """Read one key owned by the caller's workspace."""
+        """Read one key owned by the caller's workspace.
+
+        中文：读取一把由调用者 workspace 所有的 key。
+        """
+    # 中文：读取一条属于调用方工作区的密钥。
 
         return self._owned_api_key(api_key_id, principal)
 

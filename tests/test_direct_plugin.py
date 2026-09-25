@@ -36,7 +36,11 @@ from cyrene_exchange.protocol import NormalizedInferenceRequest
 
 
 class RecordingInvoker:
-    """Record one typed invocation and return a configurable response."""
+    """Record one typed invocation and return a configurable response.
+
+    中文：记录一次类型化调用，并返回可配置的响应。
+    """
+# 中文：记录一次有类型的调用，并返回可配置的响应。
 
     def __init__(self, response: DirectPayload) -> None:
         self.response = response

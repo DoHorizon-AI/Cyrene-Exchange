@@ -1,4 +1,6 @@
-"""Unit tests for Cyrene correlation hierarchy, header sanitization, and error mapping."""
+"""Unit tests for Cyrene correlation hierarchy, header sanitization, and error mapping.
+
+中文：Cyrene 关联层级、标头清理和错误映射的单元测试。"""
 
 from __future__ import annotations
 
@@ -32,12 +34,16 @@ def test_w3c_traceparent_parsing() -> None:
     assert span_id == "00f067aa0ba902b7"
 
     # Reject invalid version
+    # 中文：拒绝无效版本。
     assert parse_w3c_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01") is None
     # Reject all-zero trace_id
+    # 中文：拒绝全零 trace_id。
     assert parse_w3c_traceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01") is None
     # Reject all-zero span_id
+    # 中文：拒绝全零 span_id。
     assert parse_w3c_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01") is None
     # Reject invalid length / hex
+    # 中文：拒绝无效长度或十六进制值。
     assert parse_w3c_traceparent("00-short-00f067aa0ba902b7-01") is None
     assert parse_w3c_traceparent("") is None
     assert parse_w3c_traceparent(None) is None
@@ -45,11 +51,13 @@ def test_w3c_traceparent_parsing() -> None:
 
 def test_correlation_id_sanitization() -> None:
     # Control chars and newlines stripped
+    # 中文：剔除控制字符和换行符。
     malicious = "req-123\r\nInjected-Header: evil\x00"
     sanitized = sanitize_request_id(malicious)
     assert sanitized == "req-123Injected-Header:evil"
 
     # Length bounding
+    # 中文：限制长度。
     long_str = "x" * 300
     assert len(sanitize_request_id(long_str) or "") == 128
     assert len(sanitize_operation_id(long_str) or "") == 128
@@ -117,6 +125,7 @@ def test_error_mapping_catalog() -> None:
     assert m2.status == 502
 
     # Unknown code falls back safely
+    # 中文：未知代码安全回退。
     m3 = map_exchange_error("CUSTOM_FAILURE")
     assert m3.canonical_code == "PRODUCT.EXCHANGE.CUSTOM_FAILURE"
     assert m3.cause_kind == "unknown"
@@ -134,6 +143,7 @@ def test_api_correlation_headers_and_error_response(tmp_path: Path) -> None:
     client = TestClient(app)
 
     # Valid W3C traceparent and request-id propagation
+    # 中文：传播有效的 W3C traceparent 和 request-id。
     traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     response = client.get(
         "/api/v1/gateway-endpoints",
@@ -148,9 +158,11 @@ def test_api_correlation_headers_and_error_response(tmp_path: Path) -> None:
         response.headers["traceparent"] == "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000001-01"
     )
     # Malicious newlines stripped from x-request-id
+    # 中文：剔除 x-request-id 中的恶意换行符。
     assert response.headers["x-request-id"] == "client-req-001Injected:True"
 
     # Error scenario: unauthenticated control call
+    # 中文：错误场景：未认证的控制调用。
     err_response = client.get(
         "/api/v1/gateway-endpoints",
         headers={"traceparent": traceparent},

@@ -23,20 +23,32 @@ from cyrene_exchange_product.store import ExchangeStore
 
 
 class RequestAuditList(BaseModel):
-    """Bounded list response for the read-only audit surface."""
+    """Bounded list response for the read-only audit surface.
+
+    中文：只读审计接口的有界列表响应。
+    """
+# 中文：只读审计接口使用的有界列表响应。
 
     items: list[RequestAuditRecord]
 
 
 def create_audit_app(*, database_path: Path) -> FastAPI:
-    """Build a separate read-only audit API without changing control OpenAPI."""
+    """Build a separate read-only audit API without changing control OpenAPI.
+
+    中文：构建独立的只读审计 API，不更改 control OpenAPI。
+    """
+# 中文：构建独立的只读审计 API，不修改控制 API 的 OpenAPI 定义。
 
     store = ExchangeStore(database_path)
     app = FastAPI(title="Cyrene Exchange Usage Audit API", version="1.0.0")
     app.state.exchange_store = store
 
     def principal_for(authorization: str | None) -> RequestPrincipal:
-        """Resolve identity only from the persisted controlled credential."""
+        """Resolve identity only from the persisted controlled credential.
+
+        中文：仅从已持久化的受控凭据中解析身份。
+        """
+    # 中文：仅从已持久化的受控凭据解析身份。
 
         if authorization is None or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Authorization must use a Bearer token")
@@ -51,7 +63,11 @@ def create_audit_app(*, database_path: Path) -> FastAPI:
         authorization: Annotated[str | None, Header(alias="Authorization")] = None,
         limit: int = Query(default=100, ge=1, le=500),
     ) -> RequestAuditList:
-        """List only the caller's own workspace and actor records."""
+        """List only the caller's own workspace and actor records.
+
+        中文：仅列出调用者自己的 workspace 和 actor 记录。
+        """
+    # 中文：只列出调用方所属工作区和主体的记录。
 
         principal = principal_for(authorization)
         return RequestAuditList(
@@ -70,7 +86,11 @@ def create_audit_app(*, database_path: Path) -> FastAPI:
         request_id: Annotated[str, ApiPath(alias="requestId", min_length=1, max_length=200)],
         authorization: Annotated[str | None, Header(alias="Authorization")] = None,
     ) -> RequestAuditRecord:
-        """Read one audit row when workspace and actor both match."""
+        """Read one audit row when workspace and actor both match.
+
+        中文：仅当 workspace 和 actor 都匹配时读取一条审计记录。
+        """
+    # 中文：仅当工作区和主体均匹配时读取一条审计记录。
 
         principal = principal_for(authorization)
         record = store.get_request_audit(request_id)

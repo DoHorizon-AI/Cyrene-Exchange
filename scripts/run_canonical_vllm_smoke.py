@@ -4,7 +4,10 @@
 The script owns only process composition for a developer check. Platform's
 generic resolver selects the implementation; Exchange calls the Plugins-owned
 endpoint directly, and the provider connector owns upstream HTTP.
+
+中文：运行 Exchange 到官方 Direct Plugin 的本地 smoke 检查。脚本只负责为开发者组合进程；Platform 通用 resolver 选择实现，Exchange 直接调用 Plugins 所有的 endpoint，而 provider connector 负责上游 HTTP。
 """
+# 中文：运行本地 Exchange → 直接 Official Plugin 冒烟流程。此脚本只负责开发者检查所需的进程组合。Platform 的通用解析器负责选择实现；Exchange 直接调用 Plugins 所有的端点，而提供方连接器负责上游 HTTP。
 
 from __future__ import annotations
 
@@ -30,11 +33,16 @@ from cyrene_exchange.platform_resolver import PlatformResolverAdapter
 def _default_root(name: str) -> Path:
     # ``scripts`` is under ``Cyrene-Exchange``; sibling repositories live in
     # the workspace's ``Cyrene`` directory.
+    # 中文：``scripts`` 位于 ``Cyrene-Exchange`` 下；同级仓库位于工作区的 ``Cyrene`` 目录中。
     return Path(__file__).resolve().parents[3] / name
 
 
 def _wait_for_ready(process: subprocess.Popen[str], timeout: float) -> str:
-    """Read one credential-free direct Plugin readiness document."""
+    """Read one credential-free direct Plugin readiness document.
+
+    中文：读取一份无凭据的 Direct Plugin readiness 文档。
+    """
+# 中文：读取一份不含凭据的直接 Plugin 就绪状态文档。
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -73,7 +81,11 @@ def _post(port: int, payload: dict[str, Any], exchange_token: str) -> tuple[int,
 
 
 def _request_id(body: str, *, stream: bool = False) -> str | None:
-    """Extract a response request id without retaining the response body."""
+    """Extract a response request id without retaining the response body.
+
+    中文：从响应中提取 request ID，不保留响应正文。
+    """
+# 中文：提取响应请求 ID，但不保留响应正文。
 
     try:
         if stream:
@@ -91,7 +103,11 @@ def _request_id(body: str, *, stream: bool = False) -> str | None:
 
 
 def _publish_readiness(readiness_file: Path | None, document: dict[str, Any]) -> None:
-    """Publish one credential-free JSON readiness document to stdout and disk."""
+    """Publish one credential-free JSON readiness document to stdout and disk.
+
+    中文：向 stdout 和磁盘发布一份不含凭据的 JSON readiness 文档。
+    """
+# 中文：向标准输出和磁盘发布一份不含凭据的 JSON 就绪状态文档。
 
     encoded = json.dumps(document, separators=(",", ":"))
     if readiness_file is not None:
@@ -103,7 +119,11 @@ def _publish_readiness(readiness_file: Path | None, document: dict[str, Any]) ->
 
 
 def _wait_for_stop() -> None:
-    """Wait for SIGINT/SIGTERM while leaving the HTTP server on its worker thread."""
+    """Wait for SIGINT/SIGTERM while leaving the HTTP server on its worker thread.
+
+    中文：等待 SIGINT/SIGTERM，同时保持 HTTP server 在线程中继续运行。
+    """
+# 中文：等待 SIGINT/SIGTERM，同时让 HTTP 服务器继续运行在线程中。
 
     stop_event = Event()
     previous_handlers: dict[int, Any] = {}

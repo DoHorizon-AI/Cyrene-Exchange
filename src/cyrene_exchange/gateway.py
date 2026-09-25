@@ -9,7 +9,10 @@
 # 职责：Exchange Product 实现。
 # 本头部说明归属；响应整形保留工具调用与 usage 事实。
 ###############################################################################
-"""Exchange Product Core request policy and capability orchestration."""
+"""Exchange Product Core request policy and capability orchestration.
+
+Exchange Product Core 的请求策略与能力编排。
+"""
 
 from __future__ import annotations
 
@@ -37,7 +40,10 @@ from .protocol import NormalizedInferenceRequest, ProtocolError
 
 
 class GatewayError(Exception):
-    """An error with a defined Product-to-transport response mapping."""
+    """An error with a defined Product-to-transport response mapping.
+
+    具有明确 Product 到传输层响应映射的错误。
+    """
 
     status_code = 500
     error_type = "gateway_error"
@@ -51,7 +57,10 @@ class GatewayError(Exception):
 
 
 class GatewayLifecycleError(GatewayError):
-    """A durable request lifecycle callback failed before the request was safe."""
+    """A durable request lifecycle callback failed before the request was safe.
+
+    请求达到安全执行条件之前，持久化生命周期回调失败。
+    """
 
     status_code = 500
     error_type = "gateway_lifecycle_error"
@@ -68,7 +77,10 @@ class InvalidRequestError(GatewayError):
 
 
 class ModelNotPermittedError(GatewayError):
-    """The credential's model scope excludes the requested model."""
+    """The credential's model scope excludes the requested model.
+
+    凭据的模型范围不包含所请求的模型。
+    """
 
     status_code = 403
     error_type = "model_not_permitted"
@@ -115,6 +127,8 @@ class RequestPrincipal:
     adapters may persist only the references, never the credential itself.
     An empty ``model_scope`` admits every model pattern; a non-empty scope is a
     set of fnmatch patterns the requested model must match.
+
+    根据 Exchange 凭据解析出的可信身份。请求载荷不会参与构造此值。Product adapter 只能持久化这些引用，不能持久化凭据本身。空的 ``model_scope`` 表示允许所有模型模式；非空范围是一组 fnmatch 模式，请求的模型必须匹配其中之一。
     """
 
     actor_id: str
@@ -132,7 +146,10 @@ class RequestPrincipal:
                 raise ValueError("request principal model_scope patterns must be non-empty text")
 
     def permits(self, model: str) -> bool:
-        """Return whether the requested model is inside this scope."""
+        """Return whether the requested model is inside this scope.
+
+        返回请求的模型是否属于此范围。
+        """
 
         if not self.model_scope:
             return True
@@ -141,7 +158,10 @@ class RequestPrincipal:
 
 @dataclass(frozen=True)
 class RequestMetadata:
-    """Non-content request facts exposed to a Product lifecycle recorder."""
+    """Non-content request facts exposed to a Product lifecycle recorder.
+
+    提供给 Product 生命周期记录器的非内容类请求事实。
+    """
 
     request_id: str
     model: str
@@ -156,10 +176,16 @@ RequestRejectionStatus = Literal["rejected", "cancelled"]
 
 
 class RequestLifecycleObserver(Protocol):
-    """Durable observer for request admission and terminal provider facts."""
+    """Durable observer for request admission and terminal provider facts.
+
+    用于记录请求准入和提供方终态事实的持久化观察器。
+    """
 
     def on_request_started(self, metadata: RequestMetadata) -> None:
-        """Record trusted route and identity facts before provider execution."""
+        """Record trusted route and identity facts before provider execution.
+
+        在执行提供方调用前记录可信路由和身份事实。
+        """
 
     def on_request_finished(
         self,
@@ -169,7 +195,10 @@ class RequestLifecycleObserver(Protocol):
         usage: ProviderUsage | None,
         error_type: str | None,
     ) -> None:
-        """Record exactly one terminal outcome and observed provider usage."""
+        """Record exactly one terminal outcome and observed provider usage.
+
+        精确记录一次终态结果和观测到的提供方用量。
+        """
 
     def on_request_rejected(
         self,
@@ -181,12 +210,18 @@ class RequestLifecycleObserver(Protocol):
         model: str | None,
         stream: bool | None,
     ) -> None:
-        """Record a request that never reached a provider."""
+        """Record a request that never reached a provider.
+
+        记录一条未到达提供方的请求。
+        """
 
 
 @dataclass(frozen=True)
 class GatewayResponse:
-    """Normalized Product response returned to a transport adapter."""
+    """Normalized Product response returned to a transport adapter.
+
+    返回给传输 adapter 的规范化 Product 响应。
+    """
 
     request_id: str
     model: str
@@ -199,7 +234,10 @@ class GatewayResponse:
 
 @dataclass
 class _ToolCallAccumulator:
-    """Mutable assembly state for one indexed provider tool call."""
+    """Mutable assembly state for one indexed provider tool call.
+
+    用于组装一条带索引的提供方工具调用的可变状态。
+    """
 
     index: int
     call_id: str | None = None
@@ -210,7 +248,10 @@ class _ToolCallAccumulator:
     function_arguments_seen: bool = False
 
     def merge(self, delta: ToolCallDelta) -> None:
-        """Append one fragment while rejecting conflicting call identity."""
+        """Append one fragment while rejecting conflicting call identity.
+
+        追加一个片段，并拒绝调用身份冲突的情况。
+        """
 
         if delta.index != self.index:
             raise ProviderFailureError("provider tool-call index changed during assembly")
@@ -230,7 +271,10 @@ class _ToolCallAccumulator:
             self.function_arguments += delta.function_arguments
 
     def to_openai_message(self) -> dict[str, Any]:
-        """Serialize complete accumulated tool-call state."""
+        """Serialize complete accumulated tool-call state.
+
+        序列化已完整累积的工具调用状态。
+        """
 
         function: dict[str, str] = {}
         if self.function_name_seen:
@@ -239,6 +283,7 @@ class _ToolCallAccumulator:
             function["arguments"] = self.function_arguments
         # ``index`` orders streamed fragments; OpenAI's completed message
         # schema represents that order by the list position and omits it.
+        # ``index`` 用于排列流式片段；OpenAI 完成消息的 schema 通过列表顺序表达该顺序，因此省略此字段。
         result: dict[str, Any] = {}
         if self.call_id is not None:
             result["id"] = self.call_id
@@ -258,6 +303,8 @@ class ExchangeGateway:
     The resolver is the only way this class obtains routing and provider
     implementations.  Exchange owns candidate lifecycle and fallback policy;
     the routing capability owns candidate selection/scoring.
+
+    围绕 Platform 解析出的模型能力执行 Product 所有的策略。此类只能通过 resolver 获取路由和提供方实现。Exchange 拥有候选项生命周期和 fallback 策略；路由能力拥有候选项选择与评分。
     """
 
     def __init__(
@@ -305,6 +352,8 @@ class ExchangeGateway:
         Fallback is deliberately limited to failures before a usable provider
         response begins.  Once a stream has emitted a chunk, Exchange cannot
         safely replay a partial response through another route.
+
+        处理一个 OpenAI 兼容的 chat 请求。Fallback 仅用于可用的提供方响应开始之前发生的故障。流一旦发出数据块，Exchange 就无法安全地通过另一条路由重放部分响应。
         """
 
         request_id = request_id or f"chatcmpl-{uuid.uuid4().hex}"
@@ -445,6 +494,7 @@ class ExchangeGateway:
             try:
                 # Admission is deliberately before provider resolution and
                 # invocation, so failed bindings remain auditable too.
+                # 准入必须在解析和调用提供方之前完成，因此绑定失败也能留下审计记录。
                 self._observe_started(metadata)
                 started = True
                 provider = self._resolve_provider(target)
@@ -625,7 +675,10 @@ class ExchangeGateway:
 
     @staticmethod
     def _audit_error_type(exc: Exception) -> str:
-        """Prefer stable Gateway error types over implementation class names."""
+        """Prefer stable Gateway error types over implementation class names.
+
+        优先使用稳定的 Gateway 错误类型，而不是实现类名称。
+        """
 
         return exc.error_type if isinstance(exc, GatewayError) else type(exc).__name__
 
@@ -669,6 +722,7 @@ class ExchangeGateway:
         except Exception as exc:
             # No bytes have reached the client in non-stream mode, so Product
             # fallback may safely be attempted by the caller's next request.
+            # 非流式模式尚未向客户端发送任何字节，因此调用方可以安全地在下一次请求中尝试 Product fallback。
             raise ProviderFailureError(
                 f"{target.route_id or target.provider_ref}: {exc}",
                 usage=self._merge_chunk_usage(collected),
@@ -728,7 +782,10 @@ class ExchangeGateway:
         terminal_attempted = False
 
         def provider_chunks() -> Iterable[ProviderChunk]:
-            """Map provider cancellation while the lazy stream is consumed."""
+            """Map provider cancellation while the lazy stream is consumed.
+
+            在消费惰性数据流时映射提供方取消结果。
+            """
 
             try:
                 yield from self._with_first(first, chunks)
@@ -826,7 +883,10 @@ class ExchangeGateway:
         current: ProviderUsage | None,
         observed: ProviderUsage | None,
     ) -> ProviderUsage | None:
-        """Merge provider-reported usage facts without estimating missing data."""
+        """Merge provider-reported usage facts without estimating missing data.
+
+        合并提供方报告的用量事实，不估算缺失数据。
+        """
 
         if observed is None:
             return current
@@ -843,7 +903,10 @@ class ExchangeGateway:
 
     @classmethod
     def _merge_chunk_usage(cls, chunks: Iterable[ProviderChunk]) -> ProviderUsage | None:
-        """Collect the last known exact usage components from provider chunks."""
+        """Collect the last known exact usage components from provider chunks.
+
+        从提供方数据块中收集最近一次已知的精确用量分项。
+        """
 
         usage: ProviderUsage | None = None
         for chunk in chunks:
@@ -852,7 +915,10 @@ class ExchangeGateway:
 
     @staticmethod
     def _assemble_message(chunks: Iterable[ProviderChunk]) -> dict[str, Any]:
-        """Assemble text and indexed tool-call fragments into one assistant message."""
+        """Assemble text and indexed tool-call fragments into one assistant message.
+
+        将文本和带索引的工具调用片段组装成一条 assistant 消息。
+        """
 
         content = "".join(chunk.delta for chunk in chunks)
         role = next((chunk.role for chunk in chunks if chunk.role is not None), "assistant")
