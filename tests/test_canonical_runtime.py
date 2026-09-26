@@ -185,6 +185,14 @@ def create_test_gateway(resolver, max_route_attempts: int = 3):
     )
 
 
+def test_gateway_requires_lifecycle_observer() -> None:
+    with pytest.raises(ValueError, match="lifecycle_observer is required"):
+        ExchangeGateway(
+            Resolver(FakeRouter([]), {}),
+            principal_resolver=resolve_test_principal,
+        )
+
+
 def test_auth_resolution_failure_logs_trace_without_credential(capsys: pytest.CaptureFixture[str]) -> None:
     """Keep the boundary trace while a failing resolver cannot leak its credential.
 
