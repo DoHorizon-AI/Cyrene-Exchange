@@ -17,9 +17,11 @@ from pathlib import Path
 from threading import Thread
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cyrene_exchange_product import cli, create_app
+from cyrene_exchange_product import server as exchange_server
 from cyrene_exchange_product.domain import ProductPrincipal
 from cyrene_exchange_product.server import (
     OpenAICompatibleProvider,
@@ -478,7 +480,9 @@ def test_route_source_origin_outside_the_allow_list_is_refused(tmp_path: Path) -
         upstream.shutdown()
 
 
-def test_navigator_web_endpoints_and_proxy_rewrite(tmp_path: Path) -> None:
+def test_navigator_web_endpoints_and_proxy_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     mock_dist = tmp_path / "mock_dist"
     mock_dist.mkdir()
     (mock_dist / "index.html").write_text(
@@ -490,6 +494,12 @@ def test_navigator_web_endpoints_and_proxy_rewrite(tmp_path: Path) -> None:
     (mock_assets / "app.js").write_text("console.log('navigator');", encoding="utf-8")
 
     endpoint_id = _seed_endpoint(tmp_path / "exchange.sqlite3", "Navigator Web Gateway")
+    # Force the CPU-only environment shape so the assertions below do not
+    # depend on whether the host running the tests happens to have a GPU.
+    # 强制 CPU-only 环境形态,使断言不依赖运行测试的主机是否装有 GPU。
+    monkeypatch.setattr(
+        exchange_server, "_query_gpu", lambda: {"available": False, "gpus": []}
+    )
     app = build_product_app(
         database_path=tmp_path / "exchange.sqlite3",
         resolver=OperatorBindingResolver(
@@ -508,6 +518,17 @@ def test_navigator_web_endpoints_and_proxy_rewrite(tmp_path: Path) -> None:
         assert data["authenticated"] is True
         assert "/api/v1/exchange" in data["proxyPrefixes"]
         assert "gatewayBaseUrl" in data
+
+        # GPU probe reports unavailable in CPU-only environments (no nvidia-smi),
+        # and the standard shape keeps "gpus" present as an empty list.
+        gpu = data["gpu"]
+        assert gpu["available"] is False
+        assert gpu["gpus"] == []
+        disk = data["disk"]
+        assert disk["available"] is True
+        assert disk["totalGib"] > 0
+        blocker_codes = [b["code"] for b in data["blockers"]]
+        assert "GPU_UNAVAILABLE" in blocker_codes
 
         # Auth session
         session = client.get("/api/v1/auth/session")
@@ -548,3 +569,25 @@ def test_navigator_web_endpoints_and_proxy_rewrite(tmp_path: Path) -> None:
         asset = client.get("/assets/app.js")
         assert asset.status_code == 200
         assert "console.log" in asset.text
+
+
+def test_system_status_probes_return_standard_shape_on_any_host() -> None:
+    """The probes must not crash and must keep the documented response shape,
+    whether or not the host has a GPU or nvidia-smi installed.
+
+    中文:无论主机是否装有 GPU 或 nvidia-smi,探针都不得崩溃,且必须保持
+    文档约定的响应结构。
+    """
+    gpu = exchange_server._query_gpu()
+    assert isinstance(gpu["available"], bool)
+    assert isinstance(gpu["gpus"], list)
+    for device in gpu["gpus"]:
+        assert isinstance(device["name"], str)
+        assert isinstance(device["totalMib"], (int, float))
+        assert isinstance(device["usedMib"], (int, float))
+        assert isinstance(device["utilizationPct"], (int, float))
+
+    disk = exchange_server._query_disk()
+    assert isinstance(disk["available"], bool)
+    if disk["available"]:
+        assert disk["totalGib"] > 0

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -437,6 +439,61 @@ def _find_web_dist() -> Path | None:
     return None
 
 
+def _query_gpu() -> dict[str, Any]:
+    """Query NVIDIA GPUs through nvidia-smi; unavailable returns an empty list.
+
+    中文:通过 nvidia-smi 查询 NVIDIA GPU;不可用时返回空列表而非缺失字段,
+    便于 Web 控制台统一渲染 "UNAVAILABLE" 状态。
+    """
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return {"available": False, "gpus": []}
+        gpus: list[dict[str, Any]] = []
+        for line in out.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 4:
+                gpus.append(
+                    {
+                        "name": parts[0],
+                        "totalMib": float(parts[1]) if "." in parts[1] else int(parts[1]),
+                        "usedMib": float(parts[2]) if "." in parts[2] else int(parts[2]),
+                        "utilizationPct": float(parts[3]) if "." in parts[3] else int(parts[3]),
+                    }
+                )
+        return {"available": True, "gpus": gpus}
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        return {"available": False, "gpus": []}
+
+
+def _query_disk() -> dict[str, Any]:
+    """Return basic disk usage for the workspace root filesystem.
+
+    中文:返回工作区根文件系统的基本磁盘使用情况。
+    """
+    try:
+        usage = shutil.disk_usage("/")
+        total = usage.total if usage.total > 0 else 1
+        return {
+            "available": True,
+            "totalGib": round(usage.total / 1024**3, 1),
+            "usedGib": round(usage.used / 1024**3, 1),
+            "freeGib": round(usage.free / 1024**3, 1),
+            "usedPct": round(usage.used * 100 / total, 1),
+        }
+    except OSError:
+        return {"available": False}
+
+
 def build_product_app(
     *,
     database_path: Any,
@@ -591,6 +648,16 @@ def build_product_app(
         revoked_keys = len(keys) - active_keys
         now_utc = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         base_url = str(request.base_url).rstrip("/")
+        gpu_info = _query_gpu()
+        disk_info = _query_disk()
+        blockers: list[dict[str, Any]] = []
+        if not gpu_info.get("available"):
+            blockers.append(
+                {
+                    "code": "GPU_UNAVAILABLE",
+                    "message": "No GPU detected. Model fine-tuning and inference require a GPU.",
+                }
+            )
         return {
             "service": "cyrene-exchange",
             "status": "UP",
@@ -603,6 +670,9 @@ def build_product_app(
             },
             "routes": len(routes),
             "gatewayBaseUrl": base_url,
+            "gpu": gpu_info,
+            "disk": disk_info,
+            "blockers": blockers,
             "observedAt": now_utc,
         }
 
