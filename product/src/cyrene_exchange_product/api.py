@@ -30,13 +30,17 @@ from cyrene_exchange_product.domain import (
     CreateEndpointRequest,
     CreateRouteDraftRequest,
     CreateRouteRequest,
+    CreateWorkspaceRouteDraftRequest,
     EditRouteDraftRequest,
     GatewayEndpoint,
     GatewayRoute,
     ProblemDetails,
     ProductPrincipal,
+    RouteSource,
     WorkspaceEndpointGrant,
     WorkspaceGatewayRoute,
+    WorkspaceReactorEndpointGrant,
+    WorkspaceReactorEndpointSelector,
     WorkspaceRouteSourceProvenance,
 )
 from cyrene_exchange_product.errors import ExchangeProductError, map_exchange_error
@@ -79,6 +83,10 @@ def create_app(
     database_path: Path,
     control_credentials: Mapping[str, ProductPrincipal] | None = None,
     workspace_endpoint_grants: Iterable[WorkspaceEndpointGrant] = (),
+    workspace_reactor_endpoint_grants: Iterable[WorkspaceReactorEndpointGrant] = (),
+    resolve_workspace_reactor_endpoint: (
+        Callable[[WorkspaceReactorEndpointSelector, str], RouteSource] | None
+    ) = None,
     allowed_binding_ids: frozenset[str] = frozenset(),
     validate_route_target: Callable[[GatewayRoute], None] | None = None,
     store: ExchangeStore | None = None,
@@ -95,6 +103,7 @@ def create_app(
     if control_credentials is not None:
         store.configure_credentials(control_credentials)
     store.configure_workspace_endpoint_grants(workspace_endpoint_grants)
+    store.configure_workspace_reactor_endpoint_grants(workspace_reactor_endpoint_grants)
     control_refs = {p.credential_ref for p in (control_credentials or {}).values()}
 
     def principal(request: Request) -> ProductPrincipal:
@@ -348,13 +357,60 @@ def create_app(
         status_code=201,
     )
     def create_workspace_draft(
-        command: CreateRouteDraftRequest,
+        command: CreateWorkspaceRouteDraftRequest,
         request: Request,
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ) -> WorkspaceGatewayRoute:
         identity = scoped_principal(request)
         admit_binding(command.target_binding_id)
-        route = service.create_scoped_route_draft(command, idempotency_key, identity)
+        organization_id = identity.organization_id
+        if organization_id is None:
+            raise AssertionError("scoped_principal must return an organization-scoped identity")
+        if not store.workspace_endpoint_is_granted(
+            command.endpoint_id, organization_id, identity.workspace_id
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_PERMISSION_DENIED",
+                title="Endpoint not permitted",
+                detail="No operator grant permits this destination in the authenticated workspace.",
+                status=403,
+            )
+        source_endpoint_id = command.source_endpoint.endpoint_id
+        if not store.workspace_reactor_endpoint_is_granted(
+            source_endpoint_id, organization_id, identity.workspace_id
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_SOURCE_PERMISSION_DENIED",
+                title="Reactor Endpoint not permitted",
+                detail=(
+                    "No operator grant permits this Reactor source in the authenticated workspace."
+                ),
+                status=403,
+            )
+        if resolve_workspace_reactor_endpoint is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_SOURCE_UNREACHABLE",
+                title="Reactor source unavailable",
+                detail="Configure the private Reactor source resolver before creating drafts.",
+                status=503,
+                retryable=True,
+            )
+        source = resolve_workspace_reactor_endpoint(command.source_endpoint, command.target_model)
+        internal_command = CreateRouteDraftRequest(
+            endpoint_id=command.endpoint_id,
+            model_pattern=command.model_pattern,
+            target_binding_id=command.target_binding_id,
+            target_model=command.target_model,
+            priority=command.priority,
+            source=source,
+        )
+        route = service.create_scoped_route_draft(
+            internal_command,
+            idempotency_key,
+            identity,
+            idempotency_command=command,
+            reactor_source_endpoint_id=source_endpoint_id,
+        )
         return _workspace_route_projection(route)
 
     @app.patch("/api/v1/gateway-route-drafts/{routeId}", response_model=GatewayRoute)

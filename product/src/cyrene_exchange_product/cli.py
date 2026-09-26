@@ -26,7 +26,9 @@ from cyrene_exchange_product.domain import (
     CreateRouteRequest,
     ProductPrincipal,
     WorkspaceEndpointGrant,
+    WorkspaceReactorEndpointGrant,
 )
+from cyrene_exchange_product.route_admission import ReactorWorkspaceSourceResolver
 from cyrene_exchange_product.server import (
     OpenAICompatibleProvider,
     OperatorBindingResolver,
@@ -85,9 +87,7 @@ def _workspace_endpoint_grants(entries: list[str]) -> tuple[WorkspaceEndpointGra
     for entry in entries:
         parts = entry.split("=", 2)
         if len(parts) != 3 or not all(part.strip() for part in parts):
-            raise SystemExit(
-                "Workspace endpoint grants must use ENDPOINT_UUID=ORG_ID=WORKSPACE_ID"
-            )
+            raise SystemExit("Workspace endpoint grants must use ENDPOINT_UUID=ORG_ID=WORKSPACE_ID")
         try:
             endpoint_id = UUID(parts[0].strip())
             grants.append(
@@ -99,6 +99,29 @@ def _workspace_endpoint_grants(entries: list[str]) -> tuple[WorkspaceEndpointGra
             )
         except ValueError as exc:
             raise SystemExit("Workspace endpoint grant contains an invalid endpoint UUID") from exc
+    return tuple(grants)
+
+
+def _workspace_reactor_endpoint_grants(
+    entries: list[str],
+) -> tuple[WorkspaceReactorEndpointGrant, ...]:
+    """Parse operator grants for Reactor source Endpoints."""
+
+    grants: list[WorkspaceReactorEndpointGrant] = []
+    for entry in entries:
+        parts = entry.split("=", 2)
+        if len(parts) != 3 or not all(part.strip() for part in parts):
+            raise SystemExit("Reactor Endpoint grants must use ENDPOINT_UUID=ORG_ID=WORKSPACE_ID")
+        try:
+            grants.append(
+                WorkspaceReactorEndpointGrant(
+                    endpoint_id=UUID(parts[0].strip()),
+                    organization_id=parts[1].strip(),
+                    workspace_id=parts[2].strip(),
+                )
+            )
+        except ValueError as exc:
+            raise SystemExit("Reactor Endpoint grant contains an invalid UUID") from exc
     return tuple(grants)
 
 
@@ -183,14 +206,41 @@ def _serve(arguments: argparse.Namespace) -> int:
     else:
         resolver = OperatorBindingResolver(providers)
         resolver_factory = None
+    workspace_reactor_origin = arguments.workspace_reactor_origin
+    workspace_reactor_token_env = arguments.workspace_reactor_token_env
+    if bool(workspace_reactor_origin) != bool(workspace_reactor_token_env):
+        raise SystemExit(
+            "Workspace Reactor source requires both --workspace-reactor-origin and "
+            "--workspace-reactor-token-env"
+        )
+    workspace_source_resolver = None
+    if workspace_reactor_origin and workspace_reactor_token_env:
+        workspace_reactor_token = os.environ.get(workspace_reactor_token_env)
+        if not workspace_reactor_token:
+            raise SystemExit("The configured Workspace Reactor source credential is empty")
+        if workspace_reactor_token in credentials or workspace_reactor_token in gateway_credentials:
+            raise SystemExit(
+                "The Reactor source credential must be distinct from Exchange credentials"
+            )
+        try:
+            workspace_source_resolver = ReactorWorkspaceSourceResolver(
+                reactor_origin=workspace_reactor_origin,
+                reactor_token=workspace_reactor_token,
+            )
+        except ValueError as exc:
+            raise SystemExit("Workspace Reactor source configuration is invalid") from exc
     app = build_product_app(
         database_path=arguments.database.resolve(),
         resolver=resolver,
         resolver_factory=resolver_factory,
         control_credentials=credentials or None,
         gateway_credentials=gateway_credentials or None,
-        workspace_endpoint_grants=_workspace_endpoint_grants(
-            arguments.workspace_endpoint_grant
+        workspace_endpoint_grants=_workspace_endpoint_grants(arguments.workspace_endpoint_grant),
+        workspace_reactor_endpoint_grants=_workspace_reactor_endpoint_grants(
+            arguments.workspace_reactor_endpoint_grant
+        ),
+        resolve_workspace_reactor_endpoint=(
+            workspace_source_resolver.resolve if workspace_source_resolver is not None else None
         ),
         allowed_binding_ids=_admitted_bindings(arguments),
         endpoint_id=arguments.endpoint_id,
@@ -417,7 +467,25 @@ def parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="ENDPOINT_UUID=ORG_ID=WORKSPACE_ID",
-        help="Operator grant allowing one organization/workspace to reference an endpoint",
+        help=(
+            "Operator grant allowing one organization/workspace to target an Exchange "
+            "GatewayEndpoint"
+        ),
+    )
+    serve.add_argument(
+        "--workspace-reactor-endpoint-grant",
+        action="append",
+        default=[],
+        metavar="ENDPOINT_UUID=ORG_ID=WORKSPACE_ID",
+        help="Operator grant allowing one organization/workspace to select a Reactor Endpoint",
+    )
+    serve.add_argument(
+        "--workspace-reactor-origin",
+        help="Fixed private Reactor service origin used only for granted source resolution",
+    )
+    serve.add_argument(
+        "--workspace-reactor-token-env",
+        help="Environment variable holding the private Reactor service Bearer",
     )
     serve.add_argument("--endpoint-id", type=UUID)
     serve.add_argument(

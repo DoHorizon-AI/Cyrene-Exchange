@@ -17,7 +17,9 @@ from cyrene_exchange_product.domain import (
     GatewayEndpoint,
     GatewayRoute,
     ProductPrincipal,
+    RouteSource,
     WorkspaceEndpointGrant,
+    WorkspaceReactorEndpointGrant,
     utc_now,
 )
 from cyrene_exchange_product.server import OperatorBindingResolver, build_product_app
@@ -31,6 +33,7 @@ TOKEN_A_ROTATION = "private-service-a-next"
 TOKEN_B = "private-service-b"
 TOKEN_WRONG_WORKSPACE = "private-service-wrong-workspace"
 TOKEN_LEGACY = "legacy-control-token"
+REACTOR_ENDPOINT_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
 def _endpoint(endpoint_id: UUID) -> GatewayEndpoint:
@@ -62,6 +65,21 @@ def _draft_body(endpoint_id: UUID) -> dict[str, object]:
     }
 
 
+def _workspace_draft_body(endpoint_id: UUID) -> dict[str, object]:
+    return {
+        "endpointId": str(endpoint_id),
+        "modelPattern": "chat",
+        "targetBindingId": "permitted",
+        "targetModel": "upstream-chat",
+        "priority": 10,
+        "sourceEndpoint": {
+            "product": "reactor",
+            "endpointId": str(REACTOR_ENDPOINT_ID),
+            "resourceVersion": 2,
+        },
+    }
+
+
 def _app(tmp_path: Path):
     database = tmp_path / "exchange-scope.sqlite3"
     store = ExchangeStore(database)
@@ -88,11 +106,21 @@ def _app(tmp_path: Path):
         WorkspaceEndpointGrant(granted_endpoint_id, ORG_A, WORKSPACE),
         WorkspaceEndpointGrant(granted_endpoint_id, ORG_B, WORKSPACE),
     )
+    reactor_grants = (
+        WorkspaceReactorEndpointGrant(REACTOR_ENDPOINT_ID, ORG_A, WORKSPACE),
+        WorkspaceReactorEndpointGrant(REACTOR_ENDPOINT_ID, ORG_B, WORKSPACE),
+    )
     app = create_app(
         database_path=database,
         store=store,
         control_credentials=credentials,
         workspace_endpoint_grants=grants,
+        workspace_reactor_endpoint_grants=reactor_grants,
+        resolve_workspace_reactor_endpoint=lambda selector, _target_model: RouteSource(
+            resource_uri=f"https://reactor.example/api/v1/endpoints/{selector.endpoint_id}",
+            resource_version=selector.resource_version,
+            artifact_digest="sha256:" + "a" * 64,
+        ),
         allowed_binding_ids=frozenset({"permitted"}),
     )
     return app, store, granted_endpoint_id, legacy_endpoint_id
@@ -104,7 +132,7 @@ def _create_private_draft(
     response = client.post(
         "/api/v1/workspace/gateway-route-drafts",
         headers={"Authorization": f"Bearer {token}", "Idempotency-Key": key},
-        json=_draft_body(endpoint_id),
+        json=_workspace_draft_body(endpoint_id),
     )
     assert response.status_code == 201, response.text
     return dict(response.json())
@@ -187,7 +215,7 @@ def test_private_routes_are_scoped_and_legacy_paths_do_not_expose_them(
             )
 
             # Product bodies cannot set the authenticated organization.
-            forged_body = _draft_body(endpoint_id)
+            forged_body = _workspace_draft_body(endpoint_id)
             forged_body["organizationId"] = ORG_B
             assert (
                 client.post(
@@ -212,7 +240,7 @@ def test_private_routes_are_scoped_and_legacy_paths_do_not_expose_them(
                         "Authorization": f"Bearer {token}",
                         "Idempotency-Key": f"denied-{blocked_endpoint}",
                     },
-                    json=_draft_body(blocked_endpoint),
+                    json=_workspace_draft_body(blocked_endpoint),
                 )
                 assert denied.status_code == 403
 
@@ -297,7 +325,7 @@ def test_control_and_gateway_bearers_have_separate_route_authority(tmp_path: Pat
             gateway_token: ProductPrincipal("gateway", "gateway-workspace", "cred://gateway/api")
         },
     )
-    draft_body = _draft_body(endpoint_id)
+    draft_body = _workspace_draft_body(endpoint_id)
     with TestClient(app) as client:
         private_read = client.get(
             "/api/v1/workspace/gateway-routes",
@@ -403,7 +431,7 @@ def test_unconfigured_private_alias_fails_closed(tmp_path: Path) -> None:
             assert (
                 client.post(
                     "/api/v1/workspace/gateway-route-drafts",
-                    json=_draft_body(endpoint_id),
+                    json=_workspace_draft_body(endpoint_id),
                     headers={"Idempotency-Key": "missing-auth"},
                 ).status_code
                 == 403

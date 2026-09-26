@@ -40,7 +40,10 @@ from cyrene_exchange_product.api import create_app
 from cyrene_exchange_product.domain import (
     EndpointState,
     ProductPrincipal,
+    RouteSource,
     WorkspaceEndpointGrant,
+    WorkspaceReactorEndpointGrant,
+    WorkspaceReactorEndpointSelector,
 )
 from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.routing import (
@@ -509,6 +512,10 @@ def build_product_app(
     control_credentials: Mapping[str, ProductPrincipal] | None = None,
     gateway_credentials: Mapping[str, ProductPrincipal] | None = None,
     workspace_endpoint_grants: Iterable[WorkspaceEndpointGrant] = (),
+    workspace_reactor_endpoint_grants: Iterable[WorkspaceReactorEndpointGrant] = (),
+    resolve_workspace_reactor_endpoint: (
+        Callable[[WorkspaceReactorEndpointSelector, str], RouteSource] | None
+    ) = None,
     allowed_binding_ids: frozenset[str] = frozenset(),
     endpoint_id: UUID | None = None,
     validate_route_target: Callable[[Any], None] | None = None,
@@ -544,9 +551,7 @@ def build_product_app(
     for token, principal in configured_gateway_map.items():
         control_principal = control_map.get(token)
         if control_principal is not None and control_principal.organization_id is not None:
-            raise ValueError(
-                "a Workspace control credential cannot also be a Gateway credential"
-            )
+            raise ValueError("a Workspace control credential cannot also be a Gateway credential")
         existing = effective_gateway_credentials.get(token)
         if existing is not None and existing != principal:
             raise ValueError("a Gateway credential has conflicting configured identities")
@@ -571,6 +576,8 @@ def build_product_app(
         database_path=database_path,
         control_credentials=control_credentials,
         workspace_endpoint_grants=workspace_endpoint_grants,
+        workspace_reactor_endpoint_grants=workspace_reactor_endpoint_grants,
+        resolve_workspace_reactor_endpoint=resolve_workspace_reactor_endpoint,
         allowed_binding_ids=allowed_binding_ids,
         validate_route_target=validate_route_target or _route_validator(effective),
         store=store,
@@ -582,9 +589,7 @@ def build_product_app(
         credentials=effective_gateway_credentials,
         record_requests=record_requests,
     )
-    data_plane_resolver = data_plane_principal_resolver(
-        store, effective_gateway_credentials
-    )
+    data_plane_resolver = data_plane_principal_resolver(store, effective_gateway_credentials)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

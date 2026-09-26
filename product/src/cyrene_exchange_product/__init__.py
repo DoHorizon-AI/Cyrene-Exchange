@@ -18,6 +18,7 @@ from cyrene_exchange_product.domain import (
     TenantQuota,
     UsageState,
     WorkspaceEndpointGrant,
+    WorkspaceReactorEndpointGrant,
 )
 from cyrene_exchange_product.quota import ProductQuotaGuard
 from cyrene_exchange_product.routing import (
@@ -37,6 +38,7 @@ __all__ = [
     "TenantQuota",
     "UsageState",
     "WorkspaceEndpointGrant",
+    "WorkspaceReactorEndpointGrant",
     "build_gateway_from_store",
     "create_app",
     "create_audit_app",

@@ -174,9 +174,7 @@ class ExchangeProductService:
 
         return self.store.list_legacy_routes()
 
-    def list_workspace_routes(
-        self, organization_id: str, workspace_id: str
-    ) -> list[GatewayRoute]:
+    def list_workspace_routes(self, organization_id: str, workspace_id: str) -> list[GatewayRoute]:
         """List routes for one authenticated organization/workspace pair."""
 
         return self.store.list_workspace_routes(organization_id, workspace_id)
@@ -210,7 +208,13 @@ class ExchangeProductService:
         return self.store.create_route_draft(route, key, digest)
 
     def create_scoped_route_draft(
-        self, command: CreateRouteDraftRequest, key: str, principal: ProductPrincipal
+        self,
+        command: CreateRouteDraftRequest,
+        key: str,
+        principal: ProductPrincipal,
+        *,
+        idempotency_command: ContractModel,
+        reactor_source_endpoint_id: UUID,
     ) -> GatewayRoute:
         """Create a DRAFT whose organization and workspace come from credentials."""
 
@@ -243,7 +247,7 @@ class ExchangeProductService:
         ).hexdigest()
         request_digest = hashlib.sha256(
             (
-                request_hash(command)
+                request_hash(idempotency_command)
                 + "\0"
                 + principal.organization_id
                 + "\0"
@@ -257,6 +261,7 @@ class ExchangeProductService:
             key,
             request_digest,
             idempotency_scope=f"create-route-draft:v1:{scope_digest}",
+            reactor_source_endpoint_id=reactor_source_endpoint_id,
         )
 
     def edit_route_draft(

@@ -66,6 +66,48 @@ class RouteSource(ContractModel):
     )
 
 
+class WorkspaceReactorEndpointSelector(ContractModel):
+    """Opaque command selector for one granted Reactor Endpoint. | 私有端点选择器。"""
+
+    product: Literal["reactor"]
+    endpoint_id: UUID
+    resource_version: int = Field(ge=1)
+
+
+class CreateWorkspaceRouteDraftRequest(ContractModel):
+    """Workspace command that selects a Reactor source without accepting a URL.
+
+    中文:私有 Workspace 命令只选择 Reactor Endpoint,不接受来源 URL。
+    """
+
+    endpoint_id: UUID
+    model_pattern: str = Field(min_length=1, max_length=200)
+    target_binding_id: str = Field(min_length=1, max_length=300)
+    target_model: str = Field(min_length=1, max_length=200)
+    priority: int = Field(ge=0, le=10_000)
+    source_endpoint: WorkspaceReactorEndpointSelector
+
+
+@dataclass(frozen=True)
+class WorkspaceReactorEndpointGrant:
+    """Operator-owned Reactor source assignment to one organization/workspace.
+
+    中文:由 operator 管理的 Reactor 来源授权,固定绑定一个组织和 workspace。
+    """
+
+    endpoint_id: UUID
+    organization_id: str
+    workspace_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.endpoint_id, UUID):
+            raise TypeError("Reactor Endpoint grant endpoint_id must be a UUID")
+        for field_name in ("organization_id", "workspace_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Reactor Endpoint grant {field_name} must be non-empty text")
+
+
 class GatewayEndpoint(ContractModel):
     """Externally published model API surface. | 对外发布的模型 API 表面。"""
 

@@ -38,6 +38,7 @@ from cyrene_exchange_product.domain import (
     TenantQuota,
     UsageState,
     WorkspaceEndpointGrant,
+    WorkspaceReactorEndpointGrant,
 )
 from cyrene_exchange_product.errors import ExchangeProductError
 
@@ -73,6 +74,12 @@ class ExchangeStore:
                 CREATE INDEX IF NOT EXISTS ix_gateway_routes_endpoint
                     ON gateway_routes(endpoint_id, priority, id);
                 CREATE TABLE IF NOT EXISTS workspace_endpoint_grants (
+                    endpoint_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    PRIMARY KEY(endpoint_id, organization_id, workspace_id)
+                );
+                CREATE TABLE IF NOT EXISTS workspace_reactor_endpoint_grants (
                     endpoint_id TEXT NOT NULL,
                     organization_id TEXT NOT NULL,
                     workspace_id TEXT NOT NULL,
@@ -279,6 +286,7 @@ class ExchangeStore:
         digest: str,
         *,
         idempotency_scope: str = "create-route-draft",
+        reactor_source_endpoint_id: UUID | None = None,
     ) -> GatewayRoute:
         """Atomically retain the draft and Send to retry identity. | 原子保存草稿与幂等身份。"""
         with self._mutation() as cursor:
@@ -310,6 +318,34 @@ class ExchangeStore:
                         detail="No GatewayEndpoint exists with the requested id.",
                         status=404,
                     )
+                if reactor_source_endpoint_id is None:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_SOURCE_PERMISSION_DENIED",
+                        title="Reactor Endpoint not permitted",
+                        detail="A server-resolved Reactor Endpoint is required for private drafts.",
+                        status=403,
+                    )
+                source_grant = cursor.execute(
+                    """
+                    SELECT 1 FROM workspace_reactor_endpoint_grants
+                    WHERE endpoint_id = ? AND organization_id = ? AND workspace_id = ?
+                    """,
+                    (
+                        str(reactor_source_endpoint_id),
+                        route.organization_id,
+                        route.workspace_id,
+                    ),
+                ).fetchone()
+                if source_grant is None:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_SOURCE_PERMISSION_DENIED",
+                        title="Reactor Endpoint not permitted",
+                        detail=(
+                            "No operator grant permits this Reactor Endpoint in the "
+                            "authenticated workspace."
+                        ),
+                        status=403,
+                    )
             replay = self.resolve_idempotency(idempotency_scope, key, digest)
             if replay is not None:
                 existing = self.get_route(UUID(replay))
@@ -339,24 +375,73 @@ class ExchangeStore:
             )
         return route
 
-    def configure_workspace_endpoint_grants(
-        self, grants: Iterable[WorkspaceEndpointGrant]
-    ) -> None:
+    def configure_workspace_endpoint_grants(self, grants: Iterable[WorkspaceEndpointGrant]) -> None:
         """Replace grants from operator configuration, never from request bodies."""
 
         prepared: set[tuple[str, str, str]] = set()
         for grant in grants:
             if not isinstance(grant, WorkspaceEndpointGrant):
                 raise TypeError("workspace endpoint grants must be WorkspaceEndpointGrant values")
-            prepared.add(
-                (str(grant.endpoint_id), grant.organization_id, grant.workspace_id)
-            )
+            prepared.add((str(grant.endpoint_id), grant.organization_id, grant.workspace_id))
         with self._mutation() as cursor:
             cursor.execute("DELETE FROM workspace_endpoint_grants")
             cursor.executemany(
                 """
                 INSERT INTO workspace_endpoint_grants(endpoint_id, organization_id, workspace_id)
                 VALUES (?, ?, ?)
+                """,
+                sorted(prepared),
+            )
+
+    def workspace_endpoint_is_granted(
+        self, endpoint_id: UUID, organization_id: str, workspace_id: str
+    ) -> bool:
+        """Check Exchange destination assignment before source resolution."""
+
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM workspace_endpoint_grants
+                WHERE endpoint_id = ? AND organization_id = ? AND workspace_id = ?
+                """,
+                (str(endpoint_id), organization_id, workspace_id),
+            ).fetchone()
+        return row is not None
+
+    def workspace_reactor_endpoint_is_granted(
+        self, endpoint_id: UUID, organization_id: str, workspace_id: str
+    ) -> bool:
+        """Check source assignment before making a private Reactor request."""
+
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM workspace_reactor_endpoint_grants
+                WHERE endpoint_id = ? AND organization_id = ? AND workspace_id = ?
+                """,
+                (str(endpoint_id), organization_id, workspace_id),
+            ).fetchone()
+        return row is not None
+
+    def configure_workspace_reactor_endpoint_grants(
+        self, grants: Iterable[WorkspaceReactorEndpointGrant]
+    ) -> None:
+        """Replace Reactor source assignments from operator configuration."""
+
+        prepared: set[tuple[str, str, str]] = set()
+        for grant in grants:
+            if not isinstance(grant, WorkspaceReactorEndpointGrant):
+                raise TypeError(
+                    "Reactor source grants must be WorkspaceReactorEndpointGrant values"
+                )
+            prepared.add((str(grant.endpoint_id), grant.organization_id, grant.workspace_id))
+        with self._mutation() as cursor:
+            cursor.execute("DELETE FROM workspace_reactor_endpoint_grants")
+            cursor.executemany(
+                """
+                INSERT INTO workspace_reactor_endpoint_grants(
+                    endpoint_id, organization_id, workspace_id
+                ) VALUES (?, ?, ?)
                 """,
                 sorted(prepared),
             )

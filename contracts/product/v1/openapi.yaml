@@ -153,10 +153,10 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CreateRouteDraftRequest'
+              $ref: '#/components/schemas/CreateWorkspaceRouteDraftRequest'
       responses:
         '201':
-          description: DRAFT created for the authenticated organization and workspace; source provenance omits the internal Reactor URL
+          description: DRAFT created for the authenticated organization and workspace; the command selector is resolved server-side and the response omits the internal Reactor URL
           content:
             application/json:
               schema:
@@ -168,7 +168,9 @@ paths:
         '409':
           $ref: '#/components/responses/Problem'
         '422':
-          description: Request validation failed
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
   /api/v1/api-keys:
     post:
       operationId: createApiKey
@@ -569,6 +571,61 @@ components:
       - source
       title: CreateRouteDraftRequest
       description: Explicit Send to creates a draft, never an active route. | 发送到只创建草稿。
+    CreateWorkspaceRouteDraftRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - endpointId
+      - modelPattern
+      - targetBindingId
+      - targetModel
+      - priority
+      - sourceEndpoint
+      properties:
+        endpointId:
+          type: string
+          format: uuid
+        modelPattern:
+          type: string
+          minLength: 1
+          maxLength: 200
+        targetBindingId:
+          type: string
+          minLength: 1
+          maxLength: 300
+        targetModel:
+          type: string
+          minLength: 1
+          maxLength: 200
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 10000
+        sourceEndpoint:
+          type: object
+          additionalProperties: false
+          required:
+          - product
+          - endpointId
+          - resourceVersion
+          properties:
+            product:
+              type: string
+              const: reactor
+            endpointId:
+              type: string
+              format: uuid
+            resourceVersion:
+              type: integer
+              minimum: 1
+          description: >-
+            Command-only opaque selector. It is resolved by Exchange through
+            its operator grant and fixed private Reactor origin; callers cannot
+            supply a URL, path, host, or arbitrary operation.
+      title: CreateWorkspaceRouteDraftRequest
+      description: >-
+        Private Workspace command. The Reactor source selector is not a
+        navigable ProductResourceReference and contains no network location.
     EditRouteDraftRequest:
       properties:
         resourceVersion:

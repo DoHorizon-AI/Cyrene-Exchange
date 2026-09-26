@@ -71,6 +71,24 @@ EXCHANGE_ERROR_MAPPINGS: dict[str, ErrorMapping] = {
         recovery_action="fix_configuration",
         status=403,
     ),
+    "EXCHANGE_SOURCE_PERMISSION_DENIED": ErrorMapping(
+        canonical_code="PRODUCT.EXCHANGE.SOURCE_PERMISSION_DENIED",
+        cause_kind="authorization",
+        recovery_action="fix_configuration",
+        status=403,
+    ),
+    "EXCHANGE_SOURCE_VERSION_CONFLICT": ErrorMapping(
+        canonical_code="PRODUCT.EXCHANGE.SOURCE_VERSION_CONFLICT",
+        cause_kind="stale_version",
+        recovery_action="refresh_resource",
+        status=409,
+    ),
+    "EXCHANGE_SOURCE_UNREACHABLE": ErrorMapping(
+        canonical_code="PRODUCT.EXCHANGE.SOURCE_UNREACHABLE",
+        cause_kind="upstream_unreachable",
+        recovery_action="query_state_first",
+        status=503,
+    ),
     "EXCHANGE_TARGET_UNREACHABLE": ErrorMapping(
         canonical_code="PRODUCT.EXCHANGE.TARGET_UNREACHABLE",
         cause_kind="upstream_unreachable",
