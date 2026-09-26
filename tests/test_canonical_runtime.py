@@ -185,6 +185,35 @@ def create_test_gateway(resolver, max_route_attempts: int = 3):
     )
 
 
+def test_auth_resolution_failure_logs_trace_without_credential(capsys: pytest.CaptureFixture[str]) -> None:
+    """Keep the boundary trace while a failing resolver cannot leak its credential.
+
+    中文:解析器失败时保留边界 trace，且不泄露凭据。"""
+
+    secret = "sensitive-credential"
+    trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+
+    def fail_resolver(_token: str) -> RequestPrincipal | None:
+        raise RuntimeError(f"resolver rejected {secret}")
+
+    gateway = ExchangeGateway(
+        Resolver(FakeRouter([]), {}),
+        principal_resolver=fail_resolver,
+        lifecycle_observer=NoOpLifecycleObserver(),
+        max_route_attempts=1,
+    )
+    with pytest.raises(AuthenticationError, match="invalid credentials"):
+        gateway._authenticate(
+            {
+                "Authorization": f"Bearer {secret}",
+                "traceparent": f"00-{trace_id}-00f067aa0ba902b7-01",
+            }
+        )
+    log_line = capsys.readouterr().err
+    assert json.loads(log_line)["trace_id"] == trace_id
+    assert secret not in log_line
+
+
 def http_json_request(gateway, request_payload, headers=HEADERS):
     server = create_reference_server(gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

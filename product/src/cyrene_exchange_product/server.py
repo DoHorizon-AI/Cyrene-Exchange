@@ -690,6 +690,10 @@ def build_product_app(
             return _openai_error(400, "invalid_request_error", "request body must be an object")
         cancel_event = Event()
         try:
+            gateway_headers = dict(request.headers.items())
+            trace_id = getattr(request.state, "trace_id", None)
+            if isinstance(trace_id, str):
+                gateway_headers["traceparent"] = f"00-{trace_id}-0000000000000001-01"
             # The gateway and its provider adapters are synchronous, so the call
             # runs on the worker thread instead of stalling the event loop that
             # also serves probes and concurrent requests.
@@ -697,7 +701,7 @@ def build_product_app(
             # 避免阻塞同时处理探测和并发请求的事件循环。
             response = await run_in_threadpool(
                 gateway.handle_openai_chat,
-                dict(request.headers.items()),
+                gateway_headers,
                 payload,
                 cancel_event=cancel_event,
             )
