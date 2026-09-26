@@ -26,6 +26,7 @@ jobs:
       AZURE_LOCATION: eastasia
       AZURE_CONTAINERAPP_ENV: cae-dh-eastasia
       AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      CYRENE_PUBLIC_BASE_URL: https://cyrene.dohorizon-llc.net
 
     steps:
       - name: Checkout Cyrene-Exchange
@@ -99,7 +100,7 @@ jobs:
               --environment "$AZURE_CONTAINERAPP_ENV" \
               --image "${{ steps.meta.outputs.full_image }}" \
               --target-port 8000 \
-              --ingress external \
+              --ingress internal \
               --registry-server ghcr.io \
               --registry-username "${{ github.actor }}" \
               --registry-password "${{ secrets.GITHUB_TOKEN }}" \
@@ -107,25 +108,56 @@ jobs:
               --memory 1.0Gi \
               --min-replicas 1 \
               --max-replicas 2 \
-              --env-vars CYRENE_HOST="0.0.0.0" CYRENE_PORT="8000"
+              --env-vars CYRENE_HOST="0.0.0.0" CYRENE_PORT="8000" CYRENE_PUBLIC_BASE_URL="$CYRENE_PUBLIC_BASE_URL"
           fi
 
-      - name: Verify Deployment Health and IP Location
+      - name: Verify healthy revision and public Web gateway
         if: env.AZURE_CREDENTIALS != ''
         run: |
-          FQDN=$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.configuration.ingress.fqdn" -o tsv)
-          echo "Deployed FQDN: https://$FQDN"
-          echo "Checking IP geolocation..."
-          APP_IP=$(getent hosts "$FQDN" | awk '{ print $1 }' | head -n1 || true)
-          if [ -n "$APP_IP" ]; then
-            echo "Resolved IP: $APP_IP"
-            curl -s "https://ipinfo.io/$APP_IP/json" || true
-          fi
-          echo "Checking health probe (/healthz)..."
           for i in {1..30}; do
-            if curl -s -f "https://$FQDN/healthz" >/dev/null 2>&1; then
-              echo "Health check passed!"
-              break
+            REVISION=$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.latestRevisionName" -o tsv)
+            READY=$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.latestReadyRevisionName" -o tsv)
+            if [ -n "$REVISION" ] && [ "$REVISION" = "$READY" ]; then
+              HEALTH=$(az containerapp revision show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --revision "$REVISION" --query "properties.healthState" -o tsv)
+              if [ "$HEALTH" = "Healthy" ]; then
+                echo "Healthy revision: $REVISION"
+                break
+              fi
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "Exchange revision did not become healthy" >&2
+              exit 1
             fi
             sleep 3
           done
+          for i in {1..30}; do
+            if curl -fsS "$CYRENE_PUBLIC_BASE_URL/v1/models" | python3 -c 'import json, sys; assert json.load(sys.stdin)["object"] == "list"'; then
+              echo "Web gateway reached Exchange"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "Web gateway did not reach Exchange" >&2
+              exit 1
+            fi
+            sleep 3
+          done
+          python3 - "$CYRENE_PUBLIC_BASE_URL" <<'PY'
+          import json
+          import sys
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          request = Request(
+              sys.argv[1] + "/v1/chat/completions",
+              data=b'{"model":"no-route","messages":[{"role":"user","content":"probe"}]}',
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              urlopen(request, timeout=10)
+          except HTTPError as error:
+              payload = json.load(error)
+              if error.code != 401 or payload.get("error", {}).get("type") != "authentication_error":
+                  raise RuntimeError("Web gateway did not enforce Exchange authentication") from error
+          else:
+              raise RuntimeError("Web gateway accepted a request without credentials")
+          PY
