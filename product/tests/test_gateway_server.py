@@ -514,14 +514,16 @@ def test_navigator_web_endpoints_and_proxy_rewrite(
         assert data["service"] == "cyrene-exchange"
         assert data["status"] == "UP"
         assert data["authenticated"] is True
-        assert "/api/v1/exchange" in data["proxyPrefixes"]
-        assert "/api/v1/catalyst" in data["proxyPrefixes"]
-        assert "/api/v1/echo" in data["proxyPrefixes"]
+        assert data["proxyPrefixes"] == ["/api/v1/exchange"]
         assert "gatewayBaseUrl" in data
-        assert "services" in data
-        service_names = [s["name"] for s in data["services"]]
-        assert "catalyst" in service_names
-        assert "echo" in service_names
+        assert data["services"] == []
+        for product_path in (
+            "/api/v1/catalyst/datasets",
+            "/api/v1/echo/evaluation-inputs",
+            "/api/v1/reactor/model-imports",
+            "/api/v1/yield/training-drafts",
+        ):
+            assert client.get(product_path).status_code == 404
 
         # GPU probe reports unavailable in CPU-only environments (no nvidia-smi),
         # and the standard shape keeps "gpus" present as an empty list.
