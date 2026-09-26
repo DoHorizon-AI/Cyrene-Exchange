@@ -126,13 +126,13 @@ paths:
       - WorkspaceControlBearer: []
       responses:
         '200':
-          description: GatewayRoutes assigned to the authenticated organization and workspace
+          description: Workspace-scoped GatewayRoutes with non-navigable source provenance and no internal Reactor URL
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: ./gateway-route.schema.json
+                  $ref: ./workspace-gateway-route.schema.json
         '403':
           $ref: '#/components/responses/Problem'
   /api/v1/workspace/gateway-route-drafts:
@@ -156,11 +156,11 @@ paths:
               $ref: '#/components/schemas/CreateRouteDraftRequest'
       responses:
         '201':
-          description: DRAFT created for the authenticated organization and workspace
+          description: DRAFT created for the authenticated organization and workspace; source provenance omits the internal Reactor URL
           content:
             application/json:
               schema:
-                $ref: ./gateway-route.schema.json
+                $ref: ./workspace-gateway-route.schema.json
         '403':
           $ref: '#/components/responses/Problem'
         '404':

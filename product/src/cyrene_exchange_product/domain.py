@@ -101,6 +101,40 @@ class GatewayRoute(ContractModel):
     organization_id: str | None = Field(default=None, exclude=True)
 
 
+class WorkspaceRouteSourceProvenance(ContractModel):
+    """Non-navigable Reactor provenance without its internal resource URL."""
+
+    product: Literal["reactor"] = "reactor"
+    resource_version: int = Field(ge=1)
+    artifact_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    model_version_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256/[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+
+
+class WorkspaceGatewayRoute(ContractModel):
+    """Workspace route projection that omits internal service addresses."""
+
+    id: UUID
+    endpoint_id: UUID
+    state: RouteState = RouteState.ACTIVE
+    model_pattern: str = Field(min_length=1, max_length=200)
+    target_binding_id: str = Field(min_length=1, max_length=300)
+    target_capability_type: Literal["model.provider.v1"] = "model.provider.v1"
+    target_model: str | None = Field(default=None, min_length=1, max_length=200)
+    priority: int = Field(ge=0, le=10_000)
+    created_at: datetime
+    updated_at: datetime
+    resource_version: int = Field(ge=1)
+    source_provenance: WorkspaceRouteSourceProvenance | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    created_by: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    workspace_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
 class CreateEndpointRequest(ContractModel):
     """Create-GatewayEndpoint command. | 创建网关端点请求。"""
 

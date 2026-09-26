@@ -36,6 +36,8 @@ from cyrene_exchange_product.domain import (
     ProblemDetails,
     ProductPrincipal,
     WorkspaceEndpointGrant,
+    WorkspaceGatewayRoute,
+    WorkspaceRouteSourceProvenance,
 )
 from cyrene_exchange_product.errors import ExchangeProductError, map_exchange_error
 from cyrene_exchange_product.logging import (
@@ -54,6 +56,22 @@ def _incoming_trace_id(value: str) -> str | None:
     if match is None or match.group(1) == "0" * 32 or match.group(2) == "0" * 16:
         return None
     return match.group(1)
+
+
+def _workspace_route_projection(route: GatewayRoute) -> WorkspaceGatewayRoute:
+    """Remove the internal Reactor URL from the browser-facing Workspace view."""
+
+    payload = route.model_dump(exclude={"source", "organization_id"})
+    if route.source is not None:
+        model_version_digest = None
+        if route.source.model_version_id is not None:
+            model_version_digest = route.source.model_version_id.removeprefix("model-version://")
+        payload["source_provenance"] = WorkspaceRouteSourceProvenance(
+            resource_version=route.source.resource_version,
+            artifact_digest=route.source.artifact_digest,
+            model_version_digest=model_version_digest,
+        ).model_dump(exclude_none=True)
+    return WorkspaceGatewayRoute.model_validate(payload)
 
 
 def create_app(
@@ -294,13 +312,16 @@ def create_app(
     def list_routes() -> list[GatewayRoute]:
         return service.list_routes()
 
-    @app.get("/api/v1/workspace/gateway-routes", response_model=list[GatewayRoute])
-    def list_workspace_routes(request: Request) -> list[GatewayRoute]:
+    @app.get("/api/v1/workspace/gateway-routes", response_model=list[WorkspaceGatewayRoute])
+    def list_workspace_routes(request: Request) -> list[WorkspaceGatewayRoute]:
         identity = scoped_principal(request)
         organization_id = identity.organization_id
         if organization_id is None:
             raise AssertionError("scoped_principal must return an organization-scoped identity")
-        return service.list_workspace_routes(organization_id, identity.workspace_id)
+        return [
+            _workspace_route_projection(route)
+            for route in service.list_workspace_routes(organization_id, identity.workspace_id)
+        ]
 
     def admit_binding(binding_id: str) -> None:
         if binding_id not in allowed_binding_ids:
@@ -323,17 +344,18 @@ def create_app(
 
     @app.post(
         "/api/v1/workspace/gateway-route-drafts",
-        response_model=GatewayRoute,
+        response_model=WorkspaceGatewayRoute,
         status_code=201,
     )
     def create_workspace_draft(
         command: CreateRouteDraftRequest,
         request: Request,
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
-    ) -> GatewayRoute:
+    ) -> WorkspaceGatewayRoute:
         identity = scoped_principal(request)
         admit_binding(command.target_binding_id)
-        return service.create_scoped_route_draft(command, idempotency_key, identity)
+        route = service.create_scoped_route_draft(command, idempotency_key, identity)
+        return _workspace_route_projection(route)
 
     @app.patch("/api/v1/gateway-route-drafts/{routeId}", response_model=GatewayRoute)
     def edit_draft(

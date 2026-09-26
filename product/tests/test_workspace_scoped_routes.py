@@ -132,6 +132,13 @@ def test_private_routes_are_scoped_and_legacy_paths_do_not_expose_them(
             assert route_a["id"] != route_b["id"]
             assert route_a["state"] == route_b["state"] == "DRAFT"
             assert "organizationId" not in route_a
+            assert route_a["sourceProvenance"] == {
+                "product": "reactor",
+                "resourceVersion": 2,
+                "artifactDigest": "sha256:" + "a" * 64,
+            }
+            assert "source" not in route_a
+            assert "reactor.example" not in str(route_a)
 
             private_a = client.get(
                 "/api/v1/workspace/gateway-routes",
@@ -143,6 +150,14 @@ def test_private_routes_are_scoped_and_legacy_paths_do_not_expose_them(
             )
             assert [row["id"] for row in private_a.json()] == [route_a["id"]]
             assert [row["id"] for row in private_b.json()] == [route_b["id"]]
+            private_source = private_a.json()[0]["sourceProvenance"]
+            assert private_source == {
+                "product": "reactor",
+                "resourceVersion": 2,
+                "artifactDigest": "sha256:" + "a" * 64,
+            }
+            assert "source" not in private_a.json()[0]
+            assert "reactor.example" not in private_a.text
 
             legacy_list = client.get(
                 "/api/v1/gateway-routes", headers={"Authorization": f"Bearer {TOKEN_A}"}
@@ -220,6 +235,11 @@ def test_private_routes_are_scoped_and_legacy_paths_do_not_expose_them(
                 json=_draft_body(endpoint_id),
             )
             assert legacy_created.status_code == 201
+            expected_resource_uri = (
+                "https://reactor.example/api/v1/endpoints/"
+                "11111111-1111-4111-8111-111111111111"
+            )
+            assert legacy_created.json()["source"]["resourceUri"] == expected_resource_uri
             legacy_id = legacy_created.json()["id"]
             assert store.get_route(UUID(legacy_id)).organization_id is None
             assert [
@@ -229,10 +249,12 @@ def test_private_routes_are_scoped_and_legacy_paths_do_not_expose_them(
                     headers={"Authorization": f"Bearer {TOKEN_LEGACY}"},
                 ).json()
             ] == [legacy_id]
-            assert client.get(
+            legacy_fetched = client.get(
                 f"/api/v1/gateway-routes/{legacy_id}",
                 headers={"Authorization": f"Bearer {TOKEN_LEGACY}"},
-            ).status_code == 200
+            )
+            assert legacy_fetched.status_code == 200
+            assert legacy_fetched.json()["source"]["resourceUri"] == expected_resource_uri
             private_after_legacy_write = client.get(
                 "/api/v1/workspace/gateway-routes",
                 headers={"Authorization": f"Bearer {TOKEN_A}"},

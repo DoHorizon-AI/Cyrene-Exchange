@@ -72,6 +72,12 @@ provider-reported usage facts to the Plugins-owned `billing.usage.v1` ledger by
 request ID. The billing plugin derives summaries and cost; it does not receive
 prompts, responses, credentials, or route state.
 
+The private Workspace route list and draft-creation responses use
+`workspace-gateway-route.schema.json`. Their `sourceProvenance` contains only
+the Reactor product label, resource version, and content digests; the internal
+Reactor `resourceUri` remains in the stored route for server-side admission and
+resolution and is returned only by the legacy route API.
+
 数据面标准化器会保留文本工具定义、工具选择、工具结果历史、带索引的流式工具调用
 片段以及 provider 报告的 usage；provider 未提供 token 数量时不会估算。普通文本请求继续
 通过 `model.provider.v1` v1 直连 Plugin；包含结构化 chat 字段的请求协商 v2 与
@@ -80,6 +86,10 @@ prompts, responses, credentials, or route state.
 Product 所有的 SQLite 请求审计仍是请求终态权威。配置 `BillingUsageClient` 后，Exchange
 会按请求 ID 把同一份不含内容的 provider 用量事实发送给 Plugins 所有的
 `billing.usage.v1` 账本。计费插件负责汇总与费用计算，不接收 Prompt、响应、凭据或路由状态。
+
+私有 Workspace 路由列表与草稿创建响应使用 `workspace-gateway-route.schema.json`。其中的
+`sourceProvenance` 只包含 Reactor 产品标签、资源版本和内容 digest；内部 `resourceUri` 仍保留在
+服务端路由数据中供 admission 与解析使用，并且只由 legacy 路由 API 返回。
 ---
 <!-- Chinese Translation / 中文翻译 -->
 
