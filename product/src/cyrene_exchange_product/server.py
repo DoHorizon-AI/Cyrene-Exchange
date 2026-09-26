@@ -726,6 +726,14 @@ def build_product_app(
         "CYRENE_ECHO_URL",
         "https://cyrene-echo.whitefield-8c4d4393.eastasia.azurecontainerapps.io",
     )
+    reactor_url = os.environ.get(
+        "CYRENE_REACTOR_URL",
+        "https://cyrene-reactor.whitefield-8c4d4393.eastasia.azurecontainerapps.io",
+    )
+    yield_url = os.environ.get(
+        "CYRENE_YIELD_URL",
+        "https://cyrene-yield.whitefield-8c4d4393.eastasia.azurecontainerapps.io",
+    )
 
     @app.get("/api/v1/system/status")
     def system_status(request: Request) -> dict[str, Any]:
@@ -757,6 +765,12 @@ def build_product_app(
         if echo_url:
             proxy_prefixes.append("/api/v1/echo")
             service_urls["echo"] = echo_url
+        if reactor_url:
+            proxy_prefixes.append("/api/v1/reactor")
+            service_urls["reactor"] = reactor_url
+        if yield_url:
+            proxy_prefixes.append("/api/v1/yield")
+            service_urls["yield"] = yield_url
         services_info = _query_services(service_urls)
         return {
             "service": "cyrene-exchange",
@@ -857,6 +871,28 @@ def build_product_app(
     )
     async def proxy_echo(request: Request, path: str = "") -> Response:
         return await _forward_request(echo_url, path, request)
+
+    @app.api_route(
+        "/api/v1/reactor",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    )
+    @app.api_route(
+        "/api/v1/reactor/{path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    )
+    async def proxy_reactor(request: Request, path: str = "") -> Response:
+        return await _forward_request(reactor_url, path, request)
+
+    @app.api_route(
+        "/api/v1/yield",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    )
+    @app.api_route(
+        "/api/v1/yield/{path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    )
+    async def proxy_yield(request: Request, path: str = "") -> Response:
+        return await _forward_request(yield_url, path, request)
 
     effective_web_dist = Path(web_dist) if web_dist is not None else _find_web_dist()
     if (
