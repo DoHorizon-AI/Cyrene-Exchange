@@ -25,7 +25,7 @@ from fnmatch import fnmatchcase
 from threading import Event
 from typing import Any, Literal, Protocol
 
-from .logging import format_cyrene_log
+from .logging import format_cyrene_log, parse_w3c_traceparent
 
 from .capabilities import (
     MODEL_PROVIDER_CAPABILITY,
@@ -636,12 +636,19 @@ class ExchangeGateway:
         try:
             principal = self._principal_resolver(token)
         except Exception as exc:
+            traceparent = next(
+                (value for key, value in headers.items() if key.lower() == "traceparent"),
+                None,
+            )
+            trace = parse_w3c_traceparent(traceparent)
             sys.stderr.write(
                 format_cyrene_log(
                     level="WARN",
                     event_name="exchange.gateway.auth_failed",
                     message="Token principal resolution failed",
-                    attributes={"cause": str(exc), "cause_type": type(exc).__name__},
+                    trace_id=trace[0] if trace else None,
+                    span_id=trace[1] if trace else None,
+                    attributes={"cause_type": type(exc).__name__},
                 )
                 + "\n"
             )
