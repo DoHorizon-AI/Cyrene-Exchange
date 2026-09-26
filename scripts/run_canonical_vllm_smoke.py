@@ -98,7 +98,7 @@ def _request_id(body: str, *, stream: bool = False) -> str | None:
             return None
         document = json.loads(body)
     except (json.JSONDecodeError, TypeError):
-        return None
+        return None  # diagnostic-allow: optional smoke response ID could not be parsed.
     return document.get("id") if isinstance(document, dict) and isinstance(document.get("id"), str) else None
 
 

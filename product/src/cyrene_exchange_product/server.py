@@ -195,8 +195,8 @@ def _stream_chunk(line: str) -> ProviderChunk | None:
         return None
     try:
         event = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        raise ProviderUnavailableError("provider emitted malformed JSON in an SSE event") from exc
     if not isinstance(event, Mapping):
         return None
     choices = event.get("choices") or []
@@ -808,7 +808,7 @@ async def _sse(body: Any, cancel_event: Event) -> AsyncIterator[str]:
             encoded = item if isinstance(item, str) else json.dumps(item, separators=(",", ":"))
             yield f"data: {encoded}\n\n"
     except GatewayError:
-        return
+        return  # diagnostic-allow: Gateway persists the failed stream audit before closing SSE.
     finally:
         cancel_event.set()
 

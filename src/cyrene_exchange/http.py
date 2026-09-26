@@ -40,6 +40,7 @@ def _watch_client_disconnect(connection: socket.socket, cancel_event: Event, sto
         try:
             readable, _, _ = select.select([connection], [], [], 0.1)
         except (OSError, ValueError):
+            cancel_event.set()
             return
         if not readable:
             continue

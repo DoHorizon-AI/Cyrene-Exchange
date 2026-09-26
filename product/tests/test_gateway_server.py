@@ -26,9 +26,17 @@ from cyrene_exchange_product.domain import ProductPrincipal
 from cyrene_exchange_product.server import (
     OpenAICompatibleProvider,
     OperatorBindingResolver,
+    ProviderUnavailableError,
     RouteSourceProviderResolver,
+    _stream_chunk,
     build_product_app,
 )
+
+
+def test_malformed_upstream_sse_event_fails_closed() -> None:
+    with pytest.raises(ProviderUnavailableError, match="malformed JSON"):
+        _stream_chunk("data: {malformed")
+
 
 CONTROL_HEADERS = {"Authorization": "Bearer control-token"}
 CONTROL_PRINCIPAL = ProductPrincipal("actor", "workspace", "cred://exchange/control")
