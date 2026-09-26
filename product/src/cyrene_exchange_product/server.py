@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
 from threading import Event, Lock
 from typing import Any
 from urllib.parse import urlsplit
@@ -28,7 +31,8 @@ from cyrene_exchange.gateway import GatewayError
 from cyrene_exchange.protocol import NormalizedInferenceRequest
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from cyrene_exchange_product.api import create_app
 from cyrene_exchange_product.domain import EndpointState, ProductPrincipal
@@ -400,6 +404,39 @@ def _select_endpoint(store: ExchangeStore, endpoint_id: UUID | None) -> UUID:
     return active[0].id
 
 
+def _find_web_dist() -> Path | None:
+    env_path = os.environ.get("CYRENE_WEB_DIST")
+    server_file = Path(__file__).resolve()
+    candidates = [
+        Path(env_path) if env_path else None,
+        server_file.parent / "web_dist",
+        server_file.parents[2] / "web_dist",
+        server_file.parents[3] / "web_dist",
+        Path.cwd() / "web_dist",
+        Path.cwd().parent / "web_dist",
+        Path("/app/web_dist"),
+        Path("/app/exchange/web_dist"),
+        server_file.parents[4]
+        / "Cyrene-Client"
+        / "apps"
+        / "web"
+        / "services"
+        / "navigator"
+        / "dist",
+        server_file.parents[5]
+        / "Cyrene-Client"
+        / "apps"
+        / "web"
+        / "services"
+        / "navigator"
+        / "dist",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_dir() and (candidate / "index.html").is_file():
+            return candidate.resolve()
+    return None
+
+
 def build_product_app(
     *,
     database_path: Any,
@@ -533,6 +570,122 @@ def build_product_app(
             media_type="text/event-stream",
             headers={"X-Request-Id": response.request_id, "Cache-Control": "no-cache"},
         )
+
+    @app.middleware("http")
+    async def rewrite_exchange_proxy_path(request: Request, call_next: Any) -> Any:
+        path = request.scope.get("path", "")
+        if path.startswith("/api/v1/exchange/api/v1/"):
+            request.scope["path"] = path[len("/api/v1/exchange") :]
+        return await call_next(request)
+
+    @app.get("/api/v1/system/status")
+    def system_status(request: Request) -> dict[str, Any]:
+        routes = store.list_active_routes()
+        keys = store.list_api_keys()
+        active_keys = sum(
+            1
+            for k in keys
+            if getattr(k, "state", None) == "ACTIVE" or getattr(k, "revoked_at", None) is None
+        )
+        revoked_keys = len(keys) - active_keys
+        now_utc = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        base_url = str(request.base_url).rstrip("/")
+        return {
+            "service": "cyrene-exchange",
+            "status": "UP",
+            "version": "1.0.0",
+            "authenticated": True,
+            "proxyPrefixes": ["/api/v1/exchange"],
+            "credentials": {
+                "active": active_keys,
+                "revoked": revoked_keys,
+            },
+            "routes": len(routes),
+            "gatewayBaseUrl": base_url,
+            "observedAt": now_utc,
+        }
+
+    @app.get("/api/v1/auth/session")
+    def auth_session() -> dict[str, Any]:
+        return {
+            "authenticated": True,
+            "state": "AUTHENTICATED",
+            "sessionId": "sso-session",
+            "expiresAt": "2099-01-01T00:00:00Z",
+            "refreshExpiresAt": "2099-01-01T00:00:00Z",
+            "refreshable": False,
+            "csrfToken": None,
+            "refreshed": False,
+        }
+
+    @app.post("/api/v1/auth/session/refresh")
+    def auth_refresh() -> dict[str, Any]:
+        return auth_session()
+
+    @app.post("/api/v1/auth/pair")
+    def auth_pair() -> dict[str, Any]:
+        return auth_session()
+
+    @app.delete("/api/v1/auth/session")
+    def auth_logout() -> dict[str, Any]:
+        return {"status": "ok"}
+
+    active_route_state: dict[str, Any] = {}
+
+    @app.get("/api/v1/navigator/active-route")
+    def get_active_route(request: Request) -> dict[str, Any]:
+        if active_route_state:
+            return active_route_state
+        routes = store.list_active_routes()
+        base_url = str(request.base_url).rstrip("/")
+        if routes:
+            first_route = routes[0]
+            return {
+                "gatewayEndpointId": str(first_route.endpoint_id),
+                "modelId": first_route.model_pattern,
+                "baseUrl": f"{base_url}/v1",
+                "apiKeyHint": "",
+            }
+        return {
+            "gatewayEndpointId": "default",
+            "modelId": "default",
+            "baseUrl": f"{base_url}/v1",
+            "apiKeyHint": "",
+        }
+
+    @app.post("/api/v1/navigator/active-route")
+    async def set_active_route(request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        active_route_state.clear()
+        active_route_state.update(payload)
+        return active_route_state
+
+    @app.post("/api/proxy/exchange-gateway/v1/chat/completions")
+    async def proxy_chat_completions(request: Request) -> Any:
+        return await chat_completions(request)
+
+    web_dist = _find_web_dist()
+    if web_dist:
+        assets_dir = web_dist / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        @app.get("/")
+        async def serve_index() -> FileResponse:
+            return FileResponse(str(web_dist / "index.html"))
+
+        @app.get("/{full_path:path}")
+        async def spa_fallback(full_path: str) -> Any:
+            target = web_dist / full_path
+            if target.is_file() and not full_path.startswith(
+                ("api/", "v1/", "healthz", "readyz", "docs", "openapi.json")
+            ):
+                return FileResponse(str(target))
+            if not full_path.startswith(
+                ("api/", "v1/", "healthz", "readyz", "docs", "openapi.json")
+            ):
+                return FileResponse(str(web_dist / "index.html"))
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
 
     return app
 

@@ -16,6 +16,7 @@ Exchange Product Core 的请求策略与能力编排。
 
 from __future__ import annotations
 
+import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
@@ -23,6 +24,8 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from threading import Event
 from typing import Any, Literal, Protocol
+
+from .logging import format_cyrene_log
 
 from .capabilities import (
     MODEL_PROVIDER_CAPABILITY,
@@ -599,7 +602,16 @@ class ExchangeGateway:
             raise AuthenticationError("Bearer token is empty")
         try:
             principal = self._principal_resolver(token)
-        except Exception:
+        except Exception as exc:
+            sys.stderr.write(
+                format_cyrene_log(
+                    level="WARN",
+                    event_name="exchange.gateway.auth_failed",
+                    message="Token principal resolution failed",
+                    attributes={"cause": str(exc), "cause_type": type(exc).__name__},
+                )
+                + "\n"
+            )
             principal = None
         if isinstance(principal, RequestPrincipal):
             return principal
@@ -658,6 +670,21 @@ class ExchangeGateway:
         stream: bool | None,
     ) -> None:
         if self._lifecycle_observer is None:
+            sys.stderr.write(
+                format_cyrene_log(
+                    level="WARN",
+                    event_name="exchange.gateway.request_rejected",
+                    message=f"Request {request_id} rejected with {error_type}",
+                    attributes={
+                        "request_id": request_id,
+                        "status": status,
+                        "error_type": error_type,
+                        "model": model,
+                        "stream": stream,
+                    },
+                )
+                + "\n"
+            )
             return
         try:
             self._lifecycle_observer.on_request_rejected(

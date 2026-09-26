@@ -476,3 +476,60 @@ def test_route_source_origin_outside_the_allow_list_is_refused(tmp_path: Path) -
     finally:
         source.shutdown()
         upstream.shutdown()
+
+
+def test_navigator_web_endpoints_and_proxy_rewrite(tmp_path: Path) -> None:
+    endpoint_id = _seed_endpoint(tmp_path / "exchange.sqlite3", "Navigator Web Gateway")
+    app = build_product_app(
+        database_path=tmp_path / "exchange.sqlite3",
+        resolver=OperatorBindingResolver(
+            {"binding:default": OpenAICompatibleProvider("http://127.0.0.1:8000")}
+        ),
+        control_credentials=None,
+    )
+    with TestClient(app) as client:
+        # System status
+        status = client.get("/api/v1/system/status")
+        assert status.status_code == 200
+        data = status.json()
+        assert data["service"] == "cyrene-exchange"
+        assert data["status"] == "UP"
+        assert data["authenticated"] is True
+        assert "/api/v1/exchange" in data["proxyPrefixes"]
+        assert "gatewayBaseUrl" in data
+
+        # Auth session
+        session = client.get("/api/v1/auth/session")
+        assert session.status_code == 200
+        assert session.json()["authenticated"] is True
+        assert session.json()["state"] == "AUTHENTICATED"
+
+        # Active route get & set
+        active_route = client.get("/api/v1/navigator/active-route")
+        assert active_route.status_code == 200
+
+        updated_route = client.post(
+            "/api/v1/navigator/active-route",
+            json={
+                "gatewayEndpointId": endpoint_id,
+                "modelId": "custom-model",
+                "baseUrl": "http://testserver/v1",
+                "apiKeyHint": "hint",
+            },
+        )
+        assert updated_route.status_code == 200
+        assert updated_route.json()["modelId"] == "custom-model"
+
+        # Proxy path rewriting (/api/v1/exchange/api/v1/* -> /api/v1/*)
+        proxy_endpoints = client.get("/api/v1/exchange/api/v1/gateway-endpoints")
+        assert proxy_endpoints.status_code == 200
+        assert len(proxy_endpoints.json()) >= 1
+
+        # Root and SPA fallback web serving
+        root = client.get("/")
+        assert root.status_code == 200
+        assert "Navigator" in root.text
+
+        spa = client.get("/chat")
+        assert spa.status_code == 200
+        assert "Navigator" in spa.text

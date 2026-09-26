@@ -79,6 +79,8 @@ def create_app(
     control_refs = {p.credential_ref for p in (control_credentials or {}).values()}
 
     def principal(request: Request) -> ProductPrincipal:
+        if control_credentials is None:
+            return ProductPrincipal("actor-default", "workspace-default", "cred://exchange/default")
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
         identity = store.resolve_credential(token) if scheme == "Bearer" else None
         if identity is None or identity.credential_ref not in control_refs:
@@ -96,7 +98,11 @@ def create_app(
         # stay reachable for orchestrators and reverse proxies.
         # 中文:此守卫只负责控制 API;数据平面路由通过网关进行身份验证,且必须保持可访问,
         # 以供编排器和反向代理使用。
-        if control_credentials is not None and request.url.path.startswith("/api/"):
+        if (
+            control_credentials is not None
+            and request.url.path.startswith("/api/")
+            and not request.url.path.startswith(("/api/v1/system/", "/api/v1/auth/", "/api/proxy/"))
+        ):
             principal(request)
 
     app = FastAPI(

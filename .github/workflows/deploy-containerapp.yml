@@ -22,8 +22,9 @@ jobs:
 
     env:
       # Pinned sibling revisions recorded in Cyrene-Workspace
-      CYRENE_PLATFORM_REVISION: 24ab3769cbec11aabb8bd18e61b4f76275216a03
+      CYRENE_PLATFORM_REVISION: da725fb5da2eb33bb32d8471be803bb4b8b6058f
       CYRENE_PLUGINS_REVISION: ab7be45a2c283ca360e8b9d96d0a8526e94de88b
+      CYRENE_CLIENT_REVISION: 86a04d8f466e1121f5ea4608997ab273f24a1f15
       AZURE_RESOURCE_GROUP: Container-APP
       AZURE_APP_NAME: cyrene-exchange
       AZURE_LOCATION: eastasia
@@ -36,9 +37,9 @@ jobs:
         with:
           path: Cyrene-Services/Cyrene-Exchange
 
-      - name: Fetch sibling repositories (Cyrene-Platform & Cyrene-Plugins-Official)
+      - name: Fetch sibling repositories (Cyrene-Platform, Cyrene-Plugins-Official & Cyrene-Client)
         run: |
-          for entry in "Cyrene-Platform:$CYRENE_PLATFORM_REVISION" "Cyrene-Plugins-Official:$CYRENE_PLUGINS_REVISION"; do
+          for entry in "Cyrene-Platform:$CYRENE_PLATFORM_REVISION" "Cyrene-Plugins-Official:$CYRENE_PLUGINS_REVISION" "Cyrene-Client:$CYRENE_CLIENT_REVISION"; do
             name="${entry%%:*}"
             revision="${entry#*:}"
             git init --quiet "$name"
