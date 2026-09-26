@@ -2,7 +2,7 @@ name: cd-containerapp
 
 on:
   push:
-    branches: [main, release]
+    branches: [main, release, develop]
   workflow_dispatch:
     inputs:
       image_tag:
@@ -22,10 +22,12 @@ jobs:
 
     env:
       # Pinned sibling revisions recorded in Cyrene-Workspace
-      CYRENE_PLATFORM_REVISION: 06a9bd75edfed1359b09770e749520162d75e242
-      CYRENE_PLUGINS_REVISION: a41284c2ffe71a7412f556841f9ccc4a91864138
+      CYRENE_PLATFORM_REVISION: 24ab3769cbec11aabb8bd18e61b4f76275216a03
+      CYRENE_PLUGINS_REVISION: ab7be45a2c283ca360e8b9d96d0a8526e94de88b
       AZURE_RESOURCE_GROUP: Container-APP
       AZURE_APP_NAME: cyrene-exchange
+      AZURE_LOCATION: eastasia
+      AZURE_CONTAINERAPP_ENV: cae-dh-eastasia
 
     steps:
       - name: Checkout Cyrene-Exchange
@@ -77,20 +79,56 @@ jobs:
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
 
-      - name: Log in to Azure (if AZURE_CREDENTIALS configured)
-        if: env.AZURE_CREDENTIALS != ''
+      - name: Log in to Azure
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
         uses: azure/login@v2
-        env:
-          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Update Azure Container App revision
-        if: env.AZURE_CREDENTIALS != ''
-        env:
-          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Deploy or update Azure Container App
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
         run: |
-          az containerapp update \
-            --name "$AZURE_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --image "${{ steps.meta.outputs.full_image }}"
+          if az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            echo "Updating existing container app $AZURE_APP_NAME in $AZURE_RESOURCE_GROUP..."
+            az containerapp update \
+              --name "$AZURE_APP_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --image "${{ steps.meta.outputs.full_image }}"
+          else
+            echo "Creating container app $AZURE_APP_NAME in $AZURE_CONTAINERAPP_ENV ($AZURE_LOCATION)..."
+            az containerapp create \
+              --name "$AZURE_APP_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --environment "$AZURE_CONTAINERAPP_ENV" \
+              --image "${{ steps.meta.outputs.full_image }}" \
+              --target-port 8000 \
+              --ingress external \
+              --registry-server ghcr.io \
+              --registry-username "${{ github.actor }}" \
+              --registry-password "${{ secrets.GITHUB_TOKEN }}" \
+              --cpu 0.5 \
+              --memory 1.0Gi \
+              --min-replicas 1 \
+              --max-replicas 2 \
+              --env-vars CYRENE_HOST="0.0.0.0" CYRENE_PORT="8000"
+          fi
+
+      - name: Verify Deployment Health and IP Location
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
+        run: |
+          FQDN=$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "Deployed FQDN: https://$FQDN"
+          echo "Checking IP geolocation..."
+          APP_IP=$(getent hosts "$FQDN" | awk '{ print $1 }' | head -n1 || true)
+          if [ -n "$APP_IP" ]; then
+            echo "Resolved IP: $APP_IP"
+            curl -s "https://ipinfo.io/$APP_IP/json" || true
+          fi
+          echo "Checking health probe (/healthz)..."
+          for i in {1..30}; do
+            if curl -s -f "https://$FQDN/healthz" >/dev/null 2>&1; then
+              echo "Health check passed!"
+              break
+            fi
+            sleep 3
+          done

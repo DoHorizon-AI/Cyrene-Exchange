@@ -14,9 +14,9 @@ GITHUB_USER="${GITHUB_USER:-$(gh api user -q .login 2>/dev/null || echo "Baijin6
 GITHUB_ORG="${GITHUB_ORG:-DoHorizon-AI}"
 IMAGE_REPO="${IMAGE_REPO:-ghcr.io/${GITHUB_USER,,}/cyrene-exchange}"
 IMAGE_TAG="${IMAGE_TAG:-$(date +%Y%m%d%H%M%S)}"
-RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-rg-cyrene-prod}"
-LOCATION="${AZURE_LOCATION:-japaneast}"
-ENV_NAME="${AZURE_CONTAINERAPP_ENV:-cae-cyrene}"
+RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-Container-APP}"
+LOCATION="${AZURE_LOCATION:-eastasia}"
+ENV_NAME="${AZURE_CONTAINERAPP_ENV:-cae-dh-eastasia}"
 APP_NAME="${AZURE_CONTAINERAPP_NAME:-cyrene-exchange}"
 PORT=8000
 
@@ -124,6 +124,13 @@ FQDN="$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROU
 APP_URL="https://${FQDN}"
 echo "🎉 Deployment successful!"
 echo "🌐 App FQDN: ${APP_URL}"
+
+echo "🌍 Resolving IP and verifying Azure Hong Kong data center location..."
+APP_IP="$(getent hosts "$FQDN" | awk '{ print $1 }' | head -n1 || true)"
+if [ -n "$APP_IP" ]; then
+  echo "📍 Resolved IP: ${APP_IP}"
+  curl -s "https://ipinfo.io/${APP_IP}/json" || true
+fi
 
 echo "🩺 Testing liveness probe (/healthz)..."
 for i in {1..30}; do
