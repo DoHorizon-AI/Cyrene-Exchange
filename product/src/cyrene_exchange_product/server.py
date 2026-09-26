@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +32,7 @@ from cyrene_exchange.capabilities import (
 )
 from cyrene_exchange.gateway import GatewayError
 from cyrene_exchange.protocol import NormalizedInferenceRequest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -494,6 +495,87 @@ def _query_disk() -> dict[str, Any]:
         return {"available": False}
 
 
+def _query_services(service_urls: Mapping[str, str]) -> list[dict[str, Any]]:
+    """Probe configured service base URLs for UP/DOWN health and latency.
+
+    中文:对已配置的服务基础 URL 探测 UP/DOWN 健康状态与延迟。
+    """
+    results: list[dict[str, Any]] = []
+    for name, base_url in service_urls.items():
+        if not base_url:
+            continue
+        url = f"{base_url.rstrip('/')}/"
+        start = datetime.now(UTC)
+        status = "DOWN"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Cyrene-HealthCheck"})
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if 200 <= resp.status < 400:
+                    status = "UP"
+        except Exception:
+            status = "DOWN"
+        latency_ms = round((datetime.now(UTC) - start).total_seconds() * 1000, 1)
+        results.append(
+            {
+                "name": name,
+                "url": f"/api/v1/{name}",
+                "status": status,
+                "latencyMs": latency_ms,
+            }
+        )
+    return results
+
+
+async def _forward_request(
+    upstream_base_url: str,
+    sub_path: str,
+    request: Request,
+) -> Response:
+    """Forward incoming proxy requests to upstream service."""
+    suffix = "/" + sub_path.lstrip("/") if sub_path else ""
+    target_prefix = "" if suffix.startswith("/api/v1/") else "/api/v1"
+    target_path = f"{target_prefix}{suffix}" if suffix else "/"
+    target_url = f"{upstream_base_url.rstrip('/')}{target_path}"
+    if request.url.query:
+        target_url = f"{target_url}?{request.url.query}"
+
+    hop_by_hop = {
+        "host",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in hop_by_hop}
+    body = await request.body()
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            upstream_resp = await client.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                content=body,
+            )
+            resp_headers = {
+                k: v for k, v in upstream_resp.headers.items() if k.lower() not in hop_by_hop
+            }
+            return Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+                media_type=upstream_resp.headers.get("content-type"),
+            )
+    except httpx.RequestError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": f"Upstream service unavailable: {exc}"},
+        )
+
+
 def build_product_app(
     *,
     database_path: Any,
@@ -636,6 +718,15 @@ def build_product_app(
             request.scope["path"] = path[len("/api/v1/exchange") :]
         return await call_next(request)
 
+    catalyst_url = os.environ.get(
+        "CYRENE_CATALYST_URL",
+        "https://cyrene-catalyst.whitefield-8c4d4393.eastasia.azurecontainerapps.io",
+    )
+    echo_url = os.environ.get(
+        "CYRENE_ECHO_URL",
+        "https://cyrene-echo.whitefield-8c4d4393.eastasia.azurecontainerapps.io",
+    )
+
     @app.get("/api/v1/system/status")
     def system_status(request: Request) -> dict[str, Any]:
         routes = store.list_active_routes()
@@ -658,12 +749,21 @@ def build_product_app(
                     "message": "No GPU detected. Model fine-tuning and inference require a GPU.",
                 }
             )
+        proxy_prefixes = ["/api/v1/exchange"]
+        service_urls: dict[str, str] = {}
+        if catalyst_url:
+            proxy_prefixes.append("/api/v1/catalyst")
+            service_urls["catalyst"] = catalyst_url
+        if echo_url:
+            proxy_prefixes.append("/api/v1/echo")
+            service_urls["echo"] = echo_url
+        services_info = _query_services(service_urls)
         return {
             "service": "cyrene-exchange",
             "status": "UP",
             "version": "1.0.0",
             "authenticated": True,
-            "proxyPrefixes": ["/api/v1/exchange"],
+            "proxyPrefixes": proxy_prefixes,
             "credentials": {
                 "active": active_keys,
                 "revoked": revoked_keys,
@@ -672,6 +772,7 @@ def build_product_app(
             "gatewayBaseUrl": base_url,
             "gpu": gpu_info,
             "disk": disk_info,
+            "services": services_info,
             "blockers": blockers,
             "observedAt": now_utc,
         }
@@ -734,6 +835,28 @@ def build_product_app(
     @app.post("/api/proxy/exchange-gateway/v1/chat/completions")
     async def proxy_chat_completions(request: Request) -> Any:
         return await chat_completions(request)
+
+    @app.api_route(
+        "/api/v1/catalyst",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    )
+    @app.api_route(
+        "/api/v1/catalyst/{path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    )
+    async def proxy_catalyst(request: Request, path: str = "") -> Response:
+        return await _forward_request(catalyst_url, path, request)
+
+    @app.api_route(
+        "/api/v1/echo",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    )
+    @app.api_route(
+        "/api/v1/echo/{path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    )
+    async def proxy_echo(request: Request, path: str = "") -> Response:
+        return await _forward_request(echo_url, path, request)
 
     effective_web_dist = Path(web_dist) if web_dist is not None else _find_web_dist()
     if (

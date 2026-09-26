@@ -517,7 +517,13 @@ def test_navigator_web_endpoints_and_proxy_rewrite(
         assert data["status"] == "UP"
         assert data["authenticated"] is True
         assert "/api/v1/exchange" in data["proxyPrefixes"]
+        assert "/api/v1/catalyst" in data["proxyPrefixes"]
+        assert "/api/v1/echo" in data["proxyPrefixes"]
         assert "gatewayBaseUrl" in data
+        assert "services" in data
+        service_names = [s["name"] for s in data["services"]]
+        assert "catalyst" in service_names
+        assert "echo" in service_names
 
         # GPU probe reports unavailable in CPU-only environments (no nvidia-smi),
         # and the standard shape keeps "gpus" present as an empty list.
