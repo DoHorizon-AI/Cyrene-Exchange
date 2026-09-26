@@ -447,6 +447,7 @@ def build_product_app(
     endpoint_id: UUID | None = None,
     validate_route_target: Callable[[Any], None] | None = None,
     record_requests: bool = True,
+    web_dist: Path | str | None = None,
 ) -> FastAPI:
     """Fuse the control-plane API with the OpenAI-compatible data plane.
 
@@ -664,19 +665,23 @@ def build_product_app(
     async def proxy_chat_completions(request: Request) -> Any:
         return await chat_completions(request)
 
-    web_dist = _find_web_dist()
-    if web_dist:
-        assets_dir = web_dist / "assets"
+    effective_web_dist = Path(web_dist) if web_dist is not None else _find_web_dist()
+    if (
+        effective_web_dist
+        and effective_web_dist.is_dir()
+        and (effective_web_dist / "index.html").is_file()
+    ):
+        assets_dir = effective_web_dist / "assets"
         if assets_dir.is_dir():
             app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
         @app.get("/")
         async def serve_index() -> FileResponse:
-            return FileResponse(str(web_dist / "index.html"))
+            return FileResponse(str(effective_web_dist / "index.html"))
 
         @app.get("/{full_path:path}")
         async def spa_fallback(full_path: str) -> Any:
-            target = web_dist / full_path
+            target = effective_web_dist / full_path
             if target.is_file() and not full_path.startswith(
                 ("api/", "v1/", "healthz", "readyz", "docs", "openapi.json")
             ):
@@ -684,7 +689,7 @@ def build_product_app(
             if not full_path.startswith(
                 ("api/", "v1/", "healthz", "readyz", "docs", "openapi.json")
             ):
-                return FileResponse(str(web_dist / "index.html"))
+                return FileResponse(str(effective_web_dist / "index.html"))
             return JSONResponse(status_code=404, content={"detail": "Not Found"})
 
     return app

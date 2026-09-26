@@ -479,6 +479,16 @@ def test_route_source_origin_outside_the_allow_list_is_refused(tmp_path: Path) -
 
 
 def test_navigator_web_endpoints_and_proxy_rewrite(tmp_path: Path) -> None:
+    mock_dist = tmp_path / "mock_dist"
+    mock_dist.mkdir()
+    (mock_dist / "index.html").write_text(
+        "<!doctype html><html><body><h1>Cyrene Navigator</h1></body></html>",
+        encoding="utf-8",
+    )
+    mock_assets = mock_dist / "assets"
+    mock_assets.mkdir()
+    (mock_assets / "app.js").write_text("console.log('navigator');", encoding="utf-8")
+
     endpoint_id = _seed_endpoint(tmp_path / "exchange.sqlite3", "Navigator Web Gateway")
     app = build_product_app(
         database_path=tmp_path / "exchange.sqlite3",
@@ -486,6 +496,7 @@ def test_navigator_web_endpoints_and_proxy_rewrite(tmp_path: Path) -> None:
             {"binding:default": OpenAICompatibleProvider("http://127.0.0.1:8000")}
         ),
         control_credentials=None,
+        web_dist=mock_dist,
     )
     with TestClient(app) as client:
         # System status
@@ -533,3 +544,7 @@ def test_navigator_web_endpoints_and_proxy_rewrite(tmp_path: Path) -> None:
         spa = client.get("/chat")
         assert spa.status_code == 200
         assert "Navigator" in spa.text
+
+        asset = client.get("/assets/app.js")
+        assert asset.status_code == 200
+        assert "console.log" in asset.text
