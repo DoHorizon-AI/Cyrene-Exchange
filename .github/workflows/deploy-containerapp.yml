@@ -1,0 +1,163 @@
+name: cd-containerapp
+
+on:
+  push:
+    branches: [main, release, develop]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (defaults to git sha)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-deploy:
+    name: cd / build, push & deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      AZURE_RESOURCE_GROUP: Container-APP
+      AZURE_APP_NAME: cyrene-exchange
+      AZURE_LOCATION: eastasia
+      AZURE_CONTAINERAPP_ENV: cae-dh-eastasia
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      CYRENE_PUBLIC_BASE_URL: https://cyrene.dohorizon-llc.net
+
+    steps:
+      - name: Checkout Cyrene-Exchange
+        uses: actions/checkout@v5
+        with:
+          path: Cyrene-Services/Cyrene-Exchange
+
+      - name: Fetch sibling repositories (Cyrene-Platform, Cyrene-Plugins-Official & Cyrene-Client)
+        run: |
+          TARGET_BRANCH="${GITHUB_REF_NAME:-develop}"
+          for name in Cyrene-Platform Cyrene-Plugins-Official Cyrene-Client; do
+            echo "Fetching $name (target branch: $TARGET_BRANCH)..."
+            git clone --quiet --depth 1 --branch "$TARGET_BRANCH" "https://github.com/DoHorizon-AI/$name.git" "$name" 2>/dev/null || \
+            git clone --quiet --depth 1 --branch develop "https://github.com/DoHorizon-AI/$name.git" "$name" 2>/dev/null || \
+            git clone --quiet --depth 1 "https://github.com/DoHorizon-AI/$name.git" "$name"
+          done
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${REPO_OWNER}/cyrene-exchange"
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="sha-${GITHUB_SHA::7}"
+          fi
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "full_image=${IMAGE}:${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Cyrene-Services/Cyrene-Exchange/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+
+      - name: Log in to Azure
+        if: env.AZURE_CREDENTIALS != ''
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy or update Azure Container App
+        if: env.AZURE_CREDENTIALS != ''
+        run: |
+          if az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            echo "Updating existing container app $AZURE_APP_NAME in $AZURE_RESOURCE_GROUP..."
+            az containerapp update \
+              --name "$AZURE_APP_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --image "${{ steps.meta.outputs.full_image }}"
+          else
+            echo "Creating container app $AZURE_APP_NAME in $AZURE_CONTAINERAPP_ENV ($AZURE_LOCATION)..."
+            az containerapp create \
+              --name "$AZURE_APP_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --environment "$AZURE_CONTAINERAPP_ENV" \
+              --image "${{ steps.meta.outputs.full_image }}" \
+              --target-port 8000 \
+              --ingress internal \
+              --registry-server ghcr.io \
+              --registry-username "${{ github.actor }}" \
+              --registry-password "${{ secrets.GITHUB_TOKEN }}" \
+              --cpu 0.5 \
+              --memory 1.0Gi \
+              --min-replicas 1 \
+              --max-replicas 2 \
+              --env-vars CYRENE_HOST="0.0.0.0" CYRENE_PORT="8000" CYRENE_PUBLIC_BASE_URL="$CYRENE_PUBLIC_BASE_URL"
+          fi
+
+      - name: Verify healthy revision and public Web gateway
+        if: env.AZURE_CREDENTIALS != ''
+        run: |
+          for i in {1..30}; do
+            REVISION=$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.latestRevisionName" -o tsv)
+            READY=$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.latestReadyRevisionName" -o tsv)
+            if [ -n "$REVISION" ] && [ "$REVISION" = "$READY" ]; then
+              HEALTH=$(az containerapp revision show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --revision "$REVISION" --query "properties.healthState" -o tsv)
+              if [ "$HEALTH" = "Healthy" ]; then
+                echo "Healthy revision: $REVISION"
+                break
+              fi
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "Exchange revision did not become healthy" >&2
+              exit 1
+            fi
+            sleep 3
+          done
+          for i in {1..30}; do
+            if curl -fsS "$CYRENE_PUBLIC_BASE_URL/v1/models" | python3 -c 'import json, sys; assert json.load(sys.stdin)["object"] == "list"'; then
+              echo "Web gateway reached Exchange"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "Web gateway did not reach Exchange" >&2
+              exit 1
+            fi
+            sleep 3
+          done
+          python3 - "$CYRENE_PUBLIC_BASE_URL" <<'PY'
+          import json
+          import sys
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          request = Request(
+              sys.argv[1] + "/v1/chat/completions",
+              data=b'{"model":"no-route","messages":[{"role":"user","content":"probe"}]}',
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              urlopen(request, timeout=10)
+          except HTTPError as error:
+              payload = json.load(error)
+              if error.code != 401 or payload.get("error", {}).get("type") != "authentication_error":
+                  raise RuntimeError("Web gateway did not enforce Exchange authentication") from error
+          else:
+              raise RuntimeError("Web gateway accepted a request without credentials")
+          PY

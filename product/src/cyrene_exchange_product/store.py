@@ -11,9 +11,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 from uuid import UUID
@@ -25,6 +27,8 @@ from cyrene_exchange.gateway import (
 )
 
 from cyrene_exchange_product.domain import (
+    ApiKey,
+    ApiKeyState,
     GatewayEndpoint,
     GatewayRoute,
     ProductPrincipal,
@@ -111,6 +115,39 @@ class ExchangeStore:
                     ON request_audits(workspace_id, started_at DESC, request_id);
                 """
             )
+            self._migrate_api_credentials()
+
+    def _migrate_api_credentials(self) -> None:
+        """Add the API-key metadata columns to the existing credential table.
+
+        SQLite adds nullable columns in place; the operator-configured rows keep
+        NULL api_key_id/name and therefore never appear in the API-key list.
+
+        为既有凭据表就地补充 API Key 元数据列；操作者配置的行保持 NULL，
+        不会出现在 API Key 列表中。
+        """
+
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(api_credentials)")
+        }
+        additions = (
+            ("api_key_id", "TEXT"),
+            ("name", "TEXT"),
+            ("expires_at", "INTEGER"),
+            ("revoked_at", "INTEGER"),
+            ("model_scope", "TEXT"),
+            ("resource_version", "INTEGER NOT NULL DEFAULT 1"),
+        )
+        for name, definition in additions:
+            if name not in columns:
+                self._connection.execute(
+                    f"ALTER TABLE api_credentials ADD COLUMN {name} {definition}"
+                )
+        self._connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_api_credentials_api_key_id "
+            "ON api_credentials(api_key_id) WHERE api_key_id IS NOT NULL"
+        )
 
     def close(self) -> None:
         """Close the database connection. | 关闭数据库连接。"""
@@ -222,6 +259,38 @@ class ExchangeStore:
             ).fetchall()
         return [GatewayRoute.model_validate_json(row["document"]) for row in rows]
 
+    def list_endpoints(self) -> list[GatewayEndpoint]:
+        """Return every persisted gateway endpoint. | 返回全部网关端点。"""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT document FROM gateway_endpoints ORDER BY id ASC"
+            ).fetchall()
+        return [GatewayEndpoint.model_validate_json(row["document"]) for row in rows]
+
+    def list_active_routes(self) -> list[GatewayRoute]:
+        """Return every active route across endpoints. | 返回全部活动路由。"""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT document FROM gateway_routes
+                WHERE state = ?
+                ORDER BY priority ASC, id ASC
+                """,
+                (RouteState.ACTIVE.value,),
+            ).fetchall()
+        return [GatewayRoute.model_validate_json(row["document"]) for row in rows]
+
+    def list_all_routes(self) -> list[GatewayRoute]:
+        """Return every persisted route, including drafts. | 返回全部路由。"""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT document FROM gateway_routes ORDER BY priority ASC, id ASC"
+            ).fetchall()
+        return [GatewayRoute.model_validate_json(row["document"]) for row in rows]
+
     def resolve_idempotency(self, scope: str, key: str | None, digest: str) -> str | None:
         """Resolve replay or reject conflicting key reuse. | 解析幂等重放。"""
 
@@ -259,7 +328,9 @@ class ExchangeStore:
 
     @contextmanager
     def _mutation(self) -> Iterator[sqlite3.Cursor]:
-        """Run one durable mutation under SQLite's immediate write lock."""
+        """Run one durable mutation under SQLite's immediate write lock.
+
+        中文:在 SQLite 的 immediate 写锁下执行一次持久化变更。"""
 
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -273,7 +344,9 @@ class ExchangeStore:
                 self._connection.commit()
 
     def configure_credentials(self, credentials: Mapping[str, ProductPrincipal]) -> None:
-        """Persist controlled token mappings without storing bearer secrets."""
+        """Persist controlled token mappings without storing bearer secrets.
+
+        中文:持久化受控令牌映射,不存储 bearer 密钥。"""
 
         prepared: list[tuple[str, ProductPrincipal, str]] = []
         for token, principal in credentials.items():
@@ -320,8 +393,117 @@ class ExchangeStore:
                     ),
                 )
 
+    def disable_credential(self, credential_ref: str) -> bool:
+        """Revoke one credential reference without deleting its audit trail.
+
+        中文:撤销一个凭据引用,但不删除其审计记录。"""
+
+        with self._mutation() as cursor:
+            cursor.execute(
+                "UPDATE api_credentials SET enabled = 0 WHERE credential_ref = ? AND enabled = 1",
+                (credential_ref,),
+            )
+            return cursor.rowcount > 0
+
+    def create_api_key(
+        self,
+        api_key: ApiKey,
+        secret_digest: str,
+        key: str | None,
+        request_digest: str,
+    ) -> tuple[ApiKey, bool]:
+        """Persist one server-generated key and its replay identity atomically.
+
+        Returns the stored key and whether this call created it. A replay
+        returns the existing metadata without the secret, which is only ever
+        shown by the creation response.
+
+        中文:原子持久化一个由服务器生成的密钥及其重放标识。
+
+                中文:返回已存储的密钥及本次调用是否创建了该密钥。重放请求会返回现有元数据而不返回密钥;密钥只会在创建响应中展示一次。
+        """
+
+        with self._mutation() as cursor:
+            replay = self.resolve_idempotency("create-api-key", key, request_digest)
+            if replay is not None:
+                existing = self.get_api_key(UUID(replay))
+                if existing is None:
+                    raise RuntimeError("api-key idempotency points to an absent key")
+                return existing, False
+            cursor.execute(
+                """
+                INSERT INTO api_credentials(
+                    credential_ref, token_digest, actor_id, workspace_id, enabled, created_at,
+                    api_key_id, name, expires_at, model_scope, resource_version
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    api_key.credential_ref,
+                    secret_digest,
+                    api_key.actor_id,
+                    api_key.workspace_id,
+                    _unix_ms(),
+                    str(api_key.id),
+                    api_key.name,
+                    _to_unix_ms(api_key.expires_at),
+                    json.dumps(api_key.model_scope, separators=(",", ":")),
+                    api_key.resource_version,
+                ),
+            )
+            if key is not None:
+                cursor.execute(
+                    "INSERT INTO idempotency(scope, key, request_hash, resource_id) "
+                    "VALUES ('create-api-key', ?, ?, ?)",
+                    (key, request_digest, str(api_key.id)),
+                )
+        return api_key, True
+
+    def get_api_key(self, api_key_id: UUID) -> ApiKey | None:
+        """Read one server-generated key by Product identity. | 按身份读取密钥。"""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM api_credentials WHERE api_key_id = ?", (str(api_key_id),)
+            ).fetchone()
+        return _api_key_from_row(row) if row is not None else None
+
+    def list_api_keys(self) -> list[ApiKey]:
+        """List server-generated keys, newest first. | 列出服务端生成的密钥。"""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM api_credentials WHERE api_key_id IS NOT NULL "
+                "ORDER BY created_at DESC, api_key_id DESC"
+            ).fetchall()
+        return [_api_key_from_row(row) for row in rows]
+
+    def revoke_api_key(self, api_key_id: UUID) -> ApiKey | None:
+        """Revoke one key and retain its metadata. | 撤销密钥并保留元数据。"""
+
+        with self._mutation() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM api_credentials WHERE api_key_id = ?", (str(api_key_id),)
+            ).fetchone()
+            if row is None:
+                return None
+            existing = _api_key_from_row(row)
+            if existing.state == ApiKeyState.REVOKED:
+                return existing
+            now_ms = _unix_ms()
+            cursor.execute(
+                "UPDATE api_credentials SET enabled = 0, revoked_at = ?, "
+                "resource_version = resource_version + 1 WHERE api_key_id = ?",
+                (now_ms, str(api_key_id)),
+            )
+            updated = cursor.execute(
+                "SELECT * FROM api_credentials WHERE api_key_id = ?", (str(api_key_id),)
+            ).fetchone()
+        return _api_key_from_row(updated)
+
     def resolve_credential(self, token: str) -> RequestPrincipal | None:
-        """Resolve one bearer token to trusted identity metadata."""
+        """Resolve one bearer token to trusted identity metadata.
+
+        中文:将一个 bearer token 解析为可信的身份元数据。"""
 
         if not isinstance(token, str) or not token:
             return None
@@ -329,22 +511,27 @@ class ExchangeStore:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT actor_id, workspace_id, credential_ref
+                SELECT actor_id, workspace_id, credential_ref, model_scope
                 FROM api_credentials
                 WHERE token_digest = ? AND enabled = 1
+                  AND (expires_at IS NULL OR expires_at > ?)
                 """,
-                (digest,),
+                (digest, _unix_ms()),
             ).fetchone()
         if row is None:
             return None
+        scope = json.loads(str(row["model_scope"])) if row["model_scope"] else []
         return RequestPrincipal(
             actor_id=str(row["actor_id"]),
             workspace_id=str(row["workspace_id"]),
             credential_ref=str(row["credential_ref"]),
+            model_scope=frozenset(str(item) for item in scope),
         )
 
     def save_tenant_quota(self, quota: TenantQuota) -> None:
-        """Persist Product quota policy without duplicating usage totals."""
+        """Persist Product quota policy without duplicating usage totals.
+
+        中文:持久化 Product 配额策略,不重复存储用量总数。"""
 
         with self._mutation() as cursor:
             cursor.execute(
@@ -366,7 +553,9 @@ class ExchangeStore:
             )
 
     def get_tenant_quota(self, tenant_id: str) -> TenantQuota | None:
-        """Read Product quota policy; usage remains Plugins-owned."""
+        """Read Product quota policy; usage remains Plugins-owned.
+
+        中文:读取 Product 配额策略;用量仍由 Plugins 所有。"""
 
         with self._lock:
             row = self._connection.execute(
@@ -379,7 +568,9 @@ class ExchangeStore:
         return TenantQuota.model_validate(dict(row)) if row is not None else None
 
     def begin_request(self, metadata: RequestMetadata) -> None:
-        """Persist trusted request admission before provider invocation."""
+        """Persist trusted request admission before provider invocation.
+
+        中文:在调用提供方之前持久化可信的请求准入记录。"""
 
         principal = metadata.principal
         try:
@@ -425,7 +616,9 @@ class ExchangeStore:
         model: str | None,
         stream: bool | None,
     ) -> None:
-        """Persist an authenticated rejection without request content."""
+        """Persist an authenticated rejection without request content.
+
+        中文:持久化经过认证的拒绝结果,不记录请求内容。"""
 
         with self._mutation() as cursor:
             cursor.execute(
@@ -459,7 +652,9 @@ class ExchangeStore:
         usage: ProviderUsage | None,
         error_type: str | None,
     ) -> None:
-        """Record one terminal outcome; repeated callbacks cannot add usage."""
+        """Record one terminal outcome; repeated callbacks cannot add usage.
+
+        中文:记录一次最终结果;重复回调不能增加用量。"""
 
         usage_state, prompt_tokens, completion_tokens, total_tokens, source = _usage_values(usage)
         with self._mutation() as cursor:
@@ -500,7 +695,9 @@ class ExchangeStore:
             )
 
     def get_request_audit(self, request_id: str) -> RequestAuditRecord | None:
-        """Read one content-free durable request audit record."""
+        """Read one content-free durable request audit record.
+
+        中文:读取一条不含内容的持久化请求审计记录。"""
 
         with self._lock:
             row = self._connection.execute(
@@ -515,7 +712,9 @@ class ExchangeStore:
         actor_id: str | None = None,
         limit: int = 100,
     ) -> list[RequestAuditRecord]:
-        """List durable audit rows with bounded workspace/actor filters."""
+        """List durable audit rows with bounded workspace/actor filters.
+
+        中文:使用有界的 workspace/actor 条件列出持久化审计记录。"""
 
         bounded_limit = max(1, min(limit, 500))
         clauses: list[str] = []
@@ -537,17 +736,59 @@ class ExchangeStore:
 
 
 def _unix_ms() -> int:
-    """Return current Unix wall-clock time in milliseconds."""
+    """Return current Unix wall-clock time in milliseconds.
+
+    中文:返回当前 Unix 墙上时钟时间,单位为毫秒。"""
 
     import time
 
     return time.time_ns() // 1_000_000
 
 
+def _to_unix_ms(value: datetime | None) -> int | None:
+    """Convert an optional aware timestamp to Unix milliseconds.
+
+    中文:将可选的带时区时间戳转换为 Unix 毫秒时间。"""
+
+    return None if value is None else int(value.timestamp() * 1000)
+
+
+def _from_unix_ms(value: int | None) -> datetime | None:
+    """Convert optional Unix milliseconds to an aware UTC timestamp.
+
+    中文:将可选的 Unix 毫秒时间转换为带时区的 UTC 时间戳。"""
+
+    return None if value is None else datetime.fromtimestamp(value / 1000, tz=UTC)
+
+
+def _api_key_from_row(row: sqlite3.Row) -> ApiKey:
+    """Project one api_credentials row onto the public ApiKey metadata.
+
+    中文:将一条 api_credentials 记录投影为公开 ApiKey 元数据。"""
+
+    scope = json.loads(str(row["model_scope"])) if row["model_scope"] else []
+    return ApiKey(
+        id=UUID(str(row["api_key_id"])),
+        name=str(row["name"]),
+        credential_ref=str(row["credential_ref"]),
+        actor_id=str(row["actor_id"]),
+        workspace_id=str(row["workspace_id"]),
+        state=ApiKeyState.REVOKED if row["revoked_at"] else ApiKeyState.ACTIVE,
+        model_scope=[str(item) for item in scope],
+        created_at=_from_unix_ms(int(row["created_at"])) or datetime.now(UTC),
+        updated_at=_from_unix_ms(int(row["revoked_at"] or row["created_at"])) or datetime.now(UTC),
+        expires_at=_from_unix_ms(row["expires_at"]),
+        revoked_at=_from_unix_ms(row["revoked_at"]),
+        resource_version=int(row["resource_version"]),
+    )
+
+
 def _usage_values(
     usage: ProviderUsage | None,
 ) -> tuple[UsageState, int | None, int | None, int | None, str | None]:
-    """Classify only provider facts; never infer missing token counts."""
+    """Classify only provider facts; never infer missing token counts.
+
+    中文:只对提供方事实进行分类;绝不推断缺失的 token 计数。"""
 
     if usage is None:
         return UsageState.UNKNOWN, None, None, None, None
@@ -563,7 +804,9 @@ def _usage_values(
 
 
 def _audit_from_row(row: sqlite3.Row) -> RequestAuditRecord:
-    """Convert a SQLite row into the public content-free audit model."""
+    """Convert a SQLite row into the public content-free audit model.
+
+    中文:将 SQLite 记录转换为公开的无内容审计模型。"""
 
     values = dict(row)
     values["stream"] = None if values["stream"] is None else bool(values["stream"])

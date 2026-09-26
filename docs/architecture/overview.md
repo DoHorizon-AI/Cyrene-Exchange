@@ -46,3 +46,17 @@ outside this Product repository.
 | Provider translation and serving | Official provider Plugin, Reactor, or external provider |
 | Usage aggregation and cost calculation | Plugins `billing.usage.v1` |
 | Worker/process lifecycle and hardware facts | Platform/Reactor execution plane |
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 权威表中文说明
+
+| 关注点 | 规范所有者 |
+| --- | --- |
+| Endpoint、Route、凭据、审计和配额上限 | Exchange Product 的 `ExchangeStore` |
+| 请求规范化、回退和响应策略 | `ExchangeGateway` |
+| 能力解析和执行模式选择 | Platform |
+| `model.provider.v1` 契约与端点 | Plugins |
+| Provider 转换和模型服务 | Official provider Plugin、Reactor 或外部 Provider |
+| 用量汇总和费用计算 | Plugins 的 `billing.usage.v1` |
+| Worker/进程生命周期和硬件事实 | Platform/Reactor 执行平面 |

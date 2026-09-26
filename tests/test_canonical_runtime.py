@@ -35,6 +35,7 @@ from cyrene_exchange.gateway import (
     AuthenticationError,
     ExchangeGateway,
     InvalidRequestError,
+    NoOpLifecycleObserver,
     RequestCancelled,
     RequestPrincipal,
 )
@@ -47,7 +48,11 @@ TEST_PRINCIPAL = RequestPrincipal("actor-test", "workspace-test", "credential-te
 
 
 def resolve_test_principal(token: str) -> RequestPrincipal | None:
-    """Resolve only the explicit test credential to a trusted identity."""
+    """Resolve only the explicit test credential to a trusted identity.
+
+    中文:仅将明确指定的测试凭据解析为可信身份。
+    """
+    # 中文:只将显式测试凭据解析为可信身份.
 
     return TEST_PRINCIPAL if token == "test-token" else None
 
@@ -117,7 +122,11 @@ def payload(*, stream: bool = False) -> dict[str, Any]:
 
 
 def tool_payload(*, stream: bool = False, include_usage: bool = False) -> dict[str, Any]:
-    """Build a text-only request with one function tool and tool history."""
+    """Build a text-only request with one function tool and tool history.
+
+    中文:构造仅含文本、一个 function tool 及其调用历史的请求。
+    """
+    # 中文:构造一个包含函数工具和工具历史记录的纯文本请求.
 
     value: dict[str, Any] = {
         "model": "requested-model",
@@ -163,11 +172,54 @@ def tool_payload(*, stream: bool = False, include_usage: bool = False) -> dict[s
     return value
 
 
-def make_gateway(router, providers):
+def make_gateway(router, providers, max_route_attempts: int = 3):
+    return create_test_gateway(Resolver(router, providers), max_route_attempts=max_route_attempts)
+
+
+def create_test_gateway(resolver, max_route_attempts: int = 3):
     return ExchangeGateway(
-        Resolver(router, providers),
+        resolver,
         principal_resolver=resolve_test_principal,
+        lifecycle_observer=NoOpLifecycleObserver(),
+        max_route_attempts=max_route_attempts,
     )
+
+
+def test_gateway_requires_lifecycle_observer() -> None:
+    with pytest.raises(ValueError, match="lifecycle_observer is required"):
+        ExchangeGateway(
+            Resolver(FakeRouter([]), {}),
+            principal_resolver=resolve_test_principal,
+        )
+
+
+def test_auth_resolution_failure_logs_trace_without_credential(capsys: pytest.CaptureFixture[str]) -> None:
+    """Keep the boundary trace while a failing resolver cannot leak its credential.
+
+    中文:解析器失败时保留边界 trace，且不泄露凭据。"""
+
+    secret = "sensitive-credential"
+    trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+
+    def fail_resolver(_token: str) -> RequestPrincipal | None:
+        raise RuntimeError(f"resolver rejected {secret}")
+
+    gateway = ExchangeGateway(
+        Resolver(FakeRouter([]), {}),
+        principal_resolver=fail_resolver,
+        lifecycle_observer=NoOpLifecycleObserver(),
+        max_route_attempts=1,
+    )
+    with pytest.raises(AuthenticationError, match="invalid credentials"):
+        gateway._authenticate(
+            {
+                "Authorization": f"Bearer {secret}",
+                "traceparent": f"00-{trace_id}-00f067aa0ba902b7-01",
+            }
+        )
+    log_line = capsys.readouterr().err
+    assert json.loads(log_line)["trace_id"] == trace_id
+    assert secret not in log_line
 
 
 def http_json_request(gateway, request_payload, headers=HEADERS):
@@ -188,7 +240,11 @@ def http_json_request(gateway, request_payload, headers=HEADERS):
 
 
 def http_stream_request(gateway, request_payload, headers=HEADERS):
-    """Send one real HTTP request and return its status, headers, and SSE body."""
+    """Send one real HTTP request and return its status, headers, and SSE body.
+
+    中文:发送一次真实 HTTP 请求,并返回状态码、headers 与 SSE 正文。
+    """
+    # 中文:发送一条真实 HTTP 请求,并返回其状态码、标头和 SSE 正文。
 
     server = create_reference_server(gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -211,7 +267,7 @@ def test_http_request_uses_platform_resolver_routing_provider_and_normalizes_res
     router = FakeRouter([RouteTarget("provider-a", route_id="primary")])
     provider = FakeProvider([ProviderChunk(delta="hello "), ProviderChunk(delta="world", finish_reason="stop")])
     resolver = Resolver(router, {"provider-a": provider})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver)
     server = create_reference_server(gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -367,7 +423,7 @@ def test_invalid_auth_and_invalid_request_are_product_errors():
 def test_http_maps_invalid_auth_and_invalid_request_without_resolving_capabilities():
     router = FakeRouter([])
     resolver = Resolver(router, {})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver)
 
     auth_status, auth_body = http_json_request(gateway, payload(), headers={})
     request_status, request_body = http_json_request(
@@ -387,7 +443,7 @@ def test_provider_failure_before_first_token_uses_routing_candidates_in_order():
     down = FakeProvider(error=RuntimeError("connection refused"))
     healthy = FakeProvider([ProviderChunk(delta="fallback response", finish_reason="stop")])
     resolver = Resolver(router, {"down": down, "healthy": healthy})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver, max_route_attempts=3)
 
     response = gateway.handle_openai_chat(HEADERS, payload())
 
@@ -405,7 +461,7 @@ def test_provider_cancellation_never_falls_back_to_another_route():
     cancelled = FakeProvider(error=ProviderInvocationCancelled("execution cancelled"))
     healthy = FakeProvider([ProviderChunk(delta="must not run")])
     resolver = Resolver(router, {"cancelled": cancelled, "healthy": healthy})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver)
 
     with pytest.raises(RequestCancelled):
         gateway.handle_openai_chat(HEADERS, payload())
@@ -422,7 +478,7 @@ def test_provider_failure_after_first_stream_token_is_not_double_routed():
     partial = FailingAfterFirstProvider()
     healthy = FakeProvider([ProviderChunk(delta="fallback")])
     resolver = Resolver(router, {"partial": partial, "healthy": healthy})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver, max_route_attempts=3)
 
     response = gateway.handle_openai_chat(HEADERS, payload(stream=True))
     events = iter(response.body)
@@ -439,10 +495,7 @@ def test_provider_cancellation_after_first_stream_token_maps_to_request_cancelle
     router = FakeRouter([RouteTarget("cancelled", route_id="primary"), RouteTarget("healthy")])
     cancelled = CancellingAfterFirstProvider()
     healthy = FakeProvider([ProviderChunk(delta="must not run")])
-    gateway = ExchangeGateway(
-        Resolver(router, {"cancelled": cancelled, "healthy": healthy}),
-        principal_resolver=resolve_test_principal,
-    )
+    gateway = make_gateway(router, {"cancelled": cancelled, "healthy": healthy})
 
     response = gateway.handle_openai_chat(HEADERS, payload(stream=True))
     events = iter(response.body)

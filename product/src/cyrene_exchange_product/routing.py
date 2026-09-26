@@ -22,6 +22,7 @@ from cyrene_exchange.capabilities import (
 )
 from cyrene_exchange.gateway import (
     ExchangeGateway,
+    NoOpLifecycleObserver,
     TokenPrincipalResolver,
 )
 from cyrene_exchange.protocol import NormalizedInferenceRequest
@@ -100,7 +101,7 @@ def build_gateway_from_store(
 
     store.configure_credentials(credentials)
     principal_resolver: TokenPrincipalResolver = store.resolve_credential
-    observer = RequestAuditRecorder(store, billing) if record_requests else None
+    observer = RequestAuditRecorder(store, billing) if record_requests else NoOpLifecycleObserver()
     return ExchangeGateway(
         ProductRoutingResolver(StoredRoutePlanner(store, endpoint_id), delegate),
         principal_resolver=principal_resolver,

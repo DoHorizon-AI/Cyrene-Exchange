@@ -27,6 +27,8 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Install exact locked dependencies
         run: uv sync --frozen --extra dev
+      - name: Reject unreviewed silent exceptions
+        run: python scripts/check_silent_exceptions.py
       - name: Lint and test the direct Plugin consumer
         run: |
           uv run --no-sync ruff check --no-cache src tests
@@ -43,6 +45,43 @@ jobs:
             echo 'Automatic source CI must not require private sibling repositories.' >&2
             exit 1
           fi
+
+  exchange-cross-repository:
+    name: ci / exchange-cross-repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Pinned to the revisions recorded in Cyrene-Workspace/release-lock.json.
+      # Bump both together with that lock, never independently.
+      CYRENE_PLATFORM_REVISION: 06a9bd75edfed1359b09770e749520162d75e242
+      CYRENE_PLUGINS_REVISION: a41284c2ffe71a7412f556841f9ccc4a91864138
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch the pinned sibling checkouts
+        run: |
+          for entry in "Cyrene-Platform:$CYRENE_PLATFORM_REVISION" "Cyrene-Plugins-Official:$CYRENE_PLUGINS_REVISION"; do
+            name="${entry%%:*}"
+            revision="${entry#*:}"
+            git init --quiet "$RUNNER_TEMP/$name"
+            git -C "$RUNNER_TEMP/$name" remote add origin "https://github.com/DoHorizon-AI/$name.git"
+            # Fetch the pinned commit directly: it is a branch tip, so the
+            # server can serve it, and a wrong pin fails here with the ref name
+            # rather than half-way through the test run.
+            git -C "$RUNNER_TEMP/$name" fetch --quiet --depth 1 origin "$revision"
+            git -C "$RUNNER_TEMP/$name" checkout --quiet --detach FETCH_HEAD
+          done
+      - name: Install exact locked dependencies
+        run: uv sync --frozen --extra dev
+      - name: Run the cross-repository acceptance lane
+        env:
+          CYRENE_PLATFORM_WORKTREE: ${{ runner.temp }}/Cyrene-Platform
+          CYRENE_PLUGINS_WORKTREE: ${{ runner.temp }}/Cyrene-Plugins-Official
+        run: uv run --no-sync pytest -p no:cacheprovider -q tests/test_platform_integration.py
 
   publish-artifact:
     name: ci / immutable-artifact

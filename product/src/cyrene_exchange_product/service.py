@@ -11,11 +11,17 @@
 from __future__ import annotations
 
 import hashlib
+import secrets
 from collections.abc import Callable
+from datetime import UTC
 from uuid import UUID, uuid4
 
 from cyrene_exchange_product.domain import (
+    ApiKey,
+    ApiKeyState,
     ContractModel,
+    CreateApiKeyRequest,
+    CreatedApiKey,
     CreateEndpointRequest,
     CreateRouteDraftRequest,
     CreateRouteRequest,
@@ -85,6 +91,11 @@ class ExchangeProductService:
             )
         return endpoint
 
+    def list_endpoints(self) -> list[GatewayEndpoint]:
+        """List persisted gateway endpoints. | 列出网关端点。"""
+
+        return self.store.list_endpoints()
+
     def disable_endpoint(self, endpoint_id: UUID) -> GatewayEndpoint:
         """Disable publication without deleting route evidence. | 禁用发布但保留路由证据。"""
 
@@ -144,6 +155,11 @@ class ExchangeProductService:
                 status=404,
             )
         return route
+
+    def list_routes(self) -> list[GatewayRoute]:
+        """List persisted routes in stable priority order. | 列出路由。"""
+
+        return self.store.list_all_routes()
 
     def create_route_draft(
         self, command: CreateRouteDraftRequest, key: str, principal: ProductPrincipal
@@ -240,3 +256,111 @@ class ExchangeProductService:
                 status=409,
             )
         return route
+
+    # ── API keys ────────────────────────────────────────────────────────
+    # 中文:API 密钥。
+
+    def create_api_key(
+        self,
+        command: CreateApiKeyRequest,
+        principal: ProductPrincipal,
+        idempotency_key: str | None,
+    ) -> tuple[CreatedApiKey, bool]:
+        """Generate and persist one gateway key; the secret is shown once.
+
+        生成并持久化网关密钥；明文只在创建响应中出现一次。
+        """
+
+        now = utc_now()
+        expires_at = command.expires_at
+        if expires_at is not None:
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at <= now:
+                raise ExchangeProductError(
+                    code="EXCHANGE_API_KEY_EXPIRY_INVALID",
+                    title="API key expiry is invalid",
+                    detail="Choose an expiry that is after the current time.",
+                    status=422,
+                )
+        scope = [pattern.strip() for pattern in command.model_scope]
+        if any(not pattern for pattern in scope):
+            raise ExchangeProductError(
+                code="EXCHANGE_API_KEY_SCOPE_INVALID",
+                title="API key model scope is invalid",
+                detail="Model scope patterns must be non-empty text.",
+                status=422,
+            )
+        identifier = uuid4()
+        api_key = ApiKey(
+            id=identifier,
+            name=command.name,
+            credential_ref=f"api-key://{identifier}",
+            actor_id=principal.actor_id,
+            workspace_id=principal.workspace_id,
+            state=ApiKeyState.ACTIVE,
+            model_scope=scope,
+            created_at=now,
+            updated_at=now,
+            expires_at=expires_at,
+            resource_version=1,
+        )
+        secret = "cyk_" + secrets.token_urlsafe(32)
+        digest = hashlib.sha256(
+            (
+                request_hash(command) + "\0" + principal.workspace_id + "\0" + principal.actor_id
+            ).encode()
+        ).hexdigest()
+        stored, created = self.store.create_api_key(
+            api_key,
+            hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+            idempotency_key,
+            digest,
+        )
+        response = CreatedApiKey(**stored.model_dump(), secret=secret if created else None)
+        return response, created
+
+    def list_api_keys(self, principal: ProductPrincipal) -> list[ApiKey]:
+        """List this workspace's keys without any secret material.
+
+        中文:列出当前 workspace 的 key,不包含任何 secret。
+        """
+        # 中文:列出此工作区的密钥,不返回任何秘密材料。
+
+        return [
+            key for key in self.store.list_api_keys() if key.workspace_id == principal.workspace_id
+        ]
+
+    def get_api_key(self, api_key_id: UUID, principal: ProductPrincipal) -> ApiKey:
+        """Read one key owned by the caller's workspace.
+
+        中文:读取一把由调用者 workspace 所有的 key。
+        """
+        # 中文:读取一条属于调用方工作区的密钥。
+
+        return self._owned_api_key(api_key_id, principal)
+
+    def revoke_api_key(self, api_key_id: UUID, principal: ProductPrincipal) -> ApiKey:
+        """Revoke one key owned by the caller's workspace. | 撤销密钥。"""
+
+        self._owned_api_key(api_key_id, principal)
+        revoked = self.store.revoke_api_key(api_key_id)
+        if revoked is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_API_KEY_NOT_FOUND",
+                title="API key not found",
+                detail="No API key exists with the requested id.",
+                status=404,
+            )
+        return revoked
+
+    def _owned_api_key(self, api_key_id: UUID, principal: ProductPrincipal) -> ApiKey:
+        api_key = self.store.get_api_key(api_key_id)
+        if api_key is None or api_key.workspace_id != principal.workspace_id:
+            raise ExchangeProductError(
+                code="EXCHANGE_API_KEY_NOT_FOUND",
+                title="API key not found",
+                detail="No API key exists with the requested id in this workspace.",
+                status=404,
+            )
+        return api_key

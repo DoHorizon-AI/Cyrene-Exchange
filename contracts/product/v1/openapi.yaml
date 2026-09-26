@@ -26,6 +26,17 @@ paths:
                 $ref: ./gateway-endpoint.schema.json
         '409':
           $ref: '#/components/responses/Problem'
+    get:
+      operationId: listGatewayEndpoints
+      responses:
+        '200':
+          description: Persisted GatewayEndpoints
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: ./gateway-endpoint.schema.json
   /api/v1/gateway-endpoints/{endpointId}:
     get:
       operationId: getGatewayEndpoint
@@ -76,6 +87,17 @@ paths:
           $ref: '#/components/responses/Problem'
         '409':
           $ref: '#/components/responses/Problem'
+    get:
+      operationId: listGatewayRoutes
+      responses:
+        '200':
+          description: Persisted GatewayRoutes in priority order
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: ./gateway-route.schema.json
   /api/v1/gateway-routes/{routeId}:
     get:
       operationId: getGatewayRoute
@@ -93,6 +115,81 @@ paths:
             application/json:
               schema:
                 $ref: ./gateway-route.schema.json
+        '404':
+          $ref: '#/components/responses/Problem'
+  /api/v1/api-keys:
+    post:
+      operationId: createApiKey
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApiKeyRequest'
+      responses:
+        '201':
+          description: API key metadata; the secret is present only when created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedApiKey'
+        '403':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+    get:
+      operationId: listApiKeys
+      responses:
+        '200':
+          description: API key metadata without secret material
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ApiKey'
+        '403':
+          $ref: '#/components/responses/Problem'
+  /api/v1/api-keys/{apiKeyId}:
+    get:
+      operationId: getApiKey
+      parameters:
+      - name: apiKeyId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: API key metadata without secret material
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKey'
+        '404':
+          $ref: '#/components/responses/Problem'
+  /api/v1/api-keys/{apiKeyId}/actions/revoke:
+    post:
+      operationId: revokeApiKey
+      parameters:
+      - name: apiKeyId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Revoked API key metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKey'
         '404':
           $ref: '#/components/responses/Problem'
   /v1/chat/completions:
@@ -452,6 +549,118 @@ components:
       - priority
       title: EditRouteDraftRequest
       description: Editable route intent with optimistic concurrency. | 草稿修改与版本检查。
+    ApiKeyState:
+      type: string
+      enum:
+      - ACTIVE
+      - REVOKED
+      title: ApiKeyState
+      description: Gateway API key lifecycle. | 网关 API Key 生命周期。
+    CreateApiKeyRequest:
+      properties:
+        name:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Name
+        expiresAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+        modelScope:
+          items:
+            type: string
+          maxItems: 100
+          type: array
+          title: Modelscope
+      additionalProperties: false
+      type: object
+      required:
+      - name
+      title: CreateApiKeyRequest
+      description: Server-generated gateway key request. | 服务端生成网关密钥请求。
+    ApiKey:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        name:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Name
+        credentialRef:
+          type: string
+          pattern: ^api-key://[0-9a-f-]{36}$
+          title: Credentialref
+        actorId:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Actorid
+        workspaceId:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Workspaceid
+        state:
+          $ref: '#/components/schemas/ApiKeyState'
+        modelScope:
+          items:
+            type: string
+          maxItems: 100
+          type: array
+          title: Modelscope
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        updatedAt:
+          type: string
+          format: date-time
+          title: Updatedat
+        expiresAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+        revokedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - name
+      - credentialRef
+      - actorId
+      - workspaceId
+      - state
+      - createdAt
+      - updatedAt
+      - resourceVersion
+      title: ApiKey
+      description: Gateway credential metadata; the secret is never persisted. | 密钥元数据。
+    CreatedApiKey:
+      allOf:
+      - $ref: '#/components/schemas/ApiKey'
+      - properties:
+          secret:
+            anyOf:
+            - type: string
+            - type: 'null'
+            title: Secret
+        type: object
+        title: CreatedApiKey
+      description: Creation response carrying the one-time secret. | 仅创建响应携带一次性密钥。
     EndpointState:
       type: string
       enum:
