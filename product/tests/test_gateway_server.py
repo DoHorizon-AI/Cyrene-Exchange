@@ -497,9 +497,7 @@ def test_navigator_web_endpoints_and_proxy_rewrite(
     # Force the CPU-only environment shape so the assertions below do not
     # depend on whether the host running the tests happens to have a GPU.
     # 强制 CPU-only 环境形态,使断言不依赖运行测试的主机是否装有 GPU。
-    monkeypatch.setattr(
-        exchange_server, "_query_gpu", lambda: {"available": False, "gpus": []}
-    )
+    monkeypatch.setattr(exchange_server, "_query_gpu", lambda: {"available": False, "gpus": []})
     app = build_product_app(
         database_path=tmp_path / "exchange.sqlite3",
         resolver=OperatorBindingResolver(
