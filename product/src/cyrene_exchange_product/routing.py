@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from fnmatch import fnmatchcase
+from hashlib import sha256
 from uuid import UUID
 
 from cyrene_exchange.billing import BillingUsageClient
@@ -23,6 +24,7 @@ from cyrene_exchange.capabilities import (
 from cyrene_exchange.gateway import (
     ExchangeGateway,
     NoOpLifecycleObserver,
+    RequestPrincipal,
     TokenPrincipalResolver,
 )
 from cyrene_exchange.protocol import NormalizedInferenceRequest
@@ -72,6 +74,30 @@ class ProductRoutingResolver:
         return self._delegate.resolve(capability_id, implementation_ref)
 
 
+def data_plane_principal_resolver(
+    store: ExchangeStore, credentials: Mapping[str, ProductPrincipal]
+) -> TokenPrincipalResolver:
+    """Accept only API keys and explicitly configured Gateway Bearers.
+
+    The store also contains Workspace control credentials so the control API
+    can resolve server-assigned scope. Keep those identities out of chat
+    authentication unless the token was independently configured as a
+    Gateway credential.
+
+    中文:只接受 API key 与显式配置的 Gateway Bearer。控制 API 使用的 Workspace
+    凭据也保存在同一身份表中；除非令牌另行配置为 Gateway 凭据，否则不得用于聊天。
+    """
+
+    configured_digests = frozenset(
+        sha256(token.encode("utf-8")).hexdigest() for token in credentials
+    )
+
+    def resolve(token: str) -> RequestPrincipal | None:
+        return store.resolve_data_plane_credential(token, configured_digests)
+
+    return resolve
+
+
 def build_gateway_from_store(
     store: ExchangeStore,
     endpoint_id: UUID,
@@ -100,7 +126,7 @@ def build_gateway_from_store(
     """
 
     store.configure_credentials(credentials)
-    principal_resolver: TokenPrincipalResolver = store.resolve_credential
+    principal_resolver = data_plane_principal_resolver(store, credentials)
     observer = RequestAuditRecorder(store, billing) if record_requests else NoOpLifecycleObserver()
     return ExchangeGateway(
         ProductRoutingResolver(StoredRoutePlanner(store, endpoint_id), delegate),

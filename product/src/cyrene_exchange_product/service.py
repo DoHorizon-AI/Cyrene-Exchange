@@ -156,10 +156,30 @@ class ExchangeProductService:
             )
         return route
 
+    def get_legacy_route(self, route_id: UUID) -> GatewayRoute:
+        """Read a route only when its organization scope is historically unknown."""
+
+        route = self.store.get_legacy_route(route_id)
+        if route is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_NOT_FOUND",
+                title="GatewayRoute not found",
+                detail="No legacy GatewayRoute exists with the requested id.",
+                status=404,
+            )
+        return route
+
     def list_routes(self) -> list[GatewayRoute]:
         """List persisted routes in stable priority order. | 列出路由。"""
 
-        return self.store.list_all_routes()
+        return self.store.list_legacy_routes()
+
+    def list_workspace_routes(
+        self, organization_id: str, workspace_id: str
+    ) -> list[GatewayRoute]:
+        """List routes for one authenticated organization/workspace pair."""
+
+        return self.store.list_workspace_routes(organization_id, workspace_id)
 
     def create_route_draft(
         self, command: CreateRouteDraftRequest, key: str, principal: ProductPrincipal
@@ -188,6 +208,56 @@ class ExchangeProductService:
             ).encode()
         ).hexdigest()
         return self.store.create_route_draft(route, key, digest)
+
+    def create_scoped_route_draft(
+        self, command: CreateRouteDraftRequest, key: str, principal: ProductPrincipal
+    ) -> GatewayRoute:
+        """Create a DRAFT whose organization and workspace come from credentials."""
+
+        if principal.organization_id is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONTROL_PERMISSION_DENIED",
+                title="Workspace scope required",
+                detail="Use a control credential configured with organization and workspace scope.",
+                status=403,
+            )
+        now = utc_now()
+        route = GatewayRoute(
+            id=uuid4(),
+            endpoint_id=command.endpoint_id,
+            state=RouteState.DRAFT,
+            model_pattern=command.model_pattern,
+            target_binding_id=command.target_binding_id,
+            target_model=command.target_model,
+            priority=command.priority,
+            created_at=now,
+            updated_at=now,
+            resource_version=1,
+            source=command.source,
+            created_by=principal.actor_id,
+            workspace_id=principal.workspace_id,
+            organization_id=principal.organization_id,
+        )
+        scope_digest = hashlib.sha256(
+            (principal.organization_id + "\0" + principal.workspace_id).encode("utf-8")
+        ).hexdigest()
+        request_digest = hashlib.sha256(
+            (
+                request_hash(command)
+                + "\0"
+                + principal.organization_id
+                + "\0"
+                + principal.workspace_id
+                + "\0"
+                + principal.actor_id
+            ).encode("utf-8")
+        ).hexdigest()
+        return self.store.create_route_draft(
+            route,
+            key,
+            request_digest,
+            idempotency_scope=f"create-route-draft:v1:{scope_digest}",
+        )
 
     def edit_route_draft(
         self, route_id: UUID, command: EditRouteDraftRequest, principal: ProductPrincipal
@@ -240,7 +310,14 @@ class ExchangeProductService:
         return self.store.replace_route_version(active, version)
 
     def _owned_draft(self, route_id: UUID, principal: ProductPrincipal) -> GatewayRoute:
-        route = self.get_route(route_id)
+        route = self.store.get_legacy_route(route_id)
+        if route is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_NOT_FOUND",
+                title="GatewayRoute not found",
+                detail="No legacy GatewayRoute exists with the requested id.",
+                status=404,
+            )
         if route.workspace_id != principal.workspace_id or route.created_by != principal.actor_id:
             raise ExchangeProductError(
                 code="EXCHANGE_ROUTE_PERMISSION_DENIED",
@@ -256,6 +333,11 @@ class ExchangeProductService:
                 status=409,
             )
         return route
+
+    def get_owned_draft(self, route_id: UUID, principal: ProductPrincipal) -> GatewayRoute:
+        """Return a draft only after checking its server-assigned owner scope."""
+
+        return self._owned_draft(route_id, principal)
 
     # ── API keys ────────────────────────────────────────────────────────
     # 中文:API 密钥。
@@ -298,6 +380,7 @@ class ExchangeProductService:
             credential_ref=f"api-key://{identifier}",
             actor_id=principal.actor_id,
             workspace_id=principal.workspace_id,
+            organization_id=principal.organization_id,
             state=ApiKeyState.ACTIVE,
             model_scope=scope,
             created_at=now,
@@ -306,16 +389,23 @@ class ExchangeProductService:
             resource_version=1,
         )
         secret = "cyk_" + secrets.token_urlsafe(32)
-        digest = hashlib.sha256(
-            (
-                request_hash(command) + "\0" + principal.workspace_id + "\0" + principal.actor_id
-            ).encode()
-        ).hexdigest()
+        digest_source = (
+            request_hash(command) + "\0" + principal.workspace_id + "\0" + principal.actor_id
+        )
+        idempotency_scope = "create-api-key"
+        if principal.organization_id is not None:
+            digest_source += "\0" + principal.organization_id
+            scope_digest = hashlib.sha256(
+                (principal.organization_id + "\0" + principal.workspace_id).encode("utf-8")
+            ).hexdigest()
+            idempotency_scope = f"create-api-key:v1:{scope_digest}"
+        digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
         stored, created = self.store.create_api_key(
             api_key,
             hashlib.sha256(secret.encode("utf-8")).hexdigest(),
             idempotency_key,
             digest,
+            idempotency_scope=idempotency_scope,
         )
         response = CreatedApiKey(**stored.model_dump(), secret=secret if created else None)
         return response, created
@@ -327,9 +417,7 @@ class ExchangeProductService:
         """
         # 中文:列出此工作区的密钥,不返回任何秘密材料。
 
-        return [
-            key for key in self.store.list_api_keys() if key.workspace_id == principal.workspace_id
-        ]
+        return [key for key in self.store.list_api_keys() if self._key_in_scope(key, principal)]
 
     def get_api_key(self, api_key_id: UUID, principal: ProductPrincipal) -> ApiKey:
         """Read one key owned by the caller's workspace.
@@ -356,7 +444,7 @@ class ExchangeProductService:
 
     def _owned_api_key(self, api_key_id: UUID, principal: ProductPrincipal) -> ApiKey:
         api_key = self.store.get_api_key(api_key_id)
-        if api_key is None or api_key.workspace_id != principal.workspace_id:
+        if api_key is None or not self._key_in_scope(api_key, principal):
             raise ExchangeProductError(
                 code="EXCHANGE_API_KEY_NOT_FOUND",
                 title="API key not found",
@@ -364,3 +452,9 @@ class ExchangeProductService:
                 status=404,
             )
         return api_key
+
+    @staticmethod
+    def _key_in_scope(api_key: ApiKey, principal: ProductPrincipal) -> bool:
+        if api_key.workspace_id != principal.workspace_id:
+            return False
+        return api_key.organization_id == principal.organization_id

@@ -96,6 +96,9 @@ class GatewayRoute(ContractModel):
     source: RouteSource | None = Field(default=None, exclude_if=lambda value: value is None)
     created_by: str | None = Field(default=None, exclude_if=lambda value: value is None)
     workspace_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    # This server-assigned scope is persisted separately from the public document.
+    # 中文:此服务端分配的组织范围单独持久化,不进入公开文档。
+    organization_id: str | None = Field(default=None, exclude=True)
 
 
 class CreateEndpointRequest(ContractModel):
@@ -169,6 +172,7 @@ class ApiKey(ContractModel):
     expires_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
     revoked_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
     resource_version: int = Field(ge=1)
+    organization_id: str | None = Field(default=None, exclude=True)
 
 
 class CreatedApiKey(ApiKey):
@@ -203,12 +207,37 @@ class ProductPrincipal:
     actor_id: str
     workspace_id: str
     credential_ref: str
+    organization_id: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("actor_id", "workspace_id", "credential_ref"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"principal {field_name} must be non-empty text")
+        if self.organization_id is not None and (
+            not isinstance(self.organization_id, str) or not self.organization_id.strip()
+        ):
+            raise ValueError("principal organization_id must be non-empty text when configured")
+
+
+@dataclass(frozen=True)
+class WorkspaceEndpointGrant:
+    """Operator-owned permission to reference one endpoint from one Product scope.
+
+    中文:由 operator 配置的 endpoint 使用许可，固定绑定一个组织和 workspace。
+    """
+
+    endpoint_id: UUID
+    organization_id: str
+    workspace_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.endpoint_id, UUID):
+            raise TypeError("workspace endpoint grant endpoint_id must be a UUID")
+        for field_name in ("organization_id", "workspace_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"workspace endpoint grant {field_name} must be non-empty text")
 
 
 class TenantQuota(ContractModel):

@@ -2,7 +2,7 @@
 # ==============================================================================
 # Script: deploy_to_azure_containerapp.sh
 # Purpose: Build Cyrene Exchange (with Platform & Plugins), push to GHCR,
-#          deploy to Azure Container Apps, and verify dynamic zero-downtime update.
+#          deploy to Azure Container Apps with private ingress and optional probes.
 # ==============================================================================
 set -euo pipefail
 
@@ -108,7 +108,7 @@ else
     --environment "$ENV_NAME" \
     --image "${IMAGE_REPO}:${IMAGE_TAG}" \
     --target-port "$PORT" \
-    --ingress external \
+    --ingress internal \
     --registry-server "$REGISTRY_SERVER" \
     --registry-username "$GITHUB_USER" \
     --registry-password "$GHCR_TOKEN" \
@@ -119,9 +119,21 @@ else
     --output none
 fi
 
+# The image update command preserves existing ingress settings. Force internal
+# ingress for both newly created and pre-existing apps before reporting the URL.
+az containerapp ingress enable \
+  --name "$APP_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --target-port "$PORT" \
+  --transport auto \
+  --type internal \
+  --output none
+
 # 5. Retrieve FQDN and Verify
 FQDN="$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query 'properties.configuration.ingress.fqdn' -o tsv)"
 APP_URL="https://${FQDN}"
+VERIFY_URL="${AZURE_CONTAINERAPP_VERIFY_URL:-$APP_URL}"
+VERIFY_URL="${VERIFY_URL%/}"
 echo "🎉 Deployment successful!"
 echo "🌐 App FQDN: ${APP_URL}"
 
@@ -133,17 +145,24 @@ if [ -n "$APP_IP" ]; then
 fi
 
 echo "🩺 Testing liveness probe (/healthz)..."
+RUNTIME_VERIFY_AVAILABLE=false
 for i in {1..30}; do
-  if curl -s -f "${APP_URL}/healthz" >/dev/null 2>&1; then
-    echo "✅ Health check passed: $(curl -s "${APP_URL}/healthz")"
+  if curl -s -f "${VERIFY_URL}/healthz" >/dev/null 2>&1; then
+    RUNTIME_VERIFY_AVAILABLE=true
+    echo "✅ Health check passed: $(curl -s "${VERIFY_URL}/healthz")"
     break
   fi
   echo "⏳ Waiting for application warm-up ($i/30)..."
   sleep 3
 done
 
-echo "📋 Testing OpenAI models endpoint (/v1/models)..."
-curl -s "${APP_URL}/v1/models" | jq . || true
+if [ "$RUNTIME_VERIFY_AVAILABLE" = true ]; then
+  echo "📋 Testing OpenAI models endpoint (/v1/models)..."
+  curl -s "${VERIFY_URL}/v1/models" | jq . || true
+else
+  echo "⚠️ Private ingress is not reachable from this runner; runtime probes were skipped."
+  echo "   Set AZURE_CONTAINERAPP_VERIFY_URL to an address reachable from the runner."
+fi
 
 echo "=================================================================="
 echo "🔄 Demonstrating Dynamic Revision Update (Zero-Downtime Test)"
@@ -167,6 +186,11 @@ NEW_REV="$(az containerapp revision list --name "$APP_NAME" --resource-group "$R
 echo "✨ New Active Revision Deployed: ${NEW_REV}"
 
 echo "🩺 Verifying new revision health..."
-curl -s -f "${APP_URL}/healthz"
-echo ""
-echo "🏆 End-to-end verification complete! Zero-downtime dynamic update verified."
+if [ "$RUNTIME_VERIFY_AVAILABLE" = true ]; then
+  curl -s -f "${VERIFY_URL}/healthz"
+  echo ""
+  echo "🏆 Deployment and runtime health checks completed."
+else
+  echo "⚠️ Runtime verification skipped because private ingress is not reachable from this runner."
+  echo "🏆 Deployment image and revision updates completed; runtime health was not verified."
+fi

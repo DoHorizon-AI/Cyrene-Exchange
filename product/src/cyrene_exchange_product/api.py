@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 import sys
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -35,6 +35,7 @@ from cyrene_exchange_product.domain import (
     GatewayRoute,
     ProblemDetails,
     ProductPrincipal,
+    WorkspaceEndpointGrant,
 )
 from cyrene_exchange_product.errors import ExchangeProductError, map_exchange_error
 from cyrene_exchange_product.logging import (
@@ -59,6 +60,7 @@ def create_app(
     *,
     database_path: Path,
     control_credentials: Mapping[str, ProductPrincipal] | None = None,
+    workspace_endpoint_grants: Iterable[WorkspaceEndpointGrant] = (),
     allowed_binding_ids: frozenset[str] = frozenset(),
     validate_route_target: Callable[[GatewayRoute], None] | None = None,
     store: ExchangeStore | None = None,
@@ -72,17 +74,16 @@ def create_app(
 
     store = store or ExchangeStore(database_path)
     service = ExchangeProductService(store)
-    if len({p.workspace_id for p in (control_credentials or {}).values()}) > 1:
-        raise ValueError("the first route-control profile requires one configured workspace")
     if control_credentials is not None:
         store.configure_credentials(control_credentials)
+    store.configure_workspace_endpoint_grants(workspace_endpoint_grants)
     control_refs = {p.credential_ref for p in (control_credentials or {}).values()}
 
     def principal(request: Request) -> ProductPrincipal:
         if control_credentials is None:
             return ProductPrincipal("actor-default", "workspace-default", "cred://exchange/default")
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
-        identity = store.resolve_credential(token) if scheme == "Bearer" else None
+        identity = store.resolve_product_credential(token) if scheme == "Bearer" else None
         if identity is None or identity.credential_ref not in control_refs:
             raise ExchangeProductError(
                 code="EXCHANGE_CONTROL_PERMISSION_DENIED",
@@ -90,7 +91,40 @@ def create_app(
                 detail="Use an explicitly configured Exchange control credential.",
                 status=403,
             )
-        return ProductPrincipal(identity.actor_id, identity.workspace_id, identity.credential_ref)
+        return identity
+
+    def scoped_principal(request: Request) -> ProductPrincipal:
+        """Require a configured Bearer with organization and workspace scope."""
+
+        if control_credentials is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONTROL_PERMISSION_DENIED",
+                title="Workspace control credential required",
+                detail="Configure a server-side organization/workspace control credential.",
+                status=403,
+            )
+        identity = principal(request)
+        if identity.organization_id is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONTROL_PERMISSION_DENIED",
+                title="Workspace scope required",
+                detail="The control credential has no configured organization scope.",
+                status=403,
+            )
+        return identity
+
+    def legacy_operator_principal(request: Request) -> ProductPrincipal:
+        """Keep legacy global writes on organization-unscoped credentials."""
+
+        identity = principal(request)
+        if identity.organization_id is not None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONTROL_PERMISSION_DENIED",
+                title="Legacy control operation unavailable",
+                detail="Use the scoped Workspace API for organization-bound credentials.",
+                status=403,
+            )
+        return identity
 
     def protect_configured_control(request: Request) -> None:
         # The control API is the only surface this guard owns. Data-plane
@@ -216,8 +250,10 @@ def create_app(
     )
     def create_endpoint(
         command: CreateEndpointRequest,
+        request: Request,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
     ) -> GatewayEndpoint:
+        legacy_operator_principal(request)
         return service.create_endpoint(command, idempotency_key)
 
     @app.get("/api/v1/gateway-endpoints/{endpointId}", response_model=GatewayEndpoint)
@@ -236,23 +272,35 @@ def create_app(
     )
     def disable_endpoint(
         endpoint_id: Annotated[UUID, ApiPath(alias="endpointId")],
+        request: Request,
     ) -> GatewayEndpoint:
+        legacy_operator_principal(request)
         return service.disable_endpoint(endpoint_id)
 
     @app.post("/api/v1/gateway-routes", response_model=GatewayRoute, status_code=201)
     def create_route(
         command: CreateRouteRequest,
+        request: Request,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
     ) -> GatewayRoute:
+        legacy_operator_principal(request)
         return service.create_route(command, idempotency_key)
 
     @app.get("/api/v1/gateway-routes/{routeId}", response_model=GatewayRoute)
     def get_route(route_id: Annotated[UUID, ApiPath(alias="routeId")]) -> GatewayRoute:
-        return service.get_route(route_id)
+        return service.get_legacy_route(route_id)
 
     @app.get("/api/v1/gateway-routes", response_model=list[GatewayRoute])
     def list_routes() -> list[GatewayRoute]:
         return service.list_routes()
+
+    @app.get("/api/v1/workspace/gateway-routes", response_model=list[GatewayRoute])
+    def list_workspace_routes(request: Request) -> list[GatewayRoute]:
+        identity = scoped_principal(request)
+        organization_id = identity.organization_id
+        if organization_id is None:
+            raise AssertionError("scoped_principal must return an organization-scoped identity")
+        return service.list_workspace_routes(organization_id, identity.workspace_id)
 
     def admit_binding(binding_id: str) -> None:
         if binding_id not in allowed_binding_ids:
@@ -269,9 +317,23 @@ def create_app(
         request: Request,
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ) -> GatewayRoute:
-        actor = principal(request)
+        actor = legacy_operator_principal(request)
         admit_binding(command.target_binding_id)
         return service.create_route_draft(command, idempotency_key, actor)
+
+    @app.post(
+        "/api/v1/workspace/gateway-route-drafts",
+        response_model=GatewayRoute,
+        status_code=201,
+    )
+    def create_workspace_draft(
+        command: CreateRouteDraftRequest,
+        request: Request,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> GatewayRoute:
+        identity = scoped_principal(request)
+        admit_binding(command.target_binding_id)
+        return service.create_scoped_route_draft(command, idempotency_key, identity)
 
     @app.patch("/api/v1/gateway-route-drafts/{routeId}", response_model=GatewayRoute)
     def edit_draft(
@@ -279,7 +341,8 @@ def create_app(
         command: EditRouteDraftRequest,
         request: Request,
     ) -> GatewayRoute:
-        actor = principal(request)
+        actor = legacy_operator_principal(request)
+        service.get_owned_draft(route_id, actor)
         admit_binding(command.target_binding_id)
         return service.edit_route_draft(route_id, command, actor)
 
@@ -289,8 +352,8 @@ def create_app(
         command: ConfirmRouteRequest,
         request: Request,
     ) -> GatewayRoute:
-        actor = principal(request)
-        route = service.get_route(route_id)
+        actor = legacy_operator_principal(request)
+        route = service.get_owned_draft(route_id, actor)
         admit_binding(route.target_binding_id)
         if validate_route_target is None:
             raise ExchangeProductError(

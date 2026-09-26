@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +37,7 @@ from cyrene_exchange_product.domain import (
     RouteState,
     TenantQuota,
     UsageState,
+    WorkspaceEndpointGrant,
 )
 from cyrene_exchange_product.errors import ExchangeProductError
 
@@ -65,10 +66,18 @@ class ExchangeStore:
                     priority INTEGER NOT NULL,
                     state TEXT NOT NULL,
                     document TEXT NOT NULL,
+                    organization_id TEXT,
+                    workspace_id TEXT,
                     FOREIGN KEY(endpoint_id) REFERENCES gateway_endpoints(id)
                 );
                 CREATE INDEX IF NOT EXISTS ix_gateway_routes_endpoint
                     ON gateway_routes(endpoint_id, priority, id);
+                CREATE TABLE IF NOT EXISTS workspace_endpoint_grants (
+                    endpoint_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    PRIMARY KEY(endpoint_id, organization_id, workspace_id)
+                );
                 CREATE TABLE IF NOT EXISTS idempotency (
                     scope TEXT NOT NULL,
                     key TEXT NOT NULL,
@@ -81,6 +90,7 @@ class ExchangeStore:
                     token_digest TEXT NOT NULL UNIQUE,
                     actor_id TEXT NOT NULL,
                     workspace_id TEXT NOT NULL,
+                    organization_id TEXT,
                     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
                     created_at INTEGER NOT NULL
                 );
@@ -115,7 +125,49 @@ class ExchangeStore:
                     ON request_audits(workspace_id, started_at DESC, request_id);
                 """
             )
+            self._migrate_gateway_route_scope()
             self._migrate_api_credentials()
+
+    def _migrate_gateway_route_scope(self) -> None:
+        """Add server-owned route scope without assigning old rows to an org.
+
+        Existing workspace ids were assigned by the former Product API and are
+        copied as-is. Organization remains NULL because historical rows do not
+        have trustworthy organization attribution.
+
+        中文:为路由增加服务端管理的范围；旧记录保留原 workspace，组织范围留空，
+        不根据旧数据推断组织归属。
+        """
+
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(gateway_routes)")
+        }
+        if "organization_id" not in columns:
+            self._connection.execute("ALTER TABLE gateway_routes ADD COLUMN organization_id TEXT")
+        if "workspace_id" not in columns:
+            self._connection.execute("ALTER TABLE gateway_routes ADD COLUMN workspace_id TEXT")
+        with self._mutation() as cursor:
+            rows = cursor.execute(
+                "SELECT id, document FROM gateway_routes WHERE workspace_id IS NULL"
+            ).fetchall()
+            for row in rows:
+                try:
+                    document = json.loads(str(row["document"]))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(document, dict):
+                    continue
+                workspace_id = document.get("workspaceId", document.get("workspace_id"))
+                if isinstance(workspace_id, str) and workspace_id.strip():
+                    cursor.execute(
+                        "UPDATE gateway_routes SET workspace_id = ? WHERE id = ?",
+                        (workspace_id, str(row["id"])),
+                    )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_gateway_routes_scope "
+            "ON gateway_routes(organization_id, workspace_id, priority, id)"
+        )
 
     def _migrate_api_credentials(self) -> None:
         """Add the API-key metadata columns to the existing credential table.
@@ -132,6 +184,7 @@ class ExchangeStore:
             for row in self._connection.execute("PRAGMA table_info(api_credentials)")
         }
         additions = (
+            ("organization_id", "TEXT"),
             ("api_key_id", "TEXT"),
             ("name", "TEXT"),
             ("expires_at", "INTEGER"),
@@ -181,10 +234,19 @@ class ExchangeStore:
         with self._mutation() as cursor:
             cursor.execute(
                 """
-                INSERT OR REPLACE INTO gateway_routes(id, endpoint_id, priority, state, document)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO gateway_routes(
+                    id, endpoint_id, priority, state, document, organization_id, workspace_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (str(route.id), str(route.endpoint_id), route.priority, route.state, document),
+                (
+                    str(route.id),
+                    str(route.endpoint_id),
+                    route.priority,
+                    route.state,
+                    document,
+                    route.organization_id,
+                    route.workspace_id,
+                ),
             )
 
     def get_route(self, route_id: UUID) -> GatewayRoute | None:
@@ -192,36 +254,112 @@ class ExchangeStore:
 
         with self._lock:
             row = self._connection.execute(
-                "SELECT document FROM gateway_routes WHERE id = ?", (str(route_id),)
+                "SELECT document, organization_id, workspace_id FROM gateway_routes WHERE id = ?",
+                (str(route_id),),
             ).fetchone()
-        return GatewayRoute.model_validate_json(row["document"]) if row else None
+        return _route_from_row(row) if row else None
 
-    def create_route_draft(self, route: GatewayRoute, key: str, digest: str) -> GatewayRoute:
+    def get_legacy_route(self, route_id: UUID) -> GatewayRoute | None:
+        """Read a route only when it has no server-attributed organization."""
+
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT document, organization_id, workspace_id FROM gateway_routes
+                WHERE id = ? AND organization_id IS NULL
+                """,
+                (str(route_id),),
+            ).fetchone()
+        return _route_from_row(row) if row else None
+
+    def create_route_draft(
+        self,
+        route: GatewayRoute,
+        key: str,
+        digest: str,
+        *,
+        idempotency_scope: str = "create-route-draft",
+    ) -> GatewayRoute:
         """Atomically retain the draft and Send to retry identity. | 原子保存草稿与幂等身份。"""
         with self._mutation() as cursor:
-            replay = self.resolve_idempotency("create-route-draft", key, digest)
+            if route.organization_id is not None:
+                grant = cursor.execute(
+                    """
+                    SELECT 1 FROM workspace_endpoint_grants
+                    WHERE endpoint_id = ? AND organization_id = ? AND workspace_id = ?
+                    """,
+                    (str(route.endpoint_id), route.organization_id, route.workspace_id),
+                ).fetchone()
+                if grant is None:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ROUTE_PERMISSION_DENIED",
+                        title="Endpoint not permitted",
+                        detail=(
+                            "No operator grant permits this endpoint in the authenticated "
+                            "workspace."
+                        ),
+                        status=403,
+                    )
+                endpoint = cursor.execute(
+                    "SELECT 1 FROM gateway_endpoints WHERE id = ?", (str(route.endpoint_id),)
+                ).fetchone()
+                if endpoint is None:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ENDPOINT_NOT_FOUND",
+                        title="GatewayEndpoint not found",
+                        detail="No GatewayEndpoint exists with the requested id.",
+                        status=404,
+                    )
+            replay = self.resolve_idempotency(idempotency_scope, key, digest)
             if replay is not None:
                 existing = self.get_route(UUID(replay))
                 if existing is None:
                     raise RuntimeError("draft idempotency points to an absent route")
                 return existing
             cursor.execute(
-                "INSERT INTO gateway_routes(id, endpoint_id, priority, state, document) "
-                "VALUES (?, ?, ?, ?, ?)",
+                """
+                INSERT INTO gateway_routes(
+                    id, endpoint_id, priority, state, document, organization_id, workspace_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     str(route.id),
                     str(route.endpoint_id),
                     route.priority,
                     route.state,
-                    route.model_dump_json(exclude_none=True),
+                    route.model_dump_json(by_alias=True, exclude_none=True),
+                    route.organization_id,
+                    route.workspace_id,
                 ),
             )
             cursor.execute(
                 "INSERT INTO idempotency(scope, key, request_hash, resource_id) "
-                "VALUES ('create-route-draft', ?, ?, ?)",
-                (key, digest, str(route.id)),
+                "VALUES (?, ?, ?, ?)",
+                (idempotency_scope, key, digest, str(route.id)),
             )
         return route
+
+    def configure_workspace_endpoint_grants(
+        self, grants: Iterable[WorkspaceEndpointGrant]
+    ) -> None:
+        """Replace grants from operator configuration, never from request bodies."""
+
+        prepared: set[tuple[str, str, str]] = set()
+        for grant in grants:
+            if not isinstance(grant, WorkspaceEndpointGrant):
+                raise TypeError("workspace endpoint grants must be WorkspaceEndpointGrant values")
+            prepared.add(
+                (str(grant.endpoint_id), grant.organization_id, grant.workspace_id)
+            )
+        with self._mutation() as cursor:
+            cursor.execute("DELETE FROM workspace_endpoint_grants")
+            cursor.executemany(
+                """
+                INSERT INTO workspace_endpoint_grants(endpoint_id, organization_id, workspace_id)
+                VALUES (?, ?, ?)
+                """,
+                sorted(prepared),
+            )
 
     def replace_route_version(self, route: GatewayRoute, expected: int) -> GatewayRoute:
         """Commit a mutation only if the inspected draft still matches. | 版本一致时更新。"""
@@ -235,11 +373,15 @@ class ExchangeStore:
                     status=409,
                 )
             cursor.execute(
-                "UPDATE gateway_routes SET priority=?, state=?, document=? WHERE id=?",
+                """UPDATE gateway_routes
+                SET priority=?, state=?, document=?, organization_id=?, workspace_id=?
+                WHERE id=?""",
                 (
                     route.priority,
                     route.state,
-                    route.model_dump_json(exclude_none=True),
+                    route.model_dump_json(by_alias=True, exclude_none=True),
+                    route.organization_id,
+                    route.workspace_id,
                     str(route.id),
                 ),
             )
@@ -251,13 +393,13 @@ class ExchangeStore:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT document FROM gateway_routes
-                WHERE endpoint_id = ? AND state = ?
+                SELECT document, organization_id, workspace_id FROM gateway_routes
+                WHERE endpoint_id = ? AND state = ? AND organization_id IS NULL
                 ORDER BY priority ASC, id ASC
                 """,
                 (str(endpoint_id), RouteState.ACTIVE.value),
             ).fetchall()
-        return [GatewayRoute.model_validate_json(row["document"]) for row in rows]
+        return [_route_from_row(row) for row in rows]
 
     def list_endpoints(self) -> list[GatewayEndpoint]:
         """Return every persisted gateway endpoint. | 返回全部网关端点。"""
@@ -269,27 +411,45 @@ class ExchangeStore:
         return [GatewayEndpoint.model_validate_json(row["document"]) for row in rows]
 
     def list_active_routes(self) -> list[GatewayRoute]:
-        """Return every active route across endpoints. | 返回全部活动路由。"""
+        """Return active legacy routes used by the unscoped data-plane planner."""
 
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT document FROM gateway_routes
-                WHERE state = ?
+                SELECT document, organization_id, workspace_id FROM gateway_routes
+                WHERE state = ? AND organization_id IS NULL
                 ORDER BY priority ASC, id ASC
                 """,
                 (RouteState.ACTIVE.value,),
             ).fetchall()
-        return [GatewayRoute.model_validate_json(row["document"]) for row in rows]
+        return [_route_from_row(row) for row in rows]
 
-    def list_all_routes(self) -> list[GatewayRoute]:
-        """Return every persisted route, including drafts. | 返回全部路由。"""
+    def list_legacy_routes(self) -> list[GatewayRoute]:
+        """Return rows without trustworthy organization attribution."""
 
         with self._lock:
             rows = self._connection.execute(
-                "SELECT document FROM gateway_routes ORDER BY priority ASC, id ASC"
+                """
+                SELECT document, organization_id, workspace_id FROM gateway_routes
+                WHERE organization_id IS NULL
+                ORDER BY priority ASC, id ASC
+                """
             ).fetchall()
-        return [GatewayRoute.model_validate_json(row["document"]) for row in rows]
+        return [_route_from_row(row) for row in rows]
+
+    def list_workspace_routes(self, organization_id: str, workspace_id: str) -> list[GatewayRoute]:
+        """List only rows assigned to one trusted organization and workspace."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT document, organization_id, workspace_id FROM gateway_routes
+                WHERE organization_id = ? AND workspace_id = ?
+                ORDER BY priority ASC, id ASC
+                """,
+                (organization_id, workspace_id),
+            ).fetchall()
+        return [_route_from_row(row) for row in rows]
 
     def resolve_idempotency(self, scope: str, key: str | None, digest: str) -> str | None:
         """Resolve replay or reject conflicting key reuse. | 解析幂等重放。"""
@@ -376,12 +536,14 @@ class ExchangeStore:
                 cursor.execute(
                     """
                     INSERT INTO api_credentials(
-                        credential_ref, token_digest, actor_id, workspace_id, enabled, created_at
-                    ) VALUES (?, ?, ?, ?, 1, ?)
+                        credential_ref, token_digest, actor_id, workspace_id,
+                        organization_id, enabled, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?)
                     ON CONFLICT(credential_ref) DO UPDATE SET
                         token_digest = excluded.token_digest,
                         actor_id = excluded.actor_id,
                         workspace_id = excluded.workspace_id,
+                        organization_id = excluded.organization_id,
                         enabled = 1
                     """,
                     (
@@ -389,6 +551,7 @@ class ExchangeStore:
                         digest,
                         principal.actor_id,
                         principal.workspace_id,
+                        principal.organization_id,
                         _unix_ms(),
                     ),
                 )
@@ -411,6 +574,8 @@ class ExchangeStore:
         secret_digest: str,
         key: str | None,
         request_digest: str,
+        *,
+        idempotency_scope: str = "create-api-key",
     ) -> tuple[ApiKey, bool]:
         """Persist one server-generated key and its replay identity atomically.
 
@@ -424,7 +589,7 @@ class ExchangeStore:
         """
 
         with self._mutation() as cursor:
-            replay = self.resolve_idempotency("create-api-key", key, request_digest)
+            replay = self.resolve_idempotency(idempotency_scope, key, request_digest)
             if replay is not None:
                 existing = self.get_api_key(UUID(replay))
                 if existing is None:
@@ -433,15 +598,16 @@ class ExchangeStore:
             cursor.execute(
                 """
                 INSERT INTO api_credentials(
-                    credential_ref, token_digest, actor_id, workspace_id, enabled, created_at,
-                    api_key_id, name, expires_at, model_scope, resource_version
-                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                    credential_ref, token_digest, actor_id, workspace_id, organization_id,
+                    enabled, created_at, api_key_id, name, expires_at, model_scope, resource_version
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     api_key.credential_ref,
                     secret_digest,
                     api_key.actor_id,
                     api_key.workspace_id,
+                    api_key.organization_id,
                     _unix_ms(),
                     str(api_key.id),
                     api_key.name,
@@ -453,8 +619,8 @@ class ExchangeStore:
             if key is not None:
                 cursor.execute(
                     "INSERT INTO idempotency(scope, key, request_hash, resource_id) "
-                    "VALUES ('create-api-key', ?, ?, ?)",
-                    (key, request_digest, str(api_key.id)),
+                    "VALUES (?, ?, ?, ?)",
+                    (idempotency_scope, key, request_digest, str(api_key.id)),
                 )
         return api_key, True
 
@@ -526,6 +692,76 @@ class ExchangeStore:
             workspace_id=str(row["workspace_id"]),
             credential_ref=str(row["credential_ref"]),
             model_scope=frozenset(str(item) for item in scope),
+        )
+
+    def resolve_data_plane_credential(
+        self, token: str, configured_gateway_digests: frozenset[str]
+    ) -> RequestPrincipal | None:
+        """Resolve API keys or explicitly configured Gateway credentials only.
+
+        Control credentials share the credential table for durable identity
+        resolution, but an organization-scoped Workspace control token must
+        never become a chat credential by virtue of being present there.
+
+        中文:只解析 API key 或显式配置的数据平面凭据。控制凭据共用持久化身份表，
+        但组织范围 Workspace 控制令牌不能因此成为聊天凭据。
+        """
+
+        if not isinstance(token, str) or not token:
+            return None
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT actor_id, workspace_id, credential_ref, model_scope, api_key_id
+                FROM api_credentials
+                WHERE token_digest = ? AND enabled = 1
+                  AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (digest, _unix_ms()),
+            ).fetchone()
+        if row is None or (row["api_key_id"] is None and digest not in configured_gateway_digests):
+            return None
+        scope = json.loads(str(row["model_scope"])) if row["model_scope"] else []
+        return RequestPrincipal(
+            actor_id=str(row["actor_id"]),
+            workspace_id=str(row["workspace_id"]),
+            credential_ref=str(row["credential_ref"]),
+            model_scope=frozenset(str(item) for item in scope),
+        )
+
+    def resolve_product_credential(self, token: str) -> ProductPrincipal | None:
+        """Resolve a control bearer to its server-configured Product scope.
+
+        This method returns organization scope only from the credential row;
+        no request field participates in the mapping.
+
+        中文:仅从凭据记录解析控制 Bearer 的组织与 workspace 范围；请求字段不参与映射。
+        """
+
+        if not isinstance(token, str) or not token:
+            return None
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT actor_id, workspace_id, organization_id, credential_ref
+                FROM api_credentials
+                WHERE token_digest = ? AND enabled = 1
+                  AND (expires_at IS NULL OR expires_at > ?)
+                  AND api_key_id IS NULL
+                """,
+                (digest, _unix_ms()),
+            ).fetchone()
+        if row is None:
+            return None
+        return ProductPrincipal(
+            actor_id=str(row["actor_id"]),
+            workspace_id=str(row["workspace_id"]),
+            credential_ref=str(row["credential_ref"]),
+            organization_id=(
+                str(row["organization_id"]) if row["organization_id"] is not None else None
+            ),
         )
 
     def save_tenant_quota(self, quota: TenantQuota) -> None:
@@ -761,6 +997,18 @@ def _from_unix_ms(value: int | None) -> datetime | None:
     return None if value is None else datetime.fromtimestamp(value / 1000, tz=UTC)
 
 
+def _route_from_row(row: sqlite3.Row) -> GatewayRoute:
+    """Load a route with trusted scope columns as the authority."""
+
+    route = GatewayRoute.model_validate_json(str(row["document"]))
+    return route.model_copy(
+        update={
+            "organization_id": row["organization_id"],
+            "workspace_id": row["workspace_id"],
+        }
+    )
+
+
 def _api_key_from_row(row: sqlite3.Row) -> ApiKey:
     """Project one api_credentials row onto the public ApiKey metadata.
 
@@ -773,6 +1021,9 @@ def _api_key_from_row(row: sqlite3.Row) -> ApiKey:
         credential_ref=str(row["credential_ref"]),
         actor_id=str(row["actor_id"]),
         workspace_id=str(row["workspace_id"]),
+        organization_id=(
+            str(row["organization_id"]) if row["organization_id"] is not None else None
+        ),
         state=ApiKeyState.REVOKED if row["revoked_at"] else ApiKeyState.ACTIVE,
         model_scope=[str(item) for item in scope],
         created_at=_from_unix_ms(int(row["created_at"])) or datetime.now(UTC),
