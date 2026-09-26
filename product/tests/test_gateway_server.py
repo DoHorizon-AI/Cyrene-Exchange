@@ -483,6 +483,7 @@ def test_route_source_origin_outside_the_allow_list_is_refused(tmp_path: Path) -
 def test_navigator_web_endpoints_and_proxy_rewrite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("CYRENE_PUBLIC_BASE_URL", "https://cyrene.example.test")
     mock_dist = tmp_path / "mock_dist"
     mock_dist.mkdir()
     (mock_dist / "index.html").write_text(
@@ -515,7 +516,7 @@ def test_navigator_web_endpoints_and_proxy_rewrite(
         assert data["status"] == "UP"
         assert data["authenticated"] is True
         assert data["proxyPrefixes"] == ["/api/v1/exchange"]
-        assert "gatewayBaseUrl" in data
+        assert data["gatewayBaseUrl"] == "https://cyrene.example.test"
         assert data["services"] == []
         for product_path in (
             "/api/v1/catalyst/datasets",
@@ -545,6 +546,7 @@ def test_navigator_web_endpoints_and_proxy_rewrite(
         # Active route get & set
         active_route = client.get("/api/v1/navigator/active-route")
         assert active_route.status_code == 200
+        assert active_route.json()["baseUrl"] == "https://cyrene.example.test/v1"
 
         updated_route = client.post(
             "/api/v1/navigator/active-route",

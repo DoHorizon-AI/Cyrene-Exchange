@@ -525,6 +525,19 @@ def build_product_app(
         raise ValueError(
             "EXCHANGE_RESOLVER_INVALID: provide exactly one of resolver or resolver_factory"
         )
+    public_base_url = os.environ.get("CYRENE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if public_base_url:
+        parsed_public_url = urlsplit(public_base_url)
+        if (
+            parsed_public_url.scheme not in {"http", "https"}
+            or not parsed_public_url.hostname
+            or parsed_public_url.username
+            or parsed_public_url.password
+            or parsed_public_url.path
+            or parsed_public_url.query
+            or parsed_public_url.fragment
+        ):
+            raise ValueError("CYRENE_PUBLIC_BASE_URL must be an http(s) origin")
     store = ExchangeStore(database_path)
     effective = resolver_factory(store) if resolver_factory is not None else resolver
     app = create_app(
@@ -651,7 +664,7 @@ def build_product_app(
         )
         revoked_keys = len(keys) - active_keys
         now_utc = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        base_url = str(request.base_url).rstrip("/")
+        base_url = public_base_url or str(request.base_url).rstrip("/")
         gpu_info = _query_gpu()
         disk_info = _query_disk()
         blockers: list[dict[str, Any]] = []
@@ -713,7 +726,7 @@ def build_product_app(
         if active_route_state:
             return active_route_state
         routes = store.list_active_routes()
-        base_url = str(request.base_url).rstrip("/")
+        base_url = public_base_url or str(request.base_url).rstrip("/")
         if routes:
             first_route = routes[0]
             return {
