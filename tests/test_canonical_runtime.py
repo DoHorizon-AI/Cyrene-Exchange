@@ -35,6 +35,7 @@ from cyrene_exchange.gateway import (
     AuthenticationError,
     ExchangeGateway,
     InvalidRequestError,
+    NoOpLifecycleObserver,
     RequestCancelled,
     RequestPrincipal,
 )
@@ -171,10 +172,16 @@ def tool_payload(*, stream: bool = False, include_usage: bool = False) -> dict[s
     return value
 
 
-def make_gateway(router, providers):
+def make_gateway(router, providers, max_route_attempts: int = 3):
+    return create_test_gateway(Resolver(router, providers), max_route_attempts=max_route_attempts)
+
+
+def create_test_gateway(resolver, max_route_attempts: int = 3):
     return ExchangeGateway(
-        Resolver(router, providers),
+        resolver,
         principal_resolver=resolve_test_principal,
+        lifecycle_observer=NoOpLifecycleObserver(),
+        max_route_attempts=max_route_attempts,
     )
 
 
@@ -223,7 +230,7 @@ def test_http_request_uses_platform_resolver_routing_provider_and_normalizes_res
     router = FakeRouter([RouteTarget("provider-a", route_id="primary")])
     provider = FakeProvider([ProviderChunk(delta="hello "), ProviderChunk(delta="world", finish_reason="stop")])
     resolver = Resolver(router, {"provider-a": provider})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver)
     server = create_reference_server(gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -379,7 +386,7 @@ def test_invalid_auth_and_invalid_request_are_product_errors():
 def test_http_maps_invalid_auth_and_invalid_request_without_resolving_capabilities():
     router = FakeRouter([])
     resolver = Resolver(router, {})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver)
 
     auth_status, auth_body = http_json_request(gateway, payload(), headers={})
     request_status, request_body = http_json_request(
@@ -399,7 +406,7 @@ def test_provider_failure_before_first_token_uses_routing_candidates_in_order():
     down = FakeProvider(error=RuntimeError("connection refused"))
     healthy = FakeProvider([ProviderChunk(delta="fallback response", finish_reason="stop")])
     resolver = Resolver(router, {"down": down, "healthy": healthy})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver, max_route_attempts=3)
 
     response = gateway.handle_openai_chat(HEADERS, payload())
 
@@ -417,7 +424,7 @@ def test_provider_cancellation_never_falls_back_to_another_route():
     cancelled = FakeProvider(error=ProviderInvocationCancelled("execution cancelled"))
     healthy = FakeProvider([ProviderChunk(delta="must not run")])
     resolver = Resolver(router, {"cancelled": cancelled, "healthy": healthy})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver)
 
     with pytest.raises(RequestCancelled):
         gateway.handle_openai_chat(HEADERS, payload())
@@ -434,7 +441,7 @@ def test_provider_failure_after_first_stream_token_is_not_double_routed():
     partial = FailingAfterFirstProvider()
     healthy = FakeProvider([ProviderChunk(delta="fallback")])
     resolver = Resolver(router, {"partial": partial, "healthy": healthy})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver, max_route_attempts=3)
 
     response = gateway.handle_openai_chat(HEADERS, payload(stream=True))
     events = iter(response.body)
@@ -451,10 +458,7 @@ def test_provider_cancellation_after_first_stream_token_maps_to_request_cancelle
     router = FakeRouter([RouteTarget("cancelled", route_id="primary"), RouteTarget("healthy")])
     cancelled = CancellingAfterFirstProvider()
     healthy = FakeProvider([ProviderChunk(delta="must not run")])
-    gateway = ExchangeGateway(
-        Resolver(router, {"cancelled": cancelled, "healthy": healthy}),
-        principal_resolver=resolve_test_principal,
-    )
+    gateway = make_gateway(router, {"cancelled": cancelled, "healthy": healthy})
 
     response = gateway.handle_openai_chat(HEADERS, payload(stream=True))
     events = iter(response.body)

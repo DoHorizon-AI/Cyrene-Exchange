@@ -219,6 +219,40 @@ class RequestLifecycleObserver(Protocol):
         """
 
 
+class NoOpLifecycleObserver:
+    """Non-recording observer that satisfies the mandatory observer contract.
+
+    中文:满足强制 observer 契约的非记录型观察器。
+    """
+
+    allow_multiple_attempts = True
+
+    def on_request_started(self, metadata: RequestMetadata) -> None:
+        pass
+
+    def on_request_finished(
+        self,
+        metadata: RequestMetadata,
+        *,
+        status: RequestAuditTerminalStatus,
+        usage: ProviderUsage | None,
+        error_type: str | None,
+    ) -> None:
+        pass
+
+    def on_request_rejected(
+        self,
+        *,
+        request_id: str,
+        principal: RequestPrincipal | None,
+        status: RequestRejectionStatus,
+        error_type: str,
+        model: str | None,
+        stream: bool | None,
+    ) -> None:
+        pass
+
+
 @dataclass(frozen=True)
 class GatewayResponse:
     """Normalized Product response returned to a transport adapter.
@@ -323,11 +357,10 @@ class ExchangeGateway:
             raise ValueError("max_route_attempts must be positive")
         if principal_resolver is None:
             raise ValueError("principal_resolver is required")
-        if lifecycle_observer is not None:
-            if principal_resolver is None:
-                raise ValueError("request auditing requires a trusted principal_resolver")
-            if max_route_attempts != 1:
-                raise ValueError("V1 request auditing requires one provider attempt per request")
+        if lifecycle_observer is None:
+            raise ValueError("lifecycle_observer is required")
+        if max_route_attempts != 1 and not getattr(lifecycle_observer, "allow_multiple_attempts", False):
+            raise ValueError("V1 request auditing requires one provider attempt per request")
         self._resolver = resolver
         self._principal_resolver = principal_resolver
         self._lifecycle_observer = lifecycle_observer
@@ -628,8 +661,6 @@ class ExchangeGateway:
         return value if isinstance(value, bool) else None
 
     def _observe_started(self, metadata: RequestMetadata) -> None:
-        if self._lifecycle_observer is None:
-            return
         try:
             self._lifecycle_observer.on_request_started(metadata)
         except GatewayLifecycleError:
@@ -645,8 +676,6 @@ class ExchangeGateway:
         usage: ProviderUsage | None,
         error_type: str | None,
     ) -> None:
-        if self._lifecycle_observer is None:
-            return
         try:
             self._lifecycle_observer.on_request_finished(
                 metadata,
@@ -669,23 +698,6 @@ class ExchangeGateway:
         model: str | None,
         stream: bool | None,
     ) -> None:
-        if self._lifecycle_observer is None:
-            sys.stderr.write(
-                format_cyrene_log(
-                    level="WARN",
-                    event_name="exchange.gateway.request_rejected",
-                    message=f"Request {request_id} rejected with {error_type}",
-                    attributes={
-                        "request_id": request_id,
-                        "status": status,
-                        "error_type": error_type,
-                        "model": model,
-                        "stream": stream,
-                    },
-                )
-                + "\n"
-            )
-            return
         try:
             self._lifecycle_observer.on_request_rejected(
                 request_id=request_id,

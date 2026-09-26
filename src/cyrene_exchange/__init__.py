@@ -47,6 +47,7 @@ from .gateway import (
     QuotaExceededError,
     QuotaUnavailableError,
     RequestCancelled,
+    NoOpLifecycleObserver,
 )
 from .protocol import NormalizedInferenceRequest
 
@@ -99,6 +100,7 @@ __all__ = [
     "MODEL_PROVIDER_CAPABILITY",
     "MODEL_ROUTING_CAPABILITY",
     "ModelProviderExecutionError",
+    "NoOpLifecycleObserver",
     "NoRouteError",
     "NormalizedInferenceRequest",
     "ProviderChunk",

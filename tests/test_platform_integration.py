@@ -32,7 +32,7 @@ from cyrene_exchange import (
     RequestCancelled,
     local_plugin_client,
 )
-from cyrene_exchange.gateway import RequestPrincipal
+from cyrene_exchange.gateway import NoOpLifecycleObserver, RequestPrincipal
 from cyrene_exchange.http import create_reference_server
 
 
@@ -490,6 +490,7 @@ def make_gateway(platform_binaries, plugin_runtime, targets):
         principal_resolver=lambda token: (
             RequestPrincipal("actor-test", "workspace-test", "credential-test") if token == "exchange-test" else None
         ),
+        lifecycle_observer=NoOpLifecycleObserver(),
     )
     return gateway, resolver
 

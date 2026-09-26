@@ -360,6 +360,12 @@ def test_audit_requires_trusted_identity_and_one_provider_attempt(tmp_path: Path
                 lifecycle_observer=RequestAuditRecorder(store),
                 max_route_attempts=1,
             )
+        with pytest.raises(ValueError, match="lifecycle_observer is required"):
+            ExchangeGateway(
+                Resolver(provider),
+                principal_resolver=store.resolve_credential,
+                max_route_attempts=1,
+            )
         with pytest.raises(ValueError, match="one provider attempt"):
             ExchangeGateway(
                 Resolver(provider),
@@ -398,7 +404,9 @@ def test_product_quota_is_persisted_and_uses_plugin_owned_total(tmp_path: Path) 
     gateway = ExchangeGateway(
         Resolver(provider),
         principal_resolver=reopened.resolve_credential,
+        lifecycle_observer=RequestAuditRecorder(reopened),
         quota_checker=ProductQuotaGuard(reopened, billing),
+        max_route_attempts=1,
     )
     try:
         assert reopened.get_tenant_quota("actor-unit") == quota
@@ -412,7 +420,9 @@ def test_product_quota_is_persisted_and_uses_plugin_owned_total(tmp_path: Path) 
         unavailable_gateway = ExchangeGateway(
             Resolver(provider),
             principal_resolver=reopened.resolve_credential,
+            lifecycle_observer=RequestAuditRecorder(reopened),
             quota_checker=ProductQuotaGuard(reopened, None),
+            max_route_attempts=1,
         )
         with pytest.raises(QuotaUnavailableError):
             unavailable_gateway.handle_openai_chat(

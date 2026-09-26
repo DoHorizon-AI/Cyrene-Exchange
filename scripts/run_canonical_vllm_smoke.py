@@ -25,7 +25,7 @@ from threading import Event, Thread
 from typing import Any
 
 from cyrene_exchange.direct_plugin import local_plugin_client
-from cyrene_exchange.gateway import ExchangeGateway, RequestPrincipal
+from cyrene_exchange.gateway import ExchangeGateway, NoOpLifecycleObserver, RequestPrincipal
 from cyrene_exchange.http import create_reference_server
 from cyrene_exchange.platform_resolver import PlatformResolverAdapter
 
@@ -260,6 +260,7 @@ def main() -> int:
             principal_resolver=lambda token: (
                 RequestPrincipal("local-smoke", "local-smoke", "environment-token") if token == exchange_token else None
             ),
+            lifecycle_observer=NoOpLifecycleObserver(),
         )
         server = create_reference_server(gateway, port=args.listen_port if args.serve else 0)
         thread = Thread(target=server.serve_forever, daemon=True)
