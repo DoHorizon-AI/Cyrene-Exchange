@@ -27,6 +27,8 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Install exact locked dependencies
         run: uv sync --frozen --extra dev
+      - name: Reject unreviewed silent exceptions
+        run: python scripts/check_silent_exceptions.py
       - name: Lint and test the direct Plugin consumer
         run: |
           uv run --no-sync ruff check --no-cache src tests
