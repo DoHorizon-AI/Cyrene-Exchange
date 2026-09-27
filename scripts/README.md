@@ -29,3 +29,17 @@ forwarded as observed; missing usage is never estimated as a successful result.
 这条验证路径使用 reference routing 配置，不会创建持久化 Product Route、
 Reactor Deployment 或权威 Usage/Cost/Audit ledger。Provider usage 按实际观测透传；
 缺失的 usage 不会被估算成成功结果。
+
+`deploy_to_azure_containerapp.sh` creates or updates the Exchange Container App
+with **internal** ingress. Existing apps are explicitly switched to internal
+ingress after image update. An internal FQDN can only be health-checked from a
+network that can reach the Container Apps environment; set
+`AZURE_CONTAINERAPP_VERIFY_URL` to a runner-reachable private URL when needed.
+If the runner cannot reach it, image/revision deployment continues and the
+script reports that runtime health was not verified.
+
+`deploy_to_azure_containerapp.sh` 会将 Exchange Container App 创建或更新为**内部**
+Ingress；即使是已有应用，也会在镜像更新后显式切换为内部 Ingress。内部 FQDN 只能由
+可访问 Container Apps 环境的网络执行健康检查；需要时通过
+`AZURE_CONTAINERAPP_VERIFY_URL` 指定 runner 可访问的私网 URL。若 runner 无法连通，
+镜像和 revision 部署仍会继续，脚本会明确报告 runtime health 未验证。

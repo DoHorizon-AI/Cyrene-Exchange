@@ -72,6 +72,37 @@ provider-reported usage facts to the Plugins-owned `billing.usage.v1` ledger by
 request ID. The billing plugin derives summaries and cost; it does not receive
 prompts, responses, credentials, or route state.
 
+The private Workspace route list and draft-creation responses use
+`workspace-gateway-route.schema.json`. Their `sourceProvenance` contains only
+the Reactor product label, resource version, and content digests; the internal
+Reactor `resourceUri` remains in the stored route for server-side admission and
+resolution and is returned only by the legacy route API.
+
+The private `createWorkspaceGatewayRouteDraft` request uses a closed
+`sourceEndpoint` selector containing only the Reactor product, Endpoint UUID,
+and resource version. It is a command selector, not a navigable resource link.
+Exchange requires separate operator grants for its destination
+`GatewayEndpoint` and the Reactor source Endpoint, each bound to one exact
+organization/workspace pair. Before resolving a source, Exchange checks the
+Reactor grant and then reads the Endpoint and Deployment through one fixed
+operator-configured Reactor origin using a Bearer loaded from the named
+environment variable. Missing grants return 403; missing source resolver
+configuration fails closed with 503. The legacy route-draft request and its
+stored `RouteSource` remain unchanged.
+
+The runtime accepts destination grants as
+`--workspace-endpoint-grant ENDPOINT_UUID=ORG_ID=WORKSPACE_ID` and source grants
+as `--workspace-reactor-endpoint-grant ENDPOINT_UUID=ORG_ID=WORKSPACE_ID`.
+Private source resolution also requires `--workspace-reactor-origin` (one HTTPS
+origin without a path; HTTP is accepted only for loopback development) and
+`--workspace-reactor-token-env ENV_NAME`; the Reactor service secret is read
+from that environment variable and must be distinct from Exchange control and
+Gateway credentials. It must match the Reactor Product's configured
+`credential_file` secret. The Reactor Bearer authenticates only
+Exchange's fixed service-to-service reads. Workspace authority comes from the
+separate Exchange source grant and the caller's configured scoped control
+credential.
+
 数据面标准化器会保留文本工具定义、工具选择、工具结果历史、带索引的流式工具调用
 片段以及 provider 报告的 usage；provider 未提供 token 数量时不会估算。普通文本请求继续
 通过 `model.provider.v1` v1 直连 Plugin；包含结构化 chat 字段的请求协商 v2 与
@@ -80,6 +111,14 @@ prompts, responses, credentials, or route state.
 Product 所有的 SQLite 请求审计仍是请求终态权威。配置 `BillingUsageClient` 后，Exchange
 会按请求 ID 把同一份不含内容的 provider 用量事实发送给 Plugins 所有的
 `billing.usage.v1` 账本。计费插件负责汇总与费用计算，不接收 Prompt、响应、凭据或路由状态。
+
+私有 Workspace 路由列表与草稿创建响应使用 `workspace-gateway-route.schema.json`。其中的
+`sourceProvenance` 只包含 Reactor 产品标签、资源版本和内容 digest；内部 `resourceUri` 仍保留在
+服务端路由数据中供 admission 与解析使用，并且只由 legacy 路由 API 返回。
+
+私有 `createWorkspaceGatewayRouteDraft` 请求使用闭合的 `sourceEndpoint` 选择器，只包含 Reactor 产品标识、Endpoint UUID 与资源版本。它是命令选择器，不是可导航资源链接。Exchange 要求分别配置目标 `GatewayEndpoint` 与 Reactor 源 Endpoint 的 operator grant，并将每项授权绑定到精确组织/Workspace。解析来源前，Exchange 先检查 Reactor grant，再通过一个固定的 operator 配置 Reactor origin 和从指定环境变量读取的 Bearer 获取 Endpoint 与 Deployment。缺少 grant 时返回 403；缺少来源解析配置时按失败即拒绝返回 503。legacy 路由草稿请求和已存储的 `RouteSource` 不变。
+
+运行时使用 `--workspace-endpoint-grant ENDPOINT_UUID=ORG_ID=WORKSPACE_ID` 配置 Exchange 目标授权，使用 `--workspace-reactor-endpoint-grant ENDPOINT_UUID=ORG_ID=WORKSPACE_ID` 配置来源授权。私有来源解析还要求 `--workspace-reactor-origin`（不含路径的单个 HTTPS origin；仅开发 loopback 允许 HTTP）和 `--workspace-reactor-token-env ENV_NAME`；Reactor 服务密钥只从该环境变量读取，必须与 Exchange control 和 Gateway 凭据不同，并与 Reactor Product 配置的 `credential_file` 内容一致。Reactor Bearer 仅用于 Exchange 固定的服务间读取；Workspace 权限来自独立的 Exchange 来源 grant 与调用方已配置的 scoped control credential。
 ---
 <!-- Chinese Translation / 中文翻译 -->
 

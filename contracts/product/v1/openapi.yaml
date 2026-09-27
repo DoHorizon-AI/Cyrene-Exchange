@@ -68,6 +68,7 @@ paths:
   /api/v1/gateway-routes:
     post:
       operationId: createGatewayRoute
+      description: Legacy organization-unscoped write. Organization-bound credentials must use scoped Workspace routes.
       parameters:
       - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -89,9 +90,10 @@ paths:
           $ref: '#/components/responses/Problem'
     get:
       operationId: listGatewayRoutes
+      description: Lists only rows whose organization attribution is unknown.
       responses:
         '200':
-          description: Persisted GatewayRoutes in priority order
+          description: Legacy GatewayRoutes without organization attribution
           content:
             application/json:
               schema:
@@ -110,12 +112,64 @@ paths:
           format: uuid
       responses:
         '200':
-          description: GatewayRoute
+          description: Legacy GatewayRoute without organization attribution
           content:
             application/json:
               schema:
                 $ref: ./gateway-route.schema.json
         '404':
+          $ref: '#/components/responses/Problem'
+  /api/v1/workspace/gateway-routes:
+    get:
+      operationId: listWorkspaceGatewayRoutes
+      security:
+      - WorkspaceControlBearer: []
+      responses:
+        '200':
+          description: Workspace-scoped GatewayRoutes with non-navigable source provenance and no internal Reactor URL
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: ./workspace-gateway-route.schema.json
+        '403':
+          $ref: '#/components/responses/Problem'
+  /api/v1/workspace/gateway-route-drafts:
+    post:
+      operationId: createWorkspaceGatewayRouteDraft
+      security:
+      - WorkspaceControlBearer: []
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkspaceRouteDraftRequest'
+      responses:
+        '201':
+          description: DRAFT created for the authenticated organization and workspace; the command selector is resolved server-side and the response omits the internal Reactor URL
+          content:
+            application/json:
+              schema:
+                $ref: ./workspace-gateway-route.schema.json
+        '403':
+          $ref: '#/components/responses/Problem'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+        '503':
           $ref: '#/components/responses/Problem'
   /api/v1/api-keys:
     post:
@@ -338,6 +392,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
 components:
+  securitySchemes:
+    WorkspaceControlBearer:
+      type: http
+      scheme: bearer
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -513,6 +571,61 @@ components:
       - source
       title: CreateRouteDraftRequest
       description: Explicit Send to creates a draft, never an active route. | 发送到只创建草稿。
+    CreateWorkspaceRouteDraftRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - endpointId
+      - modelPattern
+      - targetBindingId
+      - targetModel
+      - priority
+      - sourceEndpoint
+      properties:
+        endpointId:
+          type: string
+          format: uuid
+        modelPattern:
+          type: string
+          minLength: 1
+          maxLength: 200
+        targetBindingId:
+          type: string
+          minLength: 1
+          maxLength: 300
+        targetModel:
+          type: string
+          minLength: 1
+          maxLength: 200
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 10000
+        sourceEndpoint:
+          type: object
+          additionalProperties: false
+          required:
+          - product
+          - endpointId
+          - resourceVersion
+          properties:
+            product:
+              type: string
+              const: reactor
+            endpointId:
+              type: string
+              format: uuid
+            resourceVersion:
+              type: integer
+              minimum: 1
+          description: >-
+            Command-only opaque selector. It is resolved by Exchange through
+            its operator grant and fixed private Reactor origin; callers cannot
+            supply a URL, path, host, or arbitrary operation.
+      title: CreateWorkspaceRouteDraftRequest
+      description: >-
+        Private Workspace command. The Reactor source selector is not a
+        navigable ProductResourceReference and contains no network location.
     EditRouteDraftRequest:
       properties:
         resourceVersion:

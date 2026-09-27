@@ -23,12 +23,13 @@ and model Artifact digest remain references to Reactor.
 
 ## Receiver operations / 接收方操作
 
-- `POST /api/v1/gateway-route-drafts`, with a mandatory `Idempotency-Key`, creates
-  a draft from `endpointId`, `modelPattern`, `targetBindingId`, `targetModel`,
-  `priority` and `source` (`product=reactor`, `resourceUri`, `resourceVersion`,
-  `artifactDigest`). The configured control credential determines the actor and
-  workspace. The chosen binding must be admitted by the receiving workspace.
-- `GET /api/v1/gateway-routes/{id}` opens the existing resource for inspection.
+- `POST /api/v1/gateway-route-drafts`, with a mandatory `Idempotency-Key`, is the
+  legacy organization-unscoped writer. It creates a draft from `endpointId`,
+  `modelPattern`, `targetBindingId`, `targetModel`, `priority` and `source`
+  (`product=reactor`, `resourceUri`, `resourceVersion`, `artifactDigest`). The
+  configured legacy control credential determines the actor and workspace.
+- `GET /api/v1/gateway-routes/{id}` opens an existing organization-unscoped
+  resource for inspection.
 - `PATCH /api/v1/gateway-route-drafts/{id}` edits model pattern, permitted target,
   target model and priority using the current `resourceVersion`.
 - `POST /api/v1/gateway-route-drafts/{id}/actions/confirm` takes the inspected
@@ -37,9 +38,76 @@ and model Artifact digest remain references to Reactor.
   through Platform selection and the direct Plugins-owned provider endpoint. The store commits
   ACTIVE only if that draft version still matches after validation.
 
+## Private Workspace adapter / 私有 Workspace 适配器
+
+Platform service calls use these fixed Product paths:
+
+- `GET /api/v1/workspace/gateway-routes` lists only routes for the Bearer
+  credential's configured organization and workspace.
+- `POST /api/v1/workspace/gateway-route-drafts` creates a `DRAFT` in that same
+  scope and requires `Idempotency-Key`.
+
+The host maps each Bearer secret to a `ProductPrincipal` containing a
+server-assigned actor, organization, workspace and credential reference. Exchange
+persists only the SHA-256 token digest. Multiple configured tokens may share one
+organization/workspace under distinct credential references during rotation.
+Credentials without an organization and missing credentials cannot call either
+private path. Configure endpoint access separately through
+`WorkspaceEndpointGrant(endpoint_id, organization_id, workspace_id)`; private
+draft creation checks the exact grant and endpoint in the same SQLite write
+transaction. Historical global endpoints receive no workspace grant by
+migration. Request bodies cannot supply the organization, workspace, actor or
+endpoint grant.
+
+The legacy `/api/v1/gateway-routes` list and `/{routeId}` read return only rows
+whose organization is unknown (`organization_id IS NULL`). Existing
+workspace-only rows stay visible through those paths after migration and remain
+unknown to the private adapter. New private rows are not visible or editable via
+the legacy route paths. Organization-bound credentials cannot use legacy global
+write operations; organization-unscoped control credentials retain the old
+writer behavior and create unscoped rows. Draft idempotency keys are partitioned
+by a digest of the trusted organization/workspace pair.
+
+The operator CLI accepts repeatable `--control-credential-env
+CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME` entries for private control Bearers
+and `--gateway-credential-env CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME` entries for
+separate chat/data-plane Bearers. Both read secret values from environment
+variables; arguments contain only variable names. Keep the two maps distinct.
+The old `--control-token(-env)` remains organization-unscoped and dual-use for
+legacy compatibility, but cannot call the private Workspace aliases. Prefer
+the environment form because raw CLI arguments can be visible to local process
+inspection. Endpoint grants use repeatable
+`--workspace-endpoint-grant ENDPOINT_UUID=ORG_ID=WORKSPACE_ID` entries. Multiple
+control credential entries can provide same-scope token rotation under distinct
+credential references.
+
 来源资源不可达、无权读取、版本变化、协议不兼容或 provider 探针失败时，草稿保持
-DRAFT 并返回明确错误。控制 API 不会把普通网关聊天凭据当作发布权限。首版每个控制
-实例只支持一个配置的 workspace；WSL 不提供多租户 GPU 硬隔离。
+DRAFT 并返回明确错误。控制 API 不会把普通网关聊天凭据当作发布权限。只有上文的
+私有 Workspace 别名按组织和 workspace 隔离；其他 legacy control 路径保留现有实例级
+语义。WSL 不提供多租户 GPU 硬隔离。
+
+Platform 私有调用固定使用 `GET /api/v1/workspace/gateway-routes` 与
+`POST /api/v1/workspace/gateway-route-drafts`。Host 将 Bearer 摘要映射到服务端配置的
+actor、组织、workspace 和 credential reference；数据库不保存明文 token。同一
+组织/workspace 可用不同 credential reference 配置多个轮换 token。没有组织范围或
+没有凭据时，私有路径拒绝请求。Operator 还必须通过
+`WorkspaceEndpointGrant(endpoint_id, organization_id, workspace_id)` 明确授权目标
+GatewayEndpoint；私有草稿在同一 SQLite 写事务中检查精确 grant 和 endpoint，历史
+全局 endpoint 不会自动授权。请求体不能声明组织、workspace、actor 或 grant。
+
+旧 `/api/v1/gateway-routes` 列表与 `/{routeId}` 读取只返回组织归属未知
+（`organization_id IS NULL`）的记录，因此迁移后 workspace-only 历史记录仍可读，
+但不会被当作私有 scope。新私有记录不会通过旧路由读取或编辑接口暴露。组织范围凭据
+不能调用旧的全局写入操作；无组织范围的旧控制凭据保留原写入语义并创建 unscoped
+记录。草稿幂等键按可信组织/workspace 派生摘要分区。
+CLI 使用可重复的
+`--control-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME` 配置私有控制
+Bearer，并用 `--gateway-credential-env CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME` 配置独立
+聊天/数据面 Bearer；秘密从环境变量读取，参数中仅出现变量名。两类映射必须分开。
+旧 `--control-token(-env)` 仅保留无组织范围的双用途兼容，不能调用私有 Workspace 别名。
+优先使用环境变量形式，避免明文出现在本机进程参数中。Endpoint grant 通过可重复的
+`--workspace-endpoint-grant ENDPOINT_UUID=ORG_ID=WORKSPACE_ID` 配置。多个控制凭据可用不同
+credential reference 为同一 scope 提供轮换。
 
 ## Existing runner integration / 现有运行入口
 
@@ -82,8 +150,8 @@ Plugins-owned 完整用量总数比较；Exchange 不保存第二套汇总，也
 
 ## 接收方操作接口
 
-- `POST /api/v1/gateway-route-drafts` 必须提供 `Idempotency-Key`，并根据 `endpointId`、`modelPattern`、`targetBindingId`、`targetModel`、`priority` 和 `source` 创建草稿。`source` 包含 `product=reactor`、`resourceUri`、`resourceVersion` 与 `artifactDigest`。配置的控制凭据决定 actor 和 workspace；接收 workspace 必须允许所选 binding。
-- `GET /api/v1/gateway-routes/{id}` 打开现有资源供检查。
+- `POST /api/v1/gateway-route-drafts` 是 organization-unscoped legacy 写入路径，必须提供 `Idempotency-Key`，并根据 `endpointId`、`modelPattern`、`targetBindingId`、`targetModel`、`priority` 和 `source` 创建草稿。`source` 包含 `product=reactor`、`resourceUri`、`resourceVersion` 与 `artifactDigest`。Legacy 控制凭据决定 actor 和 workspace。
+- `GET /api/v1/gateway-routes/{id}` 打开组织归属未知的 legacy 资源供检查。
 - `PATCH /api/v1/gateway-route-drafts/{id}` 使用当前 `resourceVersion` 编辑模型模式、允许的目标、目标模型和优先级。
 - `POST /api/v1/gateway-route-drafts/{id}/actions/confirm` 接收已检查的 `resourceVersion`。确认时会重新检查源读取权限、Endpoint 版本、READY 状态、协议/模型/Artifact 兼容性，并通过 Platform 选择和 Plugins 所有的直连 Provider 端点执行真实推理探测。仅当校验后草稿版本仍匹配时，存储才会提交 ACTIVE 状态。
 

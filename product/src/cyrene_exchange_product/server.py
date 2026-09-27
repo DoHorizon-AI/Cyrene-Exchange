@@ -37,9 +37,19 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from cyrene_exchange_product.api import create_app
-from cyrene_exchange_product.domain import EndpointState, ProductPrincipal
+from cyrene_exchange_product.domain import (
+    EndpointState,
+    ProductPrincipal,
+    RouteSource,
+    WorkspaceEndpointGrant,
+    WorkspaceReactorEndpointGrant,
+    WorkspaceReactorEndpointSelector,
+)
 from cyrene_exchange_product.errors import ExchangeProductError
-from cyrene_exchange_product.routing import build_gateway_from_store
+from cyrene_exchange_product.routing import (
+    build_gateway_from_store,
+    data_plane_principal_resolver,
+)
 from cyrene_exchange_product.store import ExchangeStore
 
 _MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
@@ -500,6 +510,12 @@ def build_product_app(
     resolver: Any = None,
     resolver_factory: Callable[[Any], Any] | None = None,
     control_credentials: Mapping[str, ProductPrincipal] | None = None,
+    gateway_credentials: Mapping[str, ProductPrincipal] | None = None,
+    workspace_endpoint_grants: Iterable[WorkspaceEndpointGrant] = (),
+    workspace_reactor_endpoint_grants: Iterable[WorkspaceReactorEndpointGrant] = (),
+    resolve_workspace_reactor_endpoint: (
+        Callable[[WorkspaceReactorEndpointSelector, str], RouteSource] | None
+    ) = None,
     allowed_binding_ids: frozenset[str] = frozenset(),
     endpoint_id: UUID | None = None,
     validate_route_target: Callable[[Any], None] | None = None,
@@ -525,6 +541,22 @@ def build_product_app(
         raise ValueError(
             "EXCHANGE_RESOLVER_INVALID: provide exactly one of resolver or resolver_factory"
         )
+    control_map = control_credentials or {}
+    configured_gateway_map = gateway_credentials or {}
+    effective_gateway_credentials = {
+        token: principal
+        for token, principal in control_map.items()
+        if principal.organization_id is None
+    }
+    for token, principal in configured_gateway_map.items():
+        control_principal = control_map.get(token)
+        if control_principal is not None and control_principal.organization_id is not None:
+            raise ValueError("a Workspace control credential cannot also be a Gateway credential")
+        existing = effective_gateway_credentials.get(token)
+        if existing is not None and existing != principal:
+            raise ValueError("a Gateway credential has conflicting configured identities")
+        effective_gateway_credentials[token] = principal
+
     public_base_url = os.environ.get("CYRENE_PUBLIC_BASE_URL", "").strip().rstrip("/")
     if public_base_url:
         parsed_public_url = urlsplit(public_base_url)
@@ -543,6 +575,9 @@ def build_product_app(
     app = create_app(
         database_path=database_path,
         control_credentials=control_credentials,
+        workspace_endpoint_grants=workspace_endpoint_grants,
+        workspace_reactor_endpoint_grants=workspace_reactor_endpoint_grants,
+        resolve_workspace_reactor_endpoint=resolve_workspace_reactor_endpoint,
         allowed_binding_ids=allowed_binding_ids,
         validate_route_target=validate_route_target or _route_validator(effective),
         store=store,
@@ -551,9 +586,10 @@ def build_product_app(
         store,
         _select_endpoint(store, endpoint_id),
         effective,
-        credentials=control_credentials or {},
+        credentials=effective_gateway_credentials,
         record_requests=record_requests,
     )
+    data_plane_resolver = data_plane_principal_resolver(store, effective_gateway_credentials)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -587,17 +623,15 @@ def build_product_app(
                 ApiKey 的模型范围会筛选此投影结果。
         """
 
-        principal = None
-        if control_credentials is not None:
-            scheme, _, token = request.headers.get("authorization", "").partition(" ")
-            principal = store.resolve_credential(token) if scheme == "Bearer" else None
-            if principal is None:
-                return _openai_error(401, "authentication_error", "invalid credentials")
+        scheme, _, token = request.headers.get("authorization", "").partition(" ")
+        principal = data_plane_resolver(token) if scheme == "Bearer" else None
+        if principal is None:
+            return _openai_error(401, "authentication_error", "invalid credentials")
         seen: list[str] = []
         for route in store.list_active_routes():
             if route.model_pattern in seen:
                 continue
-            if principal is not None and not principal.permits(route.model_pattern):
+            if not principal.permits(route.model_pattern):
                 continue
             seen.append(route.model_pattern)
         return {

@@ -15,9 +15,11 @@ This document describes only surfaces implemented by the current source.
 | `GET /api/v1/gateway-endpoints/{endpointId}` | Read an endpoint |
 | `POST /api/v1/gateway-endpoints/{endpointId}/actions/disable` | Disable an endpoint |
 | `POST /api/v1/gateway-routes` | Create or replay an active route |
-| `GET /api/v1/gateway-routes` | List persisted routes in priority order |
-| `GET /api/v1/gateway-routes/{routeId}` | Read a route or draft |
+| `GET /api/v1/gateway-routes` | List legacy routes without organization attribution |
+| `GET /api/v1/gateway-routes/{routeId}` | Read one legacy route without organization attribution |
+| `GET /api/v1/workspace/gateway-routes` | List routes for the authenticated organization/workspace |
 | `POST /api/v1/gateway-route-drafts` | Create a DRAFT from an explicit Product handoff |
+| `POST /api/v1/workspace/gateway-route-drafts` | Create a scoped DRAFT with an operator-granted endpoint |
 | `PATCH /api/v1/gateway-route-drafts/{routeId}` | Edit the inspected DRAFT version |
 | `POST /api/v1/gateway-route-drafts/{routeId}/actions/confirm` | Revalidate and activate the exact DRAFT version |
 | `POST /api/v1/api-keys` | Generate a gateway API key; the secret is returned once |
@@ -26,12 +28,24 @@ This document describes only surfaces implemented by the current source.
 | `POST /api/v1/api-keys/{apiKeyId}/actions/revoke` | Revoke a key |
 
 Control credentials are configured by the host and mapped to a trusted actor,
-workspace, and credential reference. Request bodies cannot override identity.
-Draft confirmation fails closed when source or provider validation is absent or
-fails.
+organization, workspace, and credential reference. Request bodies cannot
+override identity. The private Workspace aliases require an organization-scoped
+credential. Endpoint use also requires the operator's exact
+`(endpointId, organizationId, workspaceId)` grant; an old global endpoint is
+not automatically authorized. The legacy list/get paths expose only rows with
+no organization attribution, including migrated workspace-only rows. Scoped
+rows do not appear through those paths. Organization-bound credentials cannot
+use legacy global write operations; those remain available to existing
+organization-unscoped control credentials. Draft confirmation fails closed
+when source or provider validation is absent or fails.
 
-控制凭据由 host 配置并映射为可信 actor、workspace 与 credential reference；请求体
-不能覆盖身份。来源或 Provider 校验缺失、失败时，DRAFT 确认按 fail-closed 处理。
+控制凭据由 host 配置并映射为可信 actor、组织、workspace 与 credential reference；请求体
+不能覆盖身份。私有 Workspace 别名要求组织范围凭据。Endpoint 使用还需要 operator
+配置精确的 `(endpointId, organizationId, workspaceId)` grant；旧全局 Endpoint 不会自动
+授权。旧 list/get 只暴露没有组织归属的记录，包括迁移后的 workspace-only 历史记录；
+私有 scope 记录不会出现在旧路径中。组织范围凭据不能使用旧全局写入操作；旧写入只对
+现有无组织范围控制凭据保留。来源或 Provider 校验缺失、失败时，DRAFT 确认按
+fail-closed 处理。
 
 ## Gateway API keys / 网关密钥
 
@@ -46,14 +60,33 @@ API Key 由服务端生成为 `cyk_…` 密钥；Exchange 只保存 SHA-256 摘�
 密钥包含名称、可选过期时间和可选的 `fnmatch` 模型范围；范围为空表示允许全部
 ACTIVE 路由。
 
-`GET /v1/models` and `POST /v1/chat/completions` both require
-`Authorization: Bearer <key>` when control credentials are configured. A key
-outside its model scope receives a `model_not_permitted` error and the rejected
-request is audited.
+`GET /v1/models` and `POST /v1/chat/completions` require a Gateway data-plane
+credential or a generated API key. Organization-scoped Workspace control
+credentials are accepted only by their fixed private control paths and receive
+401 on both data-plane paths. The legacy organization-unscoped
+`--control-token(-env)` remains dual-use for compatibility and cannot access the
+private Workspace aliases. A key outside its model scope receives a
+`model_not_permitted` error and the rejected request is audited.
 
-配置控制凭据后，`GET /v1/models` 与 `POST /v1/chat/completions` 都要求
-`Authorization: Bearer <key>`。超出模型范围的请求返回 `model_not_permitted`，
-且拒绝会写入审计。
+`GET /v1/models` 与 `POST /v1/chat/completions` 要求独立的 Gateway 数据面凭据
+或服务端生成的 API key。组织范围 Workspace 控制凭据只能调用固定私有控制路径，
+访问两个数据面路径均返回 401。为兼容保留的旧无组织范围
+`--control-token(-env)` 仍可双用途使用，但不能调用私有 Workspace 别名。超出模型
+范围的 key 请求返回 `model_not_permitted`，且拒绝会写入审计。
+
+The serve CLI reads new secrets from environment variables: use repeatable
+`--control-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME` for private
+control access and `--gateway-credential-env CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME`
+for a separate data-plane bearer. Never assign the same secret to both roles.
+Generated API keys remain valid data-plane credentials. Legacy control tokens
+must be organization-unscoped; prefer the environment-variable form to avoid
+placing secret values in process arguments.
+
+Serve CLI 使用环境变量读取新密钥：私有控制访问使用可重复的
+`--control-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME`，独立数据面
+Bearer 使用 `--gateway-credential-env CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME`。同一密钥
+不能配置为两种新角色。服务端生成的 API key 仍可作为数据面凭据。旧控制令牌必须无组织
+范围；为避免明文进入进程参数，优先使用环境变量形式。
 
 ## Chat data plane / Chat 数据面
 
@@ -108,9 +141,11 @@ Anthropic Messages、WebSocket streaming、`GatewayFilterService`、MCP、Worker
 | `GET /api/v1/gateway-endpoints/{endpointId}` | 读取一个 Endpoint。 |
 | `POST /api/v1/gateway-endpoints/{endpointId}/actions/disable` | 禁用一个 Endpoint。 |
 | `POST /api/v1/gateway-routes` | 创建或重放一条活动 Route。 |
-| `GET /api/v1/gateway-routes` | 按优先级列出已持久化的 Route。 |
-| `GET /api/v1/gateway-routes/{routeId}` | 读取一条 Route 或草稿。 |
+| `GET /api/v1/gateway-routes` | 按优先级列出组织归属未知的 legacy Route。 |
+| `GET /api/v1/gateway-routes/{routeId}` | 读取一条组织归属未知的 legacy Route。 |
+| `GET /api/v1/workspace/gateway-routes` | 按认证身份的组织/workspace 列出 Route。 |
 | `POST /api/v1/gateway-route-drafts` | 根据显式 Product 交接信息创建 DRAFT。 |
+| `POST /api/v1/workspace/gateway-route-drafts` | 使用 operator endpoint grant 创建 scoped DRAFT。 |
 | `PATCH /api/v1/gateway-route-drafts/{routeId}` | 编辑已检查版本的 DRAFT。 |
 | `POST /api/v1/gateway-route-drafts/{routeId}/actions/confirm` | 重新校验并启用精确版本的 DRAFT。 |
 | `POST /api/v1/api-keys` | 生成网关 API key；秘密值只返回一次。 |

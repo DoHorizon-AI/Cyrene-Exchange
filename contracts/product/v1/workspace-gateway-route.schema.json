@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.cyrene.dev/exchange/product/v1/workspace-gateway-route.schema.json",
+  "title": "Exchange WorkspaceGatewayRoute v1",
+  "type": "object",
+  "required": [
+    "id",
+    "endpointId",
+    "state",
+    "modelPattern",
+    "targetBindingId",
+    "targetCapabilityType",
+    "priority",
+    "createdAt",
+    "updatedAt",
+    "resourceVersion"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "endpointId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "state": {
+      "enum": [
+        "ACTIVE",
+        "DISABLED",
+        "DRAFT"
+      ]
+    },
+    "modelPattern": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "targetBindingId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "targetCapabilityType": {
+      "const": "model.provider.v1"
+    },
+    "targetModel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "resourceVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "sourceProvenance": {
+      "properties": {
+        "product": {
+          "type": "string",
+          "const": "reactor",
+          "title": "Product",
+          "default": "reactor"
+        },
+        "resourceVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "title": "Resourceversion"
+        },
+        "artifactDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Artifactdigest"
+        },
+        "modelVersionDigest": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^sha256/[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Modelversiondigest"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "resourceVersion",
+        "artifactDigest"
+      ],
+      "title": "WorkspaceRouteSourceProvenance",
+      "description": "Non-navigable Reactor provenance; contains no service URL or resource reference."
+    },
+    "createdBy": {
+      "type": "string"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

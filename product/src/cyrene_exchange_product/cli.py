@@ -25,7 +25,10 @@ from cyrene_exchange_product.domain import (
     CreateApiKeyRequest,
     CreateRouteRequest,
     ProductPrincipal,
+    WorkspaceEndpointGrant,
+    WorkspaceReactorEndpointGrant,
 )
+from cyrene_exchange_product.route_admission import ReactorWorkspaceSourceResolver
 from cyrene_exchange_product.server import (
     OpenAICompatibleProvider,
     OperatorBindingResolver,
@@ -57,6 +60,7 @@ def _principal(arguments: argparse.Namespace) -> ProductPrincipal:
         actor_id=arguments.actor_id,
         workspace_id=arguments.workspace_id,
         credential_ref=arguments.credential_ref,
+        organization_id=getattr(arguments, "organization_id", None),
     )
 
 
@@ -76,13 +80,115 @@ def _admitted_bindings(arguments: argparse.Namespace) -> frozenset[str]:
     return frozenset(declared | set(_bindings(arguments.provider)))
 
 
+def _workspace_endpoint_grants(entries: list[str]) -> tuple[WorkspaceEndpointGrant, ...]:
+    """Parse operator endpoint grants without accepting request-supplied scope."""
+
+    grants: list[WorkspaceEndpointGrant] = []
+    for entry in entries:
+        parts = entry.split("=", 2)
+        if len(parts) != 3 or not all(part.strip() for part in parts):
+            raise SystemExit("Workspace endpoint grants must use ENDPOINT_UUID=ORG_ID=WORKSPACE_ID")
+        try:
+            endpoint_id = UUID(parts[0].strip())
+            grants.append(
+                WorkspaceEndpointGrant(
+                    endpoint_id=endpoint_id,
+                    organization_id=parts[1].strip(),
+                    workspace_id=parts[2].strip(),
+                )
+            )
+        except ValueError as exc:
+            raise SystemExit("Workspace endpoint grant contains an invalid endpoint UUID") from exc
+    return tuple(grants)
+
+
+def _workspace_reactor_endpoint_grants(
+    entries: list[str],
+) -> tuple[WorkspaceReactorEndpointGrant, ...]:
+    """Parse operator grants for Reactor source Endpoints."""
+
+    grants: list[WorkspaceReactorEndpointGrant] = []
+    for entry in entries:
+        parts = entry.split("=", 2)
+        if len(parts) != 3 or not all(part.strip() for part in parts):
+            raise SystemExit("Reactor Endpoint grants must use ENDPOINT_UUID=ORG_ID=WORKSPACE_ID")
+        try:
+            grants.append(
+                WorkspaceReactorEndpointGrant(
+                    endpoint_id=UUID(parts[0].strip()),
+                    organization_id=parts[1].strip(),
+                    workspace_id=parts[2].strip(),
+                )
+            )
+        except ValueError as exc:
+            raise SystemExit("Reactor Endpoint grant contains an invalid UUID") from exc
+    return tuple(grants)
+
+
 def _serve(arguments: argparse.Namespace) -> int:
+    credentials: dict[str, ProductPrincipal] = {}
+    gateway_credentials: dict[str, ProductPrincipal] = {}
+    if arguments.control_token and arguments.control_token_env:
+        raise SystemExit("Choose either --control-token or --control-token-env")
     control_token = arguments.control_token
     if arguments.control_token_env:
         control_token = os.environ.get(arguments.control_token_env)
         if not control_token:
             raise SystemExit("The configured control credential variable is empty")
-    credentials = {control_token: _principal(arguments)} if control_token else {}
+    if control_token:
+        if arguments.organization_id:
+            raise SystemExit(
+                "Legacy --control-token credentials cannot carry organization scope; "
+                "use --control-credential-env"
+            )
+        legacy_principal = ProductPrincipal(
+            actor_id=arguments.actor_id,
+            workspace_id=arguments.workspace_id,
+            credential_ref=arguments.credential_ref,
+        )
+        credentials[control_token] = legacy_principal
+        gateway_credentials[control_token] = legacy_principal
+    for entry in arguments.control_credential_env:
+        parts = entry.split("=", 3)
+        if len(parts) != 4 or not all(part.strip() for part in parts):
+            raise SystemExit(
+                "Control credential entries must use CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME"
+            )
+        credential_ref, organization_id, workspace_id, variable_name = (
+            part.strip() for part in parts
+        )
+        token = os.environ.get(variable_name)
+        if not token:
+            raise SystemExit(
+                f"The configured control credential variable {variable_name!r} is empty"
+            )
+        if token in credentials:
+            raise SystemExit("The same control credential was configured more than once")
+        credentials[token] = ProductPrincipal(
+            actor_id=arguments.actor_id,
+            workspace_id=workspace_id,
+            credential_ref=credential_ref,
+            organization_id=organization_id,
+        )
+    for entry in arguments.gateway_credential_env:
+        parts = entry.split("=", 2)
+        if len(parts) != 3 or not all(part.strip() for part in parts):
+            raise SystemExit(
+                "Gateway credential entries must use CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME"
+            )
+        credential_ref, workspace_id, variable_name = (part.strip() for part in parts)
+        token = os.environ.get(variable_name)
+        if not token:
+            raise SystemExit(
+                f"The configured Gateway credential variable {variable_name!r} is empty"
+            )
+        if token in credentials or token in gateway_credentials:
+            raise SystemExit("The same bearer secret cannot be assigned to multiple roles")
+        gateway_credentials[token] = ProductPrincipal(
+            actor_id=arguments.actor_id,
+            workspace_id=workspace_id,
+            credential_ref=credential_ref,
+        )
     providers = _bindings(arguments.provider)
     if arguments.provider_from_route_source:
         source_token = (
@@ -100,11 +206,42 @@ def _serve(arguments: argparse.Namespace) -> int:
     else:
         resolver = OperatorBindingResolver(providers)
         resolver_factory = None
+    workspace_reactor_origin = arguments.workspace_reactor_origin
+    workspace_reactor_token_env = arguments.workspace_reactor_token_env
+    if bool(workspace_reactor_origin) != bool(workspace_reactor_token_env):
+        raise SystemExit(
+            "Workspace Reactor source requires both --workspace-reactor-origin and "
+            "--workspace-reactor-token-env"
+        )
+    workspace_source_resolver = None
+    if workspace_reactor_origin and workspace_reactor_token_env:
+        workspace_reactor_token = os.environ.get(workspace_reactor_token_env)
+        if not workspace_reactor_token:
+            raise SystemExit("The configured Workspace Reactor source credential is empty")
+        if workspace_reactor_token in credentials or workspace_reactor_token in gateway_credentials:
+            raise SystemExit(
+                "The Reactor source credential must be distinct from Exchange credentials"
+            )
+        try:
+            workspace_source_resolver = ReactorWorkspaceSourceResolver(
+                reactor_origin=workspace_reactor_origin,
+                reactor_token=workspace_reactor_token,
+            )
+        except ValueError as exc:
+            raise SystemExit("Workspace Reactor source configuration is invalid") from exc
     app = build_product_app(
         database_path=arguments.database.resolve(),
         resolver=resolver,
         resolver_factory=resolver_factory,
         control_credentials=credentials or None,
+        gateway_credentials=gateway_credentials or None,
+        workspace_endpoint_grants=_workspace_endpoint_grants(arguments.workspace_endpoint_grant),
+        workspace_reactor_endpoint_grants=_workspace_reactor_endpoint_grants(
+            arguments.workspace_reactor_endpoint_grant
+        ),
+        resolve_workspace_reactor_endpoint=(
+            workspace_source_resolver.resolve if workspace_source_resolver is not None else None
+        ),
         allowed_binding_ids=_admitted_bindings(arguments),
         endpoint_id=arguments.endpoint_id,
     )
@@ -281,6 +418,7 @@ def _key_revoke_api_key(arguments: argparse.Namespace) -> int:
 def _add_principal_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--actor-id", default="cyrene-operator")
     command.add_argument("--workspace-id", default="default")
+    command.add_argument("--organization-id")
     command.add_argument("--credential-ref", default="cred://exchange/operator")
 
 
@@ -292,10 +430,62 @@ def parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="Run the independent Exchange gateway")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
-    serve.add_argument("--control-token")
+    serve.add_argument(
+        "--control-token",
+        help=(
+            "Legacy compatibility only; this value is also a Gateway credential. "
+            "Prefer --control-token-env to keep secrets out of process arguments."
+        ),
+    )
     serve.add_argument(
         "--control-token-env",
         help="Name of the environment variable holding the control credential",
+    )
+    serve.add_argument(
+        "--control-credential-env",
+        action="append",
+        default=[],
+        metavar="CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME",
+        help=(
+            "Add a scoped server-side control bearer mapping; repeat entries for "
+            "multiple workspaces or token rotation; "
+            "the environment variable contains the secret"
+        ),
+    )
+    serve.add_argument(
+        "--gateway-credential-env",
+        action="append",
+        default=[],
+        metavar="CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME",
+        help=(
+            "Add a Gateway data-plane bearer from an environment variable; repeat "
+            "for multiple credentials or rotation"
+        ),
+    )
+    serve.add_argument(
+        "--workspace-endpoint-grant",
+        action="append",
+        default=[],
+        metavar="ENDPOINT_UUID=ORG_ID=WORKSPACE_ID",
+        help=(
+            "Operator grant allowing one organization/workspace to target an Exchange "
+            "GatewayEndpoint"
+        ),
+    )
+    serve.add_argument(
+        "--workspace-reactor-endpoint-grant",
+        action="append",
+        default=[],
+        metavar="ENDPOINT_UUID=ORG_ID=WORKSPACE_ID",
+        help="Operator grant allowing one organization/workspace to select a Reactor Endpoint",
+    )
+    serve.add_argument(
+        "--workspace-reactor-origin",
+        help="Fixed private Reactor service origin used only for granted source resolution",
+    )
+    serve.add_argument(
+        "--workspace-reactor-token-env",
+        help="Environment variable holding the private Reactor service Bearer",
     )
     serve.add_argument("--endpoint-id", type=UUID)
     serve.add_argument(
