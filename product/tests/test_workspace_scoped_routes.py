@@ -88,15 +88,11 @@ def _app(tmp_path: Path):
     store.save_endpoint(_endpoint(granted_endpoint_id))
     store.save_endpoint(_endpoint(legacy_endpoint_id))
     credentials = {
-        TOKEN_A: ProductPrincipal(
-            "actor", WORKSPACE, "cred://exchange/a", organization_id=ORG_A
-        ),
+        TOKEN_A: ProductPrincipal("actor", WORKSPACE, "cred://exchange/a", organization_id=ORG_A),
         TOKEN_A_ROTATION: ProductPrincipal(
             "actor", WORKSPACE, "cred://exchange/a-rotation", organization_id=ORG_A
         ),
-        TOKEN_B: ProductPrincipal(
-            "actor", WORKSPACE, "cred://exchange/b", organization_id=ORG_B
-        ),
+        TOKEN_B: ProductPrincipal("actor", WORKSPACE, "cred://exchange/b", organization_id=ORG_B),
         TOKEN_WRONG_WORKSPACE: ProductPrincipal(
             "actor", "other-workspace", "cred://exchange/wrong-workspace", organization_id=ORG_A
         ),
@@ -264,8 +260,7 @@ def test_private_routes_are_scoped_and_legacy_paths_do_not_expose_them(
             )
             assert legacy_created.status_code == 201
             expected_resource_uri = (
-                "https://reactor.example/api/v1/endpoints/"
-                "11111111-1111-4111-8111-111111111111"
+                "https://reactor.example/api/v1/endpoints/11111111-1111-4111-8111-111111111111"
             )
             assert legacy_created.json()["source"]["resourceUri"] == expected_resource_uri
             legacy_id = legacy_created.json()["id"]
@@ -370,9 +365,12 @@ def test_control_and_gateway_bearers_have_separate_route_authority(tmp_path: Pat
             )
             assert response.status_code == 401
 
-        assert client.get(
-            "/v1/models", headers={"Authorization": f"Bearer {gateway_token}"}
-        ).status_code == 200
+        assert (
+            client.get(
+                "/v1/models", headers={"Authorization": f"Bearer {gateway_token}"}
+            ).status_code
+            == 200
+        )
 
 
 def test_serve_cli_keeps_scoped_control_secret_out_of_gateway_map(
@@ -388,17 +386,20 @@ def test_serve_cli_keeps_scoped_control_secret_out_of_gateway_map(
     )
     monkeypatch.setattr(cli.uvicorn, "run", lambda _app, **_kwargs: None)
 
-    assert cli.run(
-        [
-            "--database",
-            str(tmp_path / "cli.sqlite3"),
-            "serve",
-            "--control-credential-env",
-            "cred://exchange/private=org-a=workspace-a=EXCHANGE_CONTROL_SECRET",
-            "--gateway-credential-env",
-            "cred://exchange/gateway=workspace-a=EXCHANGE_GATEWAY_SECRET",
-        ]
-    ) == 0
+    assert (
+        cli.run(
+            [
+                "--database",
+                str(tmp_path / "cli.sqlite3"),
+                "serve",
+                "--control-credential-env",
+                "cred://exchange/private=org-a=workspace-a=EXCHANGE_CONTROL_SECRET",
+                "--gateway-credential-env",
+                "cred://exchange/gateway=workspace-a=EXCHANGE_GATEWAY_SECRET",
+            ]
+        )
+        == 0
+    )
     control_credentials = captured["control_credentials"]
     gateway_credentials = captured["gateway_credentials"]
     assert list(control_credentials) == ["private-control-secret"]
@@ -474,13 +475,19 @@ def test_workspace_api_keys_do_not_cross_organization_boundaries(tmp_path: Path)
             )
             assert [item["id"] for item in listed_a.json()] == [key_a["id"]]
             assert [item["id"] for item in listed_b.json()] == [key_b["id"]]
-            assert client.get(
-                f"/api/v1/api-keys/{key_b['id']}",
-                headers={"Authorization": f"Bearer {TOKEN_A}"},
-            ).status_code == 404
-            assert client.get(
-                "/api/v1/api-keys", headers={"Authorization": f"Bearer {TOKEN_LEGACY}"}
-            ).json() == []
+            assert (
+                client.get(
+                    f"/api/v1/api-keys/{key_b['id']}",
+                    headers={"Authorization": f"Bearer {TOKEN_A}"},
+                ).status_code
+                == 404
+            )
+            assert (
+                client.get(
+                    "/api/v1/api-keys", headers={"Authorization": f"Bearer {TOKEN_LEGACY}"}
+                ).json()
+                == []
+            )
     finally:
         store.close()
 
