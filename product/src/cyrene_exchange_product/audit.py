@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from cyrene_exchange.billing import BillingUsageClient, observed_token_usage_event
 from cyrene_exchange.capabilities import ProviderUsage
 from cyrene_exchange.gateway import (
@@ -20,6 +22,9 @@ from cyrene_exchange.gateway import (
 )
 
 from cyrene_exchange_product.store import ExchangeStore
+
+if TYPE_CHECKING:
+    from cyrene_runtime_maintenance import ActivitySourceLifecycle
 
 
 class RequestAuditRecorder:
@@ -34,9 +39,11 @@ class RequestAuditRecorder:
         self,
         store: ExchangeStore,
         billing: BillingUsageClient | None = None,
+        activity: ActivitySourceLifecycle | None = None,
     ) -> None:
         self._store = store
         self._billing = billing
+        self._activity = activity
 
     def on_request_started(self, metadata: RequestMetadata) -> None:
         """Persist route and trusted principal before provider invocation.
@@ -45,7 +52,14 @@ class RequestAuditRecorder:
         """
         # 中文:在调用提供方之前持久化路由和可信主体。
 
-        self._store.begin_request(metadata)
+        if self._activity is None:
+            self._store.begin_request(metadata)
+        else:
+            self._activity.admit_and_persist(
+                metadata.request_id,
+                lambda: self._store.begin_request(metadata),
+                state="DISPATCHING",
+            )
 
     def on_request_finished(
         self,
@@ -61,12 +75,18 @@ class RequestAuditRecorder:
         """
         # 中文:持久化一条终态结果和实际观测到的准确用量。
 
-        self._store.finish_request(
-            metadata,
-            status=status,
-            usage=usage,
-            error_type=error_type,
-        )
+        def persist_terminal() -> None:
+            self._store.finish_request(
+                metadata,
+                status=status,
+                usage=usage,
+                error_type=error_type,
+            )
+
+        if self._activity is None:
+            persist_terminal()
+        else:
+            self._activity.complete_after_persist(metadata.request_id, persist_terminal)
         event = observed_token_usage_event(metadata, status, usage)
         if self._billing is not None and event is not None:
             self._billing.record_token_usage(event)

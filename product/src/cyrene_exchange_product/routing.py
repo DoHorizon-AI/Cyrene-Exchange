@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from fnmatch import fnmatchcase
 from hashlib import sha256
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from cyrene_exchange.billing import BillingUsageClient
@@ -33,6 +34,9 @@ from cyrene_exchange_product.audit import RequestAuditRecorder
 from cyrene_exchange_product.domain import EndpointState, ProductPrincipal
 from cyrene_exchange_product.quota import ProductQuotaGuard
 from cyrene_exchange_product.store import ExchangeStore
+
+if TYPE_CHECKING:
+    from cyrene_runtime_maintenance import ActivitySourceLifecycle
 
 
 class StoredRoutePlanner:
@@ -107,6 +111,7 @@ def build_gateway_from_store(
     billing: BillingUsageClient | None = None,
     record_requests: bool = True,
     max_route_attempts: int = 1,
+    activity: ActivitySourceLifecycle | None = None,
 ) -> ExchangeGateway:
     """Compose persisted Product routing with a caller-owned capability resolver.
 
@@ -127,7 +132,11 @@ def build_gateway_from_store(
 
     store.configure_credentials(credentials)
     principal_resolver = data_plane_principal_resolver(store, credentials)
-    observer = RequestAuditRecorder(store, billing) if record_requests else NoOpLifecycleObserver()
+    observer = (
+        RequestAuditRecorder(store, billing, activity)
+        if record_requests or activity is not None
+        else NoOpLifecycleObserver()
+    )
     return ExchangeGateway(
         ProductRoutingResolver(StoredRoutePlanner(store, endpoint_id), delegate),
         principal_resolver=principal_resolver,

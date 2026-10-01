@@ -1026,6 +1026,16 @@ class ExchangeStore:
             ).fetchone()
         return _audit_from_row(row) if row is not None else None
 
+    def list_active_activity_tasks(self) -> list[dict[str, str]]:
+        """Return provider requests left in STARTED state for gate reconciliation."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT request_id FROM request_audits WHERE status = ? ORDER BY rowid",
+                (RequestAuditStatus.STARTED.value,),
+            ).fetchall()
+        return [{"task_id": str(row["request_id"]), "state": "INFLIGHT"} for row in rows]
+
     def list_request_audits(
         self,
         *,
