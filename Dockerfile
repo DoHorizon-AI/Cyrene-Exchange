@@ -9,15 +9,15 @@
 # ==============================================================================
 
 # --- Stage 1: Build Web Client (Node.js) ---
-FROM node:22-alpine AS web-builder
+FROM node:24-alpine AS web-builder
 WORKDIR /app/client
-COPY Cyrene-Client/apps/web/services/navigator/package*.json ./
-RUN npm install
-COPY Cyrene-Client/apps/web/services/navigator ./
+COPY Cyrene-Client/package.json Cyrene-Client/package-lock.json ./
+RUN npm ci
+COPY Cyrene-Client/ ./
 RUN npm run build
 
 # --- Stage 2: Build Platform Capability Resolver (Rust) ---
-FROM rust:1.85-slim-bookworm AS platform-builder
+FROM rust:1.96.1-slim-bookworm AS platform-builder
 WORKDIR /app/Cyrene-Platform
 
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev git && rm -rf /var/lib/apt/lists/*
