@@ -133,8 +133,8 @@ jobs:
             sleep 3
           done
           for i in {1..30}; do
-            if curl -fsS "$CYRENE_PUBLIC_BASE_URL/v1/models" | python3 -c 'import json, sys; assert json.load(sys.stdin)["object"] == "list"'; then
-              echo "Web gateway reached Exchange"
+            if curl -fsS "$CYRENE_PUBLIC_BASE_URL/healthz" | python3 -c 'import json, sys; assert json.load(sys.stdin)["status"] == "ok"'; then
+              echo "Public gateway reached healthy Exchange"
               break
             fi
             if [ "$i" -eq 30 ]; then
