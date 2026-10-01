@@ -68,11 +68,13 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push container image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Cyrene-Services/Cyrene-Exchange/Dockerfile
           push: true
+          platforms: linux/amd64
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
@@ -161,3 +163,54 @@ jobs:
           else:
               raise RuntimeError("Web gateway accepted a request without credentials")
           PY
+
+      - name: Create service update manifest
+        id: update-manifest
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          IMAGE_REPOSITORY: ${{ steps.meta.outputs.image }}
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SERVICE_ID: cyrene-exchange
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          source_commit = os.environ["SOURCE_COMMIT"]
+          image_digest = os.environ["IMAGE_DIGEST"]
+          version = os.environ["IMAGE_TAG"]
+          if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+              raise SystemExit("GITHUB_SHA must be a full 40-character commit SHA")
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest) is None:
+              raise SystemExit("build-push-action did not return a full sha256 image digest")
+          if not version or len(version) > 128:
+              raise SystemExit("image tag must be a non-empty version of at most 128 characters")
+
+          manifest = {
+              "schemaVersion": 1,
+              "serviceId": os.environ["SERVICE_ID"],
+              "version": version,
+              "sourceCommit": source_commit,
+              "image": {
+                  "repository": os.environ["IMAGE_REPOSITORY"],
+                  "digest": image_digest,
+              },
+              "platform": {"os": "linux", "arch": "amd64"},
+          }
+          Path("service-update-manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload service update manifest
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && steps.update-manifest.outcome == 'success' }}
+        with:
+          name: service-update-manifest-cyrene-exchange
+          path: service-update-manifest.json
+          if-no-files-found: error
+          retention-days: 30
