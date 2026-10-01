@@ -10,8 +10,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from cyrene_exchange.billing import BillingUsageClient, observed_token_usage_event
 from cyrene_exchange.capabilities import ProviderUsage
 from cyrene_exchange.gateway import (
@@ -21,10 +19,8 @@ from cyrene_exchange.gateway import (
     RequestRejectionStatus,
 )
 
+from cyrene_exchange_product.runtime_activity import ActivitySourceLifecycleProtocol
 from cyrene_exchange_product.store import ExchangeStore
-
-if TYPE_CHECKING:
-    from cyrene_runtime_maintenance import ActivitySourceLifecycle
 
 
 class RequestAuditRecorder:
@@ -39,7 +35,7 @@ class RequestAuditRecorder:
         self,
         store: ExchangeStore,
         billing: BillingUsageClient | None = None,
-        activity: ActivitySourceLifecycle | None = None,
+        activity: ActivitySourceLifecycleProtocol | None = None,
     ) -> None:
         self._store = store
         self._billing = billing

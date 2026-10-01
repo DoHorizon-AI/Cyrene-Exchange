@@ -13,15 +13,64 @@ from __future__ import annotations
 import atexit
 import os
 from collections.abc import Callable, Iterable, Mapping
+from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from cyrene_runtime_maintenance import ActivitySourceLifecycle
+from typing import Protocol, TypeVar, cast
 
 _TOKEN_FILE = "/run/secrets/cyrene-runtime-activity-token"
 _SOCKET_PATH = "/run/cyrene/runtime-maintenance.sock"
 _SOCKET_ENV = "CYRENE_RUNTIME_MAINTENANCE_SOCKET"
+_PersistResult = TypeVar("_PersistResult")
+
+
+class ActivitySourceLifecycleProtocol(Protocol):
+    """Type the SDK lifecycle methods used by this Product. | 描述所需生命周期接口。"""
+
+    def start(
+        self,
+        load_active_tasks: Callable[[], Iterable[Mapping[str, str]]],
+    ) -> None: ...
+
+    def admit_and_persist(
+        self,
+        task_id: str,
+        persist: Callable[[], _PersistResult],
+        *,
+        state: str = "ACCEPTED",
+    ) -> _PersistResult: ...
+
+    def transition_and_persist(
+        self,
+        task_id: str,
+        state: str,
+        persist: Callable[[], _PersistResult],
+    ) -> _PersistResult: ...
+
+    def complete_after_persist(
+        self,
+        task_id: str,
+        persist: Callable[[], _PersistResult],
+    ) -> _PersistResult: ...
+
+    def close(self) -> None: ...
+
+
+class RuntimeMaintenanceClientFactoryProtocol(Protocol):
+    """Type the SDK client factory used by this Product. | 描述 SDK 客户端工厂。"""
+
+    @staticmethod
+    def from_source_secret(
+        source_id: str,
+        token_path: str,
+        *,
+        catalog_generation: int,
+        socket_path: str,
+    ) -> object: ...
+
+
+class RuntimeMaintenanceSdkProtocol(Protocol):
+    RuntimeMaintenanceClient: RuntimeMaintenanceClientFactoryProtocol
+    ActivitySourceLifecycle: Callable[[object], ActivitySourceLifecycleProtocol]
 
 
 class RuntimeActivityConfigurationError(RuntimeError):
@@ -34,7 +83,7 @@ class RuntimeActivityConfigurationError(RuntimeError):
 def start_activity_source(
     expected_source_id: str,
     load_active_tasks: Callable[[], Iterable[Mapping[str, str]]],
-) -> ActivitySourceLifecycle | None:
+) -> ActivitySourceLifecycleProtocol | None:
     """Start managed tracking when an installer supplied broker settings.
 
     A standalone Product without broker configuration stays independent.
@@ -73,19 +122,19 @@ def start_activity_source(
         )
 
     try:
-        from cyrene_runtime_maintenance import ActivitySourceLifecycle, RuntimeMaintenanceClient
+        sdk = cast(RuntimeMaintenanceSdkProtocol, import_module("cyrene_runtime_maintenance"))
     except ImportError as error:
         raise RuntimeActivityConfigurationError(
             "managed activity requires the installed cyrene_runtime_maintenance SDK"
         ) from error
 
-    client = RuntimeMaintenanceClient.from_source_secret(
+    client = sdk.RuntimeMaintenanceClient.from_source_secret(
         expected_source_id,
         token_path,
         catalog_generation=int(generation_text),
         socket_path=socket_path,
     )
-    lifecycle = ActivitySourceLifecycle(client)
+    lifecycle = sdk.ActivitySourceLifecycle(client)
     lifecycle.start(load_active_tasks)
     atexit.register(lifecycle.close)
     return lifecycle
