@@ -29,6 +29,15 @@ RUN cargo build --locked --release -p cy-platform-api --bin cyrene-capability-re
 # --- Stage 3: Runtime Image (Python 3.12) ---
 FROM python:3.12-slim-bookworm AS runtime
 
+ARG CYRENE_RUNTIME_MAINTENANCE_MANIFEST_SHA256
+ARG CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256
+ARG CYRENE_RUNTIME_MAINTENANCE_RELEASE_ID
+
+LABEL io.cyrene.runtime-maintenance.sdk-version="0.1.0" \
+      io.cyrene.runtime-maintenance.manifest-sha256="${CYRENE_RUNTIME_MAINTENANCE_MANIFEST_SHA256}" \
+      io.cyrene.runtime-maintenance.wheel-sha256="${CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256}" \
+      io.cyrene.runtime-maintenance.release-id="${CYRENE_RUNTIME_MAINTENANCE_RELEASE_ID}"
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/usr/local/bin:/app/.venv/bin:$PATH" \
@@ -48,6 +57,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=platform-builder /app/Cyrene-Platform/target/release/cyrene-capability-resolver /usr/local/bin/cyrene-capability-resolver
 
 WORKDIR /app
+
+# Install the immutable, release-verified runtime maintenance SDK wheel.
+COPY --from=runtime-maintenance-wheel /cyrene_runtime_maintenance-0.1.0-py3-none-any.whl /tmp/wheels/cyrene_runtime_maintenance-0.1.0-py3-none-any.whl
+RUN printf '%s\n' "$CYRENE_RUNTIME_MAINTENANCE_MANIFEST_SHA256" | grep -Eq '^[0-9a-f]{64}$' && \
+    printf '%s\n' "$CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256" | grep -Eq '^[0-9a-f]{64}$' && \
+    test -n "$CYRENE_RUNTIME_MAINTENANCE_RELEASE_ID" && \
+    printf '%s  %s\n' "$CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256" \
+        /tmp/wheels/cyrene_runtime_maintenance-0.1.0-py3-none-any.whl | sha256sum -c - && \
+    python -m pip install --no-cache-dir --no-deps \
+        /tmp/wheels/cyrene_runtime_maintenance-0.1.0-py3-none-any.whl && \
+    rm -rf /tmp/wheels
 
 # Copy Plugins SDK & Core Providers
 COPY Cyrene-Plugins-Official/sdk/python/cyrene_model_provider_contracts /app/plugins-sdk/cyrene_model_provider_contracts
