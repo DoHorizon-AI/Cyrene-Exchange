@@ -50,6 +50,7 @@ from cyrene_exchange_product.routing import (
     build_gateway_from_store,
     data_plane_principal_resolver,
 )
+from cyrene_exchange_product.runtime_activity import start_activity_source
 from cyrene_exchange_product.store import ExchangeStore
 
 _MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
@@ -571,6 +572,10 @@ def build_product_app(
         ):
             raise ValueError("CYRENE_PUBLIC_BASE_URL must be an http(s) origin")
     store = ExchangeStore(database_path)
+    activity = start_activity_source(
+        "cyrene-exchange",
+        store.list_active_activity_tasks,
+    )
     effective = resolver_factory(store) if resolver_factory is not None else resolver
     app = create_app(
         database_path=database_path,
@@ -588,7 +593,10 @@ def build_product_app(
         effective,
         credentials=effective_gateway_credentials,
         record_requests=record_requests,
+        activity=activity,
     )
+    if activity is not None:
+        app.router.on_shutdown.append(activity.close)
     data_plane_resolver = data_plane_principal_resolver(store, effective_gateway_credentials)
 
     @app.get("/healthz")

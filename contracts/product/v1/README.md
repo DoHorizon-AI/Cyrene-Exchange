@@ -158,3 +158,14 @@ Exchange 拥有对外发布的 `GatewayEndpoint` 与 `GatewayRoute` 资源以及
 数据面规范化器会保留文本工具定义、工具选择、工具结果历史、带索引的流式工具调用片段以及 Provider 报告的用量。Provider 未提供 Token 数量时，系统不会估算。纯文本请求继续使用直连 Plugin 的 `model.provider.v1` 接口版本 1；包含结构化聊天字段的请求协商接口版本 2 和 `chat_completion_v2` 方法。只声明 v1 的 Provider 会在 Plugins 所有的契约边界失败，不会静默丢弃 Agent 语义。
 
 Product 所有的 SQLite 请求审计仍是请求终态的权威来源。配置 `BillingUsageClient` 后，Exchange 会按请求 ID 将同一份不含内容、由 Provider 报告的用量事实发送到 Plugins 所有的 `billing.usage.v1` 账本。计费插件负责派生汇总和费用；它不会接收提示词、响应、凭据或路由状态。
+
+## Product operation catalog v2
+
+This Product publishes its Workspace operation catalog at
+[../v2/catalog.json](../v2/catalog.json). Each listed operation binds its exact
+owner operationId to the corresponding OpenAPI source and schema pointers.
+The release manifest pins the catalog and its complete OpenAPI reference closure
+to the same repository commit. This catalog declares operation contracts only;
+Workspace policy controls access independently.
+
+本 Product 在 [../v2/catalog.json](../v2/catalog.json) 发布 Workspace 操作目录。每个目录项都将准确的 owner operationId 绑定到对应的 OpenAPI 文档和 schema pointer。发布清单会将目录及其完整 OpenAPI 引用闭包固定到同一仓库提交。目录只声明操作契约；访问权限由独立的 Workspace policy 控制。

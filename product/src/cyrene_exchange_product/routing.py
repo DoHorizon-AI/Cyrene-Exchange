@@ -32,6 +32,7 @@ from cyrene_exchange.protocol import NormalizedInferenceRequest
 from cyrene_exchange_product.audit import RequestAuditRecorder
 from cyrene_exchange_product.domain import EndpointState, ProductPrincipal
 from cyrene_exchange_product.quota import ProductQuotaGuard
+from cyrene_exchange_product.runtime_activity import ActivitySourceLifecycleProtocol
 from cyrene_exchange_product.store import ExchangeStore
 
 
@@ -107,6 +108,7 @@ def build_gateway_from_store(
     billing: BillingUsageClient | None = None,
     record_requests: bool = True,
     max_route_attempts: int = 1,
+    activity: ActivitySourceLifecycleProtocol | None = None,
 ) -> ExchangeGateway:
     """Compose persisted Product routing with a caller-owned capability resolver.
 
@@ -127,7 +129,11 @@ def build_gateway_from_store(
 
     store.configure_credentials(credentials)
     principal_resolver = data_plane_principal_resolver(store, credentials)
-    observer = RequestAuditRecorder(store, billing) if record_requests else NoOpLifecycleObserver()
+    observer = (
+        RequestAuditRecorder(store, billing, activity)
+        if record_requests or activity is not None
+        else NoOpLifecycleObserver()
+    )
     return ExchangeGateway(
         ProductRoutingResolver(StoredRoutePlanner(store, endpoint_id), delegate),
         principal_resolver=principal_resolver,

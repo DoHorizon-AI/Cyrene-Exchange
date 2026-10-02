@@ -1,24 +1,35 @@
-name: cd-containerapp
+name: Exchange immutable digest deployment
 
 on:
-  push:
+  workflow_run:
+    workflows: [Immutable component release]
+    types: [completed]
     branches: [main, release, develop]
   workflow_dispatch:
-    inputs:
-      image_tag:
-        description: 'Image tag to deploy (defaults to git sha)'
-        required: false
-        default: ''
 
 permissions:
+  actions: read
+  attestations: read
   contents: read
-  packages: write
+  packages: read
+
+concurrency:
+  group: exchange-containerapp-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
-    name: cd / build, push & deploy to Azure Container Apps
+  deploy-existing-app:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.name == 'Immutable component release' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.repository.full_name == 'DoHorizon-AI/Cyrene-Exchange' &&
+       github.event.workflow_run.head_repository.full_name == 'DoHorizon-AI/Cyrene-Exchange')
+    name: Verify immutable Exchange release and update an existing Azure app
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     env:
       AZURE_RESOURCE_GROUP: Container-APP
@@ -27,57 +38,349 @@ jobs:
       AZURE_CONTAINERAPP_ENV: cae-dh-eastasia
       AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
       CYRENE_PUBLIC_BASE_URL: https://cyrene.dohorizon-llc.net
+      WORKSPACE_CATALOG_COMMIT: 522524b86a8f79c70e948fed8cb27c4cc70f29c4
+      WORKSPACE_CATALOG_SHA256: 248a9a3b27f3d1daa4c0a6fdc405c612fd492483bb4157ff46b6d2836ffd0d35
 
     steps:
-      - name: Checkout Cyrene-Exchange
+      - name: Resolve and validate the triggering source identity
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          repository = "DoHorizon-AI/Cyrene-Exchange"
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+
+          def github_api(path):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{repository}/{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          if event_name == "workflow_run":
+              run = payload.get("workflow_run", {})
+              if (
+                  run.get("name") != "Immutable component release"
+                  or run.get("event") != "push"
+                  or run.get("conclusion") != "success"
+                  or run.get("repository", {}).get("full_name") != repository
+                  or run.get("head_repository", {}).get("full_name") != repository
+              ):
+                  raise SystemExit("trigger is not a successful same-repository component-release push")
+              workflow_id = run.get("workflow_id")
+              run_id = run.get("id")
+              attempt = run.get("run_attempt")
+              if not isinstance(workflow_id, int) or not isinstance(run_id, int) or not isinstance(attempt, int):
+                  raise SystemExit("workflow_run payload lacks numeric workflow/run identity")
+              workflow = github_api(f"actions/workflows/{workflow_id}")
+              if workflow.get("path") != ".github/workflows/component-release.yml":
+                  raise SystemExit("triggering workflow path is not the trusted component-release workflow")
+              verified_run = github_api(f"actions/runs/{run_id}/attempts/{attempt}")
+              if (
+                  verified_run.get("workflow_id") != workflow_id
+                  or verified_run.get("head_sha") != run.get("head_sha")
+                  or verified_run.get("head_branch") != run.get("head_branch")
+                  or verified_run.get("event") != "push"
+                  or verified_run.get("status") != "completed"
+                  or verified_run.get("conclusion") != "success"
+                  or verified_run.get("repository", {}).get("full_name") != repository
+              ):
+                  raise SystemExit("GitHub Actions API run identity differs from the workflow_run event")
+              source_commit = run["head_sha"]
+              branch = run["head_branch"]
+          elif event_name == "workflow_dispatch":
+              branch = os.environ["GITHUB_REF"].removeprefix("refs/heads/")
+              source_commit = os.environ["GITHUB_SHA"]
+          else:
+              raise SystemExit(f"unsupported trigger event: {event_name}")
+
+          if branch not in {"main", "release", "develop"}:
+              raise SystemExit("source branch is outside the immutable release channel policy")
+          if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", source_commit) is None:
+              raise SystemExit("source commit must be a full lowercase Git SHA")
+          source_ref = f"refs/heads/{branch}"
+          channel = "preview" if branch == "develop" else "stable"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"source_commit={source_commit}\n")
+              output.write(f"source_ref={source_ref}\n")
+              output.write(f"channel={channel}\n")
+          PY
+
+      - name: Check out the pinned component catalog
         uses: actions/checkout@v5
         with:
-          path: Cyrene-Services/Cyrene-Exchange
+          repository: DoHorizon-AI/Cyrene-Workspace
+          ref: ${{ env.WORKSPACE_CATALOG_COMMIT }}
+          path: workspace-catalog
+          persist-credentials: false
 
-      - name: Fetch sibling repositories (Cyrene-Platform, Cyrene-Plugins-Official & Cyrene-Client)
+      - name: Verify the pinned catalog bytes
         run: |
-          TARGET_BRANCH="${GITHUB_REF_NAME:-develop}"
-          for name in Cyrene-Platform Cyrene-Plugins-Official Cyrene-Client; do
-            echo "Fetching $name (target branch: $TARGET_BRANCH)..."
-            git clone --quiet --depth 1 --branch "$TARGET_BRANCH" "https://github.com/DoHorizon-AI/$name.git" "$name" 2>/dev/null || \
-            git clone --quiet --depth 1 --branch develop "https://github.com/DoHorizon-AI/$name.git" "$name" 2>/dev/null || \
-            git clone --quiet --depth 1 "https://github.com/DoHorizon-AI/$name.git" "$name"
-          done
+          set -euo pipefail
+          actual="$(sha256sum workspace-catalog/governance/component-catalog-v1.json | cut -d ' ' -f 1)"
+          test "$actual" = "$WORKSPACE_CATALOG_SHA256"
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Set up Python release tooling
+        uses: actions/setup-python@v6
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          python-version: "3.12"
 
-      - name: Compute image tags
-        id: meta
+      - name: Install the pinned JCS implementation
+        run: python -m pip install --disable-pip-version-check rfc8785==0.1.4
+
+      - name: Find a trusted immutable Platform SDK index
+        id: platform-index
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.source.outputs.channel }}
+          INDEX_PATH: ${{ runner.temp }}/platform-component-release-index-v1.json
+          CATALOG_PATH: workspace-catalog/governance/component-catalog-v1.json
         run: |
-          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${REPO_OWNER}/cyrene-exchange"
-          TAG="${{ github.event.inputs.image_tag }}"
-          if [ -z "$TAG" ]; then
-            TAG="sha-${GITHUB_SHA::7}"
-          fi
-          echo "image=$IMAGE" >> $GITHUB_OUTPUT
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "full_image=${IMAGE}:${TAG}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+          import rfc8785
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          publisher_id = "DoHorizon-AI/Cyrene-Platform"
+          workflow = "DoHorizon-AI/Cyrene-Platform/.github/workflows/component-release.yml"
+          asset_name = "component-release-index-v1.json"
+          catalog = json.loads(Path(os.environ["CATALOG_PATH"]).read_text(encoding="utf-8"))
+          publisher = next(
+              (row for row in catalog.get("publishers", []) if row.get("repository") == publisher_id),
+              None,
+          )
+          if publisher is None or publisher.get("workflow") != workflow:
+              raise SystemExit("pinned catalog does not authorize the Platform release workflow")
+          discovery = publisher.get("releaseDiscovery", {})
+          api_uri = discovery.get("apiUri")
+          if api_uri != "https://api.github.com/repos/DoHorizon-AI/Cyrene-Platform/releases?per_page=100":
+              raise SystemExit("Platform release API URI differs from the pinned catalog")
+          if discovery.get("indexAssetName") != asset_name:
+              raise SystemExit("Platform release index asset name differs from the pinned catalog")
 
-      - name: Build and push container image
-        id: build
-        uses: docker/build-push-action@v6
+          token = os.environ["GH_TOKEN"]
+          api_request = urllib.request.Request(
+              api_uri,
+              headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"},
+          )
+          with urllib.request.urlopen(api_request, timeout=30) as response:
+              releases = json.loads(response.read().decode("utf-8"))
+          if not isinstance(releases, list):
+              raise SystemExit("GitHub Releases API returned an invalid response")
+
+          channel = os.environ["CHANNEL"]
+          prerelease = channel == "preview"
+          source_refs = set(catalog.get("channels", {}).get(channel, {}).get("sourceRefs", []))
+          library_target = next(
+              row["target"]
+              for row in catalog.get("targets", [])
+              if row.get("id") == "linux-ubuntu-24.04-x86_64-python-3.12-library"
+          )
+          candidates = [
+              row for row in releases
+              if isinstance(row, dict)
+              and row.get("draft") is False
+              and row.get("immutable") is True
+              and row.get("prerelease") is prerelease
+              and isinstance(row.get("tag_name"), str)
+              and row["tag_name"].startswith(channel + "-")
+          ]
+          candidates.sort(
+              key=lambda row: str(row.get("published_at") or row.get("created_at") or ""),
+              reverse=True,
+          )
+
+          selected = None
+          for release in candidates:
+              tag = release["tag_name"]
+              asset = next(
+                  (row for row in release.get("assets", []) if row.get("name") == asset_name),
+                  None,
+              )
+              uri = (
+                  f"https://github.com/DoHorizon-AI/Cyrene-Platform/releases/download/{tag}/{asset_name}"
+              )
+              if not isinstance(asset, dict) or asset.get("browser_download_url") != uri:
+                  continue
+              request = urllib.request.Request(uri, headers={"Accept": "application/octet-stream"})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  if urllib.parse.urlparse(response.geturl()).hostname not in {
+                      "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"
+                  }:
+                      raise SystemExit("Platform index redirected outside GitHub release asset hosts")
+                  raw = response.read()
+              try:
+                  index = json.loads(raw.decode("utf-8", "strict"))
+              except (UnicodeDecodeError, json.JSONDecodeError):
+                  continue
+              source = index.get("source", {}) if isinstance(index, dict) else {}
+              attestation = index.get("provenance", {}).get("attestation", {}) if isinstance(index, dict) else {}
+              digest_input = {key: value for key, value in index.items() if key != "indexDigest"} if isinstance(index, dict) else {}
+              actual_digest = "sha256:" + hashlib.sha256(rfc8785.dumps(digest_input)).hexdigest()
+              commit = source.get("commit")
+              sdk = next(
+                  (
+                      row for row in index.get("releases", [])
+                      if row.get("componentId") == "cyrene-runtime-maintenance-sdk"
+                      and row.get("target") == library_target
+                  ),
+                  None,
+              ) if isinstance(index, dict) else None
+              if (
+                  not isinstance(index, dict)
+                  or index.get("schemaVersion") != 1
+                  or index.get("repository") != publisher_id
+                  or index.get("channel") != channel
+                  or actual_digest != index.get("indexDigest")
+                  or source.get("ref") not in source_refs
+                  or not isinstance(commit, str)
+                  or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) is None
+                  or tag != f"{channel}-{commit}"
+                  or attestation.get("kind") != "github-artifact-attestation"
+                  or attestation.get("subjectName") != asset_name
+                  or attestation.get("repository") != publisher_id
+                  or attestation.get("workflow") != workflow
+                  or sdk is None
+              ):
+                  continue
+              Path(os.environ["INDEX_PATH"]).write_bytes(raw)
+              selected = {"commit": commit, "ref": source["ref"]}
+              break
+
+          if selected is None:
+              raise SystemExit(f"no trusted immutable Platform {channel} index includes the runtime SDK")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"source_commit={selected['commit']}\n")
+              output.write(f"source_ref={selected['ref']}\n")
+              output.write(f"index_path={os.environ['INDEX_PATH']}\n")
+          PY
+
+      - name: Verify the Platform index attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INDEX_PATH: ${{ steps.platform-index.outputs.index_path }}
+          INDEX_SOURCE_REF: ${{ steps.platform-index.outputs.source_ref }}
+          INDEX_SOURCE_COMMIT: ${{ steps.platform-index.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "$INDEX_PATH" \
+            --repo DoHorizon-AI/Cyrene-Platform \
+            --signer-workflow DoHorizon-AI/Cyrene-Platform/.github/workflows/component-release.yml \
+            --source-ref "$INDEX_SOURCE_REF" \
+            --source-digest "$INDEX_SOURCE_COMMIT" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --format json > "$RUNNER_TEMP/platform-index-attestation.json"
+
+      - name: Check out the attested Platform release tooling
+        uses: actions/checkout@v5
         with:
-          context: .
-          file: Cyrene-Services/Cyrene-Exchange/Dockerfile
-          push: true
-          platforms: linux/amd64
-          tags: |
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.image }}:latest
+          repository: DoHorizon-AI/Cyrene-Platform
+          ref: ${{ steps.platform-index.outputs.source_commit }}
+          path: platform-tools
+          persist-credentials: false
+
+      - name: Install pinned release-tool dependencies
+        run: python -m pip install --disable-pip-version-check -r platform-tools/tooling/release/requirements.txt
+
+      - name: Validate the Platform index and exact Exchange component release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHONPATH: platform-tools
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          SOURCE_REF: ${{ steps.source.outputs.source_ref }}
+          CHANNEL: ${{ steps.source.outputs.channel }}
+          CATALOG_PATH: workspace-catalog/governance/component-catalog-v1.json
+          INDEX_PATH: ${{ steps.platform-index.outputs.index_path }}
+          RESULT_PATH: ${{ runner.temp }}/exchange-component-fetch.json
+          OUTPUT_DIR: ${{ runner.temp }}/exchange-component
+        run: |
+          set -euo pipefail
+          python platform-tools/tooling/release/validate_component_schema.py \
+            --kind index \
+            --document "$INDEX_PATH" \
+            --schema-dir workspace-catalog/governance
+          python platform-tools/tooling/release/component_artifacts.py verify-index \
+            --index "$INDEX_PATH" \
+            --catalog "$CATALOG_PATH" \
+            --verify-run \
+            --verify-attestation
+          python platform-tools/tooling/release/fetch_component.py \
+            --catalog "$CATALOG_PATH" \
+            --component cyrene-exchange \
+            --target-id windows-10.0-x86_64-docker-linux \
+            --channel "$CHANNEL" \
+            --source-commit "$SOURCE_COMMIT" \
+            --output "$OUTPUT_DIR" > "$RESULT_PATH"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          result = json.loads(Path(os.environ["RESULT_PATH"]).read_text(encoding="utf-8"))
+          index = result["index"]
+          manifest = result["manifest"]
+          artifact = manifest["artifact"]
+          expected_repository = "ghcr.io/dohorizon-ai/cyrene-exchange"
+          expected_target = {
+              "os": "windows",
+              "osVersion": "10.0",
+              "architecture": "x86_64",
+              "runtime": "docker-desktop:linux",
+          }
+          source_commit = os.environ["SOURCE_COMMIT"]
+          source_ref = os.environ["SOURCE_REF"]
+          channel = os.environ["CHANNEL"]
+          if index.get("source", {}).get("commit") != source_commit or index.get("source", {}).get("ref") != source_ref:
+              raise SystemExit("verified component index does not match the triggering source SHA/ref")
+          if manifest.get("releaseId") != f"{channel}-{source_commit}":
+              raise SystemExit("manifest release ID does not match the exact source SHA/channel")
+          if manifest.get("componentId") != "cyrene-exchange" or manifest.get("target") != expected_target:
+              raise SystemExit("verified manifest identity differs from the Exchange target")
+          if manifest.get("source", {}).get("commit") != source_commit or manifest.get("source", {}).get("ref") != source_ref:
+              raise SystemExit("verified manifest source does not match the triggering source SHA/ref")
+          if artifact.get("kind") != "oci-image" or artifact.get("repository") != expected_repository:
+              raise SystemExit("verified Exchange artifact is not the catalog-pinned OCI repository")
+          digest = artifact.get("digest", "")
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+              raise SystemExit("verified Exchange OCI digest is malformed")
+          image_ref = f"{expected_repository}@{digest}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"image_ref={image_ref}\n")
+              output.write(f"manifest_digest={manifest['manifestDigest']}\n")
+              output.write(f"release_id={manifest['releaseId']}\n")
+          PY
+
+      - name: Skip deployment when Azure credentials are not configured
+        if: env.AZURE_CREDENTIALS == ''
+        run: |
+          echo "::warning::Verified release is ready, but Azure deployment is blocked because AZURE_CREDENTIALS is not configured."
+          {
+            echo "## Exchange deployment: BLOCKED"
+            echo
+            echo "The immutable release was verified, but Azure credentials are not configured. No deployment was attempted."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log in to Azure
         if: env.AZURE_CREDENTIALS != ''
@@ -85,44 +388,63 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy or update Azure Container App
+      - name: Check that the Azure Container App already exists
+        id: app
         if: env.AZURE_CREDENTIALS != ''
         run: |
-          if az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
-            echo "Updating existing container app $AZURE_APP_NAME in $AZURE_RESOURCE_GROUP..."
-            az containerapp update \
-              --name "$AZURE_APP_NAME" \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --image "${{ steps.meta.outputs.full_image }}"
-          else
-            echo "Creating container app $AZURE_APP_NAME in $AZURE_CONTAINERAPP_ENV ($AZURE_LOCATION)..."
-            az containerapp create \
-              --name "$AZURE_APP_NAME" \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --environment "$AZURE_CONTAINERAPP_ENV" \
-              --image "${{ steps.meta.outputs.full_image }}" \
-              --target-port 8000 \
-              --ingress internal \
-              --registry-server ghcr.io \
-              --registry-username "${{ github.actor }}" \
-              --registry-password "${{ secrets.GITHUB_TOKEN }}" \
-              --cpu 0.5 \
-              --memory 1.0Gi \
-              --min-replicas 1 \
-              --max-replicas 2 \
-              --env-vars CYRENE_HOST="0.0.0.0" CYRENE_PORT="8000" CYRENE_PUBLIC_BASE_URL="$CYRENE_PUBLIC_BASE_URL"
+          set -euo pipefail
+          apps_json="$RUNNER_TEMP/existing-container-apps.json"
+          az containerapp list --resource-group "$AZURE_RESOURCE_GROUP" --output json > "$apps_json"
+          exists="$(python3 - "$apps_json" "$AZURE_APP_NAME" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          apps = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print("true" if any(row.get("name") == sys.argv[2] for row in apps) else "false")
+          PY
+          )"
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          if [ "$exists" != "true" ]; then
+            echo "::warning::Azure Container App $AZURE_APP_NAME does not exist in $AZURE_RESOURCE_GROUP; deployment is blocked and no resource will be created."
+            {
+              echo "## Exchange deployment: BLOCKED"
+              echo
+              echo "The immutable release was verified, but the existing Azure Container App was not found. No resource was created."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Verify healthy revision and public Web gateway
-        if: env.AZURE_CREDENTIALS != ''
+      - name: Update the existing Azure Container App by immutable digest
+        if: env.AZURE_CREDENTIALS != '' && steps.app.outputs.exists == 'true'
+        env:
+          IMAGE_REF: ${{ steps.release.outputs.image_ref }}
         run: |
+          set -euo pipefail
+          case "$IMAGE_REF" in
+            ghcr.io/dohorizon-ai/cyrene-exchange@sha256:*) ;;
+            *) echo "verified immutable Exchange digest reference is missing" >&2; exit 2 ;;
+          esac
+          az containerapp update \
+            --name "$AZURE_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --image "$IMAGE_REF"
+          {
+            echo "## Exchange deployment: UPDATED"
+            echo
+            echo "Updated the existing `$AZURE_APP_NAME` app to `$IMAGE_REF`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify healthy revision and public Web gateway
+        if: env.AZURE_CREDENTIALS != '' && steps.app.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
           for i in {1..30}; do
-            REVISION=$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.latestRevisionName" -o tsv)
-            READY=$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.latestReadyRevisionName" -o tsv)
-            if [ -n "$REVISION" ] && [ "$REVISION" = "$READY" ]; then
-              HEALTH=$(az containerapp revision show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --revision "$REVISION" --query "properties.healthState" -o tsv)
-              if [ "$HEALTH" = "Healthy" ]; then
-                echo "Healthy revision: $REVISION"
+            revision="$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.latestRevisionName" -o tsv)"
+            ready="$(az containerapp show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query "properties.latestReadyRevisionName" -o tsv)"
+            if [ -n "$revision" ] && [ "$revision" = "$ready" ]; then
+              health="$(az containerapp revision show --name "$AZURE_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --revision "$revision" --query "properties.healthState" -o tsv)"
+              if [ "$health" = "Healthy" ]; then
+                echo "Healthy revision: $revision"
                 break
               fi
             fi
@@ -163,54 +485,3 @@ jobs:
           else:
               raise RuntimeError("Web gateway accepted a request without credentials")
           PY
-
-      - name: Create service update manifest
-        id: update-manifest
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        env:
-          IMAGE_REPOSITORY: ${{ steps.meta.outputs.image }}
-          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          SOURCE_COMMIT: ${{ github.sha }}
-          SERVICE_ID: cyrene-exchange
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          from pathlib import Path
-
-          source_commit = os.environ["SOURCE_COMMIT"]
-          image_digest = os.environ["IMAGE_DIGEST"]
-          version = os.environ["IMAGE_TAG"]
-          if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
-              raise SystemExit("GITHUB_SHA must be a full 40-character commit SHA")
-          if re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest) is None:
-              raise SystemExit("build-push-action did not return a full sha256 image digest")
-          if not version or len(version) > 128:
-              raise SystemExit("image tag must be a non-empty version of at most 128 characters")
-
-          manifest = {
-              "schemaVersion": 1,
-              "serviceId": os.environ["SERVICE_ID"],
-              "version": version,
-              "sourceCommit": source_commit,
-              "image": {
-                  "repository": os.environ["IMAGE_REPOSITORY"],
-                  "digest": image_digest,
-              },
-              "platform": {"os": "linux", "arch": "amd64"},
-          }
-          Path("service-update-manifest.json").write_text(
-              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-          )
-          PY
-
-      - name: Upload service update manifest
-        uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() && steps.update-manifest.outcome == 'success' }}
-        with:
-          name: service-update-manifest-cyrene-exchange
-          path: service-update-manifest.json
-          if-no-files-found: error
-          retention-days: 30
