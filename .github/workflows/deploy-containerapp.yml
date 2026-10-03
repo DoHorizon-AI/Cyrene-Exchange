@@ -155,7 +155,7 @@ jobs:
         env:
           CHANNEL: ${{ steps.source.outputs.channel }}
           GH_TOKEN: ${{ github.token }}
-          CATALOG_RELEASE_ID: ${{ inputs.catalog_release_id || (steps.source.outputs.channel == 'preview' && vars.CYRENE_PREVIEW_COMPONENT_CATALOG_RELEASE_ID) || (steps.source.outputs.channel == 'stable' && vars.CYRENE_STABLE_COMPONENT_CATALOG_RELEASE_ID) }}
+          CATALOG_RELEASE_ID: ${{ inputs.catalog_release_id || (steps.source.outputs.channel == 'preview' && vars.CYRENE_PREVIEW_COMPONENT_CATALOG_RELEASE_ID) || (steps.source.outputs.channel == 'stable' && vars.CYRENE_STABLE_COMPONENT_CATALOG_RELEASE_ID) || '' }}
         run: |
           set -euo pipefail
           mkdir -p workspace-catalog/governance
