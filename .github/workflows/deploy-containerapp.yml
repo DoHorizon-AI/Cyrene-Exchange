@@ -6,6 +6,11 @@ on:
     types: [completed]
     branches: [main, release, develop]
   workflow_dispatch:
+    inputs:
+      catalog_release_id:
+        description: Exact immutable Workspace catalog release tag; blank selects the latest release in the source channel
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -38,8 +43,7 @@ jobs:
       AZURE_CONTAINERAPP_ENV: cae-dh-eastasia
       AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
       CYRENE_PUBLIC_BASE_URL: https://cyrene.dohorizon-llc.net
-      WORKSPACE_CATALOG_COMMIT: 522524b86a8f79c70e948fed8cb27c4cc70f29c4
-      WORKSPACE_CATALOG_SHA256: 248a9a3b27f3d1daa4c0a6fdc405c612fd492483bb4157ff46b6d2836ffd0d35
+      CATALOG_HELPER_SOURCE_COMMIT: "87b8e676300eb2a9041740e651773cb01a2a7724"
 
     steps:
       - name: Resolve and validate the triggering source identity
@@ -120,24 +124,82 @@ jobs:
               output.write(f"channel={channel}\n")
           PY
 
-      - name: Check out the pinned component catalog
+      - name: Check out the fixed catalog verifier and schemas
         uses: actions/checkout@v5
         with:
           repository: DoHorizon-AI/Cyrene-Workspace
-          ref: ${{ env.WORKSPACE_CATALOG_COMMIT }}
-          path: workspace-catalog
+          ref: ${{ env.CATALOG_HELPER_SOURCE_COMMIT }}
+          path: catalog-helper
+          fetch-depth: 0
           persist-credentials: false
+          sparse-checkout: |
+            packaging/fetch_component_catalog.py
+            packaging/catalog_metadata.py
+            packaging/component_updates.py
+            governance/component-catalog-v1.json
+            governance/component-catalog-v1.schema.json
+            governance/component-release-manifest-v1.schema.json
+            governance/component-release-manifest-v2.schema.json
+            governance/component-release-index-v1.schema.json
+          sparse-checkout-cone-mode: false
 
-      - name: Verify the pinned catalog bytes
-        run: |
-          set -euo pipefail
-          actual="$(sha256sum workspace-catalog/governance/component-catalog-v1.json | cut -d ' ' -f 1)"
-          test "$actual" = "$WORKSPACE_CATALOG_SHA256"
-
-      - name: Set up Python release tooling
+      - name: Set up Python catalog tooling
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Install pinned catalog verifier dependencies
+        run: python -m pip install --disable-pip-version-check jsonschema==4.26.0
+
+      - name: Fetch and verify an exact immutable catalog release
+        env:
+          CHANNEL: ${{ steps.source.outputs.channel }}
+          GH_TOKEN: ${{ github.token }}
+          CATALOG_RELEASE_ID: ${{ inputs.catalog_release_id || (steps.source.outputs.channel == 'preview' && vars.CYRENE_PREVIEW_COMPONENT_CATALOG_RELEASE_ID) || (steps.source.outputs.channel == 'stable' && vars.CYRENE_STABLE_COMPONENT_CATALOG_RELEASE_ID) }}
+        run: |
+          set -euo pipefail
+          mkdir -p workspace-catalog/governance
+          for schema in \
+            component-catalog-v1.schema.json \
+            component-release-manifest-v1.schema.json \
+            component-release-manifest-v2.schema.json \
+            component-release-index-v1.schema.json; do
+            cp "catalog-helper/governance/$schema" workspace-catalog/governance/
+          done
+          args=(--output workspace-catalog/governance/component-catalog-v1.json \
+            --metadata-output workspace-catalog/component-catalog-release.json \
+            --schema-root catalog-helper/governance)
+          if [[ -n "$CATALOG_RELEASE_ID" ]]; then
+            args+=(--release-id "$CATALOG_RELEASE_ID")
+          else
+            args+=(--latest-channel "$CHANNEL")
+          fi
+          python catalog-helper/packaging/fetch_component_catalog.py "${args[@]}"
+          python - workspace-catalog/component-catalog-release.json workspace-catalog/governance/component-catalog-v1.json <<'PY'
+          import hashlib, json, os, re, sys
+          metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+          channel = os.environ["CHANNEL"]
+          commit = metadata.get("sourceCommit")
+          refs = {"preview": {"refs/heads/develop"}, "stable": {"refs/heads/main", "refs/heads/release"}}
+          digest = metadata.get("catalogSha256")
+          if metadata.get("schemaVersion") != 1 or metadata.get("channel") != channel:
+              raise SystemExit("verified catalog metadata channel or version differs from this deployment")
+          if metadata.get("repository") != "DoHorizon-AI/Cyrene-Workspace" or metadata.get("workflow") != "DoHorizon-AI/Cyrene-Workspace/.github/workflows/component-catalog-release.yml":
+              raise SystemExit("verified catalog metadata does not identify the trusted publisher")
+          if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+              raise SystemExit("verified catalog source commit is invalid")
+          if metadata.get("releaseId") != f"catalog-{channel}-{commit}" or metadata.get("sourceRef") not in refs[channel]:
+              raise SystemExit("verified catalog release tag or source ref does not match its channel")
+          if not isinstance(metadata.get("generation"), int) or isinstance(metadata.get("generation"), bool):
+              raise SystemExit("verified catalog generation is not an integer")
+          if metadata.get("subjectName") != "component-catalog-v1.json" or metadata.get("attestationAssetName") != "component-catalog-v1.json.attestation.jsonl":
+              raise SystemExit("verified catalog metadata names unexpected release assets")
+          if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("verified catalog metadata digest is malformed")
+          actual = hashlib.sha256(open(sys.argv[2], "rb").read()).hexdigest()
+          if actual != digest.removeprefix("sha256:"):
+              raise SystemExit("verified catalog bytes do not match release metadata")
+          PY
 
       - name: Install the pinned JCS implementation
         run: python -m pip install --disable-pip-version-check rfc8785==0.1.4
