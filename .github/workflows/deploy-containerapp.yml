@@ -43,7 +43,7 @@ jobs:
       AZURE_CONTAINERAPP_ENV: cae-dh-eastasia
       AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
       CYRENE_PUBLIC_BASE_URL: https://cyrene.dohorizon-llc.net
-      CATALOG_HELPER_SOURCE_COMMIT: "87b8e676300eb2a9041740e651773cb01a2a7724"
+      CATALOG_HELPER_SOURCE_COMMIT: "69481d10f4a89f4679bc00195bc9caa5db5fb16a"
 
     steps:
       - name: Resolve and validate the triggering source identity
