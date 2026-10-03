@@ -22,12 +22,18 @@ from .gateway import RequestAuditTerminalStatus, RequestMetadata
 
 
 class BillingUsageError(RuntimeError):
-    """The billing plugin rejected a request or returned an invalid response."""
+    """The billing plugin rejected a request or returned an invalid response.
+
+    账单插件拒绝了请求,或返回了无效响应。
+    """
 
 
 @dataclass(frozen=True)
 class TokenUsageEvent:
-    """One content-free terminal usage event sent to `billing.usage.v1`."""
+    """One content-free terminal usage event sent to `billing.usage.v1`.
+
+    发送到 `billing.usage.v1` 的一条不含内容的终态用量事件。
+    """
 
     request_id: str
     tenant_id: str
@@ -40,7 +46,10 @@ class TokenUsageEvent:
     usage_source: str
 
     def to_wire(self) -> dict[str, str | int]:
-        """Serialize contract field names while preserving missing token facts."""
+        """Serialize contract field names while preserving missing token facts.
+
+        序列化契约字段名,同时保留缺失的 token 事实。
+        """
 
         wire: dict[str, str | int] = {
             "requestId": self.request_id,
@@ -61,13 +70,22 @@ class TokenUsageEvent:
 
 
 class BillingUsageClient(Protocol):
-    """Consumer port for the Plugins-owned `billing.usage.v1` capability."""
+    """Consumer port for the Plugins-owned `billing.usage.v1` capability.
+
+    供消费者使用的 `billing.usage.v1` 能力接口,该能力由 Plugins 所有。
+    """
 
     def record_token_usage(self, event: TokenUsageEvent) -> None:
-        """Idempotently record one terminal provider usage event."""
+        """Idempotently record one terminal provider usage event.
+
+        幂等地记录一条终态提供方用量事件。
+        """
 
     def total_tokens(self, tenant_id: str) -> int:
-        """Return the ledger's complete provider-backed token total."""
+        """Return the ledger's complete provider-backed token total.
+
+        返回账本中完整的、由提供方报告的 token 总量。
+        """
 
 
 def observed_token_usage_event(
@@ -75,7 +93,10 @@ def observed_token_usage_event(
     status: RequestAuditTerminalStatus,
     usage: ProviderUsage | None,
 ) -> TokenUsageEvent | None:
-    """Build an event only when at least one provider token fact exists."""
+    """Build an event only when at least one provider token fact exists.
+
+    仅当至少存在一项提供方 token 事实时才构建事件。
+    """
 
     if usage is None or not usage.to_openai_dict():
         return None
@@ -93,7 +114,10 @@ def observed_token_usage_event(
 
 
 class HttpBillingUsageClient:
-    """Synchronous stdlib HTTP client for a Plugins-owned billing endpoint."""
+    """Synchronous stdlib HTTP client for a Plugins-owned billing endpoint.
+
+    用于访问 Plugins 所有账单端点的同步标准库 HTTP 客户端。
+    """
 
     def __init__(self, base_url: str, *, timeout_seconds: float = 2.0) -> None:
         normalized = base_url.rstrip("/")
@@ -147,7 +171,7 @@ class HttpBillingUsageClient:
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
         try:
-            with urlopen(request, timeout=self._timeout_seconds) as response:  # noqa: S310 - validated HTTP(S) origin
+            with urlopen(request, timeout=self._timeout_seconds) as response:  # noqa: S310 - validated HTTP(S) origin | 已验证的 HTTP(S) 来源
                 status = response.status
                 payload = json.load(response)
         except HTTPError as exc:

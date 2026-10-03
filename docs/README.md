@@ -14,6 +14,7 @@ its persisted authority, and its Platform/Plugins boundaries.
 | [`governance/`](governance/README.md) | Recorded boundary decisions | 已记录边界决策 |
 | [`glossary.md`](glossary.md) | English-Chinese vocabulary | 中英术语表 |
 | [`faq.md`](faq.md) | Common operational questions | 常见运维问题 |
+| [`logging-and-errors.md`](logging-and-errors.md) | Cross-repository logging, error codes, and diagnostics specification | 跨仓日志、错误码与诊断规范 (草案 v0.1) |
 
 Suggested order: API, architecture overview, Exchange module guide, lifecycle,
 then tests and contracts.

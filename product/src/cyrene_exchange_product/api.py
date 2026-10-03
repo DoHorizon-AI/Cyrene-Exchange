@@ -11,7 +11,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable, Mapping
+import sys
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -22,17 +23,32 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
 from cyrene_exchange_product.domain import (
+    ApiKey,
     ConfirmRouteRequest,
+    CreateApiKeyRequest,
+    CreatedApiKey,
     CreateEndpointRequest,
     CreateRouteDraftRequest,
     CreateRouteRequest,
+    CreateWorkspaceRouteDraftRequest,
     EditRouteDraftRequest,
     GatewayEndpoint,
     GatewayRoute,
     ProblemDetails,
     ProductPrincipal,
+    RouteSource,
+    WorkspaceEndpointGrant,
+    WorkspaceGatewayRoute,
+    WorkspaceReactorEndpointGrant,
+    WorkspaceReactorEndpointSelector,
+    WorkspaceRouteSourceProvenance,
 )
-from cyrene_exchange_product.errors import ExchangeProductError
+from cyrene_exchange_product.errors import ExchangeProductError, map_exchange_error
+from cyrene_exchange_product.logging import (
+    format_cyrene_log,
+    parse_w3c_traceparent,
+    sanitize_request_id,
+)
 from cyrene_exchange_product.service import ExchangeProductService
 from cyrene_exchange_product.store import ExchangeStore
 
@@ -46,26 +62,55 @@ def _incoming_trace_id(value: str) -> str | None:
     return match.group(1)
 
 
+def _workspace_route_projection(route: GatewayRoute) -> WorkspaceGatewayRoute:
+    """Remove the internal Reactor URL from the browser-facing Workspace view."""
+
+    payload = route.model_dump(exclude={"source", "organization_id"})
+    if route.source is not None:
+        model_version_digest = None
+        if route.source.model_version_id is not None:
+            model_version_digest = route.source.model_version_id.removeprefix("model-version://")
+        payload["source_provenance"] = WorkspaceRouteSourceProvenance(
+            resource_version=route.source.resource_version,
+            artifact_digest=route.source.artifact_digest,
+            model_version_digest=model_version_digest,
+        ).model_dump(exclude_none=True)
+    return WorkspaceGatewayRoute.model_validate(payload)
+
+
 def create_app(
     *,
     database_path: Path,
     control_credentials: Mapping[str, ProductPrincipal] | None = None,
+    workspace_endpoint_grants: Iterable[WorkspaceEndpointGrant] = (),
+    workspace_reactor_endpoint_grants: Iterable[WorkspaceReactorEndpointGrant] = (),
+    resolve_workspace_reactor_endpoint: (
+        Callable[[WorkspaceReactorEndpointSelector, str], RouteSource] | None
+    ) = None,
     allowed_binding_ids: frozenset[str] = frozenset(),
     validate_route_target: Callable[[GatewayRoute], None] | None = None,
+    store: ExchangeStore | None = None,
 ) -> FastAPI:
-    """Build the Exchange Product control API. | 创建 Exchange 产品控制 API。"""
+    """Build the Exchange Product control API. | 创建 Exchange 产品控制 API。
 
-    store = ExchangeStore(database_path)
+    A caller that already owns the store (for example a fused gateway that
+    resolves providers from persisted routes) passes it in so control and data
+    plane share exactly one connection and one credential set.
+    """
+
+    store = store or ExchangeStore(database_path)
     service = ExchangeProductService(store)
-    if len({p.workspace_id for p in (control_credentials or {}).values()}) > 1:
-        raise ValueError("the first route-control profile requires one configured workspace")
     if control_credentials is not None:
         store.configure_credentials(control_credentials)
+    store.configure_workspace_endpoint_grants(workspace_endpoint_grants)
+    store.configure_workspace_reactor_endpoint_grants(workspace_reactor_endpoint_grants)
     control_refs = {p.credential_ref for p in (control_credentials or {}).values()}
 
     def principal(request: Request) -> ProductPrincipal:
+        if control_credentials is None:
+            return ProductPrincipal("actor-default", "workspace-default", "cred://exchange/default")
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
-        identity = store.resolve_credential(token) if scheme == "Bearer" else None
+        identity = store.resolve_product_credential(token) if scheme == "Bearer" else None
         if identity is None or identity.credential_ref not in control_refs:
             raise ExchangeProductError(
                 code="EXCHANGE_CONTROL_PERMISSION_DENIED",
@@ -73,10 +118,52 @@ def create_app(
                 detail="Use an explicitly configured Exchange control credential.",
                 status=403,
             )
-        return ProductPrincipal(identity.actor_id, identity.workspace_id, identity.credential_ref)
+        return identity
+
+    def scoped_principal(request: Request) -> ProductPrincipal:
+        """Require a configured Bearer with organization and workspace scope."""
+
+        if control_credentials is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONTROL_PERMISSION_DENIED",
+                title="Workspace control credential required",
+                detail="Configure a server-side organization/workspace control credential.",
+                status=403,
+            )
+        identity = principal(request)
+        if identity.organization_id is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONTROL_PERMISSION_DENIED",
+                title="Workspace scope required",
+                detail="The control credential has no configured organization scope.",
+                status=403,
+            )
+        return identity
+
+    def legacy_operator_principal(request: Request) -> ProductPrincipal:
+        """Keep legacy global writes on organization-unscoped credentials."""
+
+        identity = principal(request)
+        if identity.organization_id is not None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONTROL_PERMISSION_DENIED",
+                title="Legacy control operation unavailable",
+                detail="Use the scoped Workspace API for organization-bound credentials.",
+                status=403,
+            )
+        return identity
 
     def protect_configured_control(request: Request) -> None:
-        if control_credentials is not None:
+        # The control API is the only surface this guard owns. Data-plane
+        # routes authenticate through the gateway, and liveness probes must
+        # stay reachable for orchestrators and reverse proxies.
+        # 中文:此守卫只负责控制 API;数据平面路由通过网关进行身份验证,且必须保持可访问,
+        # 以供编排器和反向代理使用。
+        if (
+            control_credentials is not None
+            and request.url.path.startswith("/api/")
+            and not request.url.path.startswith(("/api/v1/system/", "/api/v1/auth/", "/api/proxy/"))
+        ):
             principal(request)
 
     app = FastAPI(
@@ -91,14 +178,28 @@ def create_app(
     async def propagate_trace(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        trace_id = _incoming_trace_id(request.headers.get("traceparent", "")) or uuid4().hex
+        parsed_trace = parse_w3c_traceparent(request.headers.get("traceparent"))
+        if parsed_trace is not None:
+            trace_id, _ = parsed_trace
+        else:
+            trace_id = uuid4().hex
+
+        raw_req_id = request.headers.get("x-request-id")
+        request_id = sanitize_request_id(raw_req_id) or str(uuid4())
+
         request.state.trace_id = trace_id
+        request.state.request_id = request_id
+
         response = await call_next(request)
         response.headers["traceparent"] = f"00-{trace_id}-0000000000000001-01"
+        response.headers["x-request-id"] = request_id
         return response
 
     @app.exception_handler(ExchangeProductError)
     async def product_error(request: Request, exc: ExchangeProductError) -> JSONResponse:
+        mapping = map_exchange_error(exc.code)
+        trace_id = getattr(request.state, "trace_id", None) or uuid4().hex
+        request_id = getattr(request.state, "request_id", None)
         problem = ProblemDetails(
             type=f"https://errors.cyrene.dev/exchange/{exc.code.lower()}",
             title=exc.title,
@@ -107,9 +208,26 @@ def create_app(
             instance=request.url.path,
             code=exc.code,
             retryable=exc.retryable,
-            trace_id=request.state.trace_id,
+            trace_id=trace_id,
             resource_ref=exc.resource_ref,
         )
+        # Emit structured diagnostic log to stderr
+        # 中文:向标准错误输出结构化诊断日志。
+        log_line = format_cyrene_log(
+            level="WARN" if exc.status < 500 else "ERROR",
+            event_name="exchange.product.error",
+            message=exc.detail,
+            trace_id=trace_id,
+            attributes={
+                "error.code": mapping.canonical_code,
+                "cause.kind": mapping.cause_kind,
+                "recovery.action": mapping.recovery_action,
+                "http.status": exc.status,
+                "request_id": request_id,
+                "path": request.url.path,
+            },
+        )
+        sys.stderr.write(log_line + "\n")
         return JSONResponse(
             status_code=exc.status,
             content=problem.model_dump(by_alias=True, exclude_none=True, mode="json"),
@@ -118,6 +236,9 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, _exc: RequestValidationError) -> JSONResponse:
+        mapping = map_exchange_error("EXCHANGE_REQUEST_INVALID")
+        trace_id = getattr(request.state, "trace_id", None) or uuid4().hex
+        request_id = getattr(request.state, "request_id", None)
         problem = ProblemDetails(
             type="https://errors.cyrene.dev/exchange/request-invalid",
             title="Request validation failed",
@@ -126,8 +247,23 @@ def create_app(
             instance=request.url.path,
             code="EXCHANGE_REQUEST_INVALID",
             retryable=False,
-            trace_id=request.state.trace_id,
+            trace_id=trace_id,
         )
+        log_line = format_cyrene_log(
+            level="WARN",
+            event_name="exchange.product.validation_failed",
+            message="Request validation failed",
+            trace_id=trace_id,
+            attributes={
+                "error.code": mapping.canonical_code,
+                "cause.kind": mapping.cause_kind,
+                "recovery.action": mapping.recovery_action,
+                "http.status": 422,
+                "request_id": request_id,
+                "path": request.url.path,
+            },
+        )
+        sys.stderr.write(log_line + "\n")
         return JSONResponse(
             status_code=422,
             content=problem.model_dump(by_alias=True, mode="json"),
@@ -141,8 +277,10 @@ def create_app(
     )
     def create_endpoint(
         command: CreateEndpointRequest,
+        request: Request,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
     ) -> GatewayEndpoint:
+        legacy_operator_principal(request)
         return service.create_endpoint(command, idempotency_key)
 
     @app.get("/api/v1/gateway-endpoints/{endpointId}", response_model=GatewayEndpoint)
@@ -151,25 +289,48 @@ def create_app(
     ) -> GatewayEndpoint:
         return service.get_endpoint(endpoint_id)
 
+    @app.get("/api/v1/gateway-endpoints", response_model=list[GatewayEndpoint])
+    def list_endpoints() -> list[GatewayEndpoint]:
+        return service.list_endpoints()
+
     @app.post(
         "/api/v1/gateway-endpoints/{endpointId}/actions/disable",
         response_model=GatewayEndpoint,
     )
     def disable_endpoint(
         endpoint_id: Annotated[UUID, ApiPath(alias="endpointId")],
+        request: Request,
     ) -> GatewayEndpoint:
+        legacy_operator_principal(request)
         return service.disable_endpoint(endpoint_id)
 
     @app.post("/api/v1/gateway-routes", response_model=GatewayRoute, status_code=201)
     def create_route(
         command: CreateRouteRequest,
+        request: Request,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
     ) -> GatewayRoute:
+        legacy_operator_principal(request)
         return service.create_route(command, idempotency_key)
 
     @app.get("/api/v1/gateway-routes/{routeId}", response_model=GatewayRoute)
     def get_route(route_id: Annotated[UUID, ApiPath(alias="routeId")]) -> GatewayRoute:
-        return service.get_route(route_id)
+        return service.get_legacy_route(route_id)
+
+    @app.get("/api/v1/gateway-routes", response_model=list[GatewayRoute])
+    def list_routes() -> list[GatewayRoute]:
+        return service.list_routes()
+
+    @app.get("/api/v1/workspace/gateway-routes", response_model=list[WorkspaceGatewayRoute])
+    def list_workspace_routes(request: Request) -> list[WorkspaceGatewayRoute]:
+        identity = scoped_principal(request)
+        organization_id = identity.organization_id
+        if organization_id is None:
+            raise AssertionError("scoped_principal must return an organization-scoped identity")
+        return [
+            _workspace_route_projection(route)
+            for route in service.list_workspace_routes(organization_id, identity.workspace_id)
+        ]
 
     def admit_binding(binding_id: str) -> None:
         if binding_id not in allowed_binding_ids:
@@ -186,9 +347,71 @@ def create_app(
         request: Request,
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ) -> GatewayRoute:
-        actor = principal(request)
+        actor = legacy_operator_principal(request)
         admit_binding(command.target_binding_id)
         return service.create_route_draft(command, idempotency_key, actor)
+
+    @app.post(
+        "/api/v1/workspace/gateway-route-drafts",
+        response_model=WorkspaceGatewayRoute,
+        status_code=201,
+    )
+    def create_workspace_draft(
+        command: CreateWorkspaceRouteDraftRequest,
+        request: Request,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> WorkspaceGatewayRoute:
+        identity = scoped_principal(request)
+        admit_binding(command.target_binding_id)
+        organization_id = identity.organization_id
+        if organization_id is None:
+            raise AssertionError("scoped_principal must return an organization-scoped identity")
+        if not store.workspace_endpoint_is_granted(
+            command.endpoint_id, organization_id, identity.workspace_id
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_PERMISSION_DENIED",
+                title="Endpoint not permitted",
+                detail="No operator grant permits this destination in the authenticated workspace.",
+                status=403,
+            )
+        source_endpoint_id = command.source_endpoint.endpoint_id
+        if not store.workspace_reactor_endpoint_is_granted(
+            source_endpoint_id, organization_id, identity.workspace_id
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_SOURCE_PERMISSION_DENIED",
+                title="Reactor Endpoint not permitted",
+                detail=(
+                    "No operator grant permits this Reactor source in the authenticated workspace."
+                ),
+                status=403,
+            )
+        if resolve_workspace_reactor_endpoint is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_SOURCE_UNREACHABLE",
+                title="Reactor source unavailable",
+                detail="Configure the private Reactor source resolver before creating drafts.",
+                status=503,
+                retryable=True,
+            )
+        source = resolve_workspace_reactor_endpoint(command.source_endpoint, command.target_model)
+        internal_command = CreateRouteDraftRequest(
+            endpoint_id=command.endpoint_id,
+            model_pattern=command.model_pattern,
+            target_binding_id=command.target_binding_id,
+            target_model=command.target_model,
+            priority=command.priority,
+            source=source,
+        )
+        route = service.create_scoped_route_draft(
+            internal_command,
+            idempotency_key,
+            identity,
+            idempotency_command=command,
+            reactor_source_endpoint_id=source_endpoint_id,
+        )
+        return _workspace_route_projection(route)
 
     @app.patch("/api/v1/gateway-route-drafts/{routeId}", response_model=GatewayRoute)
     def edit_draft(
@@ -196,7 +419,8 @@ def create_app(
         command: EditRouteDraftRequest,
         request: Request,
     ) -> GatewayRoute:
-        actor = principal(request)
+        actor = legacy_operator_principal(request)
+        service.get_owned_draft(route_id, actor)
         admit_binding(command.target_binding_id)
         return service.edit_route_draft(route_id, command, actor)
 
@@ -206,8 +430,8 @@ def create_app(
         command: ConfirmRouteRequest,
         request: Request,
     ) -> GatewayRoute:
-        actor = principal(request)
-        route = service.get_route(route_id)
+        actor = legacy_operator_principal(request)
+        route = service.get_owned_draft(route_id, actor)
         admit_binding(route.target_binding_id)
         if validate_route_target is None:
             raise ExchangeProductError(
@@ -220,5 +444,38 @@ def create_app(
         return service.confirm_route_draft(
             route_id, command.resource_version, actor, validate_route_target
         )
+
+    @app.post(
+        "/api/v1/api-keys",
+        response_model=CreatedApiKey,
+        response_model_exclude_none=True,
+        status_code=201,
+    )
+    def create_api_key(
+        command: CreateApiKeyRequest,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
+    ) -> CreatedApiKey:
+        actor = principal(request)
+        created, _ = service.create_api_key(command, actor, idempotency_key)
+        return created
+
+    @app.get("/api/v1/api-keys", response_model=list[ApiKey])
+    def list_api_keys(request: Request) -> list[ApiKey]:
+        return service.list_api_keys(principal(request))
+
+    @app.get("/api/v1/api-keys/{apiKeyId}", response_model=ApiKey)
+    def get_api_key(
+        api_key_id: Annotated[UUID, ApiPath(alias="apiKeyId")],
+        request: Request,
+    ) -> ApiKey:
+        return service.get_api_key(api_key_id, principal(request))
+
+    @app.post("/api/v1/api-keys/{apiKeyId}/actions/revoke", response_model=ApiKey)
+    def revoke_api_key(
+        api_key_id: Annotated[UUID, ApiPath(alias="apiKeyId")],
+        request: Request,
+    ) -> ApiKey:
+        return service.revoke_api_key(api_key_id, principal(request))
 
     return app

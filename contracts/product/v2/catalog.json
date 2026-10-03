@@ -1,0 +1,75 @@
+{
+  "schemaVersion": "cyrene.product.operation-catalog.v2",
+  "catalogVersion": "2.0.0",
+  "ownerId": "exchange",
+  "operations": [
+    {
+      "operationId": "listWorkspaceGatewayRoutes",
+      "routeId": "listWorkspaceGatewayRoutes",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1workspace~1gateway-routes/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [
+          {
+            "jsonPointer": "/*/workspaceId",
+            "matches": "WORKSPACE_ID"
+          }
+        ],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "createWorkspaceGatewayRouteDraft",
+      "routeId": "createWorkspaceGatewayRouteDraft",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1workspace~1gateway-route-drafts/post/requestBody/content/application~1json/schema",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1workspace~1gateway-route-drafts/post/responses/201/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [
+          {
+            "jsonPointer": "/workspaceId",
+            "matches": "WORKSPACE_ID"
+          }
+        ],
+        "requestBindings": []
+      }
+    }
+  ]
+}

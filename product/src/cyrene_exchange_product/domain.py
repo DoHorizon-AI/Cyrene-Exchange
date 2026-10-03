@@ -66,6 +66,48 @@ class RouteSource(ContractModel):
     )
 
 
+class WorkspaceReactorEndpointSelector(ContractModel):
+    """Opaque command selector for one granted Reactor Endpoint. | 私有端点选择器。"""
+
+    product: Literal["reactor"]
+    endpoint_id: UUID
+    resource_version: int = Field(ge=1)
+
+
+class CreateWorkspaceRouteDraftRequest(ContractModel):
+    """Workspace command that selects a Reactor source without accepting a URL.
+
+    中文:私有 Workspace 命令只选择 Reactor Endpoint,不接受来源 URL。
+    """
+
+    endpoint_id: UUID
+    model_pattern: str = Field(min_length=1, max_length=200)
+    target_binding_id: str = Field(min_length=1, max_length=300)
+    target_model: str = Field(min_length=1, max_length=200)
+    priority: int = Field(ge=0, le=10_000)
+    source_endpoint: WorkspaceReactorEndpointSelector
+
+
+@dataclass(frozen=True)
+class WorkspaceReactorEndpointGrant:
+    """Operator-owned Reactor source assignment to one organization/workspace.
+
+    中文:由 operator 管理的 Reactor 来源授权,固定绑定一个组织和 workspace。
+    """
+
+    endpoint_id: UUID
+    organization_id: str
+    workspace_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.endpoint_id, UUID):
+            raise TypeError("Reactor Endpoint grant endpoint_id must be a UUID")
+        for field_name in ("organization_id", "workspace_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Reactor Endpoint grant {field_name} must be non-empty text")
+
+
 class GatewayEndpoint(ContractModel):
     """Externally published model API surface. | 对外发布的模型 API 表面。"""
 
@@ -94,6 +136,43 @@ class GatewayRoute(ContractModel):
     updated_at: datetime
     resource_version: int = Field(ge=1)
     source: RouteSource | None = Field(default=None, exclude_if=lambda value: value is None)
+    created_by: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    workspace_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    # This server-assigned scope is persisted separately from the public document.
+    # 中文:此服务端分配的组织范围单独持久化,不进入公开文档。
+    organization_id: str | None = Field(default=None, exclude=True)
+
+
+class WorkspaceRouteSourceProvenance(ContractModel):
+    """Non-navigable Reactor provenance without its internal resource URL."""
+
+    product: Literal["reactor"] = "reactor"
+    resource_version: int = Field(ge=1)
+    artifact_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    model_version_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256/[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+
+
+class WorkspaceGatewayRoute(ContractModel):
+    """Workspace route projection that omits internal service addresses."""
+
+    id: UUID
+    endpoint_id: UUID
+    state: RouteState = RouteState.ACTIVE
+    model_pattern: str = Field(min_length=1, max_length=200)
+    target_binding_id: str = Field(min_length=1, max_length=300)
+    target_capability_type: Literal["model.provider.v1"] = "model.provider.v1"
+    target_model: str | None = Field(default=None, min_length=1, max_length=200)
+    priority: int = Field(ge=0, le=10_000)
+    created_at: datetime
+    updated_at: datetime
+    resource_version: int = Field(ge=1)
+    source_provenance: WorkspaceRouteSourceProvenance | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     created_by: str | None = Field(default=None, exclude_if=lambda value: value is None)
     workspace_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
@@ -139,6 +218,45 @@ class ConfirmRouteRequest(ContractModel):
     resource_version: int = Field(ge=1)
 
 
+class ApiKeyState(StrEnum):
+    """Gateway API key lifecycle. | 网关 API Key 生命周期。"""
+
+    ACTIVE = "ACTIVE"
+    REVOKED = "REVOKED"
+
+
+class CreateApiKeyRequest(ContractModel):
+    """Server-generated gateway key request. | 服务端生成网关密钥请求。"""
+
+    name: str = Field(min_length=1, max_length=200)
+    expires_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    model_scope: list[str] = Field(default_factory=list, max_length=100)
+
+
+class ApiKey(ContractModel):
+    """Gateway credential metadata; the secret is never persisted. | 密钥元数据。"""
+
+    id: UUID
+    name: str = Field(min_length=1, max_length=200)
+    credential_ref: str = Field(pattern=r"^api-key://[0-9a-f-]{36}$")
+    actor_id: str = Field(min_length=1, max_length=300)
+    workspace_id: str = Field(min_length=1, max_length=300)
+    state: ApiKeyState
+    model_scope: list[str] = Field(default_factory=list, max_length=100)
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    revoked_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    resource_version: int = Field(ge=1)
+    organization_id: str | None = Field(default=None, exclude=True)
+
+
+class CreatedApiKey(ApiKey):
+    """Creation response carrying the one-time secret. | 仅创建响应携带一次性密钥。"""
+
+    secret: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
 class ProblemDetails(ContractModel):
     """RFC 9457 control response with stable extensions. | RFC 9457 控制面错误。"""
 
@@ -155,17 +273,47 @@ class ProblemDetails(ContractModel):
 
 @dataclass(frozen=True)
 class ProductPrincipal:
-    """Configured Exchange identity bound to one credential reference."""
+    """Configured Exchange identity bound to one credential reference.
+
+    中文:绑定到一个凭据引用的已配置 Exchange 身份。
+    """
+
+    # 中文:绑定到一个凭据引用的 Exchange 配置身份。
 
     actor_id: str
     workspace_id: str
     credential_ref: str
+    organization_id: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("actor_id", "workspace_id", "credential_ref"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"principal {field_name} must be non-empty text")
+        if self.organization_id is not None and (
+            not isinstance(self.organization_id, str) or not self.organization_id.strip()
+        ):
+            raise ValueError("principal organization_id must be non-empty text when configured")
+
+
+@dataclass(frozen=True)
+class WorkspaceEndpointGrant:
+    """Operator-owned permission to reference one endpoint from one Product scope.
+
+    中文:由 operator 配置的 endpoint 使用许可，固定绑定一个组织和 workspace。
+    """
+
+    endpoint_id: UUID
+    organization_id: str
+    workspace_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.endpoint_id, UUID):
+            raise TypeError("workspace endpoint grant endpoint_id must be a UUID")
+        for field_name in ("organization_id", "workspace_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"workspace endpoint grant {field_name} must be non-empty text")
 
 
 class TenantQuota(ContractModel):
@@ -178,7 +326,12 @@ class TenantQuota(ContractModel):
 
 
 class RequestAuditStatus(StrEnum):
-    """Durable request lifecycle state owned by Exchange Product."""
+    """Durable request lifecycle state owned by Exchange Product.
+
+    中文:由 Exchange Product 持有的持久化 request 生命周期状态。
+    """
+
+    # 中文:由 Exchange Product 拥有的持久化请求生命周期状态。
 
     STARTED = "started"
     COMPLETED = "completed"
@@ -188,7 +341,12 @@ class RequestAuditStatus(StrEnum):
 
 
 class UsageState(StrEnum):
-    """Completeness of exact usage facts observed from a provider."""
+    """Completeness of exact usage facts observed from a provider.
+
+    中文:Provider 观测到的精确用量事实的完整性。
+    """
+
+    # 中文:提供方观测到的准确用量事实是否完整。
 
     UNKNOWN = "unknown"
     PARTIAL = "partial"
@@ -196,7 +354,12 @@ class UsageState(StrEnum):
 
 
 class RequestAuditRecord(ContractModel):
-    """Content-free persisted request, outcome, and provider usage record."""
+    """Content-free persisted request, outcome, and provider usage record.
+
+    中文:不含内容正文的持久化请求、结果与 provider 用量记录。
+    """
+
+    # 中文:不含内容的持久化请求、结果和提供方用量记录。
 
     request_id: str = Field(min_length=1, max_length=200)
     route_id: str | None = Field(default=None, min_length=1, max_length=300)
@@ -219,4 +382,5 @@ class RequestAuditRecord(ContractModel):
 
 # Keep the vocabulary explicit for callers that describe this record as usage
 # audit rather than request audit. | 为 usage audit 调用方保留明确别名。
+# 中文:明确保留这一术语,供将此记录称为 usage audit 而不是 request audit 的调用方使用。
 RequestUsageAudit = RequestAuditRecord
