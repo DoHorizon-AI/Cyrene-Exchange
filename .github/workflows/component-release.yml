@@ -929,6 +929,13 @@ jobs:
           fi
           echo "id=$release_number" >> "$GITHUB_OUTPUT"
 
+      - name: Log in to GitHub Container Registry for published provenance verification
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
       - name: Verify published index, manifests, payloads, and real provenance
         env:
           OUTPUT_ROOT: ${{ runner.temp }}/component-release
