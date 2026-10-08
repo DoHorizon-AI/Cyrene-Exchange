@@ -18,6 +18,9 @@ dependencies = [
   "uvicorn==0.52.4",
 ]
 
+[project.scripts]
+cyrene-exchange = "cyrene_exchange_product.cli:main"
+
 [project.urls]
 Repository = "https://github.com/DoHorizon-AI/Cyrene-Exchange"
 Issues = "https://github.com/DoHorizon-AI/Cyrene-Exchange/issues"

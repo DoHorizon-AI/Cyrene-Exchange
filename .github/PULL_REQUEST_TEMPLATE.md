@@ -25,3 +25,33 @@ Does this change modify or impact any of the following?
 - [ ] Backward-compatible change
 - [ ] Intentional clean cut; removed public names and migration impact are documented
 - [ ] Documentation updated (`docs/`)
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 变更说明
+<!-- 请简要、清晰地说明此变更实现了什么。 -->
+
+## 验证
+- [ ] 根目录 Ruff 和 pytest 检查已通过
+- [ ] Product Ruff、格式、mypy、pytest 和 OpenAPI 检查已通过
+- [ ] 依赖锁文件变更符合预期（`uv.lock` / `product/uv.lock`）
+- [ ] 已检查文档链接和索引
+
+## 架构影响
+此变更是否修改或影响以下任一内容？
+
+- [ ] 公开契约或 OpenAPI/JSON schema（`contracts/`）
+- [ ] Product 所有权或期望/观测状态机
+- [ ] 能力接口定义（`Capability`）
+- [ ] 持久化模式或制品不可变性
+- [ ] 线协议或进程间通信
+- [ ] 公开依赖闭包或 Plugins SDK 固定版本
+
+*如果勾选了以上任一项，请链接相关 ADR，或说明为何不需要 ADR：*
+
+---
+
+## 兼容性与迁移
+- [ ] 向后兼容的变更
+- [ ] 有意进行干净切换；已记录移除的公开名称及其迁移影响
+- [ ] 已更新文档（`docs/`）

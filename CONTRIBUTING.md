@@ -30,3 +30,11 @@ private endpoints, model data, prompts, or response content.
 
 测试只能使用虚构凭据；禁止提交 Provider key、Bearer token、私有 Endpoint、模型
 数据、Prompt 或响应内容。
+
+## Task lifecycle / 任务生命周期
+
+All contributors and coding agents must follow [AGENTS.md](AGENTS.md) and the shared
+[Cyrene task lifecycle requirements](https://github.com/DoHorizon-AI/Cyrene-Workspace/blob/develop/docs/TASK_LIFECYCLE.md).
+
+所有贡献者和 AI 编码代理均须遵循 [AGENTS.md](AGENTS.md) 与共享的
+[Cyrene 任务生命周期要求](https://github.com/DoHorizon-AI/Cyrene-Workspace/blob/develop/docs/TASK_LIFECYCLE.md)。

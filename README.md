@@ -76,3 +76,21 @@ deployment, release, or canonical merge evidence.
 
 本地 vLLM 组合脚本位于 `scripts/` 与 `product/scripts/`；其结果只证明本地集成，
 不等同于 Hosted CI、GPU、部署、发布或规范分支合并证据。
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 构建与验证说明
+
+根目录程序要求 Python 3.11 或更新版本；Product 校验使用 Python 3.12。依赖分别由 `uv.lock` 和 `product/uv.lock` 锁定。文档中的命令展示预期的本地构建与检查方式。
+
+根锁文件目前将两个 SDK 固定到 `Cyrene-Plugins-Official` 的精确 Git revision。公开发布前必须确保该 revision 已被接受并可匿名读取；本地缓存或私有凭据不能证明公开依赖闭包完整。
+
+## 文档导航
+
+- [Product API](docs/API.md)：Product HTTP API。
+- [架构](ARCHITECTURE.md)：当前所有权与请求流。
+- [生命周期与所有权](docs/REPOSITORY-LIFECYCLE.md)：分支、CI 和发布门槛。
+- [安全策略](SECURITY.md)：安全报告与处置方式。
+- [第三方声明](THIRD_PARTY_NOTICES.product.md)：第三方依赖与许可信息。
+
+本地 vLLM 组合脚本只提供本地集成证据，不能作为 Hosted CI、GPU、部署、发布或规范分支合并的证明。

@@ -9,7 +9,10 @@
 # 职责：Exchange Product 实现。
 # 本头部说明归属；参考传输会输出结构化 SSE。
 ###############################################################################
-"""Reference stdlib HTTP transport for the Exchange Product Core."""
+"""Reference stdlib HTTP transport for the Exchange Product Core.
+
+Exchange Product Core 使用的标准库 HTTP 参考传输层。
+"""
 
 from __future__ import annotations
 
@@ -27,13 +30,17 @@ from .gateway import ExchangeGateway, GatewayError
 
 
 def _watch_client_disconnect(connection: socket.socket, cancel_event: Event, stop_event: Event) -> None:
-    """Set ``cancel_event`` when the peer closes while Product work is running."""
+    """Set ``cancel_event`` when the peer closes while Product work is running.
+
+    Product 工作进行期间,如果对端关闭连接则设置 ``cancel_event``。
+    """
 
     peek_flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
     while not stop_event.wait(0.05):
         try:
             readable, _, _ = select.select([connection], [], [], 0.1)
         except (OSError, ValueError):
+            cancel_event.set()
             return
         if not readable:
             continue
@@ -62,7 +69,10 @@ def create_reference_server(
     host: str = "127.0.0.1",
     port: int = 0,
 ) -> ThreadingHTTPServer:
-    """Create an HTTP adapter without starting or owning the server thread."""
+    """Create an HTTP adapter without starting or owning the server thread.
+
+    创建 HTTP adapter,但不启动或拥有服务线程。
+    """
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
@@ -150,6 +160,7 @@ def create_reference_server(
                 # Headers are already committed, so a second JSON response
                 # would corrupt the SSE stream. The client observes a
                 # truncated stream and the request is not retried.
+                # 响应标头已经提交,再发送 JSON 响应会破坏 SSE 流。客户端会观察到流被截断,且请求不会重试。
                 cancel_event.set()
 
         def log_message(self, format: str, *args: Any) -> None:
