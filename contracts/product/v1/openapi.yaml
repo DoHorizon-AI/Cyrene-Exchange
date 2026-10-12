@@ -391,11 +391,1290 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/accounts/link-sessions:
+    post:
+      summary: Begin Link
+      operationId: accountBeginLink
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeginLinkBody'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Accountbeginlink
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/links:
+    get:
+      summary: List Links
+      operationId: accountListLinks
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Accountlistlinks
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/github/callback:
+    get:
+      summary: Complete Github Link
+      operationId: accountCompleteGitHubLink
+      parameters:
+      - name: state
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 256
+          title: State
+      - name: code
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          title: Code
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Accountcompletegithublink
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/accounts/link-sessions/wecom/confirm:
+    post:
+      summary: Confirm Wecom Link
+      operationId: accountConfirmWeComLink
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmWeComBody'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Accountconfirmwecomlink
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/links/{account_ref}/actions/unlink:
+    post:
+      summary: Unlink
+      operationId: accountUnlink
+      parameters:
+      - name: account_ref
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Account Ref
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Accountunlink
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/connections:
+    post:
+      summary: Create Connection
+      operationId: integrationCreateConnection
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnectionBody'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                title: Response Integrationcreateconnection
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+    get:
+      summary: List Connections
+      operationId: integrationListConnections
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {}
+                title: Response Integrationlistconnections
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/sync-bindings:
+    post:
+      summary: Create Binding
+      operationId: integrationCreateBinding
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBindingBody'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                title: Response Integrationcreatebinding
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+    get:
+      summary: List Bindings
+      operationId: integrationListBindings
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: connection_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Connection Id
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {}
+                title: Response Integrationlistbindings
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/sync-bindings/{binding_id}/actor-bindings:
+    post:
+      summary: Attach Actor Binding
+      operationId: integrationAttachActorBinding
+      parameters:
+      - name: binding_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Binding Id
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttachActorBindingBody'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                title: Response Integrationattachactorbinding
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+    get:
+      summary: List Actor Bindings
+      operationId: integrationListActorBindings
+      parameters:
+      - name: binding_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Binding Id
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {}
+                title: Response Integrationlistactorbindings
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/jobs:
+    get:
+      summary: List Jobs
+      operationId: integrationListJobs
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: state
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: State
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/IntegrationJobResponse'
+                title: Response Integrationlistjobs
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/connections/{connection_id}/health:
+    get:
+      summary: Get Connection Health
+      operationId: integrationGetConnectionHealth
+      parameters:
+      - name: connection_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Connection Id
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionHealthResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/operations/{operation_id}:
+    get:
+      summary: Get Operation
+      operationId: integrationGetOperation
+      parameters:
+      - name: operation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Operation Id
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/operations/{operation_id}/actions/reconcile:
+    post:
+      summary: Reconcile Operation
+      operationId: integrationReconcile
+      parameters:
+      - name: operation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Operation Id
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/sync-bindings/{bindingId}/execute-issue-comment:
+    post:
+      summary: Execute Issue Comment
+      operationId: integrationExecuteIssueComment
+      parameters:
+      - name: bindingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Bindingid
+      - name: x-cyrene-execution-credential-bin
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Cyrene-Execution-Credential-Bin
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Idempotency-Key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteIssueBody'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                title: Response Integrationexecuteissuecomment
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - ProductExecutionCredential: []
+  /api/v1/integrations/sync-bindings/{bindingId}/execute-issue-state:
+    post:
+      summary: Execute Issue State
+      operationId: integrationExecuteIssueState
+      parameters:
+      - name: bindingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Bindingid
+      - name: x-cyrene-execution-credential-bin
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Cyrene-Execution-Credential-Bin
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Idempotency-Key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteIssueBody'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                title: Response Integrationexecuteissuestate
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - ProductExecutionCredential: []
+  /api/v1/integrations/sync-bindings/{bindingId}/execute-issue-query:
+    post:
+      summary: Execute Issue Query
+      operationId: integrationExecuteIssueQuery
+      parameters:
+      - name: bindingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Bindingid
+      - name: x-cyrene-execution-credential-bin
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Cyrene-Execution-Credential-Bin
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Idempotency-Key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteIssueBody'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                title: Response Integrationexecuteissuequery
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - ProductExecutionCredential: []
+  /api/v1/integrations/sync-bindings/{binding_id}/issues/actions/comment:
+    post:
+      summary: Create Issue Comment
+      operationId: integrationCreateIssueComment
+      parameters:
+      - name: binding_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Binding Id
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentBody'
+      responses:
+        '202':
+          description: Operation accepted; Location identifies the Product operation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationStatusResponse'
+          headers:
+            Location:
+              description: URI reference for polling the Product operation.
+              schema:
+                type: string
+                format: uri-reference
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/sync-bindings/{binding_id}/issues/actions/state:
+    post:
+      summary: Update Issue State
+      operationId: integrationUpdateIssueState
+      parameters:
+      - name: binding_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Binding Id
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StateBody'
+      responses:
+        '202':
+          description: Operation accepted; Location identifies the Product operation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationStatusResponse'
+          headers:
+            Location:
+              description: URI reference for polling the Product operation.
+              schema:
+                type: string
+                format: uri-reference
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/sync-bindings/{binding_id}/issues/actions/snapshot:
+    post:
+      summary: Get Issue Snapshot
+      operationId: integrationGetIssue
+      parameters:
+      - name: binding_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Binding Id
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryIssueBody'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueSnapshotResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/sync-bindings/{binding_id}/issues/actions/query:
+    post:
+      summary: Query Issue
+      operationId: integrationQueryIssue
+      parameters:
+      - name: binding_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Binding Id
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: Idempotency-Key
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryIssueBody'
+      responses:
+        '202':
+          description: Operation accepted; Location identifies the Product operation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationStatusResponse'
+          headers:
+            Location:
+              description: URI reference for polling the Product operation.
+              schema:
+                type: string
+                format: uri-reference
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/hooks/github/{connection_id}:
+    post:
+      summary: Receive Github Webhook
+      operationId: integrationReceiveGitHubWebhook
+      parameters:
+      - name: connection_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Connection Id
+      - name: X-GitHub-Delivery
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: X-Github-Delivery
+      - name: X-GitHub-Event
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 50
+          title: X-Github-Event
+      - name: X-Hub-Signature-256
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+          title: X-Hub-Signature-256
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Integrationreceivegithubwebhook
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/integrations/hooks/wecom/{bindingId}:
+    post:
+      summary: Admit Wecom Inbound
+      operationId: integrationAdmitWeComInbound
+      parameters:
+      - name: bindingId
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Bindingid
+      - name: X-Cyrene-WeCom-Timestamp
+        in: header
+        required: true
+        description: Unix seconds, no more than 300 seconds old or 30 seconds in the future.
+        schema:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,12})$
+      - name: X-Cyrene-WeCom-Request-Id
+        in: header
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_.-]{1,200}$
+      - name: X-Cyrene-WeCom-Body-SHA256
+        in: header
+        required: true
+        description: Lowercase SHA-256 of the exact raw JSON request body.
+        schema:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+      - name: X-Cyrene-WeCom-Source-Binding-Id
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: X-Cyrene-WeCom-Signature
+        in: header
+        required: true
+        description: HMAC-SHA256 over v1, POST, exact request path, timestamp, request ID, source binding ID, and
+          body SHA-256, joined by LF.
+        schema:
+          type: string
+          pattern: ^sha256=[0-9a-f]{64}$
+      responses:
+        '202':
+          description: The source event and any fixed command/challenge work are durably recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                title: Response Integrationadmitwecominbound
+                required:
+                - accepted
+                - persisted
+                - eventId
+                properties:
+                  accepted:
+                    type: boolean
+                    const: true
+                  persisted:
+                    type: boolean
+                    const: true
+                  eventId:
+                    type: string
+                    format: uuid
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+              - schemaVersion
+              - bindingId
+              - organizationId
+              - workspaceId
+              - sourceAuthority
+              - botNamespace
+              - accountId
+              - conversationId
+              - conversationKind
+              - sourceEventId
+              - senderId
+              - fromSelf
+              - sourceTransportRequestId
+              - messageProtoB64
+              properties:
+                schemaVersion:
+                  type: integer
+                  const: 1
+                bindingId:
+                  type: string
+                  format: uuid
+                organizationId:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                workspaceId:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                sourceAuthority:
+                  type: string
+                  minLength: 1
+                  maxLength: 300
+                botNamespace:
+                  type: string
+                  minLength: 1
+                  maxLength: 300
+                accountId:
+                  type: string
+                  minLength: 1
+                  maxLength: 300
+                conversationId:
+                  type: string
+                  minLength: 1
+                  maxLength: 292
+                conversationKind:
+                  type: string
+                  enum:
+                  - private
+                  - group
+                sourceEventId:
+                  type: string
+                  minLength: 1
+                  maxLength: 300
+                senderId:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                fromSelf:
+                  type: boolean
+                sourceTransportRequestId:
+                  type: string
+                  minLength: 1
+                  maxLength: 300
+                messageProtoB64:
+                  type: string
+                  contentEncoding: base64
+                  contentMediaType: application/x-protobuf
 components:
   securitySchemes:
     WorkspaceControlBearer:
       type: http
       scheme: bearer
+    IntegrationBearer:
+      type: http
+      scheme: bearer
+    ProductExecutionCredential:
+      type: apiKey
+      in: header
+      name: x-cyrene-execution-credential-bin
+      description: Base64 Platform-approved Product execution credential, verified over the registered Exchange workload
+        mTLS channel.
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -985,3 +2264,458 @@ components:
       - msg
       - type
       title: ValidationError
+    AttachActorBindingBody:
+      properties:
+        accountLinkRef:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Accountlinkref
+        delegationRef:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Delegationref
+      additionalProperties: false
+      type: object
+      required:
+      - accountLinkRef
+      - delegationRef
+      title: AttachActorBindingBody
+      description: Attach only the authenticated member's external account and grant refs.
+    BeginLinkBody:
+      properties:
+        provider:
+          type: string
+          pattern: ^(github|wecom)$
+          title: Provider
+      additionalProperties: false
+      type: object
+      required:
+      - provider
+      title: BeginLinkBody
+      description: Fixed external account provider selector.
+    CommentBody:
+      properties:
+        issueNumber:
+          type: integer
+          minimum: 1.0
+          title: Issuenumber
+        body:
+          type: string
+          maxLength: 4000
+          minLength: 1
+          title: Body
+      additionalProperties: false
+      type: object
+      required:
+      - issueNumber
+      - body
+      title: CommentBody
+      description: One bounded GitHub issue comment.
+    ConfirmWeComBody:
+      properties:
+        linkSessionRef:
+          type: string
+          format: uuid
+          title: Linksessionref
+        challengeId:
+          type: string
+          format: uuid
+          title: Challengeid
+        challengeValue:
+          type: string
+          maxLength: 128
+          minLength: 16
+          title: Challengevalue
+      additionalProperties: false
+      type: object
+      required:
+      - linkSessionRef
+      - challengeId
+      - challengeValue
+      title: ConfirmWeComBody
+      description: Challenge confirmation tied to an Account Center link session.
+    ConnectionHealthResponse:
+      properties:
+        status:
+          type: string
+          enum:
+          - SERVING
+          - NOT_SERVING
+          - UNKNOWN
+          title: Status
+        observedAt:
+          type: string
+          format: date-time
+          title: Observedat
+        pluginId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Pluginid
+        pluginVersion:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Pluginversion
+        capabilities:
+          items:
+            type: string
+          type: array
+          title: Capabilities
+        errorCode:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Errorcode
+      additionalProperties: false
+      type: object
+      required:
+      - status
+      - observedAt
+      - capabilities
+      title: ConnectionHealthResponse
+      description: Read-only DirectPluginRuntime Health observation for a fixed connection.
+    CreateBindingBody:
+      properties:
+        connectionId:
+          type: string
+          format: uuid
+          title: Connectionid
+        notificationTargetRef:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Notificationtargetref
+      additionalProperties: false
+      type: object
+      required:
+      - connectionId
+      - notificationTargetRef
+      title: CreateBindingBody
+      description: Create a group notification rule without attaching member credentials.
+    CreateConnectionBody:
+      properties:
+        repositoryId:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Repositoryid
+        repositoryName:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Repositoryname
+      additionalProperties: false
+      type: object
+      required:
+      - repositoryId
+      - repositoryName
+      title: CreateConnectionBody
+      description: Create one fixed GitHub repository connection without member credentials.
+    ExecuteIssueBody:
+      properties:
+        operationId:
+          type: string
+          format: uuid
+          title: Operationid
+        argumentDigest:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          title: Argumentdigest
+      additionalProperties: false
+      type: object
+      required:
+      - operationId
+      - argumentDigest
+      title: ExecuteIssueBody
+      description: Authority-dispatched execution selector with no caller identity claims.
+    IntegrationJobResponse:
+      properties:
+        jobId:
+          type: string
+          title: Jobid
+        kind:
+          type: string
+          title: Kind
+        state:
+          type: string
+          title: State
+        attempts:
+          type: integer
+          title: Attempts
+        operationId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Operationid
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        updatedAt:
+          type: string
+          format: date-time
+          title: Updatedat
+        availableAt:
+          type: string
+          format: date-time
+          title: Availableat
+      additionalProperties: false
+      type: object
+      required:
+      - jobId
+      - kind
+      - state
+      - attempts
+      - operationId
+      - createdAt
+      - updatedAt
+      - availableAt
+      title: IntegrationJobResponse
+      description: Sanitized job metadata without payload, actor, credential, or grant refs.
+    IssueSnapshotResponse:
+      properties:
+        issueNumber:
+          type: integer
+          title: Issuenumber
+        state:
+          type: string
+          enum:
+          - OPEN
+          - CLOSED
+          title: State
+        title:
+          type: string
+          title: Title
+        version:
+          type: string
+          title: Version
+        freshness:
+          type: string
+          enum:
+          - FRESH
+          - STALE
+          - UNKNOWN
+          title: Freshness
+        observedAt:
+          type: string
+          title: Observedat
+      additionalProperties: false
+      type: object
+      required:
+      - issueNumber
+      - state
+      - title
+      - version
+      - freshness
+      - observedAt
+      title: IssueSnapshotResponse
+      description: Actor-scoped cached issue snapshot after an approved query succeeds.
+    OperationStatusResponse:
+      properties:
+        operationId:
+          type: string
+          title: Operationid
+        action:
+          type: string
+          title: Action
+        state:
+          type: string
+          enum:
+          - QUEUED
+          - AWAITING_AUTHORITY
+          - RUNNING
+          - ACCEPTED
+          - SUCCEEDED
+          - FAILED
+          - UNKNOWN
+          title: State
+        issueNumber:
+          type: integer
+          title: Issuenumber
+        createdAt:
+          type: string
+          title: Createdat
+        updatedAt:
+          type: string
+          title: Updatedat
+        result:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Result
+      additionalProperties: false
+      type: object
+      required:
+      - operationId
+      - action
+      - state
+      - issueNumber
+      - createdAt
+      - updatedAt
+      - result
+      title: OperationStatusResponse
+      description: Sanitized polling projection for one persisted Product operation.
+    QueryIssueBody:
+      properties:
+        issueNumber:
+          type: integer
+          minimum: 1.0
+          title: Issuenumber
+      additionalProperties: false
+      type: object
+      required:
+      - issueNumber
+      title: QueryIssueBody
+      description: One fixed read-only GitHub issue selector.
+    StateBody:
+      properties:
+        issueNumber:
+          type: integer
+          minimum: 1.0
+          title: Issuenumber
+        state:
+          type: string
+          enum:
+          - OPEN
+          - CLOSED
+          title: State
+      additionalProperties: false
+      type: object
+      required:
+      - issueNumber
+      - state
+      title: StateBody
+      description: One fixed GitHub issue state transition.
+    WorkspaceGatewayRoute:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        endpointId:
+          type: string
+          format: uuid
+          title: Endpointid
+        state:
+          $ref: '#/components/schemas/RouteState'
+          default: ACTIVE
+        modelPattern:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Modelpattern
+        targetBindingId:
+          type: string
+          maxLength: 300
+          minLength: 1
+          title: Targetbindingid
+        targetCapabilityType:
+          type: string
+          const: model.provider.v1
+          title: Targetcapabilitytype
+          default: model.provider.v1
+        targetModel:
+          anyOf:
+          - type: string
+            maxLength: 200
+            minLength: 1
+          - type: 'null'
+          title: Targetmodel
+        priority:
+          type: integer
+          maximum: 10000.0
+          minimum: 0.0
+          title: Priority
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        updatedAt:
+          type: string
+          format: date-time
+          title: Updatedat
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+        sourceProvenance:
+          anyOf:
+          - $ref: '#/components/schemas/WorkspaceRouteSourceProvenance'
+          - type: 'null'
+        createdBy:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Createdby
+        workspaceId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Workspaceid
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - endpointId
+      - modelPattern
+      - targetBindingId
+      - priority
+      - createdAt
+      - updatedAt
+      - resourceVersion
+      title: WorkspaceGatewayRoute
+      description: Workspace route projection that omits internal service addresses.
+    WorkspaceReactorEndpointSelector:
+      properties:
+        product:
+          type: string
+          const: reactor
+          title: Product
+        endpointId:
+          type: string
+          format: uuid
+          title: Endpointid
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+      additionalProperties: false
+      type: object
+      required:
+      - product
+      - endpointId
+      - resourceVersion
+      title: WorkspaceReactorEndpointSelector
+      description: Opaque command selector for one granted Reactor Endpoint. | 私有端点选择器。
+    WorkspaceRouteSourceProvenance:
+      properties:
+        product:
+          type: string
+          const: reactor
+          title: Product
+          default: reactor
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+        artifactDigest:
+          type: string
+          pattern: ^sha256:[0-9a-f]{64}$
+          title: Artifactdigest
+        modelVersionDigest:
+          anyOf:
+          - type: string
+            pattern: ^sha256/[0-9a-f]{64}$
+          - type: 'null'
+          title: Modelversiondigest
+      additionalProperties: false
+      type: object
+      required:
+      - resourceVersion
+      - artifactDigest
+      title: WorkspaceRouteSourceProvenance
+      description: Non-navigable Reactor provenance without its internal resource URL.

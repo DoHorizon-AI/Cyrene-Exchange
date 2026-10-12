@@ -70,6 +70,635 @@
         ],
         "requestBindings": []
       }
+    },
+    {
+      "operationId": "accountBeginLink",
+      "routeId": "accountBeginLink",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/BeginLinkBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1accounts~1link-sessions/post/responses/201/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "accountListLinks",
+      "routeId": "accountListLinks",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1accounts~1links/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "accountUnlink",
+      "routeId": "accountUnlink",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1accounts~1links~1{account_ref}~1actions~1unlink/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "account_ref",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationListConnections",
+      "routeId": "integrationListConnections",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1connections/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [
+          {
+            "jsonPointer": "/*/workspaceId",
+            "matches": "WORKSPACE_ID"
+          }
+        ],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationCreateConnection",
+      "routeId": "integrationCreateConnection",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/CreateConnectionBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1connections/post/responses/201/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [
+          {
+            "jsonPointer": "/*/workspaceId",
+            "matches": "WORKSPACE_ID"
+          }
+        ],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationListBindings",
+      "routeId": "integrationListBindings",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [
+          {
+            "jsonPointer": "/*/workspaceId",
+            "matches": "WORKSPACE_ID"
+          }
+        ],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationCreateBinding",
+      "routeId": "integrationCreateBinding",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/CreateBindingBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings/post/responses/201/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [
+          {
+            "jsonPointer": "/*/workspaceId",
+            "matches": "WORKSPACE_ID"
+          }
+        ],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationGetIssue",
+      "routeId": "integrationGetIssue",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": "#/components/schemas/QueryIssueBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1snapshot/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "binding_id",
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationCreateIssueComment",
+      "routeId": "integrationCreateIssueComment",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/CommentBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1comment/post/responses/202/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "binding_id",
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationUpdateIssueState",
+      "routeId": "integrationUpdateIssueState",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/StateBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1state/post/responses/202/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "binding_id",
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationGetOperation",
+      "routeId": "integrationGetOperation",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1operations~1{operation_id}/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "operation_id",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationReconcile",
+      "routeId": "integrationReconcile",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1operations~1{operation_id}~1actions~1reconcile/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "operation_id",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "accountConfirmWeComLink",
+      "routeId": "accountConfirmWeComLink",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/ConfirmWeComBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1accounts~1link-sessions~1wecom~1confirm/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationAttachActorBinding",
+      "routeId": "integrationAttachActorBinding",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/AttachActorBindingBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1actor-bindings/post/responses/201/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "binding_id",
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationListActorBindings",
+      "routeId": "integrationListActorBindings",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1actor-bindings/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "binding_id",
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationQueryIssue",
+      "routeId": "integrationQueryIssue",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/QueryIssueBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1query/post/responses/202/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "binding_id",
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationExecuteIssueComment",
+      "routeId": "integrationExecuteIssueComment",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/ExecuteIssueBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings~1{bindingId}~1execute-issue-comment/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "bindingId",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationExecuteIssueState",
+      "routeId": "integrationExecuteIssueState",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/ExecuteIssueBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings~1{bindingId}~1execute-issue-state/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "bindingId",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationExecuteIssueQuery",
+      "routeId": "integrationExecuteIssueQuery",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/components/schemas/ExecuteIssueBody",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1sync-bindings~1{bindingId}~1execute-issue-query/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "bindingId",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationListJobs",
+      "routeId": "integrationListJobs",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1jobs/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationGetConnectionHealth",
+      "routeId": "integrationGetConnectionHealth",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1connections~1{connection_id}~1health/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "connection_id",
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
     }
   ]
 }

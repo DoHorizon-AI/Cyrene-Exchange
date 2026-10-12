@@ -14,7 +14,7 @@ import re
 import sys
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, Request
@@ -44,6 +44,13 @@ from cyrene_exchange_product.domain import (
     WorkspaceRouteSourceProvenance,
 )
 from cyrene_exchange_product.errors import ExchangeProductError, map_exchange_error
+from cyrene_exchange_product.integrations.api import (
+    IntegrationServices,
+)
+from cyrene_exchange_product.integrations.api import (
+    create_router as create_integration_router,
+)
+from cyrene_exchange_product.integrations.models import IntegrationError
 from cyrene_exchange_product.logging import (
     format_cyrene_log,
     parse_w3c_traceparent,
@@ -90,6 +97,7 @@ def create_app(
     allowed_binding_ids: frozenset[str] = frozenset(),
     validate_route_target: Callable[[GatewayRoute], None] | None = None,
     store: ExchangeStore | None = None,
+    integrations: IntegrationServices | None = None,
 ) -> FastAPI:
     """Build the Exchange Product control API. | 创建 Exchange 产品控制 API。
 
@@ -162,7 +170,15 @@ def create_app(
         if (
             control_credentials is not None
             and request.url.path.startswith("/api/")
-            and not request.url.path.startswith(("/api/v1/system/", "/api/v1/auth/", "/api/proxy/"))
+            and not request.url.path.startswith(
+                (
+                    "/api/v1/system/",
+                    "/api/v1/auth/",
+                    "/api/proxy/",
+                    "/api/v1/accounts/",
+                    "/api/v1/integrations/",
+                )
+            )
         ):
             principal(request)
 
@@ -173,6 +189,29 @@ def create_app(
     )
     app.state.exchange_store = store
     app.state.exchange_service = service
+    app.state.integration_services = integrations
+    if integrations is not None:
+        app.include_router(create_integration_router(integrations))
+        app.router.on_shutdown.append(integrations.close)
+
+        base_openapi = app.openapi
+
+        def integration_openapi() -> dict[str, Any]:
+            schema = base_openapi()
+            schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
+            schemes["IntegrationBearer"] = {"type": "http", "scheme": "bearer"}
+            schemes["ProductExecutionCredential"] = {
+                "type": "apiKey",
+                "in": "header",
+                "name": "x-cyrene-execution-credential-bin",
+                "description": (
+                    "Base64 Platform-approved Product execution credential, verified over the "
+                    "registered Exchange workload mTLS channel."
+                ),
+            }
+            return schema
+
+        setattr(app, "openapi", integration_openapi)  # noqa: B010
 
     @app.middleware("http")
     async def propagate_trace(
@@ -267,6 +306,25 @@ def create_app(
         return JSONResponse(
             status_code=422,
             content=problem.model_dump(by_alias=True, mode="json"),
+            media_type="application/problem+json",
+        )
+
+    @app.exception_handler(IntegrationError)
+    async def integration_error(request: Request, exc: IntegrationError) -> JSONResponse:
+        trace_id = getattr(request.state, "trace_id", None) or uuid4().hex
+        problem = ProblemDetails(
+            type=f"https://errors.cyrene.dev/exchange/{exc.code.lower()}",
+            title=str(exc),
+            status=exc.status,
+            detail=str(exc),
+            instance=request.url.path,
+            code=exc.code,
+            retryable=exc.status >= 500,
+            trace_id=trace_id,
+        )
+        return JSONResponse(
+            status_code=exc.status,
+            content=problem.model_dump(by_alias=True, exclude_none=True, mode="json"),
             media_type="application/problem+json",
         )
 

@@ -46,6 +46,7 @@ from cyrene_exchange_product.domain import (
     WorkspaceReactorEndpointSelector,
 )
 from cyrene_exchange_product.errors import ExchangeProductError
+from cyrene_exchange_product.integrations.api import IntegrationServices
 from cyrene_exchange_product.routing import (
     build_gateway_from_store,
     data_plane_principal_resolver,
@@ -522,6 +523,7 @@ def build_product_app(
     validate_route_target: Callable[[Any], None] | None = None,
     record_requests: bool = True,
     web_dist: Path | str | None = None,
+    integrations: IntegrationServices | None = None,
 ) -> FastAPI:
     """Fuse the control-plane API with the OpenAI-compatible data plane.
 
@@ -586,6 +588,7 @@ def build_product_app(
         allowed_binding_ids=allowed_binding_ids,
         validate_route_target=validate_route_target or _route_validator(effective),
         store=store,
+        integrations=integrations,
     )
     gateway = build_gateway_from_store(
         store,
@@ -821,6 +824,30 @@ def build_product_app(
             ):
                 return FileResponse(str(effective_web_dist / "index.html"))
             return JSONResponse(status_code=404, content={"detail": "Not Found"})
+
+    return app
+
+
+def build_integration_app(
+    *, database_path: Path | str, integrations: IntegrationServices
+) -> FastAPI:
+    """Build an integration-only process without starting model gateway routes."""
+
+    del database_path  # IntegrationServices owns its separate Product database.
+    app = create_app(
+        database_path=Path(":memory:"),
+        control_credentials={},
+        integrations=integrations,
+    )
+    app.state.integration_store = integrations.store
+
+    @app.get("/healthz")
+    def integration_healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    def integration_readyz() -> JSONResponse:
+        return JSONResponse(status_code=200, content={"status": "ready"})
 
     return app
 

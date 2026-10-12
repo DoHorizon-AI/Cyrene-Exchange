@@ -169,9 +169,66 @@ jobs:
       - run: python -m pip install uv==0.12.3
       - run: python -m json.tool ../service.json >/dev/null
       - run: python ../scripts/check_silent_exceptions.py
-      - run: uv sync --frozen --group dev --no-install-local
+      - run: uv sync --frozen --group dev --extra integrations --no-install-local
       - run: uv run --no-sync ruff check --no-cache src tests
       - run: uv run --no-sync ruff format --check --no-cache src tests
       - run: uv run --no-sync mypy
       - run: uv run --no-sync pytest -p no:cacheprovider -q
       - run: uv run --no-sync openapi-spec-validator ../contracts/product/v1/openapi.yaml
+
+  product-hub-integration:
+    name: product / pinned Plugins integration hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}/product/src
+      CYRENE_REQUIRE_PLUGINS_WORKTREE: "1"
+      PLUGINS_WORKTREE: ${{ runner.temp }}/Cyrene-Plugins-Official
+    defaults:
+      run:
+        working-directory: product
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install uv==0.12.3
+      - name: Resolve the exact Plugins source pin from the consumer lock
+        id: plugins-pin
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import re
+          from pathlib import Path
+
+          lock = json.loads(Path("contracts-message.lock.json").read_text(encoding="utf-8"))
+          revision = lock.get("sourceRevision")
+          if (
+              lock.get("sourceRepository") != "DoHorizon-AI/Cyrene-Plugins-Official"
+              or not isinstance(revision, str)
+              or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+          ):
+              raise SystemExit("Exchange Plugins consumer lock has no immutable source revision")
+          print(f"revision={revision}")
+          PY
+      - name: Fetch the locked Plugins checkout
+        run: |
+          git init --quiet "$PLUGINS_WORKTREE"
+          git -C "$PLUGINS_WORKTREE" remote add origin \
+            https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git
+          git -C "$PLUGINS_WORKTREE" fetch --quiet --depth 1 origin \
+            "${{ steps.plugins-pin.outputs.revision }}"
+          git -C "$PLUGINS_WORKTREE" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$PLUGINS_WORKTREE" rev-parse HEAD)" = \
+            "${{ steps.plugins-pin.outputs.revision }}"
+      - name: Install the frozen Product integrations environment
+        run: uv sync --frozen --group dev --extra integrations --no-install-local
+      - name: Install pinned WeCom runtime test dependencies
+        run: uv pip install --python .venv/bin/python -r \
+          "$PLUGINS_WORKTREE/plugins/connectors/wecom/requirements.lock"
+      - name: Run the non-skippable real Plugin and Authority hub flow
+        env:
+          CYRENE_PLUGINS_WORKTREE: ${{ runner.temp }}/Cyrene-Plugins-Official
+        run: uv run --no-sync pytest -p no:cacheprovider -q tests/test_integration_hub_e2e.py
