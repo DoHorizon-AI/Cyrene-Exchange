@@ -76,7 +76,7 @@
       "routeId": "accountBeginLink",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/BeginLinkBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1accounts~1link-sessions/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1accounts~1link-sessions/post/responses/201/content/application~1json/schema"
       ],
@@ -197,7 +197,7 @@
       "routeId": "integrationCreateConnection",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/CreateConnectionBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1connections/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1connections/post/responses/201/content/application~1json/schema"
       ],
@@ -265,7 +265,7 @@
       "routeId": "integrationCreateBinding",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/CreateBindingBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1sync-bindings/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1sync-bindings/post/responses/201/content/application~1json/schema"
       ],
@@ -299,7 +299,7 @@
       "routeId": "integrationGetIssue",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "READ",
-      "requestSchemaPointer": "#/components/schemas/QueryIssueBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1snapshot/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1snapshot/post/responses/200/content/application~1json/schema"
       ],
@@ -328,7 +328,7 @@
       "routeId": "integrationCreateIssueComment",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/CommentBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1comment/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1comment/post/responses/202/content/application~1json/schema"
       ],
@@ -357,7 +357,7 @@
       "routeId": "integrationUpdateIssueState",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/StateBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1state/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1state/post/responses/202/content/application~1json/schema"
       ],
@@ -444,7 +444,7 @@
       "routeId": "accountConfirmWeComLink",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/ConfirmWeComBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1accounts~1link-sessions~1wecom~1confirm/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1accounts~1link-sessions~1wecom~1confirm/post/responses/200/content/application~1json/schema"
       ],
@@ -473,7 +473,7 @@
       "routeId": "integrationAttachActorBinding",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/AttachActorBindingBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1actor-bindings/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1actor-bindings/post/responses/201/content/application~1json/schema"
       ],
@@ -531,7 +531,7 @@
       "routeId": "integrationQueryIssue",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/QueryIssueBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1query/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1sync-bindings~1{binding_id}~1issues~1actions~1query/post/responses/202/content/application~1json/schema"
       ],
@@ -560,7 +560,7 @@
       "routeId": "integrationExecuteIssueComment",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/ExecuteIssueBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1sync-bindings~1{bindingId}~1execute-issue-comment/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1sync-bindings~1{bindingId}~1execute-issue-comment/post/responses/200/content/application~1json/schema"
       ],
@@ -589,7 +589,7 @@
       "routeId": "integrationExecuteIssueState",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/ExecuteIssueBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1sync-bindings~1{bindingId}~1execute-issue-state/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1sync-bindings~1{bindingId}~1execute-issue-state/post/responses/200/content/application~1json/schema"
       ],
@@ -618,7 +618,7 @@
       "routeId": "integrationExecuteIssueQuery",
       "openapiPath": "contracts/product/v1/openapi.yaml",
       "kind": "COMMAND",
-      "requestSchemaPointer": "#/components/schemas/ExecuteIssueBody",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1integrations~1sync-bindings~1{bindingId}~1execute-issue-query/post/requestBody/content/application~1json/schema",
       "responseSchemaPointers": [
         "#/paths/~1api~1v1~1integrations~1sync-bindings~1{bindingId}~1execute-issue-query/post/responses/200/content/application~1json/schema"
       ],
