@@ -125,7 +125,7 @@ it does not auto-create an ACTIVE route. Supply `--reactor-base-url` and
 
 ## Verification / 验证
 
-Run `uv sync --frozen --group dev`, Ruff, strict mypy, `uv run pytest -q`, and
+Run `uv sync --frozen --group dev --extra integrations`, Ruff, strict mypy, `uv run pytest -q`, and
 `uv run openapi-spec-validator ../contracts/product/v1/openapi.yaml`.
 Draft tests cover persistence, retries, edits, permissions, version checks and
 failure keeping routes unpublished. Their controlled validator callbacks are
@@ -163,6 +163,6 @@ Plugins-owned 完整用量总数比较；Exchange 不保存第二套汇总，也
 
 ## 验证说明
 
-验证命令包括 `uv sync --frozen --group dev`、Ruff、strict mypy、`uv run pytest -q` 和 `uv run openapi-spec-validator ../contracts/product/v1/openapi.yaml`。草稿测试覆盖持久化、重试、编辑、权限、版本检查，以及失败时不发布 Route。受控验证回调仅是单元测试证据，不代表真实模型推理或 Navigator 验收。
+验证命令包括 `uv sync --frozen --group dev --extra integrations`、Ruff、strict mypy、`uv run pytest -q` 和 `uv run openapi-spec-validator ../contracts/product/v1/openapi.yaml`。完整 Product 测试需要可选集成 SDK；Gateway-only 导入测试会验证基础安装无需该 SDK。草稿测试覆盖持久化、重试、编辑、权限、版本检查，以及失败时不发布 Route。受控验证回调仅是单元测试证据，不代表真实模型推理或 Navigator 验收。
 
 真实 CUDA 部署、跨 Product 探测、流式处理、取消和 Navigator 回答必须另行记录；不能用测试回调或此前为客户端手动启动的模型替代。

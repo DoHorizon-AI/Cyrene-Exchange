@@ -116,7 +116,12 @@ def test_runtime_paths_match_frozen_control_openapi(tmp_path: Path) -> None:
     contract, _ = read_from_filename(
         str(Path(__file__).parents[2] / "contracts/product/v1/openapi.yaml")
     )
-    control_paths = {path for path in contract["paths"] if path.startswith("/api/")}
+    control_paths = {
+        path
+        for path in contract["paths"]
+        if path.startswith("/api/")
+        and not path.startswith(("/api/v1/accounts/", "/api/v1/integrations/"))
+    }
     assert set(app.openapi()["paths"]) == control_paths
     app.state.exchange_store.close()
 

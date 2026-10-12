@@ -13,10 +13,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
+from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from threading import Event
 from uuid import UUID
 
 import uvicorn
@@ -126,6 +129,37 @@ def _workspace_reactor_endpoint_grants(
 
 
 def _serve(arguments: argparse.Namespace) -> int:
+    runtime_mode = arguments.mode or os.environ.get("CYRENE_EXCHANGE_RUNTIME_MODE", "gateway-only")
+    if runtime_mode not in {"gateway-only", "integration-only", "combined"}:
+        raise SystemExit(
+            "CYRENE_EXCHANGE_RUNTIME_MODE must be gateway-only, integration-only, or combined"
+        )
+    if runtime_mode in {"gateway-only", "combined"} and arguments.database is None:
+        raise SystemExit("--database is required for gateway-only and combined modes")
+    integrations = None
+    if runtime_mode != "gateway-only":
+        from cyrene_exchange_product.integrations.cli import (
+            build_production_services,
+            resolve_integration_database_path,
+        )
+        from cyrene_exchange_product.server import build_integration_app
+
+        integration_database = resolve_integration_database_path(
+            arguments.database,
+            explicit_path=arguments.integration_database,
+        )
+        integrations = build_production_services(integration_database)
+        if runtime_mode == "integration-only":
+            app = build_integration_app(
+                database_path=integration_database,
+                integrations=integrations,
+            )
+            uvicorn.run(app, host=arguments.host, port=arguments.port, access_log=False)
+            return 0
+
+    if arguments.database is None:
+        raise SystemExit("--database is required for the selected runtime mode")
+
     credentials: dict[str, ProductPrincipal] = {}
     gateway_credentials: dict[str, ProductPrincipal] = {}
     if arguments.control_token and arguments.control_token_env:
@@ -244,8 +278,65 @@ def _serve(arguments: argparse.Namespace) -> int:
         ),
         allowed_binding_ids=_admitted_bindings(arguments),
         endpoint_id=arguments.endpoint_id,
+        integrations=integrations,
     )
     uvicorn.run(app, host=arguments.host, port=arguments.port, access_log=False)
+    return 0
+
+
+def _integration_dispatch(arguments: argparse.Namespace, *, once: bool) -> int:
+    """Run the durable worker as its own host unit, never in the API process."""
+
+    from cyrene_exchange_product.integrations.cli import (
+        build_production_services,
+        resolve_integration_database_path,
+    )
+
+    database_path = resolve_integration_database_path(
+        arguments.database,
+        explicit_path=arguments.integration_database,
+    )
+    services = build_production_services(database_path)
+    runner = services.dispatcher_runner
+    if runner is None:
+        services.close()
+        raise SystemExit("production integration DispatcherRunner was not constructed")
+    try:
+        if once:
+            print(json.dumps(asdict(runner.run_once()), sort_keys=True, separators=(",", ":")))
+            return 0
+        stop_event = Event()
+        signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+        runner.run_forever(stop_event)
+        return 0
+    finally:
+        services.close()
+
+
+def _integration_check_config() -> int:
+    """Run offline config and Platform-profile preflight without side effects."""
+
+    from cyrene_exchange_product.integrations.cli import (
+        IntegrationConfigurationError,
+        validate_host_configuration,
+    )
+
+    try:
+        report = validate_host_configuration(require_platform_workload_profile=True)
+    except IntegrationConfigurationError:
+        print(
+            json.dumps(
+                {
+                    "valid": False,
+                    "code": "EXCHANGE_INTEGRATION_CONFIGURATION_INVALID",
+                    "message": "Integration configuration preflight failed.",
+                },
+                sort_keys=True,
+            )
+        )
+        return 2
+    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
     return 0
 
 
@@ -424,12 +515,23 @@ def _add_principal_arguments(command: argparse.ArgumentParser) -> None:
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Cyrene Exchange Product operator CLI")
-    value.add_argument("--database", type=Path, required=True)
+    value.add_argument("--database", type=Path)
     commands = value.add_subparsers(dest="command", required=True)
 
     serve = commands.add_parser("serve", help="Run the independent Exchange gateway")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--mode",
+        choices=("gateway-only", "integration-only", "combined"),
+        default=os.environ.get("CYRENE_EXCHANGE_RUNTIME_MODE", "gateway-only"),
+        help="Serve the gateway, integration API, or both; gateway-only remains the default",
+    )
+    serve.add_argument(
+        "--integration-database",
+        type=Path,
+        help="Separate SQLite path for integration inbox, outbox, and operation state",
+    )
     serve.add_argument(
         "--control-token",
         help=(
@@ -552,6 +654,28 @@ def parser() -> argparse.ArgumentParser:
     revoke_target.add_argument("--api-key-id", type=UUID)
     revoke_key.add_argument("--actor-id", default="cyrene-operator")
     revoke_key.add_argument("--workspace-id", default="default")
+
+    integrations = commands.add_parser(
+        "integrations",
+        help="Run an Exchange integration worker as a separate host-managed process",
+    )
+    integration_commands = integrations.add_subparsers(dest="integration_command", required=True)
+    integration_commands.add_parser(
+        "check-config",
+        help=(
+            "Validate Exchange integration config and Platform profile without DB or network calls"
+        ),
+    )
+    for command_name, help_text in (
+        ("dispatch", "Run the durable integration dispatcher until shutdown"),
+        ("dispatch-once", "Claim and process at most one durable integration job"),
+    ):
+        worker = integration_commands.add_parser(command_name, help=help_text)
+        worker.add_argument(
+            "--integration-database",
+            type=Path,
+            help="Separate SQLite path for integration inbox, outbox, and operation state",
+        )
     return value
 
 
@@ -562,9 +686,20 @@ def run(argv: list[str] | None = None) -> int:
     """
     # 中文:执行一条操作员命令并返回其进程退出码。
 
+    if os.environ.get("CYRENE_EXCHANGE_PROCESS_ROLE") == "check-config":
+        return _integration_check_config()
     arguments = parser().parse_args(argv)
     if arguments.command == "serve":
         return _serve(arguments)
+    if arguments.command == "integrations":
+        if arguments.integration_command == "check-config":
+            return _integration_check_config()
+        return _integration_dispatch(
+            arguments,
+            once=arguments.integration_command == "dispatch-once",
+        )
+    if arguments.database is None:
+        raise SystemExit("--database is required for route and key commands")
     if arguments.command == "route":
         if arguments.route_command == "list":
             return _route_list(arguments)

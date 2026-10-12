@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "sourceRepository": "DoHorizon-AI/Cyrene-Platform",
+  "sourceRevision": "91b3c63488e825920081bd3f5f25dd0046a89b1e",
+  "sourceRevisionStatus": "accepted-source-merged",
+  "protoSha256": {
+    "contracts/proto/cyrene/workspace/authority/v2/workspace_authority.proto": "68bbaedcf825393ff17b51b77cd2019dd6e35a682f190f108801754417bfedb1",
+    "contracts/proto/cyrene/workspace/product/v2/product_api.proto": "2a5adf164ecf26d02e728ac16d7bde6f227c286b0d1e51342472df29d0785441"
+  },
+  "grpcioToolsVersion": "1.62.3",
+  "protobufRuntimeVersion": "4.25.9"
+}

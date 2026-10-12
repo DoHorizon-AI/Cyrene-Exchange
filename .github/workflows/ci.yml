@@ -51,10 +51,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # Pinned to the revisions recorded in Cyrene-Workspace/release-lock.json.
-      # Bump both together with that lock, never independently.
+      # Platform follows Workspace's release lock; Plugins follows the Exchange
+      # message consumer lock so the same exact source drives its protocol TCK.
       CYRENE_PLATFORM_REVISION: 06a9bd75edfed1359b09770e749520162d75e242
-      CYRENE_PLUGINS_REVISION: a41284c2ffe71a7412f556841f9ccc4a91864138
+      CYRENE_PLUGINS_REVISION: 9dca63f57da2d23b8a720a513617c30d3c1430c0
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
