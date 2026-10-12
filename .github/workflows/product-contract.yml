@@ -227,8 +227,7 @@ jobs:
       - name: Install the frozen Product integrations environment
         run: uv sync --frozen --group dev --extra integrations --no-install-local
       - name: Install pinned WeCom runtime test dependencies
-        run: uv pip install --python .venv/bin/python -r \
-          "$PLUGINS_WORKTREE/plugins/connectors/wecom/requirements.lock"
+        run: uv pip install --python .venv/bin/python -r "$PLUGINS_WORKTREE/plugins/connectors/wecom/requirements.lock"
       - name: Run the non-skippable real Plugin and Authority hub flow
         env:
           CYRENE_PLUGINS_WORKTREE: ${{ env.PLUGINS_WORKTREE }}
