@@ -83,9 +83,9 @@ jobs:
       RELEASE_ID: ${{ (github.ref == 'refs/heads/develop' && 'preview-' || 'stable-') }}${{ github.sha }}
       IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
       TARGET_PROFILE: ${{ matrix.target_profile }}
-      CATALOG_HELPER_SOURCE_COMMIT: 098ce4affb2fac38754eb18bd40ed679377d4c25
+      CATALOG_HELPER_SOURCE_COMMIT: fe3ff04b786812c394e6794827cab6d44f639b74
       CATALOG_RELEASE_ID: ${{ inputs.catalog_release_id || (github.ref == 'refs/heads/develop' && vars.CYRENE_PREVIEW_COMPONENT_CATALOG_RELEASE_ID) || (github.ref != 'refs/heads/develop' && vars.CYRENE_STABLE_COMPONENT_CATALOG_RELEASE_ID) || '' }}
-      WORKSPACE_BUILDER_COMMIT: 2b1210a19b5596cb90e3ac7c46a912a8a255da80
+      WORKSPACE_BUILDER_COMMIT: fe3ff04b786812c394e6794827cab6d44f639b74
     steps:
       - name: Check out exact Product source
         uses: actions/checkout@v5
@@ -645,7 +645,7 @@ jobs:
       CHANNEL: ${{ github.ref == 'refs/heads/develop' && 'preview' || 'stable' }}
       RELEASE_ID: ${{ (github.ref == 'refs/heads/develop' && 'preview-' || 'stable-') }}${{ github.sha }}
       IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-      WORKSPACE_BUILDER_COMMIT: 2b1210a19b5596cb90e3ac7c46a912a8a255da80
+      WORKSPACE_BUILDER_COMMIT: fe3ff04b786812c394e6794827cab6d44f639b74
     steps:
       - name: Set component release output root
         run: printf 'OUTPUT_ROOT=%s/component-release\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
