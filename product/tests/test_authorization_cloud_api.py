@@ -78,7 +78,9 @@ class _AuthorizationCloud:
             state=RenewalState.WAITING_USER,
             created_at=datetime(2026, 10, 14, 12, tzinfo=UTC),
             expires_at=datetime(2026, 10, 14, 13, tzinfo=UTC),
-            authorization_url="https://open.work.weixin.qq.com/authorize?opaque=1",
+            authorization_url=(
+                "https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external&scode=abcdefgh12345678"
+            ),
             qr_attachment_ref="wecom-qr-opaque-1",
             generation=2,
         )
@@ -117,7 +119,9 @@ class _AuthorizationCloud:
             session_ref="provider-renewal-session-1",
             state=RenewalState.WAITING_USER,
             expires_at=datetime(2026, 10, 14, 13, tzinfo=UTC),
-            authorization_url="https://open.work.weixin.qq.com/authorize?opaque=1",
+            authorization_url=(
+                "https://work.weixin.qq.com/ai/qc/gen?source=wecom_cli_external&scode=abcdefgh12345678"
+            ),
             qr_attachment_ref="wecom-qr-opaque-1",
             generation=2,
         )
@@ -145,6 +149,7 @@ def _services(
     *,
     other: IntegrationPrincipal | None = None,
     authorization_cloud: Any = None,
+    email_delivery_recipient_resolver: Any = None,
 ) -> IntegrationServices:
     """Construct an API with only fixed synthetic capabilities."""
 
@@ -167,6 +172,7 @@ def _services(
         delegation_authorizer=_UnusedDelegationAuthorizer(),  # type: ignore[arg-type]
         callback_principal=callback_principal,
         authorization_cloud=authorization_cloud,
+        email_delivery_recipient_resolver=email_delivery_recipient_resolver,
     )
 
 
@@ -363,8 +369,7 @@ def test_renewal_replays_same_product_session_and_rechecks_status(tmp_path: Path
             actor, _AUTH_REF, session_ref, authorization_operation_id="accountBeginRenewalSession"
         )
         polled = client.get(
-            f"/api/v1/accounts/authorizations/{_AUTH_REF}/renewal-sessions/{session_ref}"
-            f"?workspaceId={_WORKSPACE}",
+            f"/api/v1/accounts/renewal-sessions/{session_ref}?workspaceId={_WORKSPACE}",
             headers={"Authorization": "Bearer actor-token"},
         )
 
@@ -442,8 +447,7 @@ def test_unknown_start_get_uses_only_provider_read_status_lookup(tmp_path: Path)
         )
         session_ref = started.json()["sessionRef"]
         status = client.get(
-            f"/api/v1/accounts/authorizations/{_AUTH_REF}/renewal-sessions/{session_ref}"
-            f"?workspaceId={_WORKSPACE}",
+            f"/api/v1/accounts/renewal-sessions/{session_ref}?workspaceId={_WORKSPACE}",
             headers={"Authorization": "Bearer actor-token"},
         )
 
@@ -539,6 +543,107 @@ def test_notification_feed_ack_and_sse_resume_are_actor_scoped(tmp_path: Path) -
     assert other_feed.status_code == 200 and other_feed.json()["notifications"] == []
     assert sse_id == f"id: {event['sequence']}"
     store.close()
+
+
+def test_dedicated_delivery_command_queues_one_actor_scoped_email_operation(
+    tmp_path: Path,
+) -> None:
+    operations = {
+        "integrationCreateConnection",
+        "integrationGetAuthorizationHealth",
+        "integrationListNotifications",
+        "integrationDeliverNotification",
+        "integrationGetOperation",
+    }
+    actor = _principal("actor-a", operations)
+    other = _principal("actor-b", operations)
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _connection(store, actor)
+    now = datetime(2026, 10, 14, 12, tzinfo=UTC)
+    claim = store.claim_authorization_checks("mail-api-monitor", now=now)[0]
+    store.complete_authorization_check(
+        claim,
+        AuthorizationHealthRecord(
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            actor_issuer=connection.actor_issuer,
+            actor_subject=connection.actor_subject,
+            connection_id=connection.id,
+            authorization_ref=_AUTH_REF,
+            login_state=LoginState.PRESENT,
+            authorization_state=AuthorizationState.VALID,
+            checked_at=now,
+            expires_at=None,
+            generation=1,
+        ),
+        [
+            IntegrationNotificationDraft(
+                connection_id=connection.id,
+                kind=IntegrationNotificationKind.AUTHORIZATION_REQUIRED,
+                severity=NotificationSeverity.ERROR,
+                title="Reconnect WeCom",
+                description="The provider requires authorization.",
+                dedupe_key="explicit-mail-delivery",
+            )
+        ],
+        now=now,
+    )
+    notification = store.list_notifications(actor)[0]
+    services = _services(
+        store,
+        actor,
+        other=other,
+        email_delivery_recipient_resolver=lambda principal: (
+            "oncall" if principal.subject == actor.subject else None
+        ),
+    )
+    app = create_app(database_path=tmp_path / "gateway.sqlite3", integrations=services)
+
+    with TestClient(app) as client:
+        first = client.post(
+            f"/api/v1/integrations/notifications/{notification.id}/actions/deliver"
+            f"?workspaceId={_WORKSPACE}",
+            headers={
+                "Authorization": "Bearer actor-token",
+                "Idempotency-Key": "deliver-one",
+            },
+        )
+        replay = client.post(
+            f"/api/v1/integrations/notifications/{notification.id}/actions/deliver"
+            f"?workspaceId={_WORKSPACE}",
+            headers={
+                "Authorization": "Bearer actor-token",
+                "Idempotency-Key": "deliver-one",
+            },
+        )
+        status = client.get(
+            f"{first.headers['location']}?workspaceId={_WORKSPACE}",
+            headers={"Authorization": "Bearer actor-token"},
+        )
+        cross_actor = client.get(
+            first.headers["location"],
+            headers={
+                "Authorization": "Bearer other-token",
+                "X-Cyrene-Workspace-Id": _WORKSPACE,
+            },
+        )
+
+    assert first.status_code == 202
+    assert replay.status_code == 202
+    assert replay.json()["operationId"] == first.json()["operationId"]
+    assert first.headers["location"].endswith(first.json()["operationId"])
+    assert status.status_code == 200
+    assert status.json()["state"] == "QUEUED"
+    assert status.json()["result"]["deliveryStatus"] == "READY"
+    assert "recipientRef" not in status.text and "actorSubject" not in status.text
+    assert cross_actor.status_code == 404
+    restarted = IntegrationStore(tmp_path / "integrations.sqlite3")
+    row = restarted._connection.execute(
+        "SELECT COUNT(*) AS total FROM email_notification_outbox WHERE notification_id=?",
+        (str(notification.id),),
+    ).fetchone()
+    assert row is not None and row["total"] == 1
+    restarted.close()
 
 
 def test_other_actor_cannot_reuse_authorization_ref_or_session(tmp_path: Path) -> None:

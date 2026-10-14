@@ -1,0 +1,675 @@
+"""Authorization/cloud host profiles and live caller configuration.
+
+Module: cyrene_exchange_product.integrations.authorization_cloud_profiles
+Role: Parse closed host-owned bindings and resolve actor/resource allowlists.
+模块职责：解析受限 Host 配置，并按当前身份解析 Actor 与资源允许列表。
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from cyrene_exchange_product.integrations.models import (
+    CreateIntegrationConnection,
+    IntegrationConnection,
+    IntegrationPrincipal,
+)
+
+_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$")
+_RECIPIENT_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_PROVIDER_IDS = frozenset({"wecom", "azure", "gcp", "hf", "runpod", "tailscale"})
+
+
+class AuthorizationCloudConfigurationError(ValueError):
+    """Closed authorization/cloud host settings are incomplete or ambiguous."""
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorityActorContext:
+    """Host-owned identity pins and a live first-party bearer secret reference."""
+
+    context_ref: str
+    issuer: str
+    subject: str
+    organization_id: str
+    workspace_id: str
+    bearer_token_env_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class DirectPluginEndpointConfig:
+    """One host-resolved DirectPluginRuntime address and optional mTLS profile."""
+
+    binding_id: str
+    connection_ref: str
+    transport: str
+    mtls: Mapping[str, str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class CloudTargetAlias:
+    """A caller-visible selector mapped to one binding-owned provider target."""
+
+    target_ref: str
+    display_name: str
+    allowed_context_refs: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationProviderProfile:
+    """One fixed Plugin binding scoped to configured actors and resource aliases."""
+
+    profile_ref: str
+    provider: str
+    endpoint: DirectPluginEndpointConfig
+    caller_workload: str
+    audience: str
+    expected_issuer: str
+    context_key_ref: str
+    organization_id: str
+    workspace_id: str
+    allowed_context_refs: frozenset[str]
+    display_name: str | None
+    authorization_ref: str | None
+    targets: Mapping[str, CloudTargetAlias]
+
+
+@dataclass(frozen=True, slots=True)
+class EmailNotificationProfile:
+    """An explicitly enabled mail binding and fixed recipient allowlist alias."""
+
+    enabled: bool
+    endpoint: DirectPluginEndpointConfig | None
+    caller_workload: str | None
+    audience: str | None
+    expected_issuer: str | None
+    context_key_ref: str | None
+    organization_id: str | None
+    workspace_id: str | None
+    recipient_ref: str | None
+    allowed_context_refs: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationCloudSettings:
+    """Validated immutable inputs used by the Product adapter and live resolver."""
+
+    monitor_interval_seconds: int
+    contexts: Mapping[str, AuthorityActorContext]
+    profiles: Mapping[str, AuthorizationProviderProfile]
+    email: EmailNotificationProfile
+
+
+class AuthorizationCloudProfileRegistry:
+    """Resolve only configured connection aliases and current verified actor scopes."""
+
+    def __init__(self, settings: AuthorizationCloudSettings) -> None:
+        self.settings = settings
+        identities: dict[tuple[str, str, str, str], AuthorityActorContext] = {}
+        for context in settings.contexts.values():
+            identity = (
+                context.issuer,
+                context.subject,
+                context.organization_id,
+                context.workspace_id,
+            )
+            if identity in identities:
+                raise AuthorizationCloudConfigurationError(
+                    "current authority actor pins must resolve to one bearer reference"
+                )
+            identities[identity] = context
+        self._contexts_by_identity = identities
+
+    def display_name_for_connection(
+        self,
+        principal: IntegrationPrincipal,
+        request: CreateIntegrationConnection,
+    ) -> str:
+        """Authorize a provider/binding/target alias against the live request principal."""
+
+        principal.require("integrationCreateConnection")
+        profile = self._profile(request.provider, request.binding_ref)
+        context = self._context_for_principal(
+            principal,
+            allowed_context_refs=profile.allowed_context_refs,
+            organization_id=profile.organization_id,
+            workspace_id=profile.workspace_id,
+            expected_issuer=profile.expected_issuer,
+        )
+        if request.provider == "wecom":
+            if request.target_ref is not None or profile.display_name is None:
+                raise AuthorizationCloudConfigurationError(
+                    "WeCom authorization profile does not match the connection selector"
+                )
+            return profile.display_name
+        target = profile.targets.get(request.target_ref or "")
+        if target is None:
+            raise AuthorizationCloudConfigurationError(
+                "cloud target alias is not configured for this provider binding"
+            )
+        if target.allowed_context_refs and context.context_ref not in target.allowed_context_refs:
+            raise PermissionError("cloud target is not allowed for the current actor")
+        return target.display_name
+
+    def profile_for_connection(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        *,
+        operation_id: str,
+    ) -> tuple[AuthorizationProviderProfile, str | None]:
+        """Recheck exact operation, owner, binding and target allowlists before signing."""
+
+        principal.require(operation_id)
+        if (
+            principal.issuer != connection.actor_issuer
+            or principal.subject != connection.actor_subject
+            or principal.organization_id != connection.organization_id
+            or principal.workspace_id != connection.workspace_id
+        ):
+            raise PermissionError("connection owner does not match current Platform identity")
+        profile = self._profile(connection.provider, connection.binding_ref)
+        self._context_for_principal(
+            principal,
+            allowed_context_refs=profile.allowed_context_refs,
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            expected_issuer=profile.expected_issuer,
+        )
+        if connection.organization_id != profile.organization_id:
+            raise PermissionError("connection organization is outside the provider binding")
+        target_ref: str | None = None
+        if connection.provider == "wecom":
+            if connection.target_ref is not None:
+                raise PermissionError("WeCom connection cannot select a cloud target")
+        else:
+            target = profile.targets.get(connection.target_ref or "")
+            if target is None:
+                raise PermissionError("cloud target alias is not configured")
+            target_context = self._contexts_by_identity.get(
+                (
+                    principal.issuer,
+                    principal.subject,
+                    principal.organization_id,
+                    principal.workspace_id,
+                )
+            )
+            if target.allowed_context_refs and (
+                target_context is None
+                or target_context.context_ref not in target.allowed_context_refs
+            ):
+                raise PermissionError("cloud target is not allowed for the current actor")
+            target_ref = target.target_ref
+        return profile, target_ref
+
+    def context_for_profile(
+        self,
+        principal: IntegrationPrincipal,
+        profile: AuthorizationProviderProfile,
+    ) -> AuthorityActorContext:
+        """Return one exact host-pinned actor context or reject ambiguity."""
+
+        return self._context_for_principal(
+            principal,
+            allowed_context_refs=profile.allowed_context_refs,
+            organization_id=profile.organization_id,
+            workspace_id=profile.workspace_id,
+            expected_issuer=profile.expected_issuer,
+        )
+
+    def context_for_connection(
+        self,
+        connection: IntegrationConnection,
+    ) -> tuple[AuthorityActorContext, AuthorizationProviderProfile]:
+        """Map persisted ownership to one configured credential and resource profile."""
+
+        profile = self._profile(connection.provider, connection.binding_ref)
+        if (
+            connection.organization_id != profile.organization_id
+            or connection.workspace_id != profile.workspace_id
+        ):
+            raise PermissionError("connection tenant is outside its provider binding")
+        context = self._contexts_by_identity.get(
+            (
+                connection.actor_issuer,
+                connection.actor_subject,
+                connection.organization_id,
+                connection.workspace_id,
+            )
+        )
+        if context is None or context.context_ref not in profile.allowed_context_refs:
+            raise PermissionError("connection owner has no configured live bearer context")
+        if connection.provider == "wecom":
+            if connection.target_ref is not None:
+                raise PermissionError("WeCom connection cannot select a cloud target")
+        else:
+            target = profile.targets.get(connection.target_ref or "")
+            if target is None or (
+                target.allowed_context_refs
+                and context.context_ref not in target.allowed_context_refs
+            ):
+                raise PermissionError("connection target is outside the actor resource allowlist")
+        return context, profile
+
+    def email_context_for_principal(self, principal: IntegrationPrincipal) -> AuthorityActorContext:
+        """Require both a dedicated current deliver grant and the mail actor allowlist."""
+
+        principal.require("integrationDeliverNotification")
+        email = self.settings.email
+        if not email.enabled or email.endpoint is None:
+            raise PermissionError("email delivery is disabled")
+        if (
+            principal.organization_id != email.organization_id
+            or principal.workspace_id != email.workspace_id
+            or principal.issuer != email.expected_issuer
+        ):
+            raise PermissionError("email delivery caller is outside the configured tenant")
+        return self._context_for_principal(
+            principal,
+            allowed_context_refs=email.allowed_context_refs,
+            organization_id=str(email.organization_id),
+            workspace_id=str(email.workspace_id),
+            expected_issuer=str(email.expected_issuer),
+        )
+
+    def email_recipient_for_principal(self, principal: IntegrationPrincipal) -> str | None:
+        """Return the one configured recipient only for an explicitly allowed actor."""
+
+        try:
+            self.email_context_for_principal(principal)
+        except Exception:
+            return None
+        return self.settings.email.recipient_ref
+
+    def email_recipient_for_connection(self, connection: IntegrationConnection) -> str | None:
+        """Resolve configured email consent without reconstructing an identity claim."""
+
+        email = self.settings.email
+        if not email.enabled or email.endpoint is None:
+            return None
+        context = self._contexts_by_identity.get(
+            (
+                connection.actor_issuer,
+                connection.actor_subject,
+                connection.organization_id,
+                connection.workspace_id,
+            )
+        )
+        if (
+            context is None
+            or context.context_ref not in email.allowed_context_refs
+            or connection.organization_id != email.organization_id
+            or connection.workspace_id != email.workspace_id
+            or connection.actor_issuer != email.expected_issuer
+        ):
+            return None
+        return email.recipient_ref
+
+    def email_context_for_job(self, job: Any) -> AuthorityActorContext:
+        """Resolve the same configured identity pins for an outbox actor."""
+
+        email = self.settings.email
+        context = self._contexts_by_identity.get(
+            (job.actor_issuer, job.actor_subject, job.organization_id, job.workspace_id)
+        )
+        if (
+            not email.enabled
+            or email.endpoint is None
+            or email.expected_issuer != job.actor_issuer
+            or email.organization_id != job.organization_id
+            or email.workspace_id != job.workspace_id
+            or context is None
+            or context.context_ref not in email.allowed_context_refs
+        ):
+            raise PermissionError("notification owner is not allowlisted for email delivery")
+        return context
+
+    def _context_for_principal(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        allowed_context_refs: frozenset[str],
+        organization_id: str,
+        workspace_id: str,
+        expected_issuer: str,
+    ) -> AuthorityActorContext:
+        identity = (
+            principal.issuer,
+            principal.subject,
+            principal.organization_id,
+            principal.workspace_id,
+        )
+        context = self._contexts_by_identity.get(identity)
+        if (
+            context is None
+            or context.context_ref not in allowed_context_refs
+            or principal.issuer != expected_issuer
+            or principal.organization_id != organization_id
+            or principal.workspace_id != workspace_id
+        ):
+            raise PermissionError("current Platform identity is not allowed by this profile")
+        return context
+
+    def _profile(
+        self,
+        provider: str,
+        profile_ref: str | None,
+    ) -> AuthorizationProviderProfile:
+        if profile_ref is None:
+            raise AuthorizationCloudConfigurationError("provider binding alias is required")
+        profile = self.settings.profiles.get(profile_ref)
+        if profile is None or profile.provider != provider:
+            raise AuthorizationCloudConfigurationError("provider binding alias is unavailable")
+        return profile
+
+
+def parse_authorization_cloud_settings(
+    value: object,
+    *,
+    email_value: object,
+) -> AuthorizationCloudSettings:
+    """Parse exact host fields; no Product request field becomes a URL or credential."""
+
+    cloud = _object(
+        value,
+        required={"currentAuthority", "profiles"},
+        optional={"monitorIntervalSeconds"},
+        label="authorizationCloud",
+    )
+    interval = cloud.get("monitorIntervalSeconds", 900)
+    if isinstance(interval, bool) or not isinstance(interval, int) or not 60 <= interval <= 86_400:
+        raise AuthorizationCloudConfigurationError("authorizationCloud monitor interval is invalid")
+
+    authority = _object(
+        cloud["currentAuthority"],
+        required={"contexts"},
+        optional=set(),
+        label="authorizationCloud.currentAuthority",
+    )
+    raw_contexts = authority["contexts"]
+    if not isinstance(raw_contexts, list):
+        raise AuthorizationCloudConfigurationError("currentAuthority.contexts must be an array")
+    contexts: dict[str, AuthorityActorContext] = {}
+    for index, raw_context in enumerate(raw_contexts):
+        label = f"currentAuthority.contexts[{index}]"
+        item = _object(
+            raw_context,
+            required={
+                "contextRef",
+                "issuer",
+                "subject",
+                "organizationId",
+                "workspaceId",
+                "bearerTokenEnvRef",
+            },
+            optional=set(),
+            label=label,
+        )
+        context_ref = _alias(item["contextRef"], f"{label}.contextRef")
+        if context_ref in contexts:
+            raise AuthorizationCloudConfigurationError("current authority contextRef is duplicated")
+        contexts[context_ref] = AuthorityActorContext(
+            context_ref=context_ref,
+            issuer=_text(item["issuer"], f"{label}.issuer"),
+            subject=_text(item["subject"], f"{label}.subject"),
+            organization_id=_text(item["organizationId"], f"{label}.organizationId"),
+            workspace_id=_text(item["workspaceId"], f"{label}.workspaceId"),
+            bearer_token_env_ref=_text(item["bearerTokenEnvRef"], f"{label}.bearerTokenEnvRef"),
+        )
+
+    raw_profiles = cloud["profiles"]
+    if not isinstance(raw_profiles, Mapping) or not raw_profiles:
+        raise AuthorizationCloudConfigurationError("authorizationCloud.profiles is required")
+    profiles: dict[str, AuthorizationProviderProfile] = {}
+    for raw_profile_ref, raw_profile in raw_profiles.items():
+        profile_ref = _alias(raw_profile_ref, "authorizationCloud profile key")
+        item = _object(
+            raw_profile,
+            required={
+                "provider",
+                "directPlugin",
+                "callerWorkload",
+                "audience",
+                "expectedIssuer",
+                "contextKeyRef",
+                "organizationId",
+                "workspaceId",
+                "allowedContextRefs",
+            },
+            optional={"displayName", "authorizationRef", "targets"},
+            label=f"authorizationCloud.profiles.{profile_ref}",
+        )
+        provider = _text(item["provider"], "provider")
+        if provider not in _PROVIDER_IDS:
+            raise AuthorizationCloudConfigurationError("authorizationCloud provider is unsupported")
+        endpoint = _endpoint(item["directPlugin"], f"profile {profile_ref}.directPlugin")
+        allowed_refs = _aliases(item["allowedContextRefs"], "allowedContextRefs")
+        if not allowed_refs <= set(contexts):
+            raise AuthorizationCloudConfigurationError(
+                "provider profile has an unknown actor context"
+            )
+        organization_id = _text(item["organizationId"], "organizationId")
+        workspace_id = _text(item["workspaceId"], "workspaceId")
+        expected_issuer = _text(item["expectedIssuer"], "expectedIssuer")
+        for context_ref in allowed_refs:
+            context = contexts[context_ref]
+            if (
+                context.organization_id != organization_id
+                or context.workspace_id != workspace_id
+                or context.issuer != expected_issuer
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    "provider profile actor pins do not match the binding scope"
+                )
+        display_name = _text(item["displayName"], "displayName") if "displayName" in item else None
+        authorization_ref = (
+            _alias(item["authorizationRef"], "authorizationRef")
+            if "authorizationRef" in item
+            else None
+        )
+        raw_targets = item.get("targets", {})
+        if not isinstance(raw_targets, Mapping):
+            raise AuthorizationCloudConfigurationError("provider targets must be an object")
+        targets: dict[str, CloudTargetAlias] = {}
+        for raw_alias, raw_target in raw_targets.items():
+            alias = _alias(raw_alias, "target alias")
+            target = _object(
+                raw_target,
+                required={"targetRef", "displayName"},
+                optional={"allowedContextRefs"},
+                label=f"profile {profile_ref}.targets.{alias}",
+            )
+            target_contexts = (
+                _aliases(target["allowedContextRefs"], "target allowedContextRefs")
+                if "allowedContextRefs" in target
+                else frozenset()
+            )
+            if not target_contexts <= allowed_refs:
+                raise AuthorizationCloudConfigurationError(
+                    "target actor allowlist exceeds its provider profile"
+                )
+            targets[alias] = CloudTargetAlias(
+                target_ref=_alias(target["targetRef"], "provider targetRef"),
+                display_name=_text(target["displayName"], "target displayName"),
+                allowed_context_refs=target_contexts,
+            )
+        if provider == "wecom":
+            if authorization_ref is None or display_name is None or targets:
+                raise AuthorizationCloudConfigurationError(
+                    "WeCom profiles require displayName and authorizationRef only"
+                )
+        elif not targets or display_name is not None or authorization_ref is not None:
+            raise AuthorizationCloudConfigurationError(
+                "cloud profiles require target aliases and cannot select authorization refs"
+            )
+        profiles[profile_ref] = AuthorizationProviderProfile(
+            profile_ref=profile_ref,
+            provider=provider,
+            endpoint=endpoint,
+            caller_workload=_text(item["callerWorkload"], "callerWorkload"),
+            audience=_text(item["audience"], "audience"),
+            expected_issuer=expected_issuer,
+            context_key_ref=_text(item["contextKeyRef"], "contextKeyRef"),
+            organization_id=organization_id,
+            workspace_id=workspace_id,
+            allowed_context_refs=allowed_refs,
+            display_name=display_name,
+            authorization_ref=authorization_ref,
+            targets=targets,
+        )
+
+    email = _parse_email_profile(email_value, contexts)
+    return AuthorizationCloudSettings(
+        monitor_interval_seconds=interval,
+        contexts=contexts,
+        profiles=profiles,
+        email=email,
+    )
+
+
+def _parse_email_profile(
+    value: object,
+    contexts: Mapping[str, AuthorityActorContext],
+) -> EmailNotificationProfile:
+    if value is None:
+        return EmailNotificationProfile(
+            False, None, None, None, None, None, None, None, None, frozenset()
+        )
+    item = _object(
+        value,
+        required={"enabled"},
+        optional={
+            "directPlugin",
+            "callerWorkload",
+            "audience",
+            "expectedIssuer",
+            "contextKeyRef",
+            "organizationId",
+            "workspaceId",
+            "recipientRef",
+            "allowedContextRefs",
+        },
+        label="emailNotifications",
+    )
+    if item["enabled"] is not True:
+        if set(item) != {"enabled"}:
+            raise AuthorizationCloudConfigurationError(
+                "disabled emailNotifications must not retain bindings or recipients"
+            )
+        return EmailNotificationProfile(
+            False, None, None, None, None, None, None, None, None, frozenset()
+        )
+    required = {
+        "directPlugin",
+        "callerWorkload",
+        "audience",
+        "expectedIssuer",
+        "contextKeyRef",
+        "organizationId",
+        "workspaceId",
+        "recipientRef",
+        "allowedContextRefs",
+    }
+    if not required <= set(item):
+        raise AuthorizationCloudConfigurationError("enabled emailNotifications is incomplete")
+    endpoint = _endpoint(item["directPlugin"], "emailNotifications.directPlugin")
+    allowed_refs = _aliases(item["allowedContextRefs"], "email allowedContextRefs")
+    if not allowed_refs or not allowed_refs <= set(contexts):
+        raise AuthorizationCloudConfigurationError("email actor allowlist is empty or unknown")
+    org = _text(item["organizationId"], "email organizationId")
+    workspace = _text(item["workspaceId"], "email workspaceId")
+    issuer = _text(item["expectedIssuer"], "email expectedIssuer")
+    recipient_ref = _text(item["recipientRef"], "email recipientRef")
+    if not _RECIPIENT_ALIAS.fullmatch(recipient_ref):
+        raise AuthorizationCloudConfigurationError("email recipientRef must be a configured alias")
+    for context_ref in allowed_refs:
+        context = contexts[context_ref]
+        if (
+            context.organization_id != org
+            or context.workspace_id != workspace
+            or context.issuer != issuer
+        ):
+            raise AuthorizationCloudConfigurationError("email actor pins do not match the binding")
+    return EmailNotificationProfile(
+        True,
+        endpoint,
+        _text(item["callerWorkload"], "email callerWorkload"),
+        _text(item["audience"], "email audience"),
+        issuer,
+        _text(item["contextKeyRef"], "email contextKeyRef"),
+        org,
+        workspace,
+        recipient_ref,
+        allowed_refs,
+    )
+
+
+def _endpoint(value: object, label: str) -> DirectPluginEndpointConfig:
+    item = _object(
+        value,
+        required={"bindingId", "connectionRef", "transport"},
+        optional={"mtls"},
+        label=label,
+    )
+    transport = _text(item["transport"], f"{label}.transport")
+    if transport not in {"local", "mtls"}:
+        raise AuthorizationCloudConfigurationError("DirectPlugin transport is unsupported")
+    raw_mtls = item.get("mtls")
+    mtls = None
+    if transport == "mtls":
+        raw_mtls = _object(
+            raw_mtls,
+            required={"rootCertificateRef", "clientCertificateRef", "clientKeyRef"},
+            optional=set(),
+            label=f"{label}.mtls",
+        )
+        mtls = {key: _text(value, f"{label}.mtls.{key}") for key, value in raw_mtls.items()}
+    elif raw_mtls is not None:
+        raise AuthorizationCloudConfigurationError("local DirectPlugin cannot use mTLS")
+    return DirectPluginEndpointConfig(
+        binding_id=_alias(item["bindingId"], f"{label}.bindingId"),
+        connection_ref=_text(item["connectionRef"], f"{label}.connectionRef"),
+        transport=transport,
+        mtls=mtls,
+    )
+
+
+def _object(
+    value: object,
+    *,
+    required: set[str],
+    optional: set[str],
+    label: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or not required <= set(value)
+        or set(value) - required - optional
+    ):
+        raise AuthorizationCloudConfigurationError(f"{label} has missing or unknown fields")
+    return dict(value)
+
+
+def _text(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 1024:
+        raise AuthorizationCloudConfigurationError(f"{label} must be bounded non-empty text")
+    return value.strip()
+
+
+def _alias(value: object, label: str) -> str:
+    text = _text(value, label)
+    if not _ALIAS.fullmatch(text):
+        raise AuthorizationCloudConfigurationError(f"{label} must be an opaque alias")
+    return text
+
+
+def _aliases(value: object, label: str) -> frozenset[str]:
+    if not isinstance(value, list):
+        raise AuthorizationCloudConfigurationError(f"{label} must be an array")
+    items = [_alias(item, label) for item in value]
+    if len(items) != len(set(items)):
+        raise AuthorizationCloudConfigurationError(f"{label} contains a duplicate")
+    return frozenset(items)

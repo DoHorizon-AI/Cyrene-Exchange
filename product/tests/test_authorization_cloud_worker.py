@@ -124,6 +124,7 @@ def _principal() -> IntegrationPrincipal:
                 "integrationGetAuthorizationHealth",
                 "integrationRefreshConnectionResources",
                 "integrationListNotifications",
+                "integrationDeliverNotification",
                 "integrationGetOperation",
                 "integrationListConnectionResources",
             }

@@ -80,12 +80,13 @@ notification binding 是群组资源；每位成员通过 actor binding 附加�
 | `GET /api/v1/integrations/connections/{connection_id}/health` | Read the fixed Plugin runtime health observation; offline targets return `UNKNOWN` |
 | `GET /api/v1/integrations/connections/{connection_id}/authorization-health` | Read cached provider login and authorization facts; first observation returns `UNKNOWN` |
 | `POST /api/v1/accounts/authorizations/{authorization_id}/renewal-sessions` | Start or replay the actor-owned provider renewal session; requires `Idempotency-Key` and returns `202` plus a Product `Location` |
-| `GET /api/v1/accounts/authorizations/{authorization_id}/renewal-sessions/{session_id}` | Read the actor-owned Product renewal session |
+| `GET /api/v1/accounts/renewal-sessions/{session_id}` | Read one actor-owned Product renewal session UUID; the stored session binds its exact native authorization |
 | `GET /api/v1/integrations/connections/{connection_id}/resources` | Read latest cloud observations with source and freshness |
 | `POST /api/v1/integrations/connections/{connection_id}/actions/refresh` | Queue an idempotent read-only cloud refresh; returns `202` plus a Product operation `Location` |
 | `GET /api/v1/integrations/notifications?after={sequence}` | Read the durable actor-scoped notification feed after a sequence cursor |
 | `GET /api/v1/integrations/notifications/events` | Stream the durable feed; `Last-Event-ID` resumes after a sequence |
 | `POST /api/v1/integrations/notifications/{notification_id}/ack` | Acknowledge an actor-owned notification; requires `Idempotency-Key` |
+| `POST /api/v1/integrations/notifications/{notification_id}/actions/deliver` | Queue one actor-owned email request to the host-fixed recipient alias; requires `integrationDeliverNotification` and `Idempotency-Key` |
 | `POST /api/v1/integrations/sync-bindings` | Create a notification-only binding; requires `Idempotency-Key` |
 | `GET /api/v1/integrations/sync-bindings` | List scoped bindings |
 | `POST /api/v1/integrations/sync-bindings/{binding_id}/actor-bindings` | Attach this member's own account link and Platform grant; requires `Idempotency-Key` |
@@ -125,8 +126,12 @@ Cloud refresh is a fixed provider query over a server-configured opaque target
 selector. REST accepts no endpoint, shell command, credential, or model-selected
 scope. A failed provider read leaves the last observation in place and its
 freshness ages to `STALE`; it does not report a resource as stopped. The independent
-email outbox commits `SENDING` before calling the mail adapter. A lost or ambiguous
-send becomes `UNKNOWN` and is not automatically resent.
+email outbox commits `SENDING` before calling the mail adapter. Email requires a
+fresh `integrationDeliverNotification` Platform grant and a host-enabled actor
+allowlist; `integrationListNotifications` does not authorize sending. A lost or
+ambiguous send becomes `UNKNOWN` and is not automatically resent. The explicit
+delivery route is idempotent and returns the existing job state for a previously
+queued or sent notification.
 
 Renewal creates a Product session intent before the provider call. A confirmed
 session exposes the provider's bounded official authorization URL or opaque QR

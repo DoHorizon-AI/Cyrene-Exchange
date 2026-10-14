@@ -399,6 +399,8 @@ class IntegrationServices:
             [IntegrationPrincipal, CreateIntegrationConnection], str
         ]
         | None = None,
+        email_delivery_recipient_resolver: Callable[[IntegrationPrincipal], str | None]
+        | None = None,
         authorization_cloud: Any = None,
         current_context_resolver: Any = None,
         email_notifications: Any = None,
@@ -421,6 +423,7 @@ class IntegrationServices:
         self.wecom_source_principal = wecom_source_principal
         self.account_center = account_center
         self.connection_profile_resolver = connection_profile_resolver
+        self.email_delivery_recipient_resolver = email_delivery_recipient_resolver
         self.authorization_cloud = authorization_cloud
         self.current_context_resolver = current_context_resolver
         self.email_notifications = email_notifications
@@ -435,7 +438,26 @@ class IntegrationServices:
         """Authorize aliases for this current principal and resolve display metadata."""
 
         if self.connection_profile_resolver is not None:
-            display_name = self.connection_profile_resolver(principal, request)
+            try:
+                display_name = self.connection_profile_resolver(principal, request)
+            except PermissionError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_INTEGRATION_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Provider profile is not available to this actor",
+                    detail=(
+                        "The selected provider profile or target is outside "
+                        "the current actor scope."
+                    ),
+                    status=403,
+                ) from exc
+            except Exception as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_INTEGRATION_PROVIDER_CONFIGURATION_UNAVAILABLE",
+                    title="Provider connection is not configured",
+                    detail="The selected provider profile is unavailable in trusted host settings.",
+                    status=503,
+                    retryable=True,
+                ) from exc
             if not display_name.strip() or len(display_name) > 300:
                 raise ExchangeProductError(
                     code="EXCHANGE_INTEGRATION_PROVIDER_CONFIGURATION_INVALID",
@@ -515,6 +537,37 @@ def _cloud_operation_status(operation: CloudRefreshOperation) -> dict[str, Any]:
         "createdAt": operation.created_at.isoformat(),
         "updatedAt": operation.updated_at.isoformat(),
         "result": operation.result,
+    }
+
+
+def _email_delivery_operation_status(job: Any) -> dict[str, Any]:
+    """Expose only durable delivery state, never email addresses or content."""
+
+    state = getattr(getattr(job, "state", ""), "value", str(getattr(job, "state", "")))
+    public_state = {
+        "READY": "QUEUED",
+        "CLAIMED": "QUEUED",
+        "SENDING": "RUNNING",
+        "ACCEPTED": "SUCCEEDED",
+        "UNKNOWN": "UNKNOWN",
+        "REJECTED": "FAILED",
+    }.get(state, "UNKNOWN")
+    result = {
+        "deliveryStatus": state,
+        "deliveryConfirmed": bool(getattr(job, "delivery_confirmed", False)),
+    }
+    reason_code = getattr(job, "failure_reason_code", None)
+    if reason_code:
+        result["reasonCode"] = str(reason_code)
+    return {
+        "operationId": str(job.id),
+        "action": "integration.notification.deliver",
+        "state": public_state,
+        "issueNumber": None,
+        "connectionId": str(job.connection_id) if job.connection_id else None,
+        "createdAt": job.created_at.isoformat(),
+        "updatedAt": job.updated_at.isoformat(),
+        "result": result,
     }
 
 
@@ -908,7 +961,11 @@ def create_router(services: IntegrationServices) -> APIRouter:
         )
         return _connection_response(connection)
 
-    @router.get("/api/v1/integrations/connections", operation_id="integrationListConnections")
+    @router.get(
+        "/api/v1/integrations/connections",
+        operation_id="integrationListConnections",
+        response_model=list[IntegrationConnectionResponse],
+    )
     async def list_connections(
         request: Request, workspace_id: str | None = Query(default=None, alias="workspaceId")
     ) -> list[dict[str, Any]]:
@@ -1087,10 +1144,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 session.session_ref,
                 authorization_operation_id="accountBeginRenewalSession",
             )
-        location = (
-            f"/api/v1/accounts/authorizations/{authorization_id}/renewal-sessions/"
-            f"{session.session_ref}"
-        )
+        location = f"/api/v1/accounts/renewal-sessions/{session.session_ref}"
         return JSONResponse(
             status_code=202,
             content=jsonable_encoder(_renewal_response(session)),
@@ -1098,13 +1152,12 @@ def create_router(services: IntegrationServices) -> APIRouter:
         )
 
     @router.get(
-        "/api/v1/accounts/authorizations/{authorization_id}/renewal-sessions/{session_id}",
+        "/api/v1/accounts/renewal-sessions/{session_id}",
         operation_id="accountGetRenewalSession",
         response_model=RenewalSessionResponse,
     )
     async def get_renewal_session(
-        authorization_id: str,
-        session_id: str,
+        session_id: UUID,
         request: Request,
         workspace_id: str | None = Query(default=None, alias="workspaceId"),
     ) -> dict[str, Any]:
@@ -1112,21 +1165,21 @@ def create_router(services: IntegrationServices) -> APIRouter:
             request,
             workspace_id,
             operation_id="accountGetRenewalSession",
-            resource_id=session_id,
+            resource_id=str(session_id),
         )
         require(actor, "accountGetRenewalSession")
+        session = services.store.get_renewal_session_by_id(
+            actor,
+            str(session_id),
+            authorization_operation_id="accountGetRenewalSession",
+        )
         services.store.connection_for_authorization(
             actor,
-            authorization_id,
+            session.authorization_ref,
             provider="wecom",
             authorization_operation_id="accountGetRenewalSession",
         )
-        session = services.store.get_renewal_session(
-            actor,
-            authorization_id,
-            session_id,
-            authorization_operation_id="accountGetRenewalSession",
-        )
+        authorization_id = session.authorization_ref
         has_provider_session = session.provider_session_ref is not None
         can_lookup_unknown_start = bool(
             services.authorization_cloud is not None
@@ -1426,6 +1479,71 @@ def create_router(services: IntegrationServices) -> APIRouter:
         return _notification_response(event)
 
     @router.post(
+        "/api/v1/integrations/notifications/{notification_id}/actions/deliver",
+        status_code=202,
+        operation_id="integrationDeliverNotification",
+        response_model=OperationStatusResponse,
+        responses={
+            202: {
+                "description": (
+                    "Durable email delivery accepted; Location polls its Product operation."
+                ),
+                "headers": {
+                    "Location": {
+                        "description": "URI reference for the Product delivery operation.",
+                        "schema": {"type": "string", "format": "uri-reference"},
+                    }
+                },
+            }
+        },
+    )
+    async def deliver_notification_email(
+        notification_id: UUID,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> JSONResponse:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="integrationDeliverNotification",
+            resource_id=str(notification_id),
+        )
+        require(actor, "integrationDeliverNotification")
+        recipient_resolver = services.email_delivery_recipient_resolver
+        if recipient_resolver is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_EMAIL_DELIVERY_UNAVAILABLE",
+                title="Email delivery is not configured",
+                detail=(
+                    "Configure an enabled email profile and actor allowlist "
+                    "before requesting delivery."
+                ),
+                status=503,
+                retryable=True,
+            )
+        recipient_ref = recipient_resolver(actor)
+        if not recipient_ref:
+            raise ExchangeProductError(
+                code="EXCHANGE_EMAIL_DELIVERY_FORBIDDEN",
+                title="Email delivery is not enabled for this actor",
+                detail="The current actor is not in the configured email delivery allowlist.",
+                status=403,
+            )
+        job, _created = services.store.request_notification_email_delivery(
+            actor,
+            notification_id,
+            recipient_ref=recipient_ref,
+            idempotency_key=idempotency_key,
+        )
+        location = f"/api/v1/integrations/operations/{job.id}"
+        return JSONResponse(
+            status_code=202,
+            content=_email_delivery_operation_status(job),
+            headers={"Location": location},
+        )
+
+    @router.post(
         "/api/v1/integrations/sync-bindings",
         status_code=201,
         operation_id="integrationCreateBinding",
@@ -1659,9 +1777,13 @@ def create_router(services: IntegrationServices) -> APIRouter:
         try:
             operation = services.store.get_operation(actor, operation_id)
         except IntegrationNotFound:
-            return _cloud_operation_status(
-                services.store.get_cloud_refresh_operation(actor, operation_id)
-            )
+            try:
+                cloud_operation = services.store.get_cloud_refresh_operation(actor, operation_id)
+            except IntegrationNotFound:
+                return _email_delivery_operation_status(
+                    services.store.get_email_notification_job(actor, operation_id)
+                )
+            return _cloud_operation_status(cloud_operation)
         return _operation_status(operation)
 
     @router.post(

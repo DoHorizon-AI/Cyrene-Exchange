@@ -455,7 +455,7 @@ class IntegrationStore:
         """Return an exact prior typed result or reject changed payload reuse."""
 
         row = cursor.execute(
-            """SELECT request_hash,document FROM idempotency_records
+            """SELECT request_hash,resource_id,document FROM idempotency_records
                WHERE organization_id=? AND workspace_id=? AND actor_issuer=?
                AND actor_subject=? AND operation_id=? AND idempotency_key=?""",
             (
@@ -644,6 +644,21 @@ class IntegrationStore:
 
         principal.require(authorization_operation_id)
         return self._get_connection_scoped(principal, connection_id)
+
+    def current_connection_for_provider_call(
+        self,
+        connection_id: UUID,
+    ) -> IntegrationConnection | None:
+        """Reload one enabled row immediately before a trusted provider adapter call."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT document FROM integration_connections WHERE id=? AND enabled=1",
+                (str(connection_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return IntegrationConnection.model_validate_json(str(row["document"]))
 
     def _get_connection_scoped(
         self, principal: IntegrationPrincipal, connection_id: UUID
@@ -3451,6 +3466,29 @@ class IntegrationStore:
             raise IntegrationNotFound("renewal session not found")
         return RenewalSessionRecord.model_validate_json(str(row["document"]))
 
+    def get_renewal_session_by_id(
+        self,
+        principal: IntegrationPrincipal,
+        session_ref: str,
+        *,
+        authorization_operation_id: str,
+    ) -> RenewalSessionRecord:
+        """Resolve a Product session through one actor-owned resource identifier."""
+
+        principal.require(authorization_operation_id)
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT document FROM renewal_sessions WHERE session_ref=?
+                   AND organization_id=? AND workspace_id=? AND actor_issuer=?
+                   AND actor_subject=? ORDER BY authorization_ref""",
+                (session_ref, *self._scope(principal)),
+            ).fetchall()
+        if not rows:
+            raise IntegrationNotFound("renewal session not found")
+        if len(rows) != 1:
+            raise IntegrationConflict("renewal session reference is ambiguous")
+        return RenewalSessionRecord.model_validate_json(str(rows[0]["document"]))
+
     def enqueue_cloud_refresh(
         self,
         principal: IntegrationPrincipal,
@@ -4200,12 +4238,165 @@ class IntegrationStore:
             self._persist_email_job(cursor, claimed)
             return ClaimedEmailNotification(job=claimed, claim_fence=fence)
 
+    def request_notification_email_delivery(
+        self,
+        principal: IntegrationPrincipal,
+        notification_id: UUID,
+        *,
+        recipient_ref: str,
+        idempotency_key: str,
+        now: datetime | None = None,
+    ) -> tuple[EmailNotificationJob, bool]:
+        """Queue one explicitly authorized email job without replaying prior sends."""
+
+        operation_name = "integrationDeliverNotification"
+        principal.require(operation_name)
+        if (
+            not recipient_ref
+            or len(recipient_ref) > 200
+            or not idempotency_key
+            or len(idempotency_key) > 200
+        ):
+            raise IntegrationValidationError("notification delivery selector is invalid")
+        moment = now or utc_now()
+        request_hash = hashlib.sha256(
+            _json({"notificationId": str(notification_id), "recipientRef": recipient_ref}).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        with self._transaction() as cursor:
+            replay = self._idempotency_lookup(
+                cursor,
+                principal=principal,
+                operation_name=operation_name,
+                key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if replay is not None:
+                row = cursor.execute(
+                    "SELECT document FROM email_notification_outbox WHERE id=?",
+                    (str(replay["resource_id"]),),
+                ).fetchone()
+                if row is None:
+                    raise IntegrationConflict("notification delivery result is unavailable")
+                return EmailNotificationJob.model_validate_json(str(row["document"])), False
+
+            notification_row = cursor.execute(
+                """SELECT document FROM integration_notifications WHERE id=?
+                   AND organization_id=? AND workspace_id=?
+                   AND actor_issuer=? AND actor_subject=?""",
+                (str(notification_id), *self._scope(principal)),
+            ).fetchone()
+            if notification_row is None:
+                raise IntegrationNotFound("notification is not owned by this actor")
+            notification = IntegrationNotification.model_validate_json(
+                str(notification_row["document"])
+            )
+            if notification.kind == IntegrationNotificationKind.DELIVERY_FAILED:
+                raise IntegrationValidationError("delivery failure notices cannot trigger email")
+
+            existing = cursor.execute(
+                "SELECT id,document FROM email_notification_outbox WHERE notification_id=?",
+                (str(notification_id),),
+            ).fetchone()
+            if existing is not None:
+                job = EmailNotificationJob.model_validate_json(str(existing["document"]))
+                if job.recipient_ref != recipient_ref:
+                    raise IntegrationConflict(
+                        "notification delivery is already bound to another recipient alias"
+                    )
+            else:
+                job = EmailNotificationJob(
+                    notification_id=notification.id,
+                    organization_id=notification.organization_id,
+                    workspace_id=notification.workspace_id,
+                    actor_issuer=notification.actor_issuer,
+                    actor_subject=notification.actor_subject,
+                    connection_id=notification.connection_id,
+                    recipient_ref=recipient_ref,
+                    subject=notification.title[:200],
+                    text=(
+                        notification.title
+                        + ("\n\n" + notification.description if notification.description else "")
+                    )[:4000],
+                    request_ref=f"notification:{notification.id}",
+                    available_at=moment,
+                    created_at=moment,
+                    updated_at=moment,
+                )
+                cursor.execute(
+                    """INSERT INTO email_notification_outbox(id,notification_id,organization_id,
+                       workspace_id,actor_issuer,actor_subject,connection_id,state,attempts,
+                       available_at,claim_fence,created_at,updated_at,document)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        str(job.id),
+                        str(job.notification_id),
+                        job.organization_id,
+                        job.workspace_id,
+                        job.actor_issuer,
+                        job.actor_subject,
+                        str(job.connection_id) if job.connection_id else None,
+                        job.state.value,
+                        job.attempts,
+                        _dt(job.available_at),
+                        job.claim_fence,
+                        _dt(job.created_at),
+                        _dt(job.updated_at),
+                        job.model_dump_json(by_alias=True),
+                    ),
+                )
+            self._idempotency_save(
+                cursor,
+                principal=principal,
+                operation_name=operation_name,
+                key=idempotency_key,
+                request_hash=request_hash,
+                resource_id=job.id,
+                document=job.model_dump_json(by_alias=True),
+            )
+        return job, existing is None
+
+    def get_email_notification_job(
+        self,
+        principal: IntegrationPrincipal,
+        job_id: UUID,
+        *,
+        authorization_operation_id: str = "integrationGetOperation",
+    ) -> EmailNotificationJob:
+        """Read one email job only through its exact owner and operation grant."""
+
+        principal.require(authorization_operation_id)
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT document FROM email_notification_outbox WHERE id=?
+                   AND organization_id=? AND workspace_id=?
+                   AND actor_issuer=? AND actor_subject=?""",
+                (str(job_id), *self._scope(principal)),
+            ).fetchone()
+        if row is None:
+            raise IntegrationNotFound("notification delivery operation not found")
+        return EmailNotificationJob.model_validate_json(str(row["document"]))
+
+    def current_email_job_for_provider_call(self, job_id: UUID) -> EmailNotificationJob | None:
+        """Reload one SENDING email job before its host-configured provider call."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT document FROM email_notification_outbox WHERE id=? AND state='SENDING'",
+                (str(job_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return EmailNotificationJob.model_validate_json(str(row["document"]))
+
     def release_email_claim(
         self,
         claim: ClaimedEmailNotification,
         *,
         now: datetime,
         retry_delay_seconds: int = 300,
+        failure_reason_code: str | None = None,
     ) -> EmailNotificationJob:
         """Release a claimed email job when current authorization is unavailable."""
 
@@ -4226,6 +4417,7 @@ class IntegrationStore:
                     "claim_owner": None,
                     "lease_expires_at": None,
                     "available_at": now + timedelta(seconds=retry_delay_seconds),
+                    "failure_reason_code": failure_reason_code,
                     "updated_at": now,
                 }
             )
@@ -4325,6 +4517,41 @@ class IntegrationStore:
                     now=now,
                 )
             return updated
+
+    def release_email_send_before_provider(
+        self,
+        job_id: UUID,
+        *,
+        claim_fence: int,
+        now: datetime,
+        failure_reason_code: str,
+        retry_delay_seconds: int = 300,
+    ) -> EmailNotificationJob:
+        """Return SENDING to READY only when the adapter proves no send began."""
+
+        if not 1 <= retry_delay_seconds <= 86_400:
+            raise ValueError("email retry delay is invalid")
+        with self._transaction() as cursor:
+            row = cursor.execute(
+                """SELECT document FROM email_notification_outbox WHERE id=? AND state='SENDING'
+                   AND claim_fence=?""",
+                (str(job_id), claim_fence),
+            ).fetchone()
+            if row is None:
+                raise IntegrationConflict("email send claim is stale")
+            job = EmailNotificationJob.model_validate_json(str(row["document"]))
+            ready = job.model_copy(
+                update={
+                    "state": EmailOutboxState.READY,
+                    "claim_owner": None,
+                    "lease_expires_at": None,
+                    "available_at": now + timedelta(seconds=retry_delay_seconds),
+                    "failure_reason_code": failure_reason_code,
+                    "updated_at": now,
+                }
+            )
+            self._persist_email_job(cursor, ready)
+            return ready
 
     @staticmethod
     def _persist_email_job(cursor: sqlite3.Cursor, job: EmailNotificationJob) -> None:

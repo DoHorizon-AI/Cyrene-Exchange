@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from threading import Event
@@ -36,12 +38,13 @@ from cyrene_exchange_product.integrations.store import IntegrationStore
 
 _MONITOR_OPERATION = "integrationGetAuthorizationHealth"
 _REFRESH_OPERATION = "integrationRefreshConnectionResources"
-_FEED_OPERATION = "integrationListNotifications"
+_DELIVER_OPERATION = "integrationDeliverNotification"
 _MONITOR_INTERVAL_SECONDS = 15 * 60
 _REMINDER_INTERVAL_SECONDS = 6 * 60 * 60
 _EXPIRY_WARNING_SECONDS = 24 * 60 * 60
 _EXPIRY_URGENT_SECONDS = 60 * 60
 _OPAQUE_AUTHORIZATION_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$")
+_LOGGER = logging.getLogger(__name__)
 
 
 class CurrentAuthorizationContextPort(Protocol):
@@ -146,6 +149,14 @@ class ProviderObservationUnavailable(RuntimeError):
     """A fixed provider read could not return a current observation."""
 
 
+class EmailAuthorizationUnavailable(RuntimeError):
+    """Current Platform delivery authority is missing before provider I/O."""
+
+
+class EmailDeliveryRetryableError(RuntimeError):
+    """Email provider confirms that a failure happened before its side effect."""
+
+
 @dataclass(frozen=True, slots=True)
 class AuthorizationCloudRunResult:
     """One worker cycle summary with only counts and sanitized outcome labels."""
@@ -169,6 +180,7 @@ class AuthorizationCloudRunner:
         email: EmailNotificationPort | None,
         worker_id: str,
         email_recipient_ref: str | None = None,
+        email_recipient_resolver: Callable[[IntegrationConnection], str | None] | None = None,
         monitor_interval_seconds: int = _MONITOR_INTERVAL_SECONDS,
         idle_delay_seconds: float = 1.0,
     ) -> None:
@@ -182,6 +194,7 @@ class AuthorizationCloudRunner:
         self._email = email
         self._worker_id = worker_id
         self._email_recipient_ref = email_recipient_ref
+        self._email_recipient_resolver = email_recipient_resolver
         self._monitor_interval_seconds = monitor_interval_seconds
         self._idle_delay_seconds = idle_delay_seconds
 
@@ -257,7 +270,7 @@ class AuthorizationCloudRunner:
                 drafts,
                 now=now,
                 interval_seconds=self._monitor_interval_seconds,
-                email_recipient_ref=self._email_recipient_ref,
+                email_recipient_ref=self._recipient_for_connection(claim.connection),
             )
             completed += 1
         return completed
@@ -269,8 +282,14 @@ class AuthorizationCloudRunner:
         connection = self._store.connection_for_cloud_refresh(claim)
         principal = self._current_connection_principal(connection, _REFRESH_OPERATION)
         if principal is None:
-            self._store.release_cloud_refresh_claim(claim, now=now)
-            return 0, 1, 0
+            self._store.complete_cloud_refresh(
+                claim,
+                [],
+                state=CloudRefreshState.FAILED,
+                now=now,
+                result={"reasonCode": "current_authority_unavailable"},
+            )
+            return 1, 0, 0
         latest_health = self._store.latest_authorization_health_for_connection(connection)
         if (
             latest_health is not None
@@ -311,7 +330,7 @@ class AuthorizationCloudRunner:
             observations,
             state=CloudRefreshState.SUCCEEDED,
             now=now,
-            email_recipient_ref=self._email_recipient_ref,
+            email_recipient_ref=self._recipient_for_connection(connection),
         )
         return 1, 0, 0
 
@@ -322,11 +341,15 @@ class AuthorizationCloudRunner:
         if claim is None:
             return 0, 0, 0
         try:
-            principal = self._contexts.for_notification(claim.job, operation_id=_FEED_OPERATION)
+            principal = self._contexts.for_notification(claim.job, operation_id=_DELIVER_OPERATION)
         except Exception:
             principal = None
         if principal is None or not _principal_matches_notification(principal, claim.job):
-            self._store.release_email_claim(claim, now=now)
+            self._store.release_email_claim(
+                claim,
+                now=now,
+                failure_reason_code="current_authority_unavailable",
+            )
             return 0, 1, 0
         try:
             self._store.mark_email_sending(
@@ -338,6 +361,22 @@ class AuthorizationCloudRunner:
             return 0, 0, 0
         try:
             evidence = self._email.send_notification(principal, claim.job)
+        except EmailAuthorizationUnavailable:
+            self._store.release_email_send_before_provider(
+                claim.job.id,
+                claim_fence=claim.claim_fence,
+                now=now,
+                failure_reason_code="current_authority_unavailable",
+            )
+            return 0, 1, 0
+        except EmailDeliveryRetryableError:
+            self._store.release_email_send_before_provider(
+                claim.job.id,
+                claim_fence=claim.claim_fence,
+                now=now,
+                failure_reason_code="provider_retryable_pre_send",
+            )
+            return 0, 1, 0
         except Exception:
             self._store.finish_email_notification(
                 claim.job.id,
@@ -368,6 +407,20 @@ class AuthorizationCloudRunner:
         )
         return 1, 0, int(evidence.status == "UNKNOWN")
 
+    def _recipient_for_connection(self, connection: IntegrationConnection) -> str | None:
+        """Select only the configured recipient for an explicitly allowed owner."""
+
+        if self._email_recipient_resolver is not None:
+            try:
+                return self._email_recipient_resolver(connection)
+            except Exception as exc:
+                _LOGGER.info(
+                    "Email recipient is unavailable for an authorization notification (%s)",
+                    type(exc).__name__,
+                )
+                return None
+        return self._email_recipient_ref
+
     def _current_connection_principal(
         self,
         connection: IntegrationConnection,
@@ -375,7 +428,11 @@ class AuthorizationCloudRunner:
     ) -> IntegrationPrincipal | None:
         try:
             principal = self._contexts.for_connection(connection, operation_id=operation_id)
-        except Exception:
+        except Exception as exc:
+            _LOGGER.info(
+                "Current Platform authority is unavailable for integration work (%s)",
+                type(exc).__name__,
+            )
             return None
         if not _principal_matches_connection(principal, connection, operation_id):
             return None
@@ -407,12 +464,12 @@ def _principal_matches_notification(
     principal: IntegrationPrincipal | None,
     job: EmailNotificationJob,
 ) -> bool:
-    """Require current feed permission for the exact notification owner."""
+    """Require the current dedicated delivery grant and exact notification owner."""
 
     if principal is None:
         return False
     try:
-        principal.require(_FEED_OPERATION)
+        principal.require(_DELIVER_OPERATION)
     except Exception:
         return False
     return (

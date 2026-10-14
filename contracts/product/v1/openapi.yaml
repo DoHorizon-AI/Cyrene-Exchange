@@ -756,25 +756,17 @@ paths:
       security:
       - IntegrationBearer: []
       - ProductExecutionCredential: []
-  /api/v1/accounts/authorizations/{authorization_id}/renewal-sessions/{session_id}:
+  /api/v1/accounts/renewal-sessions/{session_id}:
     get:
       summary: Get Renewal Session
       operationId: accountGetRenewalSession
       parameters:
-      - name: authorization_id
-        in: path
-        required: true
-        schema:
-          type: string
-          minLength: 1
-          maxLength: 300
       - name: session_id
         in: path
         required: true
         schema:
           type: string
-          minLength: 1
-          maxLength: 300
+          format: uuid
       - name: workspaceId
         in: query
         required: false
@@ -1327,6 +1319,61 @@ paths:
         '404':
           $ref: '#/components/responses/Problem'
         '409':
+          $ref: '#/components/responses/Problem'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/integrations/notifications/{notification_id}/actions/deliver:
+    post:
+      summary: Queue Integration Notification Email Delivery
+      operationId: integrationDeliverNotification
+      parameters:
+      - name: notification_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '202':
+          description: Email delivery intent accepted; Location polls its durable Product operation.
+          headers:
+            Location:
+              description: URI reference for the Product email delivery operation.
+              schema:
+                type: string
+                format: uri-reference
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationStatusResponse'
+        '403':
+          $ref: '#/components/responses/Problem'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+        '503':
           $ref: '#/components/responses/Problem'
       security:
       - IntegrationBearer: []

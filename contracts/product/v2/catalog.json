@@ -726,14 +726,14 @@
       "kind": "READ",
       "requestSchemaPointer": null,
       "responseSchemaPointers": [
-        "#/paths/~1api~1v1~1accounts~1authorizations~1{authorization_id}~1renewal-sessions~1{session_id}/get/responses/200/content/application~1json/schema"
+        "#/paths/~1api~1v1~1accounts~1renewal-sessions~1{session_id}/get/responses/200/content/application~1json/schema"
       ],
       "resourceId": {
         "required": true,
         "pathParameter": "session_id",
-        "minLength": 1,
-        "maxLength": 300,
-        "pattern": null
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
       },
       "idempotency": {
         "required": false,
@@ -760,9 +760,9 @@
       "resourceId": {
         "required": true,
         "pathParameter": "connection_id",
-        "minLength": 1,
-        "maxLength": 300,
-        "pattern": null
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
       },
       "idempotency": {
         "required": false,
@@ -789,9 +789,9 @@
       "resourceId": {
         "required": true,
         "pathParameter": "connection_id",
-        "minLength": 1,
-        "maxLength": 300,
-        "pattern": null
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
       },
       "idempotency": {
         "required": false,
@@ -818,9 +818,9 @@
       "resourceId": {
         "required": true,
         "pathParameter": "connection_id",
-        "minLength": 1,
-        "maxLength": 300,
-        "pattern": null
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
       },
       "idempotency": {
         "required": true,
@@ -905,9 +905,38 @@
       "resourceId": {
         "required": true,
         "pathParameter": "notification_id",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
         "minLength": 1,
-        "maxLength": 300,
-        "pattern": null
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationDeliverNotification",
+      "routeId": "integrationDeliverNotification",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1notifications~1{notification_id}~1actions~1deliver/post/responses/202/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "notification_id",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
       },
       "idempotency": {
         "required": true,
