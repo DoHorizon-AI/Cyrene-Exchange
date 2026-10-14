@@ -865,35 +865,6 @@
       }
     },
     {
-      "operationId": "integrationStreamNotifications",
-      "routeId": "integrationStreamNotifications",
-      "openapiPath": "contracts/product/v1/openapi.yaml",
-      "kind": "READ",
-      "requestSchemaPointer": null,
-      "responseSchemaPointers": [
-        "#/paths/~1api~1v1~1integrations~1notifications~1events/get/responses/200/content/text~1event-stream/schema"
-      ],
-      "resourceId": {
-        "required": false,
-        "pathParameter": null,
-        "minLength": 1,
-        "maxLength": 512,
-        "pattern": null
-      },
-      "idempotency": {
-        "required": false,
-        "header": null,
-        "minLength": 1,
-        "maxLength": 200
-      },
-      "scope": {
-        "organizationPathParameter": null,
-        "workspacePathParameter": null,
-        "responseBindings": [],
-        "requestBindings": []
-      }
-    },
-    {
       "operationId": "integrationAcknowledgeNotification",
       "routeId": "integrationAcknowledgeNotification",
       "openapiPath": "contracts/product/v1/openapi.yaml",

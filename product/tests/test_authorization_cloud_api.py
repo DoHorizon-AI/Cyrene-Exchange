@@ -467,7 +467,6 @@ def test_notification_feed_ack_and_sse_resume_are_actor_scoped(tmp_path: Path) -
     operations = {
         "integrationCreateConnection",
         "integrationListNotifications",
-        "integrationStreamNotifications",
         "integrationAcknowledgeNotification",
     }
     actor = _principal("actor-a", operations)
@@ -507,10 +506,14 @@ def test_notification_feed_ack_and_sse_resume_are_actor_scoped(tmp_path: Path) -
         ],
         now=now,
     )
-    app = create_app(
-        database_path=tmp_path / "gateway.sqlite3",
-        integrations=_services(store, actor, other=other),
-    )
+
+    class _UnexpectedExecutionVerifier:
+        def verify(self, _credential: bytes) -> Any:
+            raise AssertionError("SSE must not accept generic Product execution credentials")
+
+    services = _services(store, actor, other=other)
+    services.execution_authorization_verifier = _UnexpectedExecutionVerifier()
+    app = create_app(database_path=tmp_path / "gateway.sqlite3", integrations=services)
 
     with TestClient(app) as client:
         feed = client.get(
@@ -536,12 +539,18 @@ def test_notification_feed_ack_and_sse_resume_are_actor_scoped(tmp_path: Path) -
             headers={"Authorization": "Bearer actor-token", "Last-Event-ID": "0"},
         ) as stream:
             sse_id = next(line for line in stream.iter_lines() if line.startswith("id:"))
+        execution_credential = client.get(
+            f"/api/v1/integrations/notifications/events?workspaceId={_WORKSPACE}",
+            headers={"X-Cyrene-Execution-Credential-Bin": "opaque-signed-credential"},
+        )
 
     assert feed.status_code == 200 and feed.json()["nextSequence"] == event["sequence"]
     assert ack.status_code == 200 and ack.json()["acknowledgedAt"] is not None
     assert recovered.status_code == 200 and recovered.json()["notifications"] == []
     assert other_feed.status_code == 200 and other_feed.json()["notifications"] == []
     assert sse_id == f"id: {event['sequence']}"
+    assert execution_credential.status_code == 403
+    assert execution_credential.json()["code"] == "EXCHANGE_PLATFORM_EXECUTION_BINDING_MISMATCH"
     store.close()
 
 
