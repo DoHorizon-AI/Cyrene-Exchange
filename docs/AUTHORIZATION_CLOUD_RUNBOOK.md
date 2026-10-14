@@ -171,11 +171,16 @@ curl 'http://127.0.0.1:8081/api/v1/accounts/renewal-sessions/<product-session-uu
   -H 'Authorization: Bearer <current-first-party-bearer>'
 ```
 
-The WeCom URL is returned only for the fixed official origin/path and exact
-`source`/`scode` query shape. An ambiguous start remains `VERIFYING` without a
-URL; a user may explicitly repeat the same POST with the same key only when the
-configured provider advertises durable replay. GET performs only read-only
-status lookup.
+`authorizationUrl` is one generic navigation field. Exchange returns it only
+after one of two independent checks: the exact official onboarding QR URL
+(`/ai/qc/gen` with its fixed `source`/`scode` query), or an existing-profile
+management URL on the exact official host/path (`/ai/aiHelper/authorizationList`
+with its exact 11 typed parameters). Management query keys are unique, unknown
+keys are rejected, and the returned query is canonicalized in fixed key order.
+The field does not classify every URL as a QR flow. An ambiguous start remains
+`VERIFYING` without a URL; a user may explicitly repeat the same POST with the
+same key only when the configured provider advertises durable replay. GET
+performs only read-only status lookup.
 
 An actor with the dedicated delivery operation can queue the one fixed mail
 recipient for an existing notification. The endpoint accepts no recipient or
@@ -202,3 +207,5 @@ provider's result, not end-user delivery. An ambiguous post-send result is
 7. 邮件默认关闭。若有业务授权，复制启用片段，固定 `recipientRef` alias 与 `allowedContextRefs`，并为 Exchange/Email Plugin 的 binding 注入同一 HMAC key。Email Plugin 将 alias 映射到固定邮箱，Exchange API 不接受邮箱或邮件内容。用户必须同时持有当前 `integrationDeliverNotification` grant，并位于 Host allowlist；outbox 在 SMTP 前持久化 `SENDING`。明确的发送前授权失败会延后 job，发送结果不确定则进入 `UNKNOWN`，不自动重发。
 
 `emailNotifications.enabled.fragment.json` 中的 `ops-oncall` 只是虚构 alias；真实邮箱地址仅配置在 Email Plugin 的受信任 binding 中。JSON Schema 描述字段结构，`check-config` 还会验证 secret 引用、身份交叉约束、Provider profile、mTLS 和 target/context allowlist。
+
+`authorizationUrl` 是通用导航字段，不代表二维码。Exchange 只允许两种互相独立的来源：固定 onboarding QR 路径 `/ai/qc/gen` 与精确的 `source`/`scode` 参数；或既有 profile 管理路径 `/ai/aiHelper/authorizationList`，并要求官方 Host、11 个唯一且无额外键的 typed 参数。管理链接会按固定键顺序规范化。Client 应按已校验的路径呈现为 QR onboarding 或 profile 权限管理，不能把两类 URL 混为新登录二维码。

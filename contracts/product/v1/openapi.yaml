@@ -3035,6 +3035,10 @@ components:
           anyOf:
           - type: string
           - type: 'null'
+          description: >-
+            Verified WeCom navigation URI: the fixed onboarding QR flow or the
+            existing-profile authorization management page. This generic field
+            does not imply that every URI is a QR flow.
         qrAttachmentRef:
           anyOf:
           - type: string
@@ -3046,7 +3050,7 @@ components:
           anyOf:
           - type: string
           - type: 'null'
-      description: Product renewal session with opaque references and no credential material.
+      description: Product renewal session with opaque references and a verified provider navigation URI only.
     CloudResourceResponse:
       type: object
       additionalProperties: false

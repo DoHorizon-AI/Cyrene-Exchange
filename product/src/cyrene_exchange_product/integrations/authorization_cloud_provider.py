@@ -12,6 +12,7 @@ import logging
 import re
 from collections.abc import Callable, Mapping
 from typing import Any, cast
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 from cyrene_exchange_product.integrations.authorization_cloud import (
@@ -166,8 +167,22 @@ _TOOL_OPERATIONS = {
     "cloud_authorization_health": "cloud.authorization.health.read",
     "email_notification_send": "email.notification.send",
 }
-_OFFICIAL_WECOM_URL = re.compile(
+_OFFICIAL_WECOM_QR_URL = re.compile(
     r"^https://work\.weixin\.qq\.com/ai/qc/gen\?source=wecom_cli_external&scode=[A-Za-z0-9_-]{8,256}$"
+)
+_WECOM_MANAGEMENT_PATH = "/ai/aiHelper/authorizationList"
+_WECOM_MANAGEMENT_QUERY_KEYS = (
+    "aibotid",
+    "bar_style_type",
+    "for_native",
+    "forceInnerBrowser",
+    "from",
+    "hide_more_btn",
+    "pc_bar_bg",
+    "str_aibotid",
+    "type",
+    "ww_vh",
+    "ww_vw",
 )
 _OPAQUE_PROVIDER_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$")
 _LOGGER = logging.getLogger(__name__)
@@ -574,6 +589,11 @@ def _renewal_session(
         session = _sdk().parse_renewal_session(result)
     except Exception as exc:
         raise RuntimeError("renewal session DTO is invalid") from exc
+    safe_url = (
+        _safe_vendor_url(session.authorization_url)
+        if session.authorization_url is not None
+        else None
+    )
     if (
         session.authorization_ref != expected_authorization_ref
         or not _OPAQUE_PROVIDER_REF.fullmatch(session.session_ref)
@@ -582,10 +602,7 @@ def _renewal_session(
             session.qr_attachment_ref is not None
             and not _OPAQUE_PROVIDER_REF.fullmatch(session.qr_attachment_ref)
         )
-        or (
-            session.authorization_url is not None
-            and not _OFFICIAL_WECOM_URL.fullmatch(session.authorization_url)
-        )
+        or (session.authorization_url is not None and safe_url is None)
     ):
         raise RuntimeError("provider renewal session escaped its configured scope")
     return ProviderRenewalSession(
@@ -594,10 +611,70 @@ def _renewal_session(
         state=RenewalState(session.state.value),
         created_at=session.created_at,
         expires_at=session.expires_at,
-        authorization_url=session.authorization_url,
+        authorization_url=safe_url,
         qr_attachment_ref=session.qr_attachment_ref,
         generation=session.generation,
     )
+
+
+def _safe_vendor_url(value: str) -> str | None:
+    """Accept only the fixed onboarding QR or verified profile management URL."""
+
+    if _OFFICIAL_WECOM_QR_URL.fullmatch(value):
+        return value
+    if value != value.strip() or "#" in value or any(ord(character) < 0x20 for character in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != "work.weixin.qq.com"
+            or parsed.path != _WECOM_MANAGEMENT_PATH
+            or parsed.fragment
+            or not parsed.query
+        ):
+            return None
+        pairs = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=len(_WECOM_MANAGEMENT_QUERY_KEYS),
+            encoding="utf-8",
+            errors="strict",
+        )
+    except (ValueError, UnicodeError) as exc:
+        _LOGGER.info(
+            "Malformed WeCom navigation URI was rejected (%s)",
+            type(exc).__name__,
+        )
+        return None
+    if len(pairs) != len(_WECOM_MANAGEMENT_QUERY_KEYS):
+        return None
+    parameters = dict(pairs)
+    if (
+        len(parameters) != len(pairs)
+        or set(parameters) != set(_WECOM_MANAGEMENT_QUERY_KEYS)
+        or not re.fullmatch(r"[0-9]{17}", parameters["aibotid"])
+        or parameters["bar_style_type"] != "3"
+        or parameters["for_native"] != "true"
+        or parameters["forceInnerBrowser"] != "1"
+        or parameters["from"] != "chat"
+        or parameters["hide_more_btn"] != "true"
+        or not re.fullmatch(r"[0-9A-Fa-f]{6},[0-9A-Fa-f]{6}", parameters["pc_bar_bg"])
+        or not re.fullmatch(r"[A-Za-z0-9_-]{35}", parameters["str_aibotid"])
+        or parameters["type"] != "6"
+    ):
+        return None
+    for dimension in ("ww_vh", "ww_vw"):
+        if not re.fullmatch(r"[0-9]+", parameters[dimension]):
+            return None
+        normalized_dimension = int(parameters[dimension])
+        if not 1 <= normalized_dimension <= 4096:
+            return None
+        parameters[dimension] = str(normalized_dimension)
+
+    canonical_query = urlencode([(key, parameters[key]) for key in _WECOM_MANAGEMENT_QUERY_KEYS])
+    return urlunsplit(("https", "work.weixin.qq.com", _WECOM_MANAGEMENT_PATH, canonical_query, ""))
 
 
 def _invoke_signed_tool(

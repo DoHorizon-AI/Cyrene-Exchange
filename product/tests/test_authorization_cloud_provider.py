@@ -8,6 +8,7 @@ Role: Exercise typed signed calls, resource scoping, and email revocation gates.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -428,7 +429,7 @@ def test_cloud_query_uses_host_target_alias_and_projects_provider_observation(
     store.close()
 
 
-def test_wecom_renewal_accepts_only_the_fixed_official_qr_origin(tmp_path: Path) -> None:
+def test_wecom_renewal_accepts_only_approved_official_navigation_urls(tmp_path: Path) -> None:
     settings = _settings(include_email=False)
     registry = AuthorizationCloudProfileRegistry(settings)
     principal = _principal()
@@ -447,21 +448,30 @@ def test_wecom_renewal_accepts_only_the_fixed_official_qr_origin(tmp_path: Path)
         qr_attachment_ref="wecom-qr-attachment-1",
         generation=2,
     )
-    direct = _DirectClient(sdk.serialize_renewal_session(session))
-    provider = AuthorizationCloudDirectProvider(
-        store=store,
-        registry=registry,
-        provider_clients={"wecom-prod": direct},
-        email_client=None,
-        current_context_resolver=_StaticContexts(principal),
-        context_key=lambda _reference: _KEY,
-    )
 
-    started = provider.start_renewal(
-        principal,
-        connection,
-        _WE_COM_AUTH_REF,
-        request_id="product-session-request-id",
+    def start_with_url(url: str, request_id: str):
+        direct_client = _DirectClient(
+            sdk.serialize_renewal_session(replace(session, authorization_url=url))
+        )
+        provider_client = AuthorizationCloudDirectProvider(
+            store=store,
+            registry=registry,
+            provider_clients={"wecom-prod": direct_client},
+            email_client=None,
+            current_context_resolver=_StaticContexts(principal),
+            context_key=lambda _reference: _KEY,
+        )
+        result = provider_client.start_renewal(
+            principal,
+            connection,
+            _WE_COM_AUTH_REF,
+            request_id=request_id,
+        )
+        return result, direct_client
+
+    started, direct = start_with_url(
+        session.authorization_url,
+        "product-session-request-id",
     )
 
     assert started.session_ref == "provider-session-1"
@@ -472,38 +482,62 @@ def test_wecom_renewal_accepts_only_the_fixed_official_qr_origin(tmp_path: Path)
     assert envelope.caller_context.request_id == "product-session-request-id"
     assert dict(envelope.arguments) == {"authorization_ref": _WE_COM_AUTH_REF}
 
-    evil = _DirectClient(
-        sdk.serialize_renewal_session(
-            sdk.RenewalSession(
-                session_ref=session.session_ref,
-                authorization_ref=session.authorization_ref,
-                state=session.state,
-                created_at=session.created_at,
-                expires_at=session.expires_at,
-                authorization_url=(
-                    "https://work.weixin.qq.com.evil.example/ai/qc/gen"
-                    "?source=wecom_cli_external&scode=abcdefgh12345678"
-                ),
-                qr_attachment_ref=session.qr_attachment_ref,
-                generation=session.generation,
-            )
-        )
+    management_url = (
+        "https://work.weixin.qq.com/ai/aiHelper/authorizationList?"
+        "aibotid=12345678901234567&bar_style_type=3&for_native=true&forceInnerBrowser=1"
+        "&from=chat&hide_more_btn=true&pc_bar_bg=f6f6f7%2C202021"
+        "&str_aibotid=bot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&type=6&ww_vh=640&ww_vw=640"
     )
-    provider = AuthorizationCloudDirectProvider(
-        store=store,
-        registry=registry,
-        provider_clients={"wecom-prod": evil},
-        email_client=None,
-        current_context_resolver=_StaticContexts(principal),
-        context_key=lambda _reference: _KEY,
+    shuffled_management_url = (
+        "https://work.weixin.qq.com/ai/aiHelper/authorizationList?"
+        "ww_vw=640&ww_vh=640&type=6&str_aibotid=bot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "&pc_bar_bg=f6f6f7%2C202021&hide_more_btn=true&from=chat"
+        "&forceInnerBrowser=1&for_native=true&bar_style_type=3&aibotid=12345678901234567"
     )
-    with pytest.raises(RuntimeError, match="escaped its configured scope"):
-        provider.start_renewal(
-            principal,
-            connection,
-            _WE_COM_AUTH_REF,
-            request_id="product-session-request-id-2",
-        )
+    managed, management_direct = start_with_url(
+        shuffled_management_url,
+        "product-session-request-id-management",
+    )
+    assert managed.authorization_url == management_url
+    assert management_direct.requests[0].provider_tool_id == "wecom_reauthorization_start"
+
+    invalid_management_urls = [
+        management_url + "&type=6",
+        management_url + "&redirect=https%3A%2F%2Fevil.example",
+        management_url.replace("type=6", "type=4"),
+        management_url.replace("type=6", "type=5"),
+        management_url.replace("work.weixin.qq.com", "work.weixin.qq.com.evil.example"),
+        management_url.replace("work.weixin.qq.com", "sub.work.weixin.qq.com"),
+        management_url.replace("work.weixin.qq.com", "work.weixin.qq.com:443"),
+        management_url.replace("https://work.weixin.qq.com", "https://user@work.weixin.qq.com"),
+        management_url + "#fragment",
+        management_url + "#",
+        management_url.replace(
+            "/ai/aiHelper/authorizationList", "/prefix/ai/aiHelper/authorizationList"
+        ),
+        management_url + "/suffix",
+        management_url.replace("aibotid=12345678901234567", "aibotid=1234567890123456"),
+        management_url.replace(
+            "str_aibotid=bot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "str_aibotid=bot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        management_url.replace("pc_bar_bg=f6f6f7%2C202021", "pc_bar_bg=not-colors"),
+        management_url.replace("ww_vh=640", "ww_vh=0"),
+        management_url.replace("ww_vw=640", "ww_vw=4097"),
+        management_url.replace("ww_vh=640", "ww_vh=wide"),
+        management_url.replace("forceInnerBrowser=1", "forceInnerBrowser=0"),
+        management_url.replace("from=chat", "from=chatforce"),
+        management_url.replace("&hide_more_btn=true", ""),
+    ]
+    invalid_qr_urls = [
+        "https://work.weixin.qq.com:443/ai/qc/gen?source=wecom_cli_external&scode=abcdefgh12345678",
+        "https://work.weixin.qq.com/ai/qc/gen"
+        "?source=wecom_cli_external&scode=abcdefgh12345678"
+        "&scode=abcdefgh12345678",
+    ]
+    for index, invalid_url in enumerate([*invalid_management_urls, *invalid_qr_urls]):
+        with pytest.raises(RuntimeError, match="escaped its configured scope"):
+            start_with_url(invalid_url, f"invalid-provider-session-{index}")
     store.close()
 
 

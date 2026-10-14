@@ -134,8 +134,12 @@ delivery route is idempotent and returns the existing job state for a previously
 queued or sent notification.
 
 Renewal creates a Product session intent before the provider call. A confirmed
-session exposes the provider's bounded official authorization URL or opaque QR
-attachment ref. If the start result is ambiguous, the session remains `VERIFYING`
+session exposes the provider's strictly verified WeCom navigation URI in the
+existing `authorizationUrl` field: either the fixed onboarding QR flow or the
+existing-profile authorization management page. The field is a navigation URI,
+not a QR discriminator. Exchange validates each path with its own exact host and
+query rules, then canonicalizes the management URL. An opaque QR attachment ref
+may also be returned. If the start result is ambiguous, the session remains `VERIFYING`
 with a `provider_start_outcome_unknown` reason and no URL. Exchange does not start
 another session automatically; once the provider's durable replay implementation
 is enabled, the caller may repeat the exact POST with the same `Idempotency-Key` to
@@ -161,8 +165,10 @@ Endpoint、Shell 命令、凭据或模型选择的范围。Provider 读取失败
 freshness 随时间变为 `STALE`；不会据此报告资源已停止。独立邮件发件箱会先持久化
 `SENDING` 再调用邮件适配器；发送结果丢失或不明确时标记为 `UNKNOWN`，且不会自动重发。
 
-重新授权会在调用 Provider 前持久化 Product session intent。确认创建的 session 只暴露
-Provider 给出的有限官方授权 URL 或 opaque QR attachment ref。启动结果不明确时，session
+重新授权会在调用 Provider 前持久化 Product session intent。确认创建的 session 在现有
+`authorizationUrl` 字段中返回经过严格校验的 WeCom 导航 URI：固定 onboarding QR 流程或既有
+profile 的授权管理页。该字段表示导航 URI，不表示其一定是二维码。Exchange 对两种路径分别执行精确
+Host/query 校验，并对管理页 URL 规范化；也可返回 opaque QR attachment ref。启动结果不明确时，session
 保持 `VERIFYING`，附 `provider_start_outcome_unknown`，不提供 URL。Exchange 不会自动启动另一个
 session；Provider 的持久化重放实现启用后，调用方可使用相同 `Idempotency-Key` 重放完全相同的
 POST，以取回同一 session。新 key 表示新的用户授权操作。
