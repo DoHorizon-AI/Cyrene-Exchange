@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID
 
 import grpc
+import pytest
 from fastapi.testclient import TestClient
 
 from cyrene_exchange_product.api import create_app
@@ -155,6 +156,43 @@ class _LocalAuthority(authority_grpc.WorkspaceAuthorityServiceServicer):
         )
 
 
+class _AbortingIdentityAuthority(_LocalAuthority):
+    """Exercise real gRPC status propagation for first-party identity failures."""
+
+    def __init__(self, status: grpc.StatusCode, *, abort_method: str) -> None:
+        self.status = status
+        self.abort_method = abort_method
+
+    def NegotiateVersion(self, request: Any, context: Any) -> Any:
+        if self.abort_method == "NegotiateVersion":
+            context.abort(self.status, "synthetic negotiation failure")
+        return super().NegotiateVersion(request, context)
+
+    def VerifyIdentity(self, request: Any, context: Any) -> Any:
+        if self.abort_method == "VerifyIdentity":
+            context.abort(self.status, "synthetic identity result")
+        return authority_wire.VerifyIdentityResponse(
+            issuer="https://issuer.example",
+            subject="native-user-1",
+            organization_id="org-1",
+            workspace_id=request.workspace_id,
+        )
+
+    def GetCatalogSnapshot(self, request: Any, context: Any) -> Any:
+        if self.abort_method == "GetCatalogSnapshot":
+            context.abort(self.status, "synthetic catalog result")
+        return authority_wire.CatalogSnapshotResponse(
+            organization_id="org-1",
+            workspace_id=request.workspace_id,
+            owners=[
+                authority_wire.OwnerSnapshot(
+                    owner_id="exchange",
+                    granted_operation_ids=["integrationListConnections"],
+                )
+            ],
+        )
+
+
 def _services(
     principal: IntegrationPrincipal,
 ) -> tuple[IntegrationServices, _Authorizer, _Accounts]:
@@ -283,6 +321,95 @@ def test_native_platform_authority_grpc_verification_flows_into_rest(tmp_path: P
             )
         assert response.status_code == 201
         assert accounts.calls == ["github:native-link-1"]
+    finally:
+        server.stop(0).wait()
+
+
+@pytest.mark.parametrize(
+    ("abort_method", "rpc_status", "http_status", "problem_code"),
+    [
+        (
+            "VerifyIdentity",
+            grpc.StatusCode.UNAUTHENTICATED,
+            401,
+            "EXCHANGE_INTEGRATION_AUTH_REQUIRED",
+        ),
+        (
+            "VerifyIdentity",
+            grpc.StatusCode.PERMISSION_DENIED,
+            403,
+            "EXCHANGE_INTEGRATION_PERMISSION_DENIED",
+        ),
+        (
+            "VerifyIdentity",
+            grpc.StatusCode.UNAVAILABLE,
+            503,
+            "EXCHANGE_PLATFORM_AUTH_UNAVAILABLE",
+        ),
+        (
+            "VerifyIdentity",
+            grpc.StatusCode.DEADLINE_EXCEEDED,
+            503,
+            "EXCHANGE_PLATFORM_AUTH_UNAVAILABLE",
+        ),
+        (
+            "VerifyIdentity",
+            grpc.StatusCode.UNKNOWN,
+            503,
+            "EXCHANGE_PLATFORM_AUTH_UNAVAILABLE",
+        ),
+        (
+            "NegotiateVersion",
+            grpc.StatusCode.UNAUTHENTICATED,
+            503,
+            "EXCHANGE_PLATFORM_AUTH_UNAVAILABLE",
+        ),
+        (
+            "GetCatalogSnapshot",
+            grpc.StatusCode.UNAUTHENTICATED,
+            401,
+            "EXCHANGE_INTEGRATION_AUTH_REQUIRED",
+        ),
+        (
+            "GetCatalogSnapshot",
+            grpc.StatusCode.PERMISSION_DENIED,
+            403,
+            "EXCHANGE_INTEGRATION_PERMISSION_DENIED",
+        ),
+    ],
+)
+def test_actual_authority_rpc_status_maps_to_auth_http_status(
+    tmp_path: Path,
+    abort_method: str,
+    rpc_status: grpc.StatusCode,
+    http_status: int,
+    problem_code: str,
+) -> None:
+    socket_path = tmp_path / f"authority-{rpc_status.name.lower()}.sock"
+    server = grpc.server(ThreadPoolExecutor(max_workers=2))
+    authority_grpc.add_WorkspaceAuthorityServiceServicer_to_server(
+        _AbortingIdentityAuthority(rpc_status, abort_method=abort_method), server
+    )
+    assert server.add_insecure_port(f"unix:{socket_path}") > 0
+    server.start()
+    try:
+        principal = IntegrationPrincipal(
+            issuer="https://issuer.example",
+            subject="native-user-1",
+            organization_id="org-1",
+            workspace_id="workspace-1",
+            allowed_operation_ids=frozenset({"integrationListConnections"}),
+        )
+        services, _, _ = _services(principal)
+        services.authorizer = PlatformAuthorityIdentityVerifier.from_unix_socket(socket_path)
+        app = create_app(database_path=tmp_path / "exchange.sqlite3", integrations=services)
+        with TestClient(app) as client:
+            response = client.get(
+                "/api/v1/integrations/connections?workspaceId=workspace-1",
+                headers={"Authorization": "Bearer invalid-first-party-token"},
+            )
+        assert response.status_code == http_status
+        assert response.json()["code"] == problem_code
     finally:
         server.stop(0).wait()
 

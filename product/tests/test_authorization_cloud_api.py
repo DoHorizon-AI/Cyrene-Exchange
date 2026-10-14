@@ -1,6 +1,7 @@
 """HTTP boundary checks for actor-scoped authorization, renewal and feed routes."""
 
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,8 +11,12 @@ from fastapi.testclient import TestClient
 from cyrene_exchange_product.api import create_app
 from cyrene_exchange_product.integrations.api import IntegrationServices
 from cyrene_exchange_product.integrations.models import (
+    AuthorizationCapabilityRecord,
     AuthorizationHealthRecord,
     AuthorizationState,
+    CloudRefreshState,
+    CloudResourceRecord,
+    CloudResourceState,
     CreateIntegrationConnection,
     IntegrationNotificationDraft,
     IntegrationNotificationKind,
@@ -19,6 +24,7 @@ from cyrene_exchange_product.integrations.models import (
     LoginState,
     NotificationSeverity,
     RenewalState,
+    SnapshotFreshness,
 )
 from cyrene_exchange_product.integrations.store import IntegrationStore
 
@@ -206,10 +212,14 @@ def _record_health(
     *,
     state: AuthorizationState,
     auth_ref: str | None,
+    expires_at: datetime | None = None,
+    capabilities: list[AuthorizationCapabilityRecord] | None = None,
+    drafts: list[IntegrationNotificationDraft] | None = None,
+    checked_at: datetime | None = None,
 ) -> None:
     """Commit a synthetic verified provider observation through the monitor fence."""
 
-    now = datetime(2026, 10, 14, 12, tzinfo=UTC)
+    now = checked_at or datetime(2026, 10, 14, 12, tzinfo=UTC)
     claim = store.claim_authorization_checks("api-monitor", now=now)[0]
     store.complete_authorization_check(
         claim,
@@ -227,12 +237,21 @@ def _record_health(
             ),
             authorization_state=state,
             checked_at=now,
-            expires_at=None,
+            expires_at=expires_at,
             generation=7,
+            capabilities=capabilities or [],
         ),
-        [],
+        drafts or [],
         now=now,
     )
+
+
+def _assert_http_utc_z(value: Any) -> None:
+    """Validate an actual HTTP timestamp using the public Z-only contract."""
+
+    assert isinstance(value, str)
+    assert value.endswith("Z")
+    assert datetime.fromisoformat(value).utcoffset() == timedelta(0)
 
 
 def test_connection_list_and_unobserved_health_are_minimal_and_unknown(tmp_path: Path) -> None:
@@ -259,19 +278,20 @@ def test_connection_list_and_unobserved_health_are_minimal_and_unknown(tmp_path:
         )
 
     assert listed.status_code == 200
-    assert listed.json() == [
-        {
-            "id": str(connection.id),
-            "provider": "wecom",
-            "displayName": "Production Integration",
-            "repositoryId": None,
-            "repositoryName": None,
-            "enabled": True,
-            "createdAt": connection.created_at.isoformat().replace("+00:00", "Z"),
-            "updatedAt": connection.updated_at.isoformat().replace("+00:00", "Z"),
-        }
-    ]
-    assert set(listed.json()[0]) == {
+    listed_connection = listed.json()[0]
+    assert listed_connection | {"createdAt": "", "updatedAt": ""} == {
+        "id": str(connection.id),
+        "provider": "wecom",
+        "displayName": "Production Integration",
+        "repositoryId": None,
+        "repositoryName": None,
+        "enabled": True,
+        "createdAt": "",
+        "updatedAt": "",
+    }
+    _assert_http_utc_z(listed_connection["createdAt"])
+    _assert_http_utc_z(listed_connection["updatedAt"])
+    assert set(listed_connection) == {
         "id",
         "provider",
         "displayName",
@@ -287,6 +307,135 @@ def test_connection_list_and_unobserved_health_are_minimal_and_unknown(tmp_path:
     assert health.json()["authorizationState"] == "UNKNOWN"
     assert health.json()["checkedAt"] is None
     assert health.json()["reasonCode"] == "not_observed"
+    store.close()
+
+
+def test_health_resources_feed_and_operation_serialize_utc_z_timestamps(tmp_path: Path) -> None:
+    operations = {
+        "integrationCreateConnection",
+        "integrationGetAuthorizationHealth",
+        "integrationListConnectionResources",
+        "integrationRefreshConnectionResources",
+        "integrationListNotifications",
+        "integrationAcknowledgeNotification",
+        "integrationGetOperation",
+    }
+    actor = _principal("actor-a", operations)
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    wecom_connection = _connection(store, actor)
+    observed_at = datetime(2026, 10, 14, 12, tzinfo=UTC)
+    provider_observed_at = observed_at.astimezone(timezone(timedelta(hours=5)))
+    expires_at = provider_observed_at + timedelta(hours=2)
+    _record_health(
+        store,
+        wecom_connection,
+        state=AuthorizationState.VALID,
+        auth_ref=_AUTH_REF,
+        checked_at=provider_observed_at,
+        expires_at=expires_at,
+        capabilities=[
+            AuthorizationCapabilityRecord(
+                capability_id="wecom.message.aibot.sessions.list",
+                state=AuthorizationState.VALID,
+                last_verified_at=provider_observed_at,
+                expires_at=expires_at,
+            )
+        ],
+        drafts=[
+            IntegrationNotificationDraft(
+                connection_id=wecom_connection.id,
+                kind=IntegrationNotificationKind.AUTHORIZATION_REQUIRED,
+                severity=NotificationSeverity.WARNING,
+                title="Authorization notice",
+                description="Synthetic notification for timestamp serialization.",
+                dedupe_key="utc-http-timestamp-notification",
+            )
+        ],
+    )
+
+    azure_connection = _connection(
+        store,
+        actor,
+        provider="azure",
+        idempotency_key="azure-timestamp-connection",
+    )
+    operation = store.enqueue_cloud_refresh(
+        actor,
+        azure_connection.id,
+        idempotency_key="azure-timestamp-refresh",
+        now=observed_at,
+    )
+    claim = store.claim_cloud_refresh("utc-timestamp-worker", now=observed_at)
+    assert claim is not None
+    store.complete_cloud_refresh(
+        claim,
+        [
+            CloudResourceRecord(
+                organization_id=azure_connection.organization_id,
+                workspace_id=azure_connection.workspace_id,
+                actor_issuer=azure_connection.actor_issuer,
+                actor_subject=azure_connection.actor_subject,
+                connection_id=azure_connection.id,
+                provider="azure",
+                source="azure",
+                external_ref="vm-timestamp-1",
+                kind="azure.vm",
+                display_name="Synthetic VM",
+                status=CloudResourceState.RUNNING,
+                collected_at=provider_observed_at,
+                observed_at=provider_observed_at,
+                freshness=SnapshotFreshness.FRESH,
+            )
+        ],
+        state=CloudRefreshState.SUCCEEDED,
+        now=observed_at,
+    )
+    app = create_app(
+        database_path=tmp_path / "gateway.sqlite3",
+        integrations=_services(store, actor),
+    )
+
+    with TestClient(app) as client:
+        health = client.get(
+            f"/api/v1/integrations/connections/{wecom_connection.id}/authorization-health"
+            f"?workspaceId={_WORKSPACE}",
+            headers={"Authorization": "Bearer actor-token"},
+        )
+        resources = client.get(
+            f"/api/v1/integrations/connections/{azure_connection.id}/resources"
+            f"?workspaceId={_WORKSPACE}",
+            headers={"Authorization": "Bearer actor-token"},
+        )
+        feed = client.get(
+            f"/api/v1/integrations/notifications?workspaceId={_WORKSPACE}",
+            headers={"Authorization": "Bearer actor-token"},
+        )
+        notification = feed.json()["notifications"][0]
+        acknowledged = client.post(
+            f"/api/v1/integrations/notifications/{notification['id']}/ack?workspaceId={_WORKSPACE}",
+            headers={"Authorization": "Bearer actor-token", "Idempotency-Key": "utc-ack-1"},
+        )
+        operation_status = client.get(
+            f"/api/v1/integrations/operations/{operation.id}?workspaceId={_WORKSPACE}",
+            headers={"Authorization": "Bearer actor-token"},
+        )
+
+    assert health.status_code == 200
+    _assert_http_utc_z(health.json()["checkedAt"])
+    _assert_http_utc_z(health.json()["expiresAt"])
+    _assert_http_utc_z(health.json()["capabilities"][0]["lastVerifiedAt"])
+    _assert_http_utc_z(health.json()["capabilities"][0]["expiresAt"])
+    assert resources.status_code == 200
+    _assert_http_utc_z(resources.json()["checkedAt"])
+    _assert_http_utc_z(resources.json()["resources"][0]["collectedAt"])
+    _assert_http_utc_z(resources.json()["resources"][0]["observedAt"])
+    assert feed.status_code == 200
+    _assert_http_utc_z(notification["createdAt"])
+    assert acknowledged.status_code == 200
+    _assert_http_utc_z(acknowledged.json()["acknowledgedAt"])
+    assert operation_status.status_code == 200
+    _assert_http_utc_z(operation_status.json()["createdAt"])
+    _assert_http_utc_z(operation_status.json()["updatedAt"])
     store.close()
 
 
@@ -375,14 +524,20 @@ def test_renewal_replays_same_product_session_and_rechecks_status(tmp_path: Path
 
     assert first.status_code == 202
     assert first.headers["Location"].endswith(session_ref)
+    _assert_http_utc_z(first.json()["createdAt"])
+    _assert_http_utc_z(first.json()["expiresAt"])
     assert replay.status_code == 202
     assert replay.json()["sessionRef"] == session_ref
+    _assert_http_utc_z(replay.json()["createdAt"])
+    _assert_http_utc_z(replay.json()["expiresAt"])
     assert len(provider.start_calls) == 1
     assert provider.start_calls[0][2] == session_ref
     assert stored.provider_session_ref == "provider-renewal-session-1"
     assert stored.state == RenewalState.WAITING_USER
     assert app.state.integration_services.authorization_cloud is provider
     assert polled.status_code == 200
+    _assert_http_utc_z(polled.json()["createdAt"])
+    assert polled.json()["expiresAt"] is None
     assert provider.status_calls, (stored.state, stored.provider_session_ref, polled.json())
     assert polled.json()["state"] == "SUCCEEDED"
     assert provider.status_calls == [(_AUTH_REF, "provider-renewal-session-1")]
@@ -538,17 +693,24 @@ def test_notification_feed_ack_and_sse_resume_are_actor_scoped(tmp_path: Path) -
             f"/api/v1/integrations/notifications/events?workspaceId={_WORKSPACE}",
             headers={"Authorization": "Bearer actor-token", "Last-Event-ID": "0"},
         ) as stream:
-            sse_id = next(line for line in stream.iter_lines() if line.startswith("id:"))
+            sse_lines = list(stream.iter_lines())
+            sse_id = next(line for line in sse_lines if line.startswith("id:"))
+            sse_event = json.loads(
+                next(line for line in sse_lines if line.startswith("data: "))[len("data: ") :]
+            )
         execution_credential = client.get(
             f"/api/v1/integrations/notifications/events?workspaceId={_WORKSPACE}",
             headers={"X-Cyrene-Execution-Credential-Bin": "opaque-signed-credential"},
         )
 
     assert feed.status_code == 200 and feed.json()["nextSequence"] == event["sequence"]
+    _assert_http_utc_z(event["createdAt"])
     assert ack.status_code == 200 and ack.json()["acknowledgedAt"] is not None
+    _assert_http_utc_z(ack.json()["acknowledgedAt"])
     assert recovered.status_code == 200 and recovered.json()["notifications"] == []
     assert other_feed.status_code == 200 and other_feed.json()["notifications"] == []
     assert sse_id == f"id: {event['sequence']}"
+    _assert_http_utc_z(sse_event["createdAt"])
     assert execution_credential.status_code == 403
     assert execution_credential.json()["code"] == "EXCHANGE_PLATFORM_EXECUTION_BINDING_MISMATCH"
     store.close()
