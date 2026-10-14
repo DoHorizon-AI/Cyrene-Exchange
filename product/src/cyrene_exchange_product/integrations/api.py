@@ -20,7 +20,7 @@ from fastapi import Path as ApiPath
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 from pydantic.alias_generators import to_camel
 
 from cyrene_exchange_product.errors import ExchangeProductError
@@ -48,7 +48,46 @@ from cyrene_exchange_product.integrations.ports import (
 from cyrene_exchange_product.integrations.store import IntegrationStore
 
 
-class IntegrationRequestBody(BaseModel):
+def _http_utc_timestamp(value: datetime | None) -> str | None:
+    """Serialize an aware timestamp in the public UTC-Z wire form."""
+
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("HTTP timestamps must be timezone-aware")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _http_utc_timestamp_text(value: str | None) -> str | None:
+    """Normalize one stored RFC3339 timestamp without changing persistence."""
+
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return _http_utc_timestamp(parsed)
+
+
+def _http_timestamp_value(value: datetime | str | None) -> str | None:
+    """Normalize one known timestamp value from a model or stored string."""
+
+    if isinstance(value, datetime):
+        return _http_utc_timestamp(value)
+    if isinstance(value, str):
+        return _http_utc_timestamp_text(value)
+    return None
+
+
+class _HttpResponseModel(BaseModel):
+    """Serialize typed datetime values to the Product HTTP UTC-Z convention."""
+
+    @field_serializer("*", when_used="json", check_fields=False)
+    def _serialize_datetime_utc(self, value: Any) -> Any:
+        if isinstance(value, datetime):
+            return _http_utc_timestamp(value)
+        return value
+
+
+class IntegrationRequestBody(_HttpResponseModel):
     """Closed public JSON DTOs use camelCase while retaining internal field names."""
 
     model_config = ConfigDict(
@@ -149,7 +188,7 @@ class QueryIssueBody(IntegrationRequestBody):
     issue_number: int = Field(ge=1)
 
 
-class OperationStatusResponse(BaseModel):
+class OperationStatusResponse(_HttpResponseModel):
     """Sanitized polling projection for one persisted Product operation."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -174,7 +213,7 @@ class OperationStatusResponse(BaseModel):
     result: dict[str, Any] | None
 
 
-class IssueSnapshotResponse(BaseModel):
+class IssueSnapshotResponse(_HttpResponseModel):
     """Actor-scoped cached issue snapshot after an approved query succeeds."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -187,7 +226,7 @@ class IssueSnapshotResponse(BaseModel):
     observed_at: str = Field(alias="observedAt")
 
 
-class ConnectionHealthResponse(BaseModel):
+class ConnectionHealthResponse(_HttpResponseModel):
     """Read-only DirectPluginRuntime Health observation for a fixed connection."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -200,7 +239,7 @@ class ConnectionHealthResponse(BaseModel):
     error_code: str | None = Field(default=None, alias="errorCode")
 
 
-class IntegrationConnectionResponse(BaseModel):
+class IntegrationConnectionResponse(_HttpResponseModel):
     """Safe connection list row without tenant or actor identity fields."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -215,7 +254,7 @@ class IntegrationConnectionResponse(BaseModel):
     updated_at: datetime = Field(alias="updatedAt")
 
 
-class AuthorizationCapabilityResponse(BaseModel):
+class AuthorizationCapabilityResponse(_HttpResponseModel):
     """Actor-safe projection of one provider capability authorization state."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -229,7 +268,7 @@ class AuthorizationCapabilityResponse(BaseModel):
     reason_code: str | None = Field(default=None, alias="reasonCode")
 
 
-class AuthorizationHealthResponse(BaseModel):
+class AuthorizationHealthResponse(_HttpResponseModel):
     """Latest durable authorization observation or explicit UNKNOWN before first check."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -248,7 +287,7 @@ class AuthorizationHealthResponse(BaseModel):
     reason_code: str | None = Field(default=None, alias="reasonCode")
 
 
-class RenewalSessionResponse(BaseModel):
+class RenewalSessionResponse(_HttpResponseModel):
     """Pollable Product session; provider credentials and internal refs are omitted."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -264,7 +303,7 @@ class RenewalSessionResponse(BaseModel):
     reason_code: str | None = Field(default=None, alias="reasonCode")
 
 
-class CloudResourceResponse(BaseModel):
+class CloudResourceResponse(_HttpResponseModel):
     """Safe cloud observation projection with explicit source and cache freshness."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -283,7 +322,7 @@ class CloudResourceResponse(BaseModel):
     platform_generation: int | None = Field(default=None, alias="platformGeneration")
 
 
-class ConnectionResourcesResponse(BaseModel):
+class ConnectionResourcesResponse(_HttpResponseModel):
     """Latest cached resource projections for one scoped connection."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -294,7 +333,7 @@ class ConnectionResourcesResponse(BaseModel):
     resources: list[CloudResourceResponse]
 
 
-class NotificationResponse(BaseModel):
+class NotificationResponse(_HttpResponseModel):
     """Durable in-app event without internal actor identity or delivery payload."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -311,7 +350,7 @@ class NotificationResponse(BaseModel):
     acknowledged_at: datetime | None = Field(default=None, alias="acknowledgedAt")
 
 
-class NotificationFeedResponse(BaseModel):
+class NotificationFeedResponse(_HttpResponseModel):
     """Sequence-backed notification page for gap recovery."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -511,6 +550,8 @@ def _operation_status(operation: Any) -> dict[str, Any]:
             "version",
         }
         summary = {key: result[key] for key in allowed if key in result}
+        if "observedAt" in summary:
+            summary["observedAt"] = _http_timestamp_value(summary["observedAt"])
         if not summary:
             summary = None
     state = getattr(operation, "state", "")
@@ -519,8 +560,8 @@ def _operation_status(operation: Any) -> dict[str, Any]:
         "action": str(operation.operation_id),
         "state": getattr(state, "value", str(state)),
         "issueNumber": int(operation.issue_number),
-        "createdAt": operation.created_at.isoformat(),
-        "updatedAt": operation.updated_at.isoformat(),
+        "createdAt": _http_utc_timestamp(operation.created_at),
+        "updatedAt": _http_utc_timestamp(operation.updated_at),
         "result": summary,
     }
 
@@ -534,8 +575,8 @@ def _cloud_operation_status(operation: CloudRefreshOperation) -> dict[str, Any]:
         "state": operation.state.value,
         "issueNumber": None,
         "connectionId": str(operation.connection_id),
-        "createdAt": operation.created_at.isoformat(),
-        "updatedAt": operation.updated_at.isoformat(),
+        "createdAt": _http_utc_timestamp(operation.created_at),
+        "updatedAt": _http_utc_timestamp(operation.updated_at),
         "result": operation.result,
     }
 
@@ -565,8 +606,8 @@ def _email_delivery_operation_status(job: Any) -> dict[str, Any]:
         "state": public_state,
         "issueNumber": None,
         "connectionId": str(job.connection_id) if job.connection_id else None,
-        "createdAt": job.created_at.isoformat(),
-        "updatedAt": job.updated_at.isoformat(),
+        "createdAt": _http_utc_timestamp(job.created_at),
+        "updatedAt": _http_utc_timestamp(job.updated_at),
         "result": result,
     }
 
@@ -582,9 +623,9 @@ def _notification_response(event: IntegrationNotification) -> dict[str, Any]:
         "severity": event.severity.value,
         "title": event.title,
         "description": event.description,
-        "createdAt": event.created_at,
+        "createdAt": _http_timestamp_value(event.created_at),
         "actionRef": event.action_ref,
-        "acknowledgedAt": event.acknowledged_at,
+        "acknowledgedAt": _http_timestamp_value(event.acknowledged_at),
     }
 
 
@@ -603,8 +644,8 @@ def _connection_response(connection: Any) -> dict[str, Any]:
             "repositoryId": source.get("repositoryId"),
             "repositoryName": source.get("repositoryName"),
             "enabled": source.get("enabled", True),
-            "createdAt": source.get("createdAt"),
-            "updatedAt": source.get("updatedAt"),
+            "createdAt": _http_timestamp_value(source.get("createdAt")),
+            "updatedAt": _http_timestamp_value(source.get("updatedAt")),
         }
     return {
         "id": str(connection.id),
@@ -613,8 +654,8 @@ def _connection_response(connection: Any) -> dict[str, Any]:
         "repositoryId": connection.repository_id or None,
         "repositoryName": connection.repository_name or None,
         "enabled": connection.enabled,
-        "createdAt": connection.created_at,
-        "updatedAt": connection.updated_at,
+        "createdAt": _http_timestamp_value(connection.created_at),
+        "updatedAt": _http_timestamp_value(connection.updated_at),
     }
 
 
@@ -625,8 +666,8 @@ def _renewal_response(session: RenewalSessionRecord) -> dict[str, Any]:
         "sessionRef": session.session_ref,
         "authorizationRef": session.authorization_ref,
         "state": session.state.value,
-        "createdAt": session.created_at,
-        "expiresAt": session.expires_at,
+        "createdAt": _http_timestamp_value(session.created_at),
+        "expiresAt": _http_timestamp_value(session.expires_at),
         "authorizationUrl": session.authorization_url,
         "qrAttachmentRef": session.qr_attachment_ref,
         "generation": session.generation,
@@ -1026,7 +1067,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             "expiresAt": health.expires_at,
             "generation": health.generation,
             "capabilities": [
-                capability.model_dump(mode="json", by_alias=True)
+                capability.model_dump(mode="python", by_alias=True)
                 for capability in health.capabilities
             ],
             "reasonCode": health.reason_code,
@@ -2224,7 +2265,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             "title": title,
             "version": snapshot.version,
             "freshness": snapshot.freshness.value,
-            "observedAt": snapshot.observed_at.isoformat(),
+            "observedAt": _http_utc_timestamp(snapshot.observed_at),
         }
 
     @router.post(

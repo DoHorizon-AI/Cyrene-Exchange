@@ -99,6 +99,15 @@ notification binding 是群组资源；每位成员通过 actor binding 附加�
 | `POST /api/v1/integrations/operations/{operation_id}/actions/reconcile` | Read provider state for safe reconciliation; never resends a write |
 | `POST /api/v1/integrations/hooks/github/{connection_id}` | Verify the original GitHub HMAC in the GitHub Plugin before inbox persistence |
 
+Public Product HTTP timestamps use RFC3339 UTC with a trailing `Z`. Exchange
+normalizes stored or provider timestamps at the HTTP serialization boundary; it
+does not rewrite persistence or provider SDK values.
+
+Platform identity RPC `UNAUTHENTICATED` maps to HTTP 401, `PERMISSION_DENIED` to
+403, and transport, deadline, or unknown protocol failures to 503. These are
+first-party identity/scope outcomes; only a confirmed provider invalidation maps
+to the connection reauthorization 409.
+
 All public mutations and queued reads require `Idempotency-Key`; a repeated key
 with the same request returns the same resource/operation, while a changed request
 conflicts. Query callers poll the operation and read the cached snapshot only
@@ -187,6 +196,12 @@ POST，以取回同一 session。新 key 表示新的用户授权操作。
 作为只读状态别名，并将返回的 Provider session ref 绑定到原 Product session。GET 永远不会调用
 start 工具。如果 adapter 未声明此能力，或无法验证原 session，则状态保持 `VERIFYING`，直到人工核对
 或调用方显式使用同一个 key 重放 POST。
+
+Product HTTP 对外时间戳统一使用末尾为 `Z` 的 RFC3339 UTC 格式。Exchange 只在 HTTP 序列化边界
+规范化存储或 Provider 时间，不改写持久化值或 Provider SDK 对象。
+
+Platform identity RPC 的 `UNAUTHENTICATED` 映射为 HTTP 401，`PERMISSION_DENIED` 映射为 403；传输、超时或
+未知协议故障映射为 503。这些是第一方身份/范围结果；只有 Provider 确认授权失效才映射为连接重新授权 409。
 
 所有公开写入和排队读取都必须提供 `Idempotency-Key`；相同请求重放会返回原资源/operation，改变请求则冲突。
 查询调用方应轮询 operation，并仅在成功后读取缓存 snapshot。写入只能通过带签名的 Authority execution

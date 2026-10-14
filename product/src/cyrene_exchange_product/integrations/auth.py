@@ -117,7 +117,9 @@ class PlatformAuthorityIdentityVerifier:
             raise _unauthenticated()
         try:
             import grpc
-
+        except Exception as exc:
+            raise _platform_auth_unavailable() from exc
+        try:
             authority_wire, authority_grpc = _load_authority_wire()
 
             if self._target.startswith("unix:"):
@@ -131,36 +133,41 @@ class PlatformAuthorityIdentityVerifier:
                 channel = grpc.secure_channel(self._target, credentials)
             try:
                 stub = authority_grpc.WorkspaceAuthorityServiceStub(channel)
-                negotiation = stub.NegotiateVersion(
-                    authority_wire.NegotiateVersionRequest(
-                        minimum_version=2,
-                        maximum_version=2,
-                    ),
-                    timeout=self._timeout_seconds,
-                )
+                try:
+                    negotiation = stub.NegotiateVersion(
+                        authority_wire.NegotiateVersionRequest(
+                            minimum_version=2,
+                            maximum_version=2,
+                        ),
+                        timeout=self._timeout_seconds,
+                    )
+                except grpc.RpcError as exc:
+                    raise _platform_auth_unavailable() from exc
                 if negotiation.selected_version != 2:
                     raise RuntimeError("Platform Authority v2 was not negotiated")
                 metadata = (("authorization", f"Bearer {bearer_token}"),)
-                response = stub.VerifyIdentity(
-                    authority_wire.VerifyIdentityRequest(workspace_id=workspace_id),
-                    timeout=self._timeout_seconds,
-                    metadata=metadata,
-                )
-                catalog = stub.GetCatalogSnapshot(
-                    authority_wire.CatalogSnapshotRequest(workspace_id=workspace_id),
-                    timeout=self._timeout_seconds,
-                    metadata=metadata,
-                )
+                try:
+                    response = stub.VerifyIdentity(
+                        authority_wire.VerifyIdentityRequest(workspace_id=workspace_id),
+                        timeout=self._timeout_seconds,
+                        metadata=metadata,
+                    )
+                except grpc.RpcError as exc:
+                    raise _identity_rpc_error(exc, grpc) from exc
+                try:
+                    catalog = stub.GetCatalogSnapshot(
+                        authority_wire.CatalogSnapshotRequest(workspace_id=workspace_id),
+                        timeout=self._timeout_seconds,
+                        metadata=metadata,
+                    )
+                except grpc.RpcError as exc:
+                    raise _identity_rpc_error(exc, grpc) from exc
             finally:
                 channel.close()
+        except ExchangeProductError:
+            raise
         except Exception as exc:  # Transport/protocol errors are intentionally sanitized.
-            raise ExchangeProductError(
-                code="EXCHANGE_PLATFORM_AUTH_UNAVAILABLE",
-                title="Identity verification unavailable",
-                detail="Platform could not verify the current identity.",
-                status=503,
-                retryable=True,
-            ) from exc
+            raise _platform_auth_unavailable() from exc
         exchange_owner = next(
             (item for item in catalog.owners if item.owner_id == "exchange"), None
         )
@@ -604,3 +611,36 @@ def _unauthenticated() -> ExchangeProductError:
         detail="Authenticate through the configured Platform Authority identity verifier.",
         status=401,
     )
+
+
+def _identity_permission_denied() -> ExchangeProductError:
+    return ExchangeProductError(
+        code="EXCHANGE_INTEGRATION_PERMISSION_DENIED",
+        title="Platform denied current identity verification",
+        detail="Platform denied this caller or workspace scope.",
+        status=403,
+    )
+
+
+def _platform_auth_unavailable() -> ExchangeProductError:
+    return ExchangeProductError(
+        code="EXCHANGE_PLATFORM_AUTH_UNAVAILABLE",
+        title="Identity verification unavailable",
+        detail="Platform could not verify the current identity.",
+        status=503,
+        retryable=True,
+    )
+
+
+def _identity_rpc_error(error: Any, grpc_module: Any) -> ExchangeProductError:
+    """Map authenticated identity/catalog RPC failures without retrying bad credentials."""
+
+    try:
+        status_code = error.code()
+    except Exception:
+        return _platform_auth_unavailable()
+    if status_code == grpc_module.StatusCode.UNAUTHENTICATED:
+        return _unauthenticated()
+    if status_code == grpc_module.StatusCode.PERMISSION_DENIED:
+        return _identity_permission_denied()
+    return _platform_auth_unavailable()
