@@ -8,6 +8,7 @@ Role: Recheck current authority, sign fixed provider calls, and sanitize results
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping
 from typing import Any, cast
@@ -83,7 +84,11 @@ class PlatformCurrentAuthorizationContextResolver:
                 operation_id=operation_id,
             )
             return principal
-        except Exception:
+        except Exception as exc:
+            _LOGGER.info(
+                "Current authorization is unavailable for an integration connection (%s)",
+                type(exc).__name__,
+            )
             return None
 
     def for_notification(
@@ -102,7 +107,11 @@ class PlatformCurrentAuthorizationContextResolver:
                 return None
             context = self._registry.email_context_for_job(current)
             return self._verified_principal(context, operation_id=operation_id)
-        except Exception:
+        except Exception as exc:
+            _LOGGER.info(
+                "Current authorization is unavailable for an email notification (%s)",
+                type(exc).__name__,
+            )
             return None
 
     def email_recipient_for_connection(
@@ -161,6 +170,7 @@ _OFFICIAL_WECOM_URL = re.compile(
     r"^https://work\.weixin\.qq\.com/ai/qc/gen\?source=wecom_cli_external&scode=[A-Za-z0-9_-]{8,256}$"
 )
 _OPAQUE_PROVIDER_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$")
+_LOGGER = logging.getLogger(__name__)
 
 
 class IntegrationToolCallUnavailable(RuntimeError):

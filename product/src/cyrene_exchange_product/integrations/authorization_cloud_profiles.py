@@ -7,6 +7,7 @@ Role: Parse closed host-owned bindings and resolve actor/resource allowlists.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from cyrene_exchange_product.integrations.models import (
 _ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$")
 _RECIPIENT_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _PROVIDER_IDS = frozenset({"wecom", "azure", "gcp", "hf", "runpod", "tailscale"})
+_LOGGER = logging.getLogger(__name__)
 
 
 class AuthorizationCloudConfigurationError(ValueError):
@@ -280,7 +282,11 @@ class AuthorizationCloudProfileRegistry:
 
         try:
             self.email_context_for_principal(principal)
-        except Exception:
+        except Exception as exc:
+            _LOGGER.info(
+                "Email recipient is unavailable for the current actor (%s)",
+                type(exc).__name__,
+            )
             return None
         return self.settings.email.recipient_ref
 
