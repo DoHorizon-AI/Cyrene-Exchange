@@ -8,6 +8,7 @@ its persisted authority, and its Platform/Plugins boundaries.
 | Path | Responsibility | 职责 |
 | --- | --- | --- |
 | [`API.md`](API.md) | Implemented HTTP and Product contracts | 已实现 HTTP 与 Product 契约 |
+| [`AUTHORIZATION_CLOUD_RUNBOOK.md`](AUTHORIZATION_CLOUD_RUNBOOK.md) | Host configuration, deterministic monitoring, renewal, and notification operations | Host 配置、确定性监控、授权续期与通知运维 |
 | [`REPOSITORY-LIFECYCLE.md`](REPOSITORY-LIFECYCLE.md) | Ownership, branches, CI, and publication gates | 权威、分支、CI 与公开门 |
 | [`architecture/`](architecture/README.md) | Topology and capability flow | 拓扑与能力流 |
 | [`modules/`](modules/README.md) | Active source reading guide | 活动源码阅读导览 |

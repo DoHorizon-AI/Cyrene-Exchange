@@ -249,6 +249,7 @@ def create_app(
             retryable=exc.retryable,
             trace_id=trace_id,
             resource_ref=exc.resource_ref,
+            context=exc.context,
         )
         # Emit structured diagnostic log to stderr
         # 中文:向标准错误输出结构化诊断日志。

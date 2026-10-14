@@ -49,6 +49,16 @@ def build_production_services(
         PlatformAuthorityIdentityVerifier,
         PlatformExecutionAuthorizationVerifier,
     )
+    from cyrene_exchange_product.integrations.authorization_cloud import AuthorizationCloudRunner
+    from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
+        AuthorizationCloudConfigurationError,
+        AuthorizationCloudProfileRegistry,
+        parse_authorization_cloud_settings,
+    )
+    from cyrene_exchange_product.integrations.authorization_cloud_provider import (
+        AuthorizationCloudDirectProvider,
+        PlatformCurrentAuthorizationContextResolver,
+    )
     from cyrene_exchange_product.integrations.clients import (
         AccountCenterClient,
         DirectPluginHealthClient,
@@ -73,6 +83,18 @@ def build_production_services(
     configuration = _read_configuration(source)
     refs = _secret_refs(configuration.get("hostSecretRefs"))
     used_refs: set[str] = set()
+
+    try:
+        authorization_settings = (
+            parse_authorization_cloud_settings(
+                configuration["authorizationCloud"],
+                email_value=configuration.get("emailNotifications"),
+            )
+            if "authorizationCloud" in configuration
+            else None
+        )
+    except AuthorizationCloudConfigurationError as exc:
+        raise IntegrationConfigurationError(str(exc)) from exc
 
     def secret(reference: object) -> str:
         if not isinstance(reference, str) or reference not in refs:
@@ -328,7 +350,7 @@ def build_production_services(
     wecom_source_accounts: dict[str, dict[str, str]] = {}
     source_principals: dict[str, IntegrationPrincipal] = {}
     for binding_id, raw_source in raw_sources.items():
-        source = _config_object(
+        source_profile_fields = _config_object(
             raw_source,
             required={
                 "organizationId",
@@ -347,15 +369,19 @@ def build_production_services(
             binding_uuid = UUID(binding_key)
         except ValueError as exc:
             raise IntegrationConfigurationError("WeCom inbound binding ID must be a UUID") from exc
-        organization_id = _text(source["organizationId"], "WeCom source organizationId")
-        workspace_id = _text(source["workspaceId"], "WeCom source workspaceId")
-        source_authority = _text(source["sourceAuthority"], "WeCom source sourceAuthority")
-        bot_namespace = _text(source["botNamespace"], "WeCom source botNamespace")
-        account_id = _text(source["accountId"], "WeCom source accountId")
-        group_conversation_id = _text(
-            source["groupConversationId"], "WeCom source groupConversationId"
+        organization_id = _text(
+            source_profile_fields["organizationId"], "WeCom source organizationId"
         )
-        request_hmac_key = secret(source["requestHmacSecretRef"]).encode("utf-8")
+        workspace_id = _text(source_profile_fields["workspaceId"], "WeCom source workspaceId")
+        source_authority = _text(
+            source_profile_fields["sourceAuthority"], "WeCom source sourceAuthority"
+        )
+        bot_namespace = _text(source_profile_fields["botNamespace"], "WeCom source botNamespace")
+        account_id = _text(source_profile_fields["accountId"], "WeCom source accountId")
+        group_conversation_id = _text(
+            source_profile_fields["groupConversationId"], "WeCom source groupConversationId"
+        )
+        request_hmac_key = secret(source_profile_fields["requestHmacSecretRef"]).encode("utf-8")
         if len(request_hmac_key) < 32 or not account_id.startswith("bot:"):
             raise IntegrationConfigurationError("WeCom source HMAC key or bot account is invalid")
         source_principal = IntegrationPrincipal(
@@ -385,6 +411,88 @@ def build_production_services(
         targets=targets,
         source_accounts=wecom_source_accounts,
     )
+    integration_store = IntegrationStore(database_path)
+
+    authorization_clients: dict[str, Any] = {}
+    email_notification_client = None
+    authorization_registry = None
+    current_context_resolver = None
+    authorization_cloud_provider = None
+    authorization_cloud_runner = None
+    connection_profile_resolver = None
+    email_delivery_recipient_resolver = None
+    if authorization_settings is not None:
+        authorization_registry = AuthorizationCloudProfileRegistry(authorization_settings)
+        for profile_ref, profile in authorization_settings.profiles.items():
+            endpoint: dict[str, Any] = {
+                "bindingId": profile.endpoint.binding_id,
+                "connectionRef": profile.endpoint.connection_ref,
+                "transport": profile.endpoint.transport,
+            }
+            if profile.endpoint.mtls is not None:
+                endpoint["mtls"] = dict(profile.endpoint.mtls)
+            authorization_clients[profile_ref] = direct_client(endpoint)
+            hmac_key(profile.context_key_ref)
+            used_refs.add(profile.context_key_ref)
+        email_profile = authorization_settings.email
+        if email_profile.enabled:
+            if email_profile.endpoint is None or email_profile.context_key_ref is None:
+                raise IntegrationConfigurationError("enabled email profile is incomplete")
+            email_endpoint: dict[str, Any] = {
+                "bindingId": email_profile.endpoint.binding_id,
+                "connectionRef": email_profile.endpoint.connection_ref,
+                "transport": email_profile.endpoint.transport,
+            }
+            if email_profile.endpoint.mtls is not None:
+                email_endpoint["mtls"] = dict(email_profile.endpoint.mtls)
+            email_notification_client = direct_client(email_endpoint)
+            hmac_key(email_profile.context_key_ref)
+            used_refs.add(email_profile.context_key_ref)
+        for actor_context in authorization_settings.contexts.values():
+            reference = actor_context.bearer_token_env_ref
+            if reference not in refs:
+                raise IntegrationConfigurationError(
+                    "currentAuthority refers to an unknown bearer token secret reference"
+                )
+            # The live value is read on every use and may be absent while a durable
+            # connection is reporting its actionable unavailable state.
+            used_refs.add(reference)
+
+        def current_bearer(reference: str) -> str | None:
+            env_ref = refs.get(reference)
+            token = source.get(env_ref, "") if env_ref is not None else ""
+            return token if token.strip() else None
+
+        current_context_resolver = PlatformCurrentAuthorizationContextResolver(
+            store=integration_store,
+            identity_verifier=identity_verifier,
+            registry=authorization_registry,
+            bearer_token=current_bearer,
+        )
+        authorization_cloud_provider = AuthorizationCloudDirectProvider(
+            store=integration_store,
+            registry=authorization_registry,
+            provider_clients=authorization_clients,
+            email_client=email_notification_client,
+            current_context_resolver=current_context_resolver,
+            context_key=hmac_key,
+        )
+        authorization_cloud_runner = AuthorizationCloudRunner(
+            store=integration_store,
+            contexts=current_context_resolver,
+            provider=authorization_cloud_provider,
+            email=authorization_cloud_provider if email_profile.enabled else None,
+            worker_id=workload_id,
+            email_recipient_resolver=(
+                current_context_resolver.email_recipient_for_connection
+                if email_profile.enabled
+                else None
+            ),
+            monitor_interval_seconds=authorization_settings.monitor_interval_seconds,
+        )
+        connection_profile_resolver = authorization_registry.display_name_for_connection
+        if email_profile.enabled:
+            email_delivery_recipient_resolver = authorization_registry.email_recipient_for_principal
 
     callback_principal = IntegrationPrincipal(
         issuer="urn:cyrene:exchange-service",
@@ -393,7 +501,6 @@ def build_production_services(
         workspace_id="exchange-service",
         allowed_operation_ids=frozenset(),
     )
-    integration_store = IntegrationStore(database_path)
     account_port = IntegrationAccountCenterPort(accounts)
     github_port = IntegrationGitHubPort(github)
     dispatcher = IntegrationDispatcher(
@@ -426,7 +533,24 @@ def build_production_services(
         account_center=account_port,
         wecom_sources=wecom_sources,
         wecom_source_principal=source_principals.get,
-        transport_clients=(account_runtime, github_runtime, wecom_runtime, github_health),
+        connection_profile_resolver=connection_profile_resolver,
+        authorization_cloud=authorization_cloud_provider,
+        current_context_resolver=current_context_resolver,
+        email_notifications=(
+            authorization_cloud_provider
+            if authorization_settings is not None and authorization_settings.email.enabled
+            else None
+        ),
+        email_delivery_recipient_resolver=email_delivery_recipient_resolver,
+        authorization_cloud_runner=authorization_cloud_runner,
+        transport_clients=(
+            account_runtime,
+            github_runtime,
+            wecom_runtime,
+            github_health,
+            *authorization_clients.values(),
+            *((email_notification_client,) if email_notification_client is not None else ()),
+        ),
     )
 
 
@@ -478,6 +602,26 @@ def validate_host_configuration(
     configuration = _read_configuration(source)
     refs = _secret_refs(configuration.get("hostSecretRefs"))
     used: set[str] = set()
+    from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
+        AuthorizationCloudConfigurationError,
+        parse_authorization_cloud_settings,
+    )
+
+    try:
+        authorization_settings = (
+            parse_authorization_cloud_settings(
+                configuration["authorizationCloud"],
+                email_value=configuration.get("emailNotifications"),
+            )
+            if "authorizationCloud" in configuration
+            else None
+        )
+    except AuthorizationCloudConfigurationError as exc:
+        raise IntegrationConfigurationError(str(exc)) from exc
+    if authorization_settings is None and configuration.get("emailNotifications") is not None:
+        raise IntegrationConfigurationError(
+            "emailNotifications requires authorizationCloud current authority contexts"
+        )
 
     def resolve(reference: object) -> str:
         if not isinstance(reference, str) or reference not in refs:
@@ -500,6 +644,25 @@ def validate_host_configuration(
             raise IntegrationConfigurationError("a configured HMAC key is malformed") from None
         if len(key) != 32:
             raise IntegrationConfigurationError("configured HMAC keys must decode to 32 bytes")
+
+    def check_bearer_reference(reference: str) -> None:
+        if reference not in refs:
+            raise IntegrationConfigurationError(
+                "currentAuthority refers to an unknown bearer token secret reference"
+            )
+        # Live bearer tokens can be rotated while the worker runs. Do not pin
+        # their value at startup; a missing/expired value becomes durable UNAVAILABLE.
+        used.add(reference)
+
+    def endpoint_mapping(endpoint: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "bindingId": endpoint.binding_id,
+            "connectionRef": endpoint.connection_ref,
+            "transport": endpoint.transport,
+        }
+        if endpoint.mtls is not None:
+            result["mtls"] = dict(endpoint.mtls)
+        return result
 
     def check_path(reference: object, *, private: bool = False) -> Path:
         path = Path(resolve(reference)).expanduser()
@@ -652,6 +815,29 @@ def validate_host_configuration(
         if len(request_key) < 32:
             raise IntegrationConfigurationError("WeCom inbound request HMAC key is too short")
 
+    if authorization_settings is not None:
+        for actor_context in authorization_settings.contexts.values():
+            check_bearer_reference(actor_context.bearer_token_env_ref)
+        for profile in authorization_settings.profiles.values():
+            check_hmac(profile.context_key_ref)
+            _validate_direct_endpoint(
+                endpoint_mapping(profile.endpoint),
+                f"authorizationCloud.{profile.profile_ref}",
+                check_path,
+            )
+        if authorization_settings.email.enabled:
+            email_profile = authorization_settings.email
+            if email_profile.context_key_ref is None or email_profile.endpoint is None:
+                raise IntegrationConfigurationError(
+                    "enabled email notification profile is incomplete"
+                )
+            check_hmac(email_profile.context_key_ref)
+            _validate_direct_endpoint(
+                endpoint_mapping(email_profile.endpoint),
+                "emailNotifications",
+                check_path,
+            )
+
     # Validate direct Plugin endpoint profiles without dialing the runtime.
     for label, endpoint in (("accountCenter", account), ("githubIssues", github), ("wecom", wecom)):
         _validate_direct_endpoint(endpoint, label, check_path)
@@ -698,6 +884,15 @@ def validate_host_configuration(
         "githubIssuesBindingId": str(github["bindingId"]),
         "wecomBindingId": str(wecom["bindingId"]),
         "wecomInboundSourceCount": len(sources),
+        "authorizationCloudProfileCount": (
+            len(authorization_settings.profiles) if authorization_settings is not None else 0
+        ),
+        "currentAuthorityContextCount": (
+            len(authorization_settings.contexts) if authorization_settings is not None else 0
+        ),
+        "emailNotificationsEnabled": bool(
+            authorization_settings is not None and authorization_settings.email.enabled
+        ),
     }
 
 
@@ -727,7 +922,7 @@ def _read_configuration(environ: Mapping[str, str]) -> dict[str, Any]:
             "githubIssues",
             "wecom",
         },
-        optional=set(),
+        optional={"authorizationCloud", "emailNotifications"},
         label="Exchange integration configuration",
         expected_version=1,
     )

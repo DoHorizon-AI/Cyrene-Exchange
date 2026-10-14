@@ -21,6 +21,7 @@ class ExchangeProductError(RuntimeError):
         status: int,
         retryable: bool = False,
         resource_ref: str | None = None,
+        context: dict[str, str] | None = None,
     ) -> None:
         super().__init__(detail)
         self.code = code
@@ -29,6 +30,7 @@ class ExchangeProductError(RuntimeError):
         self.status = status
         self.retryable = retryable
         self.resource_ref = resource_ref
+        self.context = context
 
 
 class ErrorMapping:
@@ -88,6 +90,12 @@ EXCHANGE_ERROR_MAPPINGS: dict[str, ErrorMapping] = {
         cause_kind="upstream_unreachable",
         recovery_action="query_state_first",
         status=503,
+    ),
+    "EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED": ErrorMapping(
+        canonical_code="PRODUCT.EXCHANGE.CONNECTION_REAUTHORIZATION_REQUIRED",
+        cause_kind="authorization",
+        recovery_action="user_action_required",
+        status=409,
     ),
     "EXCHANGE_TARGET_UNREACHABLE": ErrorMapping(
         canonical_code="PRODUCT.EXCHANGE.TARGET_UNREACHABLE",

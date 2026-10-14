@@ -10,26 +10,36 @@ import base64
 import binascii
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Header, Query, Request
 from fastapi import Path as ApiPath
-from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
 from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations.clients import AccountCenterClient, GitHubIssuesClient
 from cyrene_exchange_product.integrations.models import (
+    AuthorizationHealthRecord,
+    AuthorizationState,
+    CloudRefreshOperation,
     CreateIntegrationConnection,
     CreateSyncBinding,
     EnqueueIssueAction,
     IntegrationAuthorizationError,
+    IntegrationNotFound,
+    IntegrationNotification,
     IntegrationPrincipal,
+    LoginState,
+    ProviderId,
+    RenewalSessionRecord,
+    RenewalState,
 )
 from cyrene_exchange_product.integrations.ports import (
     PluginHealthObservation,
@@ -63,10 +73,46 @@ class ConfirmWeComBody(IntegrationRequestBody):
 
 
 class CreateConnectionBody(IntegrationRequestBody):
-    """Create one fixed GitHub repository connection without member credentials."""
+    """Create a fixed provider connection using only configured opaque aliases."""
 
-    repository_id: str = Field(min_length=1, max_length=200)
-    repository_name: str = Field(min_length=1, max_length=300)
+    provider: ProviderId = "github"
+    binding_ref: str | None = Field(default=None, min_length=1, max_length=300)
+    target_ref: str | None = Field(default=None, min_length=1, max_length=300)
+    account_link_ref: str | None = Field(default=None, min_length=1, max_length=300)
+    repository_id: str = Field(default="", max_length=200)
+    repository_name: str = Field(default="", max_length=300)
+
+    @staticmethod
+    def _is_opaque_alias(value: str | None) -> bool:
+        return value is None or (
+            len(value) <= 300
+            and value[0].isalnum()
+            and all(character.isalnum() or character in "._:-" for character in value)
+            and "://" not in value
+        )
+
+    @model_validator(mode="after")
+    def validate_provider_shape(self) -> CreateConnectionBody:
+        """Reject URL-like selectors and provider fields outside their discriminator."""
+
+        if not all(
+            self._is_opaque_alias(value)
+            for value in (self.binding_ref, self.target_ref, self.account_link_ref)
+        ):
+            raise ValueError("provider refs must be configured opaque aliases")
+        if self.provider == "github":
+            if not self.repository_id or not self.repository_name:
+                raise ValueError("GitHub connections require repositoryId and repositoryName")
+            if self.target_ref is not None:
+                raise ValueError("GitHub connections do not accept cloud targetRef")
+        elif self.repository_id or self.repository_name:
+            raise ValueError("provider connections cannot include GitHub repository fields")
+        elif self.provider in {"azure", "gcp", "hf", "runpod", "tailscale"}:
+            if self.binding_ref is None or self.target_ref is None:
+                raise ValueError("cloud connections require bindingRef and targetRef")
+        elif self.provider == "wecom" and self.binding_ref is None:
+            raise ValueError("WeCom authorization connections require bindingRef")
+        return self
 
 
 class CreateBindingBody(IntegrationRequestBody):
@@ -119,7 +165,10 @@ class OperationStatusResponse(BaseModel):
         "FAILED",
         "UNKNOWN",
     ]
-    issue_number: int = Field(alias="issueNumber")
+    issue_number: int | None = Field(default=None, alias="issueNumber")
+    connection_id: str | None = Field(
+        default=None, alias="connectionId", exclude_if=lambda value: value is None
+    )
     created_at: str = Field(alias="createdAt")
     updated_at: str = Field(alias="updatedAt")
     result: dict[str, Any] | None
@@ -149,6 +198,126 @@ class ConnectionHealthResponse(BaseModel):
     plugin_version: str | None = Field(default=None, alias="pluginVersion")
     capabilities: list[str]
     error_code: str | None = Field(default=None, alias="errorCode")
+
+
+class IntegrationConnectionResponse(BaseModel):
+    """Safe connection list row without tenant or actor identity fields."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    id: str
+    provider: ProviderId
+    display_name: str = Field(alias="displayName")
+    repository_id: str | None = Field(default=None, alias="repositoryId")
+    repository_name: str | None = Field(default=None, alias="repositoryName")
+    enabled: bool
+    created_at: datetime = Field(alias="createdAt")
+    updated_at: datetime = Field(alias="updatedAt")
+
+
+class AuthorizationCapabilityResponse(BaseModel):
+    """Actor-safe projection of one provider capability authorization state."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    capability_id: str = Field(alias="capabilityId")
+    state: Literal[
+        "VALID", "REAUTHORIZATION_REQUIRED", "PERMISSION_DENIED", "UNKNOWN", "UNAVAILABLE"
+    ]
+    last_verified_at: datetime | None = Field(default=None, alias="lastVerifiedAt")
+    expires_at: datetime | None = Field(default=None, alias="expiresAt")
+    reason_code: str | None = Field(default=None, alias="reasonCode")
+
+
+class AuthorizationHealthResponse(BaseModel):
+    """Latest durable authorization observation or explicit UNKNOWN before first check."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    connection_id: str = Field(alias="connectionId")
+    provider: ProviderId
+    authorization_ref: str | None = Field(default=None, alias="authorizationRef")
+    login_state: Literal["PRESENT", "MISSING", "UNKNOWN", "UNAVAILABLE"] = Field(alias="loginState")
+    authorization_state: Literal[
+        "VALID", "REAUTHORIZATION_REQUIRED", "PERMISSION_DENIED", "UNKNOWN", "UNAVAILABLE"
+    ] = Field(alias="authorizationState")
+    checked_at: datetime | None = Field(default=None, alias="checkedAt")
+    expires_at: datetime | None = Field(default=None, alias="expiresAt")
+    generation: int = Field(ge=0)
+    capabilities: list[AuthorizationCapabilityResponse]
+    reason_code: str | None = Field(default=None, alias="reasonCode")
+
+
+class RenewalSessionResponse(BaseModel):
+    """Pollable Product session; provider credentials and internal refs are omitted."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    session_ref: str = Field(alias="sessionRef")
+    authorization_ref: str = Field(alias="authorizationRef")
+    state: Literal["WAITING_USER", "VERIFYING", "SUCCEEDED", "FAILED", "EXPIRED", "CANCELLED"]
+    created_at: datetime = Field(alias="createdAt")
+    expires_at: datetime | None = Field(default=None, alias="expiresAt")
+    authorization_url: str | None = Field(default=None, alias="authorizationUrl")
+    qr_attachment_ref: str | None = Field(default=None, alias="qrAttachmentRef")
+    generation: int = Field(ge=0)
+    reason_code: str | None = Field(default=None, alias="reasonCode")
+
+
+class CloudResourceResponse(BaseModel):
+    """Safe cloud observation projection with explicit source and cache freshness."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    external_ref: str = Field(alias="externalRef")
+    kind: str
+    display_name: str = Field(alias="displayName")
+    status: Literal["RUNNING", "STOPPED", "AVAILABLE", "UNAVAILABLE", "DEGRADED", "UNKNOWN"]
+    provider_status: str | None = Field(default=None, alias="providerStatus")
+    collected_at: datetime = Field(alias="collectedAt")
+    observed_at: datetime | None = Field(default=None, alias="observedAt")
+    source: str
+    freshness: Literal["FRESH", "STALE", "UNKNOWN"]
+    attributes: dict[str, str | int | float | bool | None]
+    platform_resource_ref: str | None = Field(default=None, alias="platformResourceRef")
+    platform_generation: int | None = Field(default=None, alias="platformGeneration")
+
+
+class ConnectionResourcesResponse(BaseModel):
+    """Latest cached resource projections for one scoped connection."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    connection_id: str = Field(alias="connectionId")
+    provider: ProviderId
+    checked_at: datetime | None = Field(default=None, alias="checkedAt")
+    resources: list[CloudResourceResponse]
+
+
+class NotificationResponse(BaseModel):
+    """Durable in-app event without internal actor identity or delivery payload."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    id: str
+    sequence: int = Field(ge=1)
+    connection_id: str | None = Field(default=None, alias="connectionId")
+    kind: str
+    severity: Literal["INFO", "WARNING", "ERROR"]
+    title: str
+    description: str
+    created_at: datetime = Field(alias="createdAt")
+    action_ref: str | None = Field(default=None, alias="actionRef")
+    acknowledged_at: datetime | None = Field(default=None, alias="acknowledgedAt")
+
+
+class NotificationFeedResponse(BaseModel):
+    """Sequence-backed notification page for gap recovery."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    notifications: list[NotificationResponse]
+    next_sequence: int = Field(alias="nextSequence", ge=0)
 
 
 class IntegrationJobResponse(IntegrationRequestBody):
@@ -226,6 +395,16 @@ class IntegrationServices:
         wecom_sources: Mapping[str, Any] | None = None,
         wecom_source_principal: Any = None,
         account_center: Any = None,
+        connection_profile_resolver: Callable[
+            [IntegrationPrincipal, CreateIntegrationConnection], str
+        ]
+        | None = None,
+        email_delivery_recipient_resolver: Callable[[IntegrationPrincipal], str | None]
+        | None = None,
+        authorization_cloud: Any = None,
+        current_context_resolver: Any = None,
+        email_notifications: Any = None,
+        authorization_cloud_runner: Any = None,
         transport_clients: tuple[Any, ...] = (),
     ) -> None:
         self.store = store
@@ -243,7 +422,64 @@ class IntegrationServices:
         self.wecom_sources = dict(wecom_sources or {})
         self.wecom_source_principal = wecom_source_principal
         self.account_center = account_center
+        self.connection_profile_resolver = connection_profile_resolver
+        self.email_delivery_recipient_resolver = email_delivery_recipient_resolver
+        self.authorization_cloud = authorization_cloud
+        self.current_context_resolver = current_context_resolver
+        self.email_notifications = email_notifications
+        self.authorization_cloud_runner = authorization_cloud_runner
         self.transport_clients = transport_clients
+
+    def display_name_for_connection(
+        self,
+        principal: IntegrationPrincipal,
+        request: CreateIntegrationConnection,
+    ) -> str:
+        """Authorize aliases for this current principal and resolve display metadata."""
+
+        if self.connection_profile_resolver is not None:
+            try:
+                display_name = self.connection_profile_resolver(principal, request)
+            except PermissionError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_INTEGRATION_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Provider profile is not available to this actor",
+                    detail=(
+                        "The selected provider profile or target is outside "
+                        "the current actor scope."
+                    ),
+                    status=403,
+                ) from exc
+            except Exception as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_INTEGRATION_PROVIDER_CONFIGURATION_UNAVAILABLE",
+                    title="Provider connection is not configured",
+                    detail="The selected provider profile is unavailable in trusted host settings.",
+                    status=503,
+                    retryable=True,
+                ) from exc
+            if not display_name.strip() or len(display_name) > 300:
+                raise ExchangeProductError(
+                    code="EXCHANGE_INTEGRATION_PROVIDER_CONFIGURATION_INVALID",
+                    title="Provider connection is not configured",
+                    detail="The configured provider profile does not expose a display name.",
+                    status=503,
+                )
+            return display_name
+        if (
+            request.provider == "github"
+            and request.binding_ref is None
+            and request.target_ref is None
+            and request.account_link_ref is None
+        ):
+            return request.repository_name
+        raise ExchangeProductError(
+            code="EXCHANGE_INTEGRATION_PROVIDER_CONFIGURATION_UNAVAILABLE",
+            title="Provider connection is not configured",
+            detail="Configure the selected binding and target aliases in trusted host settings.",
+            status=503,
+            retryable=True,
+        )
 
     def close(self) -> None:
         """Close this Product store and the resolved capability channels."""
@@ -287,6 +523,146 @@ def _operation_status(operation: Any) -> dict[str, Any]:
         "updatedAt": operation.updated_at.isoformat(),
         "result": summary,
     }
+
+
+def _cloud_operation_status(operation: CloudRefreshOperation) -> dict[str, Any]:
+    """Map one cloud refresh onto the existing Product operation reference shape."""
+
+    return {
+        "operationId": str(operation.id),
+        "action": "cloud.resources.refresh",
+        "state": operation.state.value,
+        "issueNumber": None,
+        "connectionId": str(operation.connection_id),
+        "createdAt": operation.created_at.isoformat(),
+        "updatedAt": operation.updated_at.isoformat(),
+        "result": operation.result,
+    }
+
+
+def _email_delivery_operation_status(job: Any) -> dict[str, Any]:
+    """Expose only durable delivery state, never email addresses or content."""
+
+    state = getattr(getattr(job, "state", ""), "value", str(getattr(job, "state", "")))
+    public_state = {
+        "READY": "QUEUED",
+        "CLAIMED": "QUEUED",
+        "SENDING": "RUNNING",
+        "ACCEPTED": "SUCCEEDED",
+        "UNKNOWN": "UNKNOWN",
+        "REJECTED": "FAILED",
+    }.get(state, "UNKNOWN")
+    result = {
+        "deliveryStatus": state,
+        "deliveryConfirmed": bool(getattr(job, "delivery_confirmed", False)),
+    }
+    reason_code = getattr(job, "failure_reason_code", None)
+    if reason_code:
+        result["reasonCode"] = str(reason_code)
+    return {
+        "operationId": str(job.id),
+        "action": "integration.notification.deliver",
+        "state": public_state,
+        "issueNumber": None,
+        "connectionId": str(job.connection_id) if job.connection_id else None,
+        "createdAt": job.created_at.isoformat(),
+        "updatedAt": job.updated_at.isoformat(),
+        "result": result,
+    }
+
+
+def _notification_response(event: IntegrationNotification) -> dict[str, Any]:
+    """Project the public feed fields while omitting its internal actor scope."""
+
+    return {
+        "id": str(event.id),
+        "sequence": event.sequence,
+        "connectionId": str(event.connection_id) if event.connection_id else None,
+        "kind": event.kind.value,
+        "severity": event.severity.value,
+        "title": event.title,
+        "description": event.description,
+        "createdAt": event.created_at,
+        "actionRef": event.action_ref,
+        "acknowledgedAt": event.acknowledged_at,
+    }
+
+
+def _connection_response(connection: Any) -> dict[str, Any]:
+    """Project one connection without actor, tenant, account, or target aliases."""
+
+    if isinstance(connection, Mapping):
+        source = dict(connection)
+        return {
+            "id": str(source.get("id") or source.get("connectionId") or ""),
+            "provider": source.get("provider", "github"),
+            "displayName": source.get("displayName")
+            or source.get("repositoryName")
+            or source.get("provider")
+            or "Integration",
+            "repositoryId": source.get("repositoryId"),
+            "repositoryName": source.get("repositoryName"),
+            "enabled": source.get("enabled", True),
+            "createdAt": source.get("createdAt"),
+            "updatedAt": source.get("updatedAt"),
+        }
+    return {
+        "id": str(connection.id),
+        "provider": connection.provider,
+        "displayName": connection.display_name or connection.repository_name or connection.provider,
+        "repositoryId": connection.repository_id or None,
+        "repositoryName": connection.repository_name or None,
+        "enabled": connection.enabled,
+        "createdAt": connection.created_at,
+        "updatedAt": connection.updated_at,
+    }
+
+
+def _renewal_response(session: RenewalSessionRecord) -> dict[str, Any]:
+    """Expose only the Product session ref and user-action fields."""
+
+    return {
+        "sessionRef": session.session_ref,
+        "authorizationRef": session.authorization_ref,
+        "state": session.state.value,
+        "createdAt": session.created_at,
+        "expiresAt": session.expires_at,
+        "authorizationUrl": session.authorization_url,
+        "qrAttachmentRef": session.qr_attachment_ref,
+        "generation": session.generation,
+        "reasonCode": session.reason_code,
+    }
+
+
+def _reauthorization_required(
+    connection_id: UUID, health: AuthorizationHealthRecord
+) -> ExchangeProductError:
+    """Build a structured conflict from confirmed provider facts and exact stored scope."""
+
+    if (
+        health.authorization_state != AuthorizationState.REAUTHORIZATION_REQUIRED
+        and health.login_state != LoginState.MISSING
+    ):
+        raise ValueError("reauthorization error requires confirmed provider invalidation")
+    if not health.authorization_ref:
+        return ExchangeProductError(
+            code="EXCHANGE_INTEGRATION_AUTHORIZATION_UNAVAILABLE",
+            title="Provider authorization reference unavailable",
+            detail="Exchange cannot identify the actor-owned provider authorization to renew.",
+            status=503,
+            retryable=True,
+        )
+    return ExchangeProductError(
+        code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+        title="Provider reauthorization required",
+        detail="The provider confirmed that this connection requires user reauthorization.",
+        status=409,
+        resource_ref=str(connection_id),
+        context={
+            "connectionId": str(connection_id),
+            "authorizationRef": health.authorization_ref,
+        },
+    )
 
 
 def create_router(services: IntegrationServices) -> APIRouter:
@@ -557,6 +933,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
         "/api/v1/integrations/connections",
         status_code=201,
         operation_id="integrationCreateConnection",
+        response_model=IntegrationConnectionResponse,
     )
     async def create_connection(
         body: CreateConnectionBody,
@@ -566,22 +943,605 @@ def create_router(services: IntegrationServices) -> APIRouter:
     ) -> Any:
         actor = await principal(request, workspace_id, operation_id="integrationCreateConnection")
         require(actor, "integrationCreateConnection")
-        return services.store.create_connection(
+        create_request = CreateIntegrationConnection(
+            provider=body.provider,
+            binding_ref=body.binding_ref,
+            target_ref=body.target_ref,
+            account_link_ref=body.account_link_ref,
+            repository_id=body.repository_id,
+            repository_name=body.repository_name,
+        )
+        create_request = create_request.model_copy(
+            update={"display_name": services.display_name_for_connection(actor, create_request)}
+        )
+        connection = services.store.create_connection(
             actor,
-            CreateIntegrationConnection(
-                repository_id=body.repository_id,
-                repository_name=body.repository_name,
-            ),
+            create_request,
             idempotency_key=idempotency_key,
         )
+        return _connection_response(connection)
 
-    @router.get("/api/v1/integrations/connections", operation_id="integrationListConnections")
+    @router.get(
+        "/api/v1/integrations/connections",
+        operation_id="integrationListConnections",
+        response_model=list[IntegrationConnectionResponse],
+    )
     async def list_connections(
         request: Request, workspace_id: str | None = Query(default=None, alias="workspaceId")
-    ) -> list[Any]:
+    ) -> list[dict[str, Any]]:
         actor = await principal(request, workspace_id, operation_id="integrationListConnections")
         require(actor, "integrationListConnections")
-        return services.store.list_connections(actor)
+        return [
+            _connection_response(connection)
+            for connection in services.store.list_connections(actor)
+        ]
+
+    @router.get(
+        "/api/v1/integrations/connections/{connection_id}/authorization-health",
+        operation_id="integrationGetAuthorizationHealth",
+        response_model=AuthorizationHealthResponse,
+    )
+    async def get_authorization_health(
+        connection_id: UUID,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="integrationGetAuthorizationHealth",
+            resource_id=str(connection_id),
+        )
+        require(actor, "integrationGetAuthorizationHealth")
+        connection = services.store.get_connection(
+            actor,
+            connection_id,
+            authorization_operation_id="integrationGetAuthorizationHealth",
+        )
+        health = services.store.latest_authorization_health(
+            actor,
+            connection_id,
+            authorization_operation_id="integrationGetAuthorizationHealth",
+        )
+        if health is None:
+            return {
+                "connectionId": str(connection.id),
+                "provider": connection.provider,
+                "authorizationRef": None,
+                "loginState": LoginState.UNKNOWN.value,
+                "authorizationState": AuthorizationState.UNKNOWN.value,
+                "checkedAt": None,
+                "expiresAt": None,
+                "generation": 0,
+                "capabilities": [],
+                "reasonCode": "not_observed",
+            }
+        return {
+            "connectionId": str(connection.id),
+            "provider": connection.provider,
+            "authorizationRef": health.authorization_ref,
+            "loginState": health.login_state.value,
+            "authorizationState": health.authorization_state.value,
+            "checkedAt": health.checked_at,
+            "expiresAt": health.expires_at,
+            "generation": health.generation,
+            "capabilities": [
+                capability.model_dump(mode="json", by_alias=True)
+                for capability in health.capabilities
+            ],
+            "reasonCode": health.reason_code,
+        }
+
+    @router.post(
+        "/api/v1/accounts/authorizations/{authorization_id}/renewal-sessions",
+        status_code=202,
+        operation_id="accountBeginRenewalSession",
+        response_model=RenewalSessionResponse,
+        responses={
+            202: {
+                "description": "Renewal session accepted; Location polls the Product session.",
+                "headers": {
+                    "Location": {
+                        "description": "URI reference for the Product renewal session.",
+                        "schema": {"type": "string", "format": "uri-reference"},
+                    }
+                },
+            }
+        },
+    )
+    async def begin_renewal_session(
+        authorization_id: str,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> JSONResponse:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="accountBeginRenewalSession",
+            resource_id=authorization_id,
+        )
+        require(actor, "accountBeginRenewalSession")
+        if not CreateConnectionBody._is_opaque_alias(authorization_id):
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                title="Authorization reference is invalid",
+                detail="Select a server-owned opaque provider authorization reference.",
+                status=422,
+            )
+        connection = services.store.connection_for_authorization(
+            actor,
+            authorization_id,
+            provider="wecom",
+            authorization_operation_id="accountBeginRenewalSession",
+        )
+        session, created = services.store.begin_renewal_session(
+            actor,
+            authorization_id,
+            idempotency_key=idempotency_key,
+        )
+        can_replay_unknown = bool(
+            services.authorization_cloud is not None
+            and getattr(services.authorization_cloud, "supports_durable_renewal_replay", False)
+        )
+        should_start = (
+            created
+            or session.reason_code == "provider_binding_unavailable"
+            or (
+                not created
+                and session.state == RenewalState.VERIFYING
+                and session.reason_code
+                in {
+                    "provider_start_pending",
+                    "provider_start_outcome_unknown",
+                    "provider_status_lookup_unavailable",
+                }
+                and can_replay_unknown
+            )
+        )
+        if should_start:
+            if services.authorization_cloud is None:
+                services.store.mark_renewal_start_unknown(
+                    actor,
+                    authorization_id,
+                    session.session_ref,
+                    reason_code="provider_binding_unavailable",
+                )
+            else:
+                try:
+                    provider_session = services.authorization_cloud.start_renewal(
+                        actor,
+                        connection,
+                        authorization_id,
+                        request_id=session.session_ref,
+                    )
+                    provider_authorization_ref = str(
+                        getattr(provider_session, "authorization_ref", "")
+                    )
+                    if provider_authorization_ref != authorization_id:
+                        raise RuntimeError("provider renewal response scope does not match")
+                    session = services.store.complete_renewal_session_start(
+                        actor,
+                        authorization_id,
+                        session.session_ref,
+                        provider_session_ref=str(provider_session.session_ref),
+                        state=RenewalState(provider_session.state),
+                        expires_at=provider_session.expires_at,
+                        authorization_url=provider_session.authorization_url,
+                        qr_attachment_ref=provider_session.qr_attachment_ref,
+                        generation=provider_session.generation,
+                    )
+                except Exception:
+                    services.store.mark_renewal_start_unknown(
+                        actor,
+                        authorization_id,
+                        session.session_ref,
+                        reason_code="provider_start_outcome_unknown",
+                    )
+            session = services.store.get_renewal_session(
+                actor,
+                authorization_id,
+                session.session_ref,
+                authorization_operation_id="accountBeginRenewalSession",
+            )
+        location = f"/api/v1/accounts/renewal-sessions/{session.session_ref}"
+        return JSONResponse(
+            status_code=202,
+            content=jsonable_encoder(_renewal_response(session)),
+            headers={"Location": location},
+        )
+
+    @router.get(
+        "/api/v1/accounts/renewal-sessions/{session_id}",
+        operation_id="accountGetRenewalSession",
+        response_model=RenewalSessionResponse,
+    )
+    async def get_renewal_session(
+        session_id: UUID,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="accountGetRenewalSession",
+            resource_id=str(session_id),
+        )
+        require(actor, "accountGetRenewalSession")
+        session = services.store.get_renewal_session_by_id(
+            actor,
+            str(session_id),
+            authorization_operation_id="accountGetRenewalSession",
+        )
+        services.store.connection_for_authorization(
+            actor,
+            session.authorization_ref,
+            provider="wecom",
+            authorization_operation_id="accountGetRenewalSession",
+        )
+        authorization_id = session.authorization_ref
+        has_provider_session = session.provider_session_ref is not None
+        can_lookup_unknown_start = bool(
+            services.authorization_cloud is not None
+            and getattr(services.authorization_cloud, "supports_request_id_status_lookup", False)
+            and session.state == RenewalState.VERIFYING
+            and session.reason_code == "provider_start_outcome_unknown"
+        )
+        if (
+            (has_provider_session or can_lookup_unknown_start)
+            and session.state in {RenewalState.WAITING_USER, RenewalState.VERIFYING}
+            and services.authorization_cloud is not None
+        ):
+            try:
+                status_request_id = str(uuid4())
+                if session.provider_session_ref is not None:
+                    provider_session = services.authorization_cloud.renewal_status(
+                        actor,
+                        authorization_id,
+                        session.provider_session_ref,
+                        request_id=status_request_id,
+                    )
+                else:
+                    provider_session = services.authorization_cloud.renewal_status_by_request_id(
+                        actor,
+                        authorization_id,
+                        request_id=session.session_ref,
+                        status_request_id=status_request_id,
+                    )
+                if (
+                    provider_session.authorization_ref != authorization_id
+                    or not provider_session.session_ref
+                    or (
+                        session.provider_session_ref is not None
+                        and provider_session.session_ref != session.provider_session_ref
+                    )
+                ):
+                    raise RuntimeError("provider renewal status scope does not match")
+                session = services.store.update_renewal_session_status(
+                    actor,
+                    authorization_id,
+                    session.session_ref,
+                    state=RenewalState(provider_session.state),
+                    expires_at=provider_session.expires_at,
+                    authorization_url=provider_session.authorization_url,
+                    qr_attachment_ref=provider_session.qr_attachment_ref,
+                    generation=provider_session.generation,
+                    provider_session_ref=provider_session.session_ref,
+                )
+            except Exception:
+                if session.provider_session_ref is None:
+                    session = services.store.mark_renewal_status_unavailable(
+                        actor,
+                        authorization_id,
+                        session.session_ref,
+                        reason_code="provider_status_lookup_unavailable",
+                    )
+                else:
+                    session = services.store.update_renewal_session_status(
+                        actor,
+                        authorization_id,
+                        session.session_ref,
+                        state=session.state,
+                        expires_at=session.expires_at,
+                        authorization_url=session.authorization_url,
+                        qr_attachment_ref=session.qr_attachment_ref,
+                        generation=session.generation,
+                        reason_code="provider_status_unavailable",
+                    )
+        return _renewal_response(session)
+
+    @router.get(
+        "/api/v1/integrations/connections/{connection_id}/resources",
+        operation_id="integrationListConnectionResources",
+        response_model=ConnectionResourcesResponse,
+        responses={409: {"$ref": "#/components/responses/Problem"}},
+    )
+    async def get_connection_resources(
+        connection_id: UUID,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="integrationListConnectionResources",
+            resource_id=str(connection_id),
+        )
+        require(actor, "integrationListConnectionResources")
+        connection = services.store.get_connection(
+            actor,
+            connection_id,
+            authorization_operation_id="integrationListConnectionResources",
+        )
+        health = services.store.latest_authorization_health(
+            actor,
+            connection_id,
+            authorization_operation_id="integrationListConnectionResources",
+        )
+        if health is not None and (
+            health.authorization_state == AuthorizationState.REAUTHORIZATION_REQUIRED
+            or health.login_state == LoginState.MISSING
+        ):
+            raise _reauthorization_required(connection.id, health)
+        resources = services.store.list_connection_resources(actor, connection_id)
+        checked_at = max((item.collected_at for item in resources), default=None)
+        return {
+            "connectionId": str(connection.id),
+            "provider": connection.provider,
+            "checkedAt": checked_at,
+            "resources": [
+                {
+                    "externalRef": item.external_ref,
+                    "kind": item.kind,
+                    "displayName": item.display_name,
+                    "status": item.status.value,
+                    "providerStatus": item.provider_status,
+                    "collectedAt": item.collected_at,
+                    "observedAt": item.observed_at,
+                    "source": item.source,
+                    "freshness": item.freshness.value,
+                    "attributes": item.attributes,
+                    "platformResourceRef": item.platform_resource_ref,
+                    "platformGeneration": item.platform_generation,
+                }
+                for item in resources
+            ],
+        }
+
+    @router.post(
+        "/api/v1/integrations/connections/{connection_id}/actions/refresh",
+        status_code=202,
+        operation_id="integrationRefreshConnectionResources",
+        response_model=OperationStatusResponse,
+        responses={
+            202: {
+                "description": "Read-only refresh accepted; Location polls the Product operation.",
+                "headers": {
+                    "Location": {
+                        "description": "URI reference for the Product operation.",
+                        "schema": {"type": "string", "format": "uri-reference"},
+                    }
+                },
+            }
+        },
+    )
+    async def refresh_connection_resources(
+        connection_id: UUID,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> JSONResponse:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="integrationRefreshConnectionResources",
+            resource_id=str(connection_id),
+        )
+        require(actor, "integrationRefreshConnectionResources")
+        connection = services.store.get_connection(
+            actor,
+            connection_id,
+            authorization_operation_id="integrationRefreshConnectionResources",
+        )
+        if connection.provider not in {"azure", "gcp", "hf", "runpod", "tailscale"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_PROVIDER_OPERATION_UNAVAILABLE",
+                title="Cloud resource refresh is unavailable",
+                detail="This connection does not select a supported cloud resource provider.",
+                status=422,
+            )
+        health = services.store.latest_authorization_health(
+            actor,
+            connection_id,
+            authorization_operation_id="integrationRefreshConnectionResources",
+        )
+        if health is not None and (
+            health.authorization_state == AuthorizationState.REAUTHORIZATION_REQUIRED
+            or health.login_state == LoginState.MISSING
+        ):
+            raise _reauthorization_required(connection.id, health)
+        operation = services.store.enqueue_cloud_refresh(
+            actor,
+            connection_id,
+            idempotency_key=idempotency_key,
+        )
+        location = f"/api/v1/integrations/operations/{operation.id}"
+        return JSONResponse(
+            status_code=202,
+            content=_cloud_operation_status(operation),
+            headers={"Location": location},
+        )
+
+    @router.get(
+        "/api/v1/integrations/notifications",
+        operation_id="integrationListNotifications",
+        response_model=NotificationFeedResponse,
+    )
+    async def list_notifications(
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=200),
+    ) -> dict[str, Any]:
+        actor = await principal(request, workspace_id, operation_id="integrationListNotifications")
+        require(actor, "integrationListNotifications")
+        events = services.store.list_notifications(
+            actor,
+            after_sequence=after,
+            limit=limit,
+            authorization_operation_id="integrationListNotifications",
+        )
+        return {
+            "notifications": [_notification_response(event) for event in events],
+            "nextSequence": events[-1].sequence if events else after,
+        }
+
+    @router.get(
+        "/api/v1/integrations/notifications/events",
+        operation_id="integrationStreamNotifications",
+        response_class=StreamingResponse,
+    )
+    async def stream_notifications(
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        after: int = Query(default=0, ge=0),
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
+        actor = await principal(
+            request, workspace_id, operation_id="integrationStreamNotifications"
+        )
+        require(actor, "integrationStreamNotifications")
+        if last_event_id is not None:
+            try:
+                cursor = int(last_event_id)
+            except ValueError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                    title="Last-Event-ID is invalid",
+                    detail="Last-Event-ID must be a non-negative notification sequence.",
+                    status=400,
+                ) from exc
+            if cursor < 0 or (after not in (0, cursor)):
+                raise ExchangeProductError(
+                    code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                    title="Notification cursor is ambiguous",
+                    detail="Use either after or Last-Event-ID, or provide matching values.",
+                    status=400,
+                )
+        else:
+            cursor = after
+
+        events = services.store.list_notifications(
+            actor,
+            after_sequence=cursor,
+            limit=100,
+            authorization_operation_id="integrationStreamNotifications",
+        )
+
+        async def event_stream() -> AsyncIterator[str]:
+            yield "retry: 3000\n"
+            if not events:
+                yield ": keep-alive\n\n"
+                return
+            for event in events:
+                event_json = NotificationResponse.model_validate(
+                    _notification_response(event)
+                ).model_dump_json(by_alias=True)
+                yield f"id: {event.sequence}\nevent: notification\ndata: {event_json}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @router.post(
+        "/api/v1/integrations/notifications/{notification_id}/ack",
+        operation_id="integrationAcknowledgeNotification",
+        response_model=NotificationResponse,
+    )
+    async def acknowledge_notification(
+        notification_id: UUID,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="integrationAcknowledgeNotification",
+            resource_id=str(notification_id),
+        )
+        require(actor, "integrationAcknowledgeNotification")
+        event = services.store.acknowledge_notification(
+            actor, notification_id, idempotency_key=idempotency_key
+        )
+        return _notification_response(event)
+
+    @router.post(
+        "/api/v1/integrations/notifications/{notification_id}/actions/deliver",
+        status_code=202,
+        operation_id="integrationDeliverNotification",
+        response_model=OperationStatusResponse,
+        responses={
+            202: {
+                "description": (
+                    "Durable email delivery accepted; Location polls its Product operation."
+                ),
+                "headers": {
+                    "Location": {
+                        "description": "URI reference for the Product delivery operation.",
+                        "schema": {"type": "string", "format": "uri-reference"},
+                    }
+                },
+            }
+        },
+    )
+    async def deliver_notification_email(
+        notification_id: UUID,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> JSONResponse:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="integrationDeliverNotification",
+            resource_id=str(notification_id),
+        )
+        require(actor, "integrationDeliverNotification")
+        recipient_resolver = services.email_delivery_recipient_resolver
+        if recipient_resolver is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_EMAIL_DELIVERY_UNAVAILABLE",
+                title="Email delivery is not configured",
+                detail=(
+                    "Configure an enabled email profile and actor allowlist "
+                    "before requesting delivery."
+                ),
+                status=503,
+                retryable=True,
+            )
+        recipient_ref = recipient_resolver(actor)
+        if not recipient_ref:
+            raise ExchangeProductError(
+                code="EXCHANGE_EMAIL_DELIVERY_FORBIDDEN",
+                title="Email delivery is not enabled for this actor",
+                detail="The current actor is not in the configured email delivery allowlist.",
+                status=403,
+            )
+        job, _created = services.store.request_notification_email_delivery(
+            actor,
+            notification_id,
+            recipient_ref=recipient_ref,
+            idempotency_key=idempotency_key,
+        )
+        location = f"/api/v1/integrations/operations/{job.id}"
+        return JSONResponse(
+            status_code=202,
+            content=_email_delivery_operation_status(job),
+            headers={"Location": location},
+        )
 
     @router.post(
         "/api/v1/integrations/sync-bindings",
@@ -814,7 +1774,17 @@ def create_router(services: IntegrationServices) -> APIRouter:
             resource_id=str(operation_id),
         )
         require(actor, "integrationGetOperation")
-        return _operation_status(services.store.get_operation(actor, operation_id))
+        try:
+            operation = services.store.get_operation(actor, operation_id)
+        except IntegrationNotFound:
+            try:
+                cloud_operation = services.store.get_cloud_refresh_operation(actor, operation_id)
+            except IntegrationNotFound:
+                return _email_delivery_operation_status(
+                    services.store.get_email_notification_job(actor, operation_id)
+                )
+            return _cloud_operation_status(cloud_operation)
+        return _operation_status(operation)
 
     @router.post(
         "/api/v1/integrations/operations/{operation_id}/actions/reconcile",

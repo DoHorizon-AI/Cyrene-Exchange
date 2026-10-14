@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 integrations = [
   "cyrene-account-center-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@a8a4b7eae15a7e69ec141ffe9de98b97cb596bf0#subdirectory=sdk/python/cyrene_account_center_contracts",
+  "cyrene-integration-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@0b13fad9106045c4a9aa9e6cee226e18fc14def8#subdirectory=sdk/python/cyrene_integration_contracts",
 ]
 
 [project.scripts]

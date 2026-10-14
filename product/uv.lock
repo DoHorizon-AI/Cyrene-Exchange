@@ -177,6 +177,7 @@ dependencies = [
 [package.optional-dependencies]
 integrations = [
     { name = "cyrene-account-center-contracts" },
+    { name = "cyrene-integration-contracts" },
 ]
 
 [package.dev-dependencies]
@@ -194,6 +195,7 @@ dev = [
 requires-dist = [
     { name = "cyrene-account-center-contracts", marker = "extra == 'integrations'", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_account_center_contracts&rev=a8a4b7eae15a7e69ec141ffe9de98b97cb596bf0" },
     { name = "cyrene-exchange", editable = "../" },
+    { name = "cyrene-integration-contracts", marker = "extra == 'integrations'", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=0b13fad9106045c4a9aa9e6cee226e18fc14def8" },
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "grpcio", specifier = "==1.62.3" },
     { name = "httpx", specifier = "==0.28.1" },
@@ -212,6 +214,14 @@ dev = [
     { name = "openapi-spec-validator", specifier = "==0.9.0" },
     { name = "pytest", specifier = "==9.1.1" },
     { name = "ruff", specifier = "==0.16.5" },
+]
+
+[[package]]
+name = "cyrene-integration-contracts"
+version = "0.1.0"
+source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=0b13fad9106045c4a9aa9e6cee226e18fc14def8#0b13fad9106045c4a9aa9e6cee226e18fc14def8" }
+dependencies = [
+    { name = "jsonschema" },
 ]
 
 [[package]]

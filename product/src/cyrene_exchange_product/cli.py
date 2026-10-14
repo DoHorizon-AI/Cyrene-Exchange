@@ -314,6 +314,38 @@ def _integration_dispatch(arguments: argparse.Namespace, *, once: bool) -> int:
         services.close()
 
 
+def _integration_authorization_cloud(arguments: argparse.Namespace, *, once: bool) -> int:
+    """Run authorization/cloud monitoring independently from the issue dispatcher."""
+
+    from cyrene_exchange_product.integrations.cli import (
+        build_production_services,
+        resolve_integration_database_path,
+    )
+
+    database_path = resolve_integration_database_path(
+        arguments.database,
+        explicit_path=arguments.integration_database,
+    )
+    services = build_production_services(database_path)
+    runner = services.authorization_cloud_runner
+    if runner is None:
+        services.close()
+        raise SystemExit(
+            "authorization/cloud provider bindings or current authority resolver are unavailable"
+        )
+    try:
+        if once:
+            print(json.dumps(asdict(runner.run_once()), sort_keys=True, separators=(",", ":")))
+            return 0
+        stop_event = Event()
+        signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+        runner.run_forever(stop_event)
+        return 0
+    finally:
+        services.close()
+
+
 def _integration_check_config() -> int:
     """Run offline config and Platform-profile preflight without side effects."""
 
@@ -669,6 +701,8 @@ def parser() -> argparse.ArgumentParser:
     for command_name, help_text in (
         ("dispatch", "Run the durable integration dispatcher until shutdown"),
         ("dispatch-once", "Claim and process at most one durable integration job"),
+        ("authorization-cloud", "Run authorization, cloud, and email monitoring until shutdown"),
+        ("authorization-cloud-once", "Run one authorization/cloud/email worker cycle"),
     ):
         worker = integration_commands.add_parser(command_name, help=help_text)
         worker.add_argument(
@@ -694,6 +728,11 @@ def run(argv: list[str] | None = None) -> int:
     if arguments.command == "integrations":
         if arguments.integration_command == "check-config":
             return _integration_check_config()
+        if arguments.integration_command.startswith("authorization-cloud"):
+            return _integration_authorization_cloud(
+                arguments,
+                once=arguments.integration_command.endswith("-once"),
+            )
         return _integration_dispatch(
             arguments,
             once=arguments.integration_command == "dispatch-once",

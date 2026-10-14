@@ -269,6 +269,7 @@ class ProblemDetails(ContractModel):
     retryable: bool
     trace_id: str
     resource_ref: str | None = None
+    context: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)

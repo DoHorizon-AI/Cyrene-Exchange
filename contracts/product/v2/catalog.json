@@ -183,12 +183,7 @@
       "scope": {
         "organizationPathParameter": null,
         "workspacePathParameter": null,
-        "responseBindings": [
-          {
-            "jsonPointer": "/*/workspaceId",
-            "matches": "WORKSPACE_ID"
-          }
-        ],
+        "responseBindings": [],
         "requestBindings": []
       }
     },
@@ -217,12 +212,7 @@
       "scope": {
         "organizationPathParameter": null,
         "workspacePathParameter": null,
-        "responseBindings": [
-          {
-            "jsonPointer": "/*/workspaceId",
-            "matches": "WORKSPACE_ID"
-          }
-        ],
+        "responseBindings": [],
         "requestBindings": []
       }
     },
@@ -690,6 +680,267 @@
       "idempotency": {
         "required": false,
         "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "accountBeginRenewalSession",
+      "routeId": "accountBeginRenewalSession",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1accounts~1authorizations~1{authorization_id}~1renewal-sessions/post/responses/202/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "authorization_id",
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "accountGetRenewalSession",
+      "routeId": "accountGetRenewalSession",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1accounts~1renewal-sessions~1{session_id}/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "session_id",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationGetAuthorizationHealth",
+      "routeId": "integrationGetAuthorizationHealth",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1connections~1{connection_id}~1authorization-health/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "connection_id",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationListConnectionResources",
+      "routeId": "integrationListConnectionResources",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1connections~1{connection_id}~1resources/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "connection_id",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationRefreshConnectionResources",
+      "routeId": "integrationRefreshConnectionResources",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1connections~1{connection_id}~1actions~1refresh/post/responses/202/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "connection_id",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationListNotifications",
+      "routeId": "integrationListNotifications",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1notifications/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationStreamNotifications",
+      "routeId": "integrationStreamNotifications",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1notifications~1events/get/responses/200/content/text~1event-stream/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationAcknowledgeNotification",
+      "routeId": "integrationAcknowledgeNotification",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1notifications~1{notification_id}~1ack/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "notification_id",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "integrationDeliverNotification",
+      "routeId": "integrationDeliverNotification",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1integrations~1notifications~1{notification_id}~1actions~1deliver/post/responses/202/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "notification_id",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      },
+      "idempotency": {
+        "required": true,
+        "header": "Idempotency-Key",
         "minLength": 1,
         "maxLength": 200
       },
