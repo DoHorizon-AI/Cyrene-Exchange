@@ -75,9 +75,17 @@ notification binding 是群组资源；每位成员通过 actor binding 附加�
 | `POST /api/v1/accounts/link-sessions/wecom/confirm` | Confirm a WeCom link; requires `Idempotency-Key` |
 | `GET /api/v1/accounts/links` | List the verified actor's linked account metadata |
 | `POST /api/v1/accounts/links/{account_ref}/actions/unlink` | Unlink; requires `Idempotency-Key` |
-| `POST /api/v1/integrations/connections` | Create a repository connection; requires `Idempotency-Key` |
-| `GET /api/v1/integrations/connections` | List this actor's scoped repository connections |
+| `POST /api/v1/integrations/connections` | Create a fixed provider connection using configured opaque aliases; requires `Idempotency-Key` |
+| `GET /api/v1/integrations/connections` | List the caller's minimal connection projection: Product id, provider, display name, legacy GitHub repository fields, enabled state, and timestamps |
 | `GET /api/v1/integrations/connections/{connection_id}/health` | Read the fixed Plugin runtime health observation; offline targets return `UNKNOWN` |
+| `GET /api/v1/integrations/connections/{connection_id}/authorization-health` | Read cached provider login and authorization facts; first observation returns `UNKNOWN` |
+| `POST /api/v1/accounts/authorizations/{authorization_id}/renewal-sessions` | Start or replay the actor-owned provider renewal session; requires `Idempotency-Key` and returns `202` plus a Product `Location` |
+| `GET /api/v1/accounts/authorizations/{authorization_id}/renewal-sessions/{session_id}` | Read the actor-owned Product renewal session |
+| `GET /api/v1/integrations/connections/{connection_id}/resources` | Read latest cloud observations with source and freshness |
+| `POST /api/v1/integrations/connections/{connection_id}/actions/refresh` | Queue an idempotent read-only cloud refresh; returns `202` plus a Product operation `Location` |
+| `GET /api/v1/integrations/notifications?after={sequence}` | Read the durable actor-scoped notification feed after a sequence cursor |
+| `GET /api/v1/integrations/notifications/events` | Stream the durable feed; `Last-Event-ID` resumes after a sequence |
+| `POST /api/v1/integrations/notifications/{notification_id}/ack` | Acknowledge an actor-owned notification; requires `Idempotency-Key` |
 | `POST /api/v1/integrations/sync-bindings` | Create a notification-only binding; requires `Idempotency-Key` |
 | `GET /api/v1/integrations/sync-bindings` | List scoped bindings |
 | `POST /api/v1/integrations/sync-bindings/{binding_id}/actor-bindings` | Attach this member's own account link and Platform grant; requires `Idempotency-Key` |
@@ -101,6 +109,63 @@ end-user delivery. API and dispatcher are separate process roles. The default
 gateway-only process does not load integration adapters; integration-only and
 combined modes require the closed host configuration and separate integration
 database.
+
+Authorization health preserves the provider's separate login and authorization
+states. `UNKNOWN` and `UNAVAILABLE` never imply `VALID` or expired. Exchange checks
+connections every 15 minutes, alerts on known expiry at 24 hours and 1 hour, and
+emits a confirmed reauthorization incident immediately. An unacknowledged
+actionable incident can repeat after 6 hours; unchanged state stays quiet. The
+health route continues to return the observed provider state. Resource reads and
+refreshes return HTTP 409 for a confirmed reauthorization block with code
+`EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED` and actor-scoped
+`context.connectionId` / `context.authorizationRef`. It is distinct from HTTP 401,
+HTTP 403, and Platform `AWAITING_AUTHORITY`.
+
+Cloud refresh is a fixed provider query over a server-configured opaque target
+selector. REST accepts no endpoint, shell command, credential, or model-selected
+scope. A failed provider read leaves the last observation in place and its
+freshness ages to `STALE`; it does not report a resource as stopped. The independent
+email outbox commits `SENDING` before calling the mail adapter. A lost or ambiguous
+send becomes `UNKNOWN` and is not automatically resent.
+
+Renewal creates a Product session intent before the provider call. A confirmed
+session exposes the provider's bounded official authorization URL or opaque QR
+attachment ref. If the start result is ambiguous, the session remains `VERIFYING`
+with a `provider_start_outcome_unknown` reason and no URL. Exchange does not start
+another session automatically; once the provider's durable replay implementation
+is enabled, the caller may repeat the exact POST with the same `Idempotency-Key` to
+recover that same session. A new key is a new user-authorized start.
+
+For a provider that advertises request-ID status lookup, the renewal GET may use
+the signed Product start request ID as a read-only status alias and then bind the
+returned provider session ref to the same Product session. Exchange never invokes
+the start tool from GET. If the adapter does not advertise this capability or the
+lookup cannot verify the original session, the session remains `VERIFYING` until
+manual reconciliation or an explicit same-key POST replay.
+
+授权健康状态分别保留 Provider 登录状态与授权状态。`UNKNOWN` 和 `UNAVAILABLE` 不代表
+`VALID`，也不代表已过期。Exchange 每 15 分钟检查连接，在已知到期前 24 小时和 1 小时
+提醒，并在 Provider 确认需要重新授权时立即创建事件。未确认的可操作事件可每 6 小时
+再次提醒；状态无变化时保持安静。刷新遇到已确认的重新授权阻塞会返回 HTTP 409，错误码
+为 `EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED`，并在 actor 范围内的
+`context.connectionId` / `context.authorizationRef` 中提供精确引用。它与 HTTP 401、HTTP 403
+及 Platform `AWAITING_AUTHORITY` 不同。
+
+Cloud 刷新只会查询服务器配置的固定 Provider 和 opaque target selector。REST 不接受
+Endpoint、Shell 命令、凭据或模型选择的范围。Provider 读取失败会保留最后一次观察，并让
+freshness 随时间变为 `STALE`；不会据此报告资源已停止。独立邮件发件箱会先持久化
+`SENDING` 再调用邮件适配器；发送结果丢失或不明确时标记为 `UNKNOWN`，且不会自动重发。
+
+重新授权会在调用 Provider 前持久化 Product session intent。确认创建的 session 只暴露
+Provider 给出的有限官方授权 URL 或 opaque QR attachment ref。启动结果不明确时，session
+保持 `VERIFYING`，附 `provider_start_outcome_unknown`，不提供 URL。Exchange 不会自动启动另一个
+session；Provider 的持久化重放实现启用后，调用方可使用相同 `Idempotency-Key` 重放完全相同的
+POST，以取回同一 session。新 key 表示新的用户授权操作。
+
+对于声明支持 request-ID 状态查询的 Provider，renewal GET 可以把带签名的 Product 启动 request ID
+作为只读状态别名，并将返回的 Provider session ref 绑定到原 Product session。GET 永远不会调用
+start 工具。如果 adapter 未声明此能力，或无法验证原 session，则状态保持 `VERIFYING`，直到人工核对
+或调用方显式使用同一个 key 重放 POST。
 
 所有公开写入和排队读取都必须提供 `Idempotency-Key`；相同请求重放会返回原资源/operation，改变请求则冲突。
 查询调用方应轮询 operation，并仅在成功后读取缓存 snapshot。写入只能通过带签名的 Authority execution

@@ -16,7 +16,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from cyrene_exchange_product.domain import ContractModel
 from cyrene_exchange_product.errors import ExchangeProductError
@@ -143,8 +143,11 @@ class IntegrationValidationError(IntegrationError):
     code = "INTEGRATION_INVALID"
 
 
+ProviderId = Literal["github", "wecom", "azure", "gcp", "hf", "runpod", "tailscale"]
+
+
 class IntegrationConnection(ContractModel):
-    """Scoped GitHub repository connection, independent of member Account Center links."""
+    """Provider-discriminated connection scoped to its verified creator."""
 
     id: UUID = Field(default_factory=uuid4)
     organization_id: str = Field(min_length=1, max_length=200)
@@ -152,19 +155,63 @@ class IntegrationConnection(ContractModel):
     actor_issuer: str = Field(min_length=1, max_length=1000)
     actor_subject: str = Field(min_length=1, max_length=1000)
     account_link_ref: str | None = Field(default=None, max_length=300)
-    provider: Literal["github"] = "github"
-    repository_id: str = Field(min_length=1, max_length=200)
-    repository_name: str = Field(min_length=1, max_length=300)
+    provider: ProviderId = "github"
+    binding_ref: str | None = Field(default=None, max_length=300)
+    target_ref: str | None = Field(default=None, max_length=300)
+    display_name: str | None = Field(default=None, min_length=1, max_length=300)
+    repository_id: str = Field(default="", max_length=200, exclude_if=lambda value: not value)
+    repository_name: str = Field(default="", max_length=300, exclude_if=lambda value: not value)
     enabled: bool = True
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
+    @model_validator(mode="after")
+    def validate_provider_shape(self) -> IntegrationConnection:
+        """Keep legacy repository connections distinct from cloud selectors."""
+
+        if self.provider == "github":
+            if not self.repository_id or not self.repository_name:
+                raise ValueError("GitHub connections require repositoryId and repositoryName")
+        elif self.repository_id or self.repository_name:
+            raise ValueError("non-GitHub connections cannot include repository fields")
+        if self.provider in {"azure", "gcp", "hf", "runpod", "tailscale"}:
+            if not self.binding_ref or not self.target_ref:
+                raise ValueError("cloud connections require configured bindingRef and targetRef")
+        elif self.target_ref is not None:
+            raise ValueError("targetRef is only valid for cloud resource connections")
+        if self.provider == "wecom" and not self.binding_ref:
+            raise ValueError("WeCom authorization connections require bindingRef")
+        return self
+
 
 class CreateIntegrationConnection(ContractModel):
-    """Create a group repository connection without member account references."""
+    """Create one provider connection using only opaque configured selectors."""
 
-    repository_id: str = Field(min_length=1, max_length=200)
-    repository_name: str = Field(min_length=1, max_length=300)
+    provider: ProviderId = "github"
+    binding_ref: str | None = Field(default=None, max_length=300)
+    target_ref: str | None = Field(default=None, max_length=300)
+    account_link_ref: str | None = Field(default=None, max_length=300)
+    display_name: str | None = Field(default=None, min_length=1, max_length=300)
+    repository_id: str = Field(default="", max_length=200, exclude_if=lambda value: not value)
+    repository_name: str = Field(default="", max_length=300, exclude_if=lambda value: not value)
+
+    @model_validator(mode="after")
+    def validate_provider_shape(self) -> CreateIntegrationConnection:
+        """Reject incomplete provider aliases before they reach persistent state."""
+
+        if self.provider == "github":
+            if not self.repository_id or not self.repository_name:
+                raise ValueError("GitHub connections require repositoryId and repositoryName")
+        elif self.repository_id or self.repository_name:
+            raise ValueError("non-GitHub connections cannot include repository fields")
+        if self.provider in {"azure", "gcp", "hf", "runpod", "tailscale"}:
+            if not self.binding_ref or not self.target_ref:
+                raise ValueError("cloud connections require configured bindingRef and targetRef")
+        elif self.target_ref is not None:
+            raise ValueError("targetRef is only valid for cloud resource connections")
+        if self.provider == "wecom" and not self.binding_ref:
+            raise ValueError("WeCom authorization connections require bindingRef")
+        return self
 
 
 class SyncBinding(ContractModel):
@@ -417,6 +464,262 @@ class ResourceSnapshot(ContractModel):
     observed_at: datetime
     freshness: SnapshotFreshness = SnapshotFreshness.FRESH
     document: dict[str, Any]
+
+
+class LoginState(StrEnum):
+    """Observed provider login presence; it does not establish validity."""
+
+    PRESENT = "PRESENT"
+    MISSING = "MISSING"
+    UNKNOWN = "UNKNOWN"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class AuthorizationState(StrEnum):
+    """Provider authorization fact, kept distinct from Platform grants."""
+
+    VALID = "VALID"
+    REAUTHORIZATION_REQUIRED = "REAUTHORIZATION_REQUIRED"
+    PERMISSION_DENIED = "PERMISSION_DENIED"
+    UNKNOWN = "UNKNOWN"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class RenewalState(StrEnum):
+    """Provider reauthorization flow state. | Provider 重新授权流程状态。"""
+
+    WAITING_USER = "WAITING_USER"
+    VERIFYING = "VERIFYING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    EXPIRED = "EXPIRED"
+    CANCELLED = "CANCELLED"
+
+
+class IntegrationNotificationKind(StrEnum):
+    """Stable in-app notification categories for scoped integrations."""
+
+    AUTHORIZATION_EXPIRING = "authorization.expiring"
+    AUTHORIZATION_REQUIRED = "authorization.required"
+    CONNECTION_UNAVAILABLE = "connection.unavailable"
+    CLOUD_RESOURCE_CHANGED = "cloud.resource.changed"
+    DELIVERY_FAILED = "delivery.failed"
+
+
+class NotificationSeverity(StrEnum):
+    """Bounded severity values shown in the Product notification feed."""
+
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+
+
+class IntegrationNotification(ContractModel):
+    """Durable actor-scoped event with a monotonic feed sequence."""
+
+    id: UUID = Field(default_factory=uuid4)
+    sequence: int = Field(ge=1)
+    organization_id: str
+    workspace_id: str
+    actor_issuer: str
+    actor_subject: str
+    connection_id: UUID | None = None
+    kind: IntegrationNotificationKind
+    severity: NotificationSeverity
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=2000)
+    created_at: datetime = Field(default_factory=utc_now)
+    action_ref: str | None = Field(default=None, max_length=300)
+    acknowledged_at: datetime | None = None
+    incident_key: str | None = Field(default=None, max_length=500)
+    stage: str | None = Field(default=None, max_length=80)
+
+
+class IntegrationNotificationDraft(ContractModel):
+    """Notification content and incident key before SQLite assigns sequence."""
+
+    connection_id: UUID | None = None
+    kind: IntegrationNotificationKind
+    severity: NotificationSeverity
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=2000)
+    action_ref: str | None = Field(default=None, max_length=300)
+    dedupe_key: str = Field(min_length=1, max_length=500)
+    incident_key: str | None = Field(default=None, max_length=500)
+    stage: str | None = Field(default=None, max_length=80)
+
+
+class ClaimedAuthorizationMonitor(ContractModel):
+    """Due connection and fencing token owned by one monitor worker."""
+
+    connection: IntegrationConnection
+    worker_id: str = Field(min_length=1, max_length=200)
+    claim_fence: int = Field(ge=1)
+    lease_expires_at: datetime
+
+
+class AuthorizationCapabilityRecord(ContractModel):
+    """Product projection of one capability authorization observation."""
+
+    capability_id: str = Field(min_length=1, max_length=200)
+    state: AuthorizationState
+    last_verified_at: datetime | None = None
+    expires_at: datetime | None = None
+    reason_code: str | None = Field(default=None, max_length=200)
+
+
+class AuthorizationHealthRecord(ContractModel):
+    """Persisted provider observation scoped to one owned connection."""
+
+    id: UUID = Field(default_factory=uuid4)
+    organization_id: str
+    workspace_id: str
+    actor_issuer: str
+    actor_subject: str
+    connection_id: UUID
+    authorization_ref: str | None = Field(default=None, max_length=300)
+    reason_code: str | None = Field(default=None, max_length=200)
+    login_state: LoginState
+    authorization_state: AuthorizationState
+    checked_at: datetime
+    expires_at: datetime | None = None
+    generation: int = Field(ge=0)
+    capabilities: list[AuthorizationCapabilityRecord] = Field(default_factory=list)
+
+
+class RenewalSessionRecord(ContractModel):
+    """Actor-scoped durable projection of one fixed provider renewal session."""
+
+    session_ref: str = Field(min_length=1, max_length=300)
+    authorization_ref: str = Field(min_length=1, max_length=300)
+    organization_id: str
+    workspace_id: str
+    actor_issuer: str
+    actor_subject: str
+    state: RenewalState
+    created_at: datetime
+    provider_session_ref: str | None = Field(default=None, max_length=300)
+    expires_at: datetime | None = None
+    authorization_url: str | None = Field(default=None, max_length=2000)
+    qr_attachment_ref: str | None = Field(default=None, max_length=300)
+    generation: int = Field(ge=0)
+    reason_code: str | None = Field(default=None, max_length=200)
+
+
+class CloudResourceState(StrEnum):
+    """Provider-reported state for a fixed cloud resource observation."""
+
+    RUNNING = "RUNNING"
+    STOPPED = "STOPPED"
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    DEGRADED = "DEGRADED"
+    UNKNOWN = "UNKNOWN"
+
+
+class CloudResourceRecord(ContractModel):
+    """Sanitized Product resource projection with provider and freshness facts."""
+
+    id: UUID = Field(default_factory=uuid4)
+    organization_id: str
+    workspace_id: str
+    actor_issuer: str
+    actor_subject: str
+    connection_id: UUID
+    provider: str = Field(min_length=1, max_length=80)
+    source: str = Field(min_length=1, max_length=120)
+    external_ref: str = Field(min_length=1, max_length=500)
+    kind: str = Field(min_length=1, max_length=120)
+    display_name: str = Field(min_length=1, max_length=300)
+    status: CloudResourceState
+    provider_status: str | None = Field(default=None, max_length=300)
+    collected_at: datetime
+    observed_at: datetime | None = None
+    freshness: SnapshotFreshness = SnapshotFreshness.UNKNOWN
+    attributes: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    platform_resource_ref: str | None = Field(default=None, max_length=300)
+    platform_generation: int | None = Field(default=None, ge=0)
+
+
+class CloudRefreshState(StrEnum):
+    """Durable read-only cloud refresh lifecycle."""
+
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
+
+
+class CloudRefreshOperation(ContractModel):
+    """Product operation reference for one idempotent cloud refresh request."""
+
+    id: UUID = Field(default_factory=uuid4)
+    organization_id: str
+    workspace_id: str
+    actor_issuer: str
+    actor_subject: str
+    connection_id: UUID
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state: CloudRefreshState = CloudRefreshState.QUEUED
+    result: dict[str, str | int | bool | None] | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ClaimedCloudRefresh(ContractModel):
+    """A refresh operation and its current worker fencing token."""
+
+    operation: CloudRefreshOperation
+    worker_id: str = Field(min_length=1, max_length=200)
+    claim_fence: int = Field(ge=1)
+    lease_expires_at: datetime
+
+
+class EmailOutboxState(StrEnum):
+    """Email side-effect state; UNKNOWN and SENDING are never auto-resendable."""
+
+    READY = "READY"
+    CLAIMED = "CLAIMED"
+    SENDING = "SENDING"
+    ACCEPTED = "ACCEPTED"
+    UNKNOWN = "UNKNOWN"
+    REJECTED = "REJECTED"
+
+
+class EmailNotificationJob(ContractModel):
+    """Durable, deduplicated email request generated from a notification."""
+
+    id: UUID = Field(default_factory=uuid4)
+    notification_id: UUID
+    organization_id: str
+    workspace_id: str
+    actor_issuer: str
+    actor_subject: str
+    connection_id: UUID | None = None
+    recipient_ref: str = Field(min_length=1, max_length=200)
+    subject: str = Field(min_length=1, max_length=200)
+    text: str = Field(min_length=1, max_length=4000)
+    request_ref: str = Field(min_length=1, max_length=300)
+    state: EmailOutboxState = EmailOutboxState.READY
+    attempts: int = Field(default=0, ge=0)
+    available_at: datetime = Field(default_factory=utc_now)
+    claim_owner: str | None = None
+    claim_fence: int = Field(default=0, ge=0)
+    lease_expires_at: datetime | None = None
+    vendor_receipt_ref: str | None = Field(default=None, max_length=300)
+    delivery_confirmed: bool = False
+    failure_reason_code: str | None = Field(default=None, max_length=200)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ClaimedEmailNotification(ContractModel):
+    """Email claim and monotonically increasing fencing value."""
+
+    job: EmailNotificationJob
+    claim_fence: int = Field(ge=1)
 
 
 class OperationAudit(ContractModel):

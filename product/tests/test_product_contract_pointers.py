@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -53,3 +54,69 @@ def test_product_catalog_request_pointers_select_the_route_body_schema() -> None
             _resolve_pointer(openapi, pointer)
             == request_body["content"]["application/json"]["schema"]
         ), operation_id
+
+
+def test_navigator_consumer_fixture_is_pinned_to_owner_operations() -> None:
+    repository_root = Path(__file__).parents[2]
+    openapi_path = repository_root / "contracts/product/v1/openapi.yaml"
+    catalog_path = repository_root / "contracts/product/v2/catalog.json"
+    fixture_path = repository_root / "contracts/product/v1/exchange-integration-consumer.json"
+    openapi, _ = read_from_filename(str(openapi_path))
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    assert fixture["sourceOpenapiSha256"] == hashlib.sha256(openapi_path.read_bytes()).hexdigest()
+    assert fixture["sourceCatalogSha256"] == hashlib.sha256(catalog_path.read_bytes()).hexdigest()
+
+    operations: dict[str, tuple[str, str, dict[str, Any]]] = {}
+    for path, path_item in openapi["paths"].items():
+        for method in ("get", "post", "put", "patch", "delete"):
+            definition = path_item.get(method)
+            if isinstance(definition, dict) and isinstance(definition.get("operationId"), str):
+                operations[definition["operationId"]] = (path, method.upper(), definition)
+    catalog_operations = {item["operationId"]: item for item in catalog["operations"]}
+
+    expected = {
+        "integrationCreateIssueComment",
+        "integrationGetIssue",
+        "integrationGetOperation",
+        "integrationQueryIssue",
+        "integrationUpdateIssueState",
+        "integrationListConnections",
+        "integrationGetAuthorizationHealth",
+        "accountBeginRenewalSession",
+        "accountGetRenewalSession",
+        "integrationListConnectionResources",
+    }
+    assert set(fixture["operations"]) == expected
+    for operation_id, entry in fixture["operations"].items():
+        path, method, definition = operations[operation_id]
+        assert entry["path"] == path
+        assert entry["method"] == method
+        assert entry["definition"] == definition
+        assert entry["catalog"] == catalog_operations[operation_id]
+
+    list_connections = fixture["operations"]["integrationListConnections"]
+    assert (
+        list_connections["definition"]["responses"]["200"]["content"]["application/json"]["schema"][
+            "type"
+        ]
+        == "array"
+    )
+    connection_properties = fixture["schemas"]["IntegrationConnectionResponse"]["properties"]
+    assert set(connection_properties) == {
+        "id",
+        "provider",
+        "displayName",
+        "repositoryId",
+        "repositoryName",
+        "enabled",
+        "createdAt",
+        "updatedAt",
+    }
+    resource_responses = fixture["operations"]["integrationListConnectionResources"]["definition"][
+        "responses"
+    ]
+    assert resource_responses["409"] == {"$ref": "#/components/responses/Problem"}
+    problem_context = fixture["schemas"]["ProblemDetails"]["properties"]["context"]
+    assert set(problem_context["properties"]) == {"connectionId", "authorizationRef"}

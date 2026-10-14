@@ -414,12 +414,30 @@ def test_catalog_read_accepts_only_exact_signed_product_approval(tmp_path: Path)
     )
 
     class _OwnedConnectionStore:
-        def list_connections(self, actor: IntegrationPrincipal) -> list[dict[str, str]]:
+        def list_connections(self, actor: IntegrationPrincipal) -> list[dict[str, Any]]:
             assert actor.issuer == "https://issuer.example"
             assert actor.subject == "approved-member"
             assert actor.workspace_id == "workspace-1"
             assert actor.allowed_operation_ids == frozenset({"integrationListConnections"})
-            return [{"connectionId": "connection-1"}]
+            return [
+                {
+                    "id": "b7649d78-8daf-4be3-b429-e98d9d2d9c92",
+                    "provider": "github",
+                    "displayName": "owner/repository",
+                    "repositoryId": "17",
+                    "repositoryName": "owner/repository",
+                    "enabled": True,
+                    "createdAt": "2026-10-14T00:00:00Z",
+                    "updatedAt": "2026-10-14T00:00:00Z",
+                    "organizationId": "private-org",
+                    "workspaceId": "private-workspace",
+                    "actorIssuer": "private-issuer",
+                    "actorSubject": "private-subject",
+                    "accountLinkRef": "private-account-ref",
+                    "bindingRef": "private-binding-ref",
+                    "targetRef": "private-target-ref",
+                }
+            ]
 
     services, authorizer, _ = _services(
         IntegrationPrincipal(
@@ -452,7 +470,18 @@ def test_catalog_read_accepts_only_exact_signed_product_approval(tmp_path: Path)
         )
 
     assert accepted.status_code == 200, accepted.text
-    assert accepted.json() == [{"connectionId": "connection-1"}]
+    assert accepted.json() == [
+        {
+            "id": "b7649d78-8daf-4be3-b429-e98d9d2d9c92",
+            "provider": "github",
+            "displayName": "owner/repository",
+            "repositoryId": "17",
+            "repositoryName": "owner/repository",
+            "enabled": True,
+            "createdAt": "2026-10-14T00:00:00Z",
+            "updatedAt": "2026-10-14T00:00:00Z",
+        }
+    ]
     assert wrong_path.status_code == 403
     assert wrong_workspace.status_code == 403
     assert authorizer.calls == []
@@ -505,7 +534,16 @@ def test_catalog_mutation_accepts_signed_proof_only_for_approved_raw_body(
             assert actor.allowed_operation_ids == frozenset({"integrationCreateConnection"})
             assert request.repository_id == "17"
             assert idempotency_key == idem
-            return {"connectionId": "connection-1"}
+            return {
+                "id": "b7649d78-8daf-4be3-b429-e98d9d2d9c92",
+                "provider": "github",
+                "displayName": "owner/repository",
+                "repositoryId": "17",
+                "repositoryName": "owner/repository",
+                "enabled": True,
+                "createdAt": "2026-10-14T00:00:00Z",
+                "updatedAt": "2026-10-14T00:00:00Z",
+            }
 
     services, authorizer, _ = _services(
         IntegrationPrincipal(
