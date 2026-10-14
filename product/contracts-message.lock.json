@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "sourceRepository": "DoHorizon-AI/Cyrene-Plugins-Official",
+  "sourceRevision": "c772bfaf632d28e8fba77dfb57aa8ed4215d16dc",
+  "sourceRevisionStatus": "accepted-source-merged",
+  "protoSha256": {
+    "contracts/proto/cyrene/message/connector/v1/message_connector.proto": "62b042119777209d61132e9332079072f5afd12b2a393d00574b82feb8f434fd",
+    "contracts/proto/cyrene/tool/provider/v1/tool_provider.proto": "19869c9b65a0f207378e2e052a04a29ad8472529038da5498984f603e0329b30"
+  },
+  "grpcioToolsVersion": "1.62.3",
+  "protobufRuntimeVersion": "4.25.9",
+  "descriptorSha256": {
+    "message": "16c830fff8e0710275a27803f4ee40df8e5ff91ec547f91e1168003bc483d024",
+    "tool": "80a2694c03cf86fde1ff046fd3237e42cde1c6ca8266eb04964feecfa92defe5"
+  }
+}

@@ -65,7 +65,10 @@ _MESSAGE_FIELDS = frozenset({"role", "content", "name", "tool_call_id", "tool_ca
 
 
 class DirectPluginInvoker(Protocol):
-    """Product-facing subset of the Plugins-owned direct endpoint client."""
+    """Product-facing subset of the Plugins-owned direct endpoint client.
+
+    面向 Product 的接口子集,底层客户端归 Plugins 所有并直接访问端点。
+    """
 
     def invoke(
         self,
@@ -78,7 +81,10 @@ class DirectPluginInvoker(Protocol):
         cancel_event: Event | None = None,
         request_id: str | None = None,
     ) -> DirectPayload:
-        """Invoke one method on the already-selected Plugin endpoint."""
+        """Invoke one method on the already-selected Plugin endpoint.
+
+        在已选定的 Plugin 端点上调用一个方法。
+        """
 
     def invoke_stream(
         self,
@@ -91,15 +97,24 @@ class DirectPluginInvoker(Protocol):
         cancel_event: Event | None = None,
         request_id: str | None = None,
     ) -> Iterable[DirectPayload]:
-        """Yield ordered results from the selected Plugin endpoint."""
+        """Yield ordered results from the selected Plugin endpoint.
+
+        按顺序产出所选 Plugin 端点返回的结果。
+        """
 
 
 class ModelProviderExecutionError(RuntimeError):
-    """The model-provider invocation or contract projection failed."""
+    """The model-provider invocation or contract projection failed.
+
+    模型提供方调用失败,或契约投影失败。
+    """
 
 
 class DirectPluginModelProvider:
-    """Implement Exchange's provider seam through one direct Plugin client."""
+    """Implement Exchange's provider seam through one direct Plugin client.
+
+    通过单个 Direct Plugin 客户端实现 Exchange 的提供方接口。
+    """
 
     def __init__(
         self,
@@ -118,7 +133,10 @@ class DirectPluginModelProvider:
         *,
         cancel_event: Event,
     ) -> Iterable[ProviderChunk]:
-        """Invoke the negotiated chat method and return ordered provider chunks."""
+        """Invoke the negotiated chat method and return ordered provider chunks.
+
+        调用协商后的 chat 方法,并按顺序返回提供方数据块。
+        """
 
         typed_request = _to_chat_request(request)
         structured = _requires_structured_chat(request)
@@ -159,7 +177,10 @@ class DirectPluginModelProvider:
         structured: bool,
         cancel_event: Event,
     ) -> Iterable[ProviderChunk]:
-        """Forward Plugin-owned typed chunks without local materialization."""
+        """Forward Plugin-owned typed chunks without local materialization.
+
+        转发 Plugins 所有的类型化数据块,不在本地物化完整结果。
+        """
 
         method = CHAT_COMPLETION_V2_METHOD if structured else CHAT_COMPLETION_METHOD
         interface_version = CHAT_COMPLETION_V2_INTERFACE_VERSION if structured else INTERFACE_VERSION
@@ -194,7 +215,10 @@ class DirectPluginModelProvider:
 
 
 def local_plugin_client(connection_ref: str) -> DirectPluginClient:
-    """Create a loopback-only client for one Plugin connection reference."""
+    """Create a loopback-only client for one Plugin connection reference.
+
+    为一个 Plugin connection reference 创建仅允许 loopback 的客户端。
+    """
 
     return DirectPluginClient.for_local_connection_ref(connection_ref)
 
@@ -284,7 +308,10 @@ def _to_chat_request(request: NormalizedInferenceRequest) -> ChatCompletionReque
 
 
 def _requires_structured_chat(request: NormalizedInferenceRequest) -> bool:
-    """Select v2 only when the request contains fields absent from v1."""
+    """Select v2 only when the request contains fields absent from v1.
+
+    仅当请求包含 v1 不具备的字段时才选择 v2。
+    """
 
     return bool(
         request.tools
@@ -372,7 +399,10 @@ def _from_chat_chunk(chunk: ChatCompletionChunk) -> ProviderChunk:
 
 
 def _from_tool_call_delta(call: ChatToolCallDelta):
-    """Project one Plugins-owned tool-call delta into Exchange facts."""
+    """Project one Plugins-owned tool-call delta into Exchange facts.
+
+    将一条 Plugins 所有的 tool-call 增量投影为 Exchange 事实。
+    """
 
     from .capabilities import ToolCallDelta
 

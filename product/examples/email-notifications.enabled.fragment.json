@@ -1,0 +1,26 @@
+{
+  "hostSecretRefs": {
+    "keys/email": "EXCHANGE_EMAIL_CONTEXT_HMAC_KEY"
+  },
+  "emailNotifications": {
+    "enabled": true,
+    "directPlugin": {
+      "bindingId": "host-email-notification-binding",
+      "connectionRef": "grpcs://email-notification.example.invalid:7443",
+      "transport": "mtls",
+      "mtls": {
+        "rootCertificateRef": "tls/plugin-root",
+        "clientCertificateRef": "tls/exchange-client-cert",
+        "clientKeyRef": "tls/exchange-client-key"
+      }
+    },
+    "callerWorkload": "cyrene-exchange",
+    "audience": "cyrene.connectors.email-notification",
+    "expectedIssuer": "https://identity.example.invalid",
+    "contextKeyRef": "keys/email",
+    "organizationId": "org-a",
+    "workspaceId": "workspace-a",
+    "recipientRef": "ops-oncall",
+    "allowedContextRefs": ["member-a"]
+  }
+}

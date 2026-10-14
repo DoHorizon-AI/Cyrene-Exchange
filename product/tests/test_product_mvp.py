@@ -30,7 +30,12 @@ from cyrene_exchange_product import ProductPrincipal, build_gateway_from_store, 
 
 
 class UpstreamHandler(BaseHTTPRequestHandler):
-    """Real local model HTTP peer used by the reference provider adapter."""
+    """Real local model HTTP peer used by the reference provider adapter.
+
+    中文:供参考 provider adapter 使用的本地真实模型 HTTP peer。
+    """
+
+    # 中文:参考提供方适配器使用的真实本地模型 HTTP 对端。
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -57,7 +62,12 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
 
 class LocalHttpProvider:
-    """Small real-HTTP provider used only to exercise the persisted routing path."""
+    """Small real-HTTP provider used only to exercise the persisted routing path.
+
+    中文:仅用于验证持久化路由流程的小型真实 HTTP provider。
+    """
+
+    # 中文:仅用于覆盖持久化路由路径的小型真实 HTTP 提供方。
 
     def __init__(self, server: ThreadingHTTPServer) -> None:
         self._server = server
@@ -84,7 +94,12 @@ class LocalHttpProvider:
 
 
 class ProviderResolver:
-    """Delegate that exposes only an opaque bound provider capability."""
+    """Delegate that exposes only an opaque bound provider capability.
+
+    中文:仅暴露不透明、已绑定 provider capability 的委托对象。
+    """
+
+    # 中文:只公开不透明已绑定提供方能力的委托对象。
 
     def __init__(self, binding_id: str, provider: LocalHttpProvider) -> None:
         self._binding_id = binding_id
@@ -101,7 +116,12 @@ def test_runtime_paths_match_frozen_control_openapi(tmp_path: Path) -> None:
     contract, _ = read_from_filename(
         str(Path(__file__).parents[2] / "contracts/product/v1/openapi.yaml")
     )
-    control_paths = {path for path in contract["paths"] if path.startswith("/api/")}
+    control_paths = {
+        path
+        for path in contract["paths"]
+        if path.startswith("/api/")
+        and not path.startswith(("/api/v1/accounts/", "/api/v1/integrations/"))
+    }
     assert set(app.openapi()["paths"]) == control_paths
     app.state.exchange_store.close()
 

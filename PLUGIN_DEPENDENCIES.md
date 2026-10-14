@@ -29,3 +29,17 @@ worker gRPC protocol are not active dependencies.
 
 已退役的 `cyrene-plugin-python-gateway-lite`、Spring prompt-cache host 与 Worker
 gRPC 协议不再是活动依赖。
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 能力与依赖归属
+
+| 能力或包 | 用途 | 所有权 |
+| --- | --- | --- |
+| `model.provider.v1` | 通过选定的直连端点执行规范化聊天请求 | Plugins 拥有契约和端点；Exchange 拥有 Product 请求策略 |
+| `model.routing.v1` | 返回按顺序排列的不透明路由候选 | Exchange 持久化 Product 路由；可复用的选择契约仍独立于 Provider 执行 |
+| `billing.usage.v1` | 记录并汇总 Provider 精确报告的用量 | Plugins 拥有幂等、汇总和费用计算；Exchange 拥有配额上限 |
+| `cyrene-model-provider-contracts` | `model.provider.v1` 的 Python 类型化编解码器 | `Cyrene-Plugins-Official` |
+| `cyrene-plugin-runtime` | 直连端点客户端和传输 | `Cyrene-Plugins-Official` |
+
+SDK 固定版本必须可匿名读取，并具有覆盖两个 SDK 目录的明确许可证映射。已退役的 Gateway、prompt-cache host 和 Worker gRPC 协议都不是当前依赖。
