@@ -57,10 +57,19 @@ class CurrentAuthorizationContextPort(Protocol):
         operation_id: str,
     ) -> IntegrationPrincipal | None: ...
 
-    def for_notification(
+    def for_claimed_notification(
         self,
         job: EmailNotificationJob,
         *,
+        claim_fence: int,
+        operation_id: str,
+    ) -> IntegrationPrincipal | None: ...
+
+    def for_sending_notification(
+        self,
+        job: EmailNotificationJob,
+        *,
+        claim_fence: int,
         operation_id: str,
     ) -> IntegrationPrincipal | None: ...
 
@@ -341,7 +350,11 @@ class AuthorizationCloudRunner:
         if claim is None:
             return 0, 0, 0
         try:
-            principal = self._contexts.for_notification(claim.job, operation_id=_DELIVER_OPERATION)
+            principal = self._contexts.for_claimed_notification(
+                claim.job,
+                claim_fence=claim.claim_fence,
+                operation_id=_DELIVER_OPERATION,
+            )
         except Exception:
             principal = None
         if principal is None or not _principal_matches_notification(principal, claim.job):

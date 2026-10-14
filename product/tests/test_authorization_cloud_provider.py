@@ -35,6 +35,7 @@ from cyrene_exchange_product.integrations.models import (
     AuthorizationHealthRecord,
     AuthorizationState,
     CreateIntegrationConnection,
+    EmailNotificationJob,
     IntegrationNotificationDraft,
     IntegrationNotificationKind,
     IntegrationPrincipal,
@@ -182,6 +183,32 @@ class _IdentityVerifier:
         return principal
 
 
+class _EmailStateIdentityVerifier(_IdentityVerifier):
+    """Record the durable outbox state at each real Platform verifier call."""
+
+    def __init__(
+        self,
+        store: IntegrationStore,
+        job_id,
+        principals: dict[str, IntegrationPrincipal],
+    ) -> None:
+        super().__init__(principals)
+        self.store = store
+        self.job_id = job_id
+        self.outbox_states: list[str] = []
+
+    def principal_for(self, *, bearer_token: str, workspace_id: str):
+        with self.store._lock:
+            row = self.store._connection.execute(
+                "SELECT document FROM email_notification_outbox WHERE id=?",
+                (str(self.job_id),),
+            ).fetchone()
+        assert row is not None
+        job = EmailNotificationJob.model_validate_json(str(row["document"]))
+        self.outbox_states.append(job.state.value)
+        return super().principal_for(bearer_token=bearer_token, workspace_id=workspace_id)
+
+
 class _DirectClient:
     def __init__(self, result: dict[str, Any]) -> None:
         self.result = result
@@ -218,9 +245,16 @@ class _StaticContexts:
         assert connection.actor_subject == self.principal.subject
         return self.principal
 
-    def for_notification(self, job, *, operation_id: str):
+    def for_claimed_notification(self, job, *, claim_fence: int, operation_id: str):
         self.principal.require(operation_id)
         assert job.actor_subject == self.principal.subject
+        assert job.claim_fence == claim_fence
+        return self.principal
+
+    def for_sending_notification(self, job, *, claim_fence: int, operation_id: str):
+        self.principal.require(operation_id)
+        assert job.actor_subject == self.principal.subject
+        assert job.claim_fence == claim_fence
         return self.principal
 
 
@@ -541,26 +575,14 @@ def test_wecom_renewal_accepts_only_approved_official_navigation_urls(tmp_path: 
     store.close()
 
 
-class _FlippingContexts:
-    def __init__(self, principal: IntegrationPrincipal) -> None:
-        self.principal = principal
-        self.calls = 0
+def _queue_test_notification_email(
+    store: IntegrationStore,
+    connection,
+    *,
+    now: datetime,
+) -> EmailNotificationJob:
+    """Create the same durable notification-derived job used by the worker."""
 
-    def for_notification(self, job, *, operation_id: str):
-        assert operation_id == "integrationDeliverNotification"
-        self.calls += 1
-        return self.principal if self.calls == 1 else None
-
-
-def test_email_revocation_between_precheck_and_sign_releases_without_send(
-    tmp_path: Path,
-) -> None:
-    principal = _principal()
-    settings = _settings(include_wecom=True, include_email=True)
-    registry = AuthorizationCloudProfileRegistry(settings)
-    store = IntegrationStore(tmp_path / "integrations.sqlite3")
-    connection = _connection(store, principal)
-    now = datetime(2026, 10, 14, 12, tzinfo=UTC)
     claim = store.claim_authorization_checks("monitor", now=now)[0]
     store.complete_authorization_check(
         claim,
@@ -584,45 +606,190 @@ def test_email_revocation_between_precheck_and_sign_releases_without_send(
                 severity=NotificationSeverity.ERROR,
                 title="Reauthorization required",
                 description="The provider confirmed that authorization is no longer valid.",
-                dedupe_key="mail-revocation-test",
+                dedupe_key="email-current-authority-test",
             )
         ],
         now=now,
         interval_seconds=900,
         email_recipient_ref="oncall",
     )
-    contexts = _FlippingContexts(principal)
-    mail = _DirectClient({})
+    with store._lock:
+        row = store._connection.execute(
+            "SELECT document FROM email_notification_outbox ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    assert row is not None
+    return EmailNotificationJob.model_validate_json(str(row["document"]))
+
+
+def _email_worker(
+    store: IntegrationStore,
+    registry: AuthorizationCloudProfileRegistry,
+    resolver: PlatformCurrentAuthorizationContextResolver,
+    mail: _DirectClient,
+) -> AuthorizationCloudRunner:
+    """Build the production resolver/adapter path around a synthetic DirectPlugin client."""
+
     provider = AuthorizationCloudDirectProvider(
         store=store,
         registry=registry,
         provider_clients={},
         email_client=mail,
-        current_context_resolver=contexts,
-        context_key=lambda reference: _KEY,
+        current_context_resolver=resolver,
+        context_key=lambda _reference: _KEY,
     )
-    runner = AuthorizationCloudRunner(
+    return AuthorizationCloudRunner(
         store=store,
-        contexts=contexts,
+        contexts=resolver,
         provider=provider,
         email=provider,
         worker_id="mail-worker",
         email_recipient_resolver=lambda _connection: "oncall",
     )
 
+
+def _email_identity_resolver(
+    store: IntegrationStore,
+    registry: AuthorizationCloudProfileRegistry,
+    identity: _IdentityVerifier,
+    tokens: list[str | None],
+) -> PlatformCurrentAuthorizationContextResolver:
+    """Resolve each Product worker grant through a fresh synthetic bearer."""
+
+    def next_bearer(_reference: str) -> str | None:
+        return tokens.pop(0) if tokens else None
+
+    return PlatformCurrentAuthorizationContextResolver(
+        store=store,
+        identity_verifier=identity,
+        registry=registry,
+        bearer_token=next_bearer,
+    )
+
+
+def test_email_worker_reverifies_claimed_then_sending_with_live_identity(tmp_path: Path) -> None:
+    principal = _principal()
+    settings = _settings(include_wecom=True, include_email=True)
+    registry = AuthorizationCloudProfileRegistry(settings)
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _connection(store, principal)
+    now = datetime(2026, 10, 14, 12, tzinfo=UTC)
+    job = _queue_test_notification_email(store, connection, now=now)
+    identity = _EmailStateIdentityVerifier(
+        store,
+        job.id,
+        {"token-v1": principal, "token-v2": principal},
+    )
+    resolver = _email_identity_resolver(
+        store,
+        registry,
+        identity,
+        ["token-v1", "token-v2"],
+    )
+    submission = sdk.EmailSubmission(
+        request_ref=job.request_ref,
+        status=sdk.EmailSubmissionStatus.ACCEPTED,
+        vendor_receipt_ref="synthetic-receipt-1",
+        delivery_confirmed=False,
+    )
+    mail = _DirectClient(sdk.serialize_email_submission(submission))
+    runner = _email_worker(store, registry, resolver, mail)
+
     result = runner.run_once(now=now + timedelta(seconds=1))
-    job = store._connection.execute("SELECT document FROM email_notification_outbox").fetchone()
+
+    assert result.email_submissions == 1
+    assert result.deferred == 0
+    assert identity.calls == [
+        ("token-v1", _WORKSPACE),
+        ("token-v2", _WORKSPACE),
+    ]
+    assert identity.outbox_states == ["CLAIMED", "SENDING"]
+    assert len(mail.requests) == 1
+    request = mail.requests[0]
+    assert request.provider_tool_id == "email_notification_send"
+    envelope = sdk.parse_tool_envelope(json.loads(request.arguments_json))
+    assert envelope.caller_context.operation_id == "email.notification.send"
+    assert dict(envelope.arguments)["request_ref"] == job.request_ref
+    persisted = store.get_email_notification_job(
+        principal,
+        job.id,
+        authorization_operation_id="integrationDeliverNotification",
+    )
+    assert persisted.state.value == "ACCEPTED"
+    assert persisted.attempts == 1
+    store.close()
+
+
+def test_email_revocation_between_claimed_precheck_and_sending_releases_without_send(
+    tmp_path: Path,
+) -> None:
+    principal = _principal()
+    revoked = _principal(operations={"integrationListConnections"})
+    registry = AuthorizationCloudProfileRegistry(_settings(include_wecom=True, include_email=True))
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _connection(store, principal)
+    now = datetime(2026, 10, 14, 12, tzinfo=UTC)
+    job = _queue_test_notification_email(store, connection, now=now)
+    identity = _EmailStateIdentityVerifier(
+        store,
+        job.id,
+        {"token-v1": principal, "token-revoked": revoked},
+    )
+    resolver = _email_identity_resolver(
+        store,
+        registry,
+        identity,
+        ["token-v1", "token-revoked"],
+    )
+    mail = _DirectClient({})
+    runner = _email_worker(store, registry, resolver, mail)
+
+    result = runner.run_once(now=now + timedelta(seconds=1))
 
     assert result.email_submissions == 0
     assert result.deferred == 1
-    assert contexts.calls == 2
+    assert identity.calls == [
+        ("token-v1", _WORKSPACE),
+        ("token-revoked", _WORKSPACE),
+    ]
+    assert identity.outbox_states == ["CLAIMED", "SENDING"]
     assert mail.requests == []
-    assert job is not None
     persisted = store.get_email_notification_job(
         principal,
-        __import__("uuid").UUID(json.loads(job["document"])["id"]),
+        job.id,
         authorization_operation_id="integrationDeliverNotification",
     )
     assert persisted.state.value == "READY"
     assert persisted.failure_reason_code == "current_authority_unavailable"
+    assert persisted.attempts == 1
+    store.close()
+
+
+def test_email_missing_live_bearer_defers_claim_without_sending_or_unknown(
+    tmp_path: Path,
+) -> None:
+    principal = _principal()
+    registry = AuthorizationCloudProfileRegistry(_settings(include_wecom=True, include_email=True))
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _connection(store, principal)
+    now = datetime(2026, 10, 14, 12, tzinfo=UTC)
+    job = _queue_test_notification_email(store, connection, now=now)
+    identity = _IdentityVerifier({})
+    resolver = _email_identity_resolver(store, registry, identity, [None])
+    mail = _DirectClient({})
+    runner = _email_worker(store, registry, resolver, mail)
+
+    result = runner.run_once(now=now + timedelta(seconds=1))
+
+    assert result.email_submissions == 0
+    assert result.deferred == 1
+    assert identity.calls == []
+    assert mail.requests == []
+    persisted = store.get_email_notification_job(
+        principal,
+        job.id,
+        authorization_operation_id="integrationDeliverNotification",
+    )
+    assert persisted.state.value == "READY"
+    assert persisted.failure_reason_code == "current_authority_unavailable"
+    assert persisted.attempts == 0
     store.close()

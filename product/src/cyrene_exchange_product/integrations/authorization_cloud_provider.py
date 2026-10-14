@@ -92,28 +92,83 @@ class PlatformCurrentAuthorizationContextResolver:
             )
             return None
 
-    def for_notification(
+    def for_claimed_notification(
         self,
         job: EmailNotificationJob,
         *,
+        claim_fence: int,
         operation_id: str,
     ) -> IntegrationPrincipal | None:
-        """Reverify the email owner and the dedicated delivery grant for each send."""
+        """Verify the exact fenced CLAIMED row before SENDING is persisted."""
 
         try:
             if operation_id != "integrationDeliverNotification":
                 return None
-            current = self._store.current_email_job_for_provider_call(job.id)
-            if current is None or not _same_email_request(current, job):
-                return None
-            context = self._registry.email_context_for_job(current)
-            return self._verified_principal(context, operation_id=operation_id)
+            current = self._store.current_claimed_email_job_for_authority(
+                job.id,
+                claim_fence=claim_fence,
+            )
+            return self._current_notification_principal(
+                current,
+                job,
+                claim_fence=claim_fence,
+                operation_id=operation_id,
+            )
         except Exception as exc:
             _LOGGER.info(
                 "Current authorization is unavailable for an email notification (%s)",
                 type(exc).__name__,
             )
             return None
+
+    def for_sending_notification(
+        self,
+        job: EmailNotificationJob,
+        *,
+        claim_fence: int,
+        operation_id: str,
+    ) -> IntegrationPrincipal | None:
+        """Reverify the exact fenced SENDING row immediately before provider signing."""
+
+        try:
+            if operation_id != "integrationDeliverNotification":
+                return None
+            current = self._store.current_sending_email_job_for_provider_call(
+                job.id,
+                claim_fence=claim_fence,
+            )
+            return self._current_notification_principal(
+                current,
+                job,
+                claim_fence=claim_fence,
+                operation_id=operation_id,
+            )
+        except Exception as exc:
+            _LOGGER.info(
+                "Current authorization is unavailable for an email notification (%s)",
+                type(exc).__name__,
+            )
+            return None
+
+    def _current_notification_principal(
+        self,
+        current: EmailNotificationJob | None,
+        requested: EmailNotificationJob,
+        *,
+        claim_fence: int,
+        operation_id: str,
+    ) -> IntegrationPrincipal | None:
+        """Bind one explicit outbox state read to its immutable actor and claim."""
+
+        if (
+            current is None
+            or requested.claim_fence != claim_fence
+            or current.claim_fence != claim_fence
+            or not _same_email_request(current, requested)
+        ):
+            return None
+        context = self._registry.email_context_for_job(current)
+        return self._verified_principal(context, operation_id=operation_id)
 
     def email_recipient_for_connection(
         self,
@@ -433,8 +488,9 @@ class AuthorizationCloudDirectProvider:
         job: EmailNotificationJob,
     ) -> EmailSubmissionEvidence:
         try:
-            fresh_principal = self._current_context_resolver.for_notification(
+            fresh_principal = self._current_context_resolver.for_sending_notification(
                 job,
+                claim_fence=job.claim_fence,
                 operation_id="integrationDeliverNotification",
             )
         except Exception as exc:
@@ -452,7 +508,11 @@ class AuthorizationCloudDirectProvider:
             job.id,
             authorization_operation_id="integrationDeliverNotification",
         )
-        if not _same_email_request(current, job) or current.state.value != "SENDING":
+        if (
+            not _same_email_request(current, job)
+            or current.state.value != "SENDING"
+            or current.claim_fence != job.claim_fence
+        ):
             raise PermissionError("email job changed before provider call")
         email_profile = self._registry.settings.email
         context = self._registry.email_context_for_job(current)

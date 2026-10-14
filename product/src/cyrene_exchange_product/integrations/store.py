@@ -4378,13 +4378,37 @@ class IntegrationStore:
             raise IntegrationNotFound("notification delivery operation not found")
         return EmailNotificationJob.model_validate_json(str(row["document"]))
 
-    def current_email_job_for_provider_call(self, job_id: UUID) -> EmailNotificationJob | None:
-        """Reload one SENDING email job before its host-configured provider call."""
+    def current_claimed_email_job_for_authority(
+        self,
+        job_id: UUID,
+        *,
+        claim_fence: int,
+    ) -> EmailNotificationJob | None:
+        """Reload only the exact fenced CLAIMED row for the pre-SENDING authority gate."""
 
         with self._lock:
             row = self._connection.execute(
-                "SELECT document FROM email_notification_outbox WHERE id=? AND state='SENDING'",
-                (str(job_id),),
+                """SELECT document FROM email_notification_outbox
+                   WHERE id=? AND state='CLAIMED' AND claim_fence=?""",
+                (str(job_id), claim_fence),
+            ).fetchone()
+        if row is None:
+            return None
+        return EmailNotificationJob.model_validate_json(str(row["document"]))
+
+    def current_sending_email_job_for_provider_call(
+        self,
+        job_id: UUID,
+        *,
+        claim_fence: int,
+    ) -> EmailNotificationJob | None:
+        """Reload only the exact fenced SENDING row immediately before provider signing."""
+
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT document FROM email_notification_outbox
+                   WHERE id=? AND state='SENDING' AND claim_fence=?""",
+                (str(job_id), claim_fence),
             ).fetchone()
         if row is None:
             return None

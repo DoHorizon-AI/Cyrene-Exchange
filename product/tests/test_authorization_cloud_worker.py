@@ -30,7 +30,13 @@ class _Contexts:
         self.connection_calls.append(operation_id)
         return self.principal
 
-    def for_notification(self, job, *, operation_id: str):
+    def for_claimed_notification(self, job, *, claim_fence: int, operation_id: str):
+        assert job.claim_fence == claim_fence
+        self.notification_calls.append(operation_id)
+        return self.principal
+
+    def for_sending_notification(self, job, *, claim_fence: int, operation_id: str):
+        assert job.claim_fence == claim_fence
         self.notification_calls.append(operation_id)
         return self.principal
 
