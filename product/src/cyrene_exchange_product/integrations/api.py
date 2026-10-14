@@ -1396,6 +1396,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             "nextSequence": events[-1].sequence if events else after,
         }
 
+    # Direct HTTP SSE reuses the notification-feed READ grant; it has no generic JSON RPC mapping.
     @router.get(
         "/api/v1/integrations/notifications/events",
         operation_id="integrationStreamNotifications",
@@ -1407,10 +1408,18 @@ def create_router(services: IntegrationServices) -> APIRouter:
         after: int = Query(default=0, ge=0),
         last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
     ) -> StreamingResponse:
-        actor = await principal(
-            request, workspace_id, operation_id="integrationStreamNotifications"
-        )
-        require(actor, "integrationStreamNotifications")
+        if request.headers.get("x-cyrene-execution-credential-bin"):
+            raise ExchangeProductError(
+                code="EXCHANGE_PLATFORM_EXECUTION_BINDING_MISMATCH",
+                title="Product execution credentials are not supported for notification SSE",
+                detail=(
+                    "The event-stream endpoint is direct Product HTTP and requires a "
+                    "first-party bearer with the integrationListNotifications grant."
+                ),
+                status=403,
+            )
+        actor = await principal(request, workspace_id, operation_id="integrationListNotifications")
+        require(actor, "integrationListNotifications")
         if last_event_id is not None:
             try:
                 cursor = int(last_event_id)
@@ -1435,7 +1444,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             actor,
             after_sequence=cursor,
             limit=100,
-            authorization_operation_id="integrationStreamNotifications",
+            authorization_operation_id="integrationListNotifications",
         )
 
         async def event_stream() -> AsyncIterator[str]:

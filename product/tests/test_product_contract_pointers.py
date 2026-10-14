@@ -95,6 +95,24 @@ def test_new_uuid_resource_operations_match_openapi_path_constraints() -> None:
         assert resource["pattern"] == uuid_pattern, operation_id
 
 
+def test_notification_sse_stays_direct_http_and_outside_generic_catalog() -> None:
+    """Keep text/event-stream on Exchange HTTP while sharing the feed-read grant."""
+
+    repository_root = Path(__file__).parents[2]
+    openapi_path = repository_root / "contracts/product/v1/openapi.yaml"
+    catalog_path = repository_root / "contracts/product/v2/catalog.json"
+    openapi, _ = read_from_filename(str(openapi_path))
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+
+    operation = openapi["paths"]["/api/v1/integrations/notifications/events"]["get"]
+    operation_ids = {item["operationId"] for item in catalog["operations"]}
+    assert operation["operationId"] == "integrationStreamNotifications"
+    assert "integrationStreamNotifications" not in operation_ids
+    assert "integrationListNotifications" in operation_ids
+    assert operation["security"] == [{"IntegrationBearer": []}]
+    assert "text/event-stream" in operation["responses"]["200"]["content"]
+
+
 def test_navigator_consumer_fixture_is_pinned_to_owner_operations() -> None:
     repository_root = Path(__file__).parents[2]
     openapi_path = repository_root / "contracts/product/v1/openapi.yaml"

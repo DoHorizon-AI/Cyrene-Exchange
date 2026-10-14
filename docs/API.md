@@ -84,7 +84,7 @@ notification binding 是群组资源；每位成员通过 actor binding 附加�
 | `GET /api/v1/integrations/connections/{connection_id}/resources` | Read latest cloud observations with source and freshness |
 | `POST /api/v1/integrations/connections/{connection_id}/actions/refresh` | Queue an idempotent read-only cloud refresh; returns `202` plus a Product operation `Location` |
 | `GET /api/v1/integrations/notifications?after={sequence}` | Read the durable actor-scoped notification feed after a sequence cursor |
-| `GET /api/v1/integrations/notifications/events` | Stream the durable feed; `Last-Event-ID` resumes after a sequence |
+| `GET /api/v1/integrations/notifications/events` | Direct HTTP SSE for the same feed-read grant; `Last-Event-ID` resumes after a sequence |
 | `POST /api/v1/integrations/notifications/{notification_id}/ack` | Acknowledge an actor-owned notification; requires `Idempotency-Key` |
 | `POST /api/v1/integrations/notifications/{notification_id}/actions/deliver` | Queue one actor-owned email request to the host-fixed recipient alias; requires `integrationDeliverNotification` and `Idempotency-Key` |
 | `POST /api/v1/integrations/sync-bindings` | Create a notification-only binding; requires `Idempotency-Key` |
@@ -133,6 +133,12 @@ ambiguous send becomes `UNKNOWN` and is not automatically resent. The explicit
 delivery route is idempotent and returns the existing job state for a previously
 queued or sent notification.
 
+The SSE route keeps the HTTP `integrationStreamNotifications` operation ID and
+`Last-Event-ID` recovery, but it is not a generic v2 catalog operation because
+its response is `text/event-stream`, not JSON. It uses the exact
+`integrationListNotifications` READ grant with the same actor and workspace
+checks; streaming the same feed does not add a privilege.
+
 Renewal creates a Product session intent before the provider call. A confirmed
 session exposes the provider's strictly verified WeCom navigation URI in the
 existing `authorizationUrl` field: either the fixed onboarding QR flow or the
@@ -172,6 +178,10 @@ Host/query 校验，并对管理页 URL 规范化；也可返回 opaque QR attac
 保持 `VERIFYING`，附 `provider_start_outcome_unknown`，不提供 URL。Exchange 不会自动启动另一个
 session；Provider 的持久化重放实现启用后，调用方可使用相同 `Idempotency-Key` 重放完全相同的
 POST，以取回同一 session。新 key 表示新的用户授权操作。
+
+通知 SSE 保留 HTTP `integrationStreamNotifications` operationId 和 `Last-Event-ID` 恢复，但因响应类型为
+`text/event-stream`，它不进入通用 v2 catalog。该路由复用相同 actor/workspace 校验和
+`integrationListNotifications` READ grant；流式读取同一通知资源不增加权限。
 
 对于声明支持 request-ID 状态查询的 Provider，renewal GET 可以把带签名的 Product 启动 request ID
 作为只读状态别名，并将返回的 Provider session ref 绑定到原 Product session。GET 永远不会调用
