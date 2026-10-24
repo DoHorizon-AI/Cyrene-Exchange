@@ -10,7 +10,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -24,6 +26,9 @@ from cyrene_exchange_product.integrations.auth import (
     _read_tls_file,
     canonical_json,
 )
+from cyrene_exchange_product.integrations.connector_profiles import (
+    validate_teams_service_url,
+)
 from cyrene_exchange_product.integrations.models import IntegrationPrincipal
 from cyrene_exchange_product.integrations.ports import (
     AccountAuthorization,
@@ -36,6 +41,7 @@ from cyrene_exchange_product.integrations.ports import (
     MessageEvidence,
     PluginHealthObservation,
     PluginHealthPort,
+    ProviderCredentialLeaseEvidence,
     ProviderRejectedError,
     RetryableReadError,
     WriteEvidence,
@@ -55,11 +61,30 @@ ACCOUNT_METHODS = {
     "get_authorization": "GetAuthorization",
     "unlink": "Unlink",
     "create_credential_lease": "CreateCredentialLease",
+    "link_github_app_installation": "LinkGitHubAppInstallation",
+    "link_huggingface_profile": "LinkHuggingFaceProfile",
+    "rotate_huggingface_profile": "RotateHuggingFaceProfile",
+    "register_host_identity_profile": "RegisterHostIdentityProfile",
+    "list_provider_profiles": "ListProviderProfiles",
+    "create_provider_credential_lease": "CreateProviderCredentialLease",
     "redeem_credential_lease": "RedeemCredentialLease",
+    "unlink_provider_profile": "UnlinkProviderProfile",
     "resolve_linked_sender": "ResolveLinkedSender",
 }
 GITHUB_TOOL_IDS = frozenset(
-    {"github.issue.get", "github.issue.comment.create", "github.issue.state.update"}
+    {
+        "github.repository.list",
+        "github.repository.get",
+        "github.branches.list",
+        "github.pull_requests.list",
+        "github.pull_request.get",
+        "github.actions.runs.list",
+        "github.ci.status",
+        "github_vendor_cli",
+        "github.issue.get",
+        "github.issue.comment.create",
+        "github.issue.state.update",
+    }
 )
 
 
@@ -128,6 +153,158 @@ def _direct_payload(type_url: str, value: bytes) -> Any:
             "the cyrene-plugin-runtime integration dependency is unavailable"
         ) from exc
     return DirectPayload(type_url, value)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderToolDefinition:
+    """One validated tool descriptor read from a configured provider catalog."""
+
+    tool_id: str
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+_LIST_TOOLS_RESPONSE_TYPE_URL = "type.cyrene.io/cyrene.tool.provider.v1.ListToolsResponse"
+_MAX_PROVIDER_CATALOG_BYTES = 1_048_576
+_MAX_PROVIDER_CATALOG_TOOLS = 256
+_MAX_PROVIDER_TOOL_SCHEMA_BYTES = 131_072
+_PROVIDER_TOOL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_CREDENTIAL_SCHEMA_PROPERTY = re.compile(
+    r"(?:token|secret|password|credential|api[-_]?key|private[-_]?key|bearer)",
+    re.IGNORECASE,
+)
+
+
+def list_provider_tool_catalog(
+    client: DirectInvoker,
+    *,
+    binding_id: str,
+    deadline_seconds: float = 5.0,
+) -> tuple[ProviderToolDefinition, ...]:
+    """Read and validate one catalog over the provider's configured DirectPlugin channel.
+
+    The result contains only provider-authored display/schema metadata. Invalid,
+    oversized, mismatched, or credential-bearing descriptors fail closed.
+    中文：目录来自已配置的 DirectPlugin 通道；不可信或含凭据字段时拒绝导出。
+    """
+
+    if not binding_id.strip() or deadline_seconds <= 0:
+        raise ValueError("a bound provider ID and positive catalog deadline are required")
+    from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
+        tool_provider_pb2 as tool_wire,
+    )
+
+    request = tool_wire.ListToolsRequest(binding_id=binding_id)
+    try:
+        response = client.invoke(
+            capability=PROVIDER_CAPABILITY,
+            interface_version="1",
+            method="list_tools",
+            request=_direct_payload(
+                "type.cyrene.io/cyrene.tool.provider.v1.ListToolsRequest",
+                request.SerializeToString(deterministic=True),
+            ),
+            deadline_seconds=deadline_seconds,
+            request_id=str(uuid4()),
+        )
+    except Exception as exc:
+        raise RuntimeError("configured provider tool catalog is unavailable") from exc
+    if (
+        response.type_url != _LIST_TOOLS_RESPONSE_TYPE_URL
+        or not response.value
+        or len(response.value) > _MAX_PROVIDER_CATALOG_BYTES
+    ):
+        raise RuntimeError("configured provider tool catalog response is invalid")
+    try:
+        typed_response = tool_wire.ListToolsResponse.FromString(response.value)
+    except Exception as exc:
+        raise RuntimeError("configured provider tool catalog response is malformed") from exc
+    result_kind = typed_response.WhichOneof("result")
+    if result_kind != "catalog":
+        raise RuntimeError("configured provider did not return a tool catalog")
+    catalog = typed_response.catalog
+    if (
+        not catalog.catalog_version
+        or len(catalog.catalog_version) > 128
+        or not catalog.tools
+        or len(catalog.tools) > _MAX_PROVIDER_CATALOG_TOOLS
+    ):
+        raise RuntimeError("configured provider tool catalog has invalid bounds")
+
+    descriptors: list[ProviderToolDefinition] = []
+    seen_ids: set[str] = set()
+    schema_bytes = 0
+    for descriptor in catalog.tools:
+        tool_id = descriptor.provider_tool_id
+        name = descriptor.display_name
+        description = descriptor.description
+        raw_schema = descriptor.input_schema_json
+        schema_bytes += len(raw_schema.encode("utf-8"))
+        if (
+            descriptor.binding_id != binding_id
+            or not _PROVIDER_TOOL_ID.fullmatch(tool_id)
+            or tool_id in seen_ids
+            or not name.strip()
+            or len(name) > 256
+            or not description.strip()
+            or len(description) > 4096
+            or not raw_schema
+            or len(raw_schema.encode("utf-8")) > _MAX_PROVIDER_TOOL_SCHEMA_BYTES
+            or schema_bytes > _MAX_PROVIDER_CATALOG_BYTES
+        ):
+            raise RuntimeError("configured provider returned an invalid tool descriptor")
+        try:
+            schema_value = json.loads(
+                raw_schema,
+                object_pairs_hook=_reject_duplicate_json_pairs,
+                parse_constant=_reject_json_constant,
+            )
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+            raise RuntimeError("configured provider returned an invalid tool schema") from exc
+        if (
+            not isinstance(schema_value, dict)
+            or schema_value.get("type") != "object"
+            or _schema_has_credential_property(schema_value)
+        ):
+            raise RuntimeError("configured provider returned a disallowed tool schema")
+        seen_ids.add(tool_id)
+        descriptors.append(
+            ProviderToolDefinition(
+                tool_id=tool_id,
+                name=name,
+                description=description,
+                input_schema=schema_value,
+            )
+        )
+    return tuple(descriptors)
+
+
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("provider schema contains a duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("provider schema contains a non-standard JSON constant")
+
+
+def _schema_has_credential_property(value: object) -> bool:
+    if isinstance(value, Mapping):
+        properties = value.get("properties")
+        if isinstance(properties, Mapping) and any(
+            not isinstance(name, str) or _CREDENTIAL_SCHEMA_PROPERTY.search(name)
+            for name in properties
+        ):
+            return True
+        return any(_schema_has_credential_property(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_schema_has_credential_property(child) for child in value)
+    return False
 
 
 class DirectPluginHealthClient(PluginHealthPort):
@@ -449,6 +626,146 @@ class AccountCenterClient:
             },
         )
 
+    def link_github_app_installation(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        installation_id: str,
+        repositories: list[Mapping[str, str]],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Link one verified GitHub App installation and its selected repository scope."""
+
+        return self._invoke_user(
+            "link_github_app_installation",
+            principal,
+            {
+                "profile_ref": profile_ref,
+                "installation_id": installation_id,
+                "repositories": [dict(item) for item in repositories],
+                "idempotency_key": idempotency_key,
+            },
+        )
+
+    def link_huggingface_profile(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        credential_secret_ref: str,
+        scopes: Mapping[str, object],
+        idempotency_key: str,
+        auth_mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Link one HF credential resolved only inside Account Center's host secret store."""
+
+        if auth_mode is not None and auth_mode not in {"fine_grained_token", "device_oauth"}:
+            raise ValueError("Hugging Face auth mode is unsupported")
+        payload: dict[str, object] = {
+            "profile_ref": profile_ref,
+            "credential_secret_ref": credential_secret_ref,
+            "scopes": dict(scopes),
+            "idempotency_key": idempotency_key,
+        }
+        if auth_mode is not None:
+            payload["auth_mode"] = auth_mode
+        return self._invoke_user(
+            "link_huggingface_profile",
+            principal,
+            payload,
+        )
+
+    def rotate_huggingface_profile(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        credential_secret_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Replace one HF host secret reference while checking the same external owner."""
+
+        return self._invoke_user(
+            "rotate_huggingface_profile",
+            principal,
+            {
+                "profile_ref": profile_ref,
+                "credential_secret_ref": credential_secret_ref,
+                "idempotency_key": idempotency_key,
+            },
+        )
+
+    def register_host_identity_profile(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        provider: str,
+        identity_ref: str,
+        target_scope: Mapping[str, object],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Register non-secret host identity and scope metadata for a fixed cloud profile."""
+
+        return self._invoke_user(
+            "register_host_identity_profile",
+            principal,
+            {
+                "profile_ref": profile_ref,
+                "provider": provider,
+                "identity_ref": identity_ref,
+                "target_scope": dict(target_scope),
+                "idempotency_key": idempotency_key,
+            },
+        )
+
+    def list_provider_profiles(self, principal: IntegrationPrincipal) -> dict[str, Any]:
+        """List only non-secret provider identity metadata visible to this actor."""
+
+        return self._invoke_user("list_provider_profiles", principal, {})
+
+    def create_provider_credential_lease(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        operation_id: str,
+        target: Mapping[str, object],
+        arguments_sha256: str,
+        connector_grant: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Create one exact target/argument-bound provider credential lease."""
+
+        payload: dict[str, object] = {
+            "profile_ref": profile_ref,
+            "operation_id": operation_id,
+            "target": dict(target),
+            "arguments_sha256": arguments_sha256,
+        }
+        if connector_grant is not None:
+            payload["connector_grant"] = dict(connector_grant)
+        return self._invoke_user(
+            "create_provider_credential_lease",
+            principal,
+            payload,
+        )
+
+    def unlink_provider_profile(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Remove a provider profile and invalidate its outstanding leases."""
+
+        return self._invoke_user(
+            "unlink_provider_profile",
+            principal,
+            {"profile_ref": profile_ref, "idempotency_key": idempotency_key},
+        )
+
     def _invoke_user(
         self,
         method: str,
@@ -465,7 +782,13 @@ class AccountCenterClient:
         payload: Mapping[str, object],
     ) -> dict[str, Any]:
         if signer is None:
-            raise RuntimeError(f"the configured {method} Account Center signer is unavailable")
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_NOT_CONFIGURED",
+                title="Account Center operation is not configured",
+                detail="This optional Account Center operation has no host-authorized signer.",
+                status=503,
+                retryable=False,
+            )
         payload = _typed_account_payload(method, payload)
         request_id = str(uuid4())
         trusted_context = signer.sign(
@@ -489,10 +812,12 @@ class AccountCenterClient:
                 request_id=request_id,
             )
         except Exception as exc:
-            if getattr(exc, "domain_code", "") in {
+            domain_code = getattr(exc, "domain_code", "")
+            provider_reason = getattr(exc, "message", "")
+            if domain_code in {
                 "idempotency_conflict",
                 "idempotency_in_progress",
-            }:
+            } or provider_reason in {"idempotency_conflict", "idempotency_in_progress"}:
                 raise ExchangeProductError(
                     code="EXCHANGE_IDEMPOTENCY_CONFLICT",
                     title="Idempotency key conflict",
@@ -500,6 +825,30 @@ class AccountCenterClient:
                         "The Account Center idempotency key is already bound to another request."
                     ),
                     status=409,
+                ) from exc
+            if domain_code == "PERMISSION_DENIED" and provider_reason == "connector_grant_replayed":
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_REPLAYED",
+                    title="Connector grant was already used",
+                    detail="Account Center rejected a previously consumed one-use connector grant.",
+                    status=409,
+                    context={"reasonCode": "account_center_connector_grant_replayed"},
+                ) from exc
+            if domain_code == "PERMISSION_DENIED":
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_AUTHORIZATION_DENIED",
+                    title="Account Center authorization denied",
+                    detail="Account Center rejected the verified actor or provider scope.",
+                    status=403,
+                    context={"reasonCode": "account_center_permission_denied"},
+                ) from exc
+            if domain_code == "INVALID_REQUEST":
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_REQUEST_INVALID",
+                    title="Account Center request invalid",
+                    detail="Account Center rejected the typed request fields.",
+                    status=422,
+                    context={"reasonCode": "account_center_request_invalid"},
                 ) from exc
             raise ExchangeProductError(
                 code="EXCHANGE_ACCOUNT_CENTER_UNAVAILABLE",
@@ -531,6 +880,7 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
     try:
         from dataclasses import asdict
 
+        import cyrene_account_center_contracts as account_contracts
         from cyrene_account_center_contracts import (
             BeginLinkRequest,
             CompleteGitHubLinkRequest,
@@ -558,10 +908,48 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         "create_credential_lease": CreateCredentialLeaseRequest,
         "resolve_linked_sender": ResolveLinkedSenderRequest,
     }
-    dto_type = dto_types.get(method)
+    dynamic_types = {
+        "link_github_app_installation": "LinkGitHubAppInstallationRequest",
+        "link_huggingface_profile": "LinkHuggingFaceProfileRequest",
+        "rotate_huggingface_profile": "RotateHuggingFaceProfileRequest",
+        "register_host_identity_profile": "RegisterHostIdentityProfileRequest",
+        "list_provider_profiles": "ListProviderProfilesRequest",
+        "create_provider_credential_lease": "CreateProviderCredentialLeaseRequest",
+        "unlink_provider_profile": "UnlinkProviderProfileRequest",
+    }
+    if method in dynamic_types:
+        dto_type = getattr(account_contracts, dynamic_types[method], None)
+        if dto_type is None:
+            raise RuntimeError(
+                "the configured Account Center SDK lacks the requested provider profile contract"
+            )
+    else:
+        dto_type = dto_types.get(method)
     if dto_type is None:
         raise ValueError("unsupported Account Center method")
     values = dict(payload)
+    if method == "create_provider_credential_lease" and "connector_grant" in values:
+        dto_fields = getattr(dto_type, "__dataclass_fields__", {})
+        if "connector_grant" not in dto_fields:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_SHARED_PROFILE_NOT_CONFIGURED",
+                title="Shared Account Center lease authorization is unavailable",
+                detail=(
+                    "The pinned Account Center contract cannot verify workspace-operator grants."
+                ),
+                status=503,
+                retryable=True,
+                context={"reasonCode": "account_center_connector_grant_contract_missing"},
+            )
+    if method == "link_huggingface_profile" and "auth_mode" in values:
+        dto_fields = getattr(dto_type, "__dataclass_fields__", {})
+        if "auth_mode" not in dto_fields:
+            if values["auth_mode"] == "fine_grained_token":
+                values.pop("auth_mode")
+            else:
+                raise RuntimeError(
+                    "the configured Account Center SDK lacks Hugging Face OAuth profile support"
+                )
     if method in {"get_authorization", "create_credential_lease"}:
         resource = values.get("resource")
         if not isinstance(resource, Mapping):
@@ -680,6 +1068,59 @@ class IntegrationAccountCenterPort:
             workspace_id=workspace_id,
             account_link_ref=str(fields["account_ref"]),
             external_sender_id=stable_subject,
+        )
+
+    def create_provider_credential_lease(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        operation_id: str,
+        target: Mapping[str, object],
+        arguments_sha256: str,
+        connector_grant: Mapping[str, object] | None = None,
+    ) -> ProviderCredentialLeaseEvidence:
+        """Request one-use lease metadata without redeeming any provider credential."""
+
+        if len(arguments_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in arguments_sha256
+        ):
+            raise ValueError("provider lease arguments digest is invalid")
+        lease = self._client.create_provider_credential_lease(
+            principal,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            target=target,
+            arguments_sha256=arguments_sha256,
+            connector_grant=connector_grant,
+        )
+        if (
+            lease.get("profile_ref") != profile_ref
+            or lease.get("operation_id") != operation_id
+            or lease.get("target") != dict(target)
+            or lease.get("arguments_sha256") != arguments_sha256
+        ):
+            raise PermissionError("Account Center returned a lease with mismatched scope")
+        lease_ref = lease.get("lease_ref")
+        provider = lease.get("provider")
+        expires_at = lease.get("expires_at")
+        if (
+            not isinstance(lease_ref, str)
+            or not lease_ref
+            or not isinstance(provider, str)
+            or provider not in {"github", "huggingface"}
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, int)
+        ):
+            raise RuntimeError("Account Center returned malformed provider lease metadata")
+        return ProviderCredentialLeaseEvidence(
+            lease_ref=lease_ref,
+            profile_ref=profile_ref,
+            provider=provider,
+            operation_id=operation_id,
+            target=dict(target),
+            arguments_sha256=arguments_sha256,
+            expires_at=datetime.fromtimestamp(expires_at, UTC),
         )
 
 
@@ -869,6 +1310,15 @@ class GitHubIssuesClient:
         self._binding_id = binding_id
         self._deadline_seconds = deadline_seconds
 
+    def list_tool_catalog(self) -> tuple[ProviderToolDefinition, ...]:
+        """Return the live catalog exposed by this configured GitHub Plugin binding."""
+
+        return list_provider_tool_catalog(
+            self._client,
+            binding_id=self._binding_id,
+            deadline_seconds=self._deadline_seconds,
+        )
+
     def get_issue(
         self,
         principal: IntegrationPrincipal,
@@ -934,6 +1384,73 @@ class GitHubIssuesClient:
                 "state": state,
             },
         )
+
+    def call_provider_tool(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        tool_id: str,
+        profile_ref: str,
+        lease_ref: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, Any]:
+        """Invoke one fixed GitHub operation with Account Center one-use lease metadata."""
+
+        if tool_id not in GITHUB_TOOL_IDS or not profile_ref or not lease_ref:
+            raise ValueError("GitHub provider tool, profile, and lease must be allowlisted")
+        envelope_payload = {
+            "payload": dict(payload),
+            "profile_ref": profile_ref,
+            "lease_ref": lease_ref,
+        }
+        trusted_context = self._signer.sign_provider_call(
+            principal=principal,
+            binding_id=self._binding_id,
+            method="call_tool",
+            operation_id=tool_id,
+            payload=envelope_payload,
+        ).as_payload()
+        from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
+            tool_provider_pb2 as tool_wire,
+        )
+
+        call = tool_wire.CallToolRequest(
+            binding_id=self._binding_id,
+            provider_tool_id=tool_id,
+            arguments_json=canonical_json(
+                {**envelope_payload, "trusted_context": trusted_context}
+            ).decode("utf-8"),
+        )
+        try:
+            response = self._client.invoke(
+                capability=PROVIDER_CAPABILITY,
+                interface_version="1",
+                method="call_tool",
+                request=_direct_payload(
+                    "type.cyrene.io/cyrene.tool.provider.v1.CallToolRequest",
+                    call.SerializeToString(deterministic=True),
+                ),
+                deadline_seconds=self._deadline_seconds,
+                request_id=str(uuid4()),
+            )
+        except Exception as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_GITHUB_PROVIDER_UNAVAILABLE",
+                title="GitHub provider unavailable",
+                detail="The configured GitHub provider capability did not complete the request.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "provider_unavailable"},
+            ) from exc
+        if response.type_url != "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse":
+            raise ExchangeProductError(
+                code="EXCHANGE_GITHUB_PROVIDER_RESPONSE_INVALID",
+                title="GitHub provider response invalid",
+                detail="The configured GitHub provider returned an unexpected response type.",
+                status=502,
+            )
+        result = _decode_generic_provider_result(response.value, provider="GitHub")
+        return result
 
     def _call_tool(
         self,
@@ -1272,6 +1789,310 @@ class WeComMessageClient:
         )
 
 
+class TeamsMessageClient:
+    """Send one grant-bound reply through the configured Teams message Plugin."""
+
+    def __init__(self, client: DirectInvoker, *, deadline_seconds: float = 10.0) -> None:
+        if deadline_seconds <= 0:
+            raise ValueError("deadline_seconds must be positive")
+        self._client = client
+        self._deadline_seconds = deadline_seconds
+
+    def send_reply(
+        self,
+        *,
+        bot_app_id: str,
+        tenant_id: str,
+        team_id: str,
+        channel_id: str,
+        conversation_id: str,
+        root_thread_id: str,
+        service_url: str,
+        text: str,
+        request_id: str,
+    ) -> MessageEvidence:
+        """Reply to one exact Teams thread using the fixed bot account binding."""
+
+        values = (
+            bot_app_id,
+            tenant_id,
+            team_id,
+            channel_id,
+            conversation_id,
+            root_thread_id,
+            service_url,
+            request_id,
+        )
+        if (
+            any(not isinstance(value, str) or not value.strip() for value in values)
+            or not text.strip()
+            or len(text) > 24_000
+        ):
+            raise ValueError("Teams reply scope, text, and request id are required")
+        validate_teams_service_url(service_url, tenant_id=tenant_id)
+        from cyrene_exchange_product.integrations._generated.cyrene.message.connector.v1 import (
+            message_connector_pb2 as message_wire,
+        )
+
+        request = message_wire.SendMessageRequest(
+            conversation=message_wire.ConversationScope(
+                vendor="msteams",
+                account_id=bot_app_id,
+                conversation_id=conversation_id,
+                kind=message_wire.CONVERSATION_KIND_CHANNEL,
+            ),
+            content=[message_wire.MessageContentPart(text=message_wire.TextContent(text=text))],
+            vendor_extension=message_wire.VendorExtension(
+                vendor="msteams",
+                facts=[
+                    message_wire.VendorFact(name="tenant_id", value=tenant_id),
+                    message_wire.VendorFact(name="team_id", value=team_id),
+                    message_wire.VendorFact(name="channel_id", value=channel_id),
+                    message_wire.VendorFact(name="service_url", value=service_url),
+                ],
+            ),
+        )
+        request.reply.message_id = root_thread_id
+        try:
+            response = self._client.invoke(
+                capability="message.connector.v1",
+                interface_version="1",
+                method="send_message",
+                request=_direct_payload(
+                    "type.cyrene.io/cyrene.message.connector.v1.SendMessageRequest",
+                    request.SerializeToString(deterministic=True),
+                ),
+                deadline_seconds=self._deadline_seconds,
+                request_id=_runtime_request_id(request_id),
+            )
+        except Exception as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_TEAMS_PROVIDER_UNAVAILABLE",
+                title="Teams connector unavailable",
+                detail="The configured Teams message connector did not complete the reply.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "provider_unavailable"},
+            ) from exc
+        expected_type = "type.cyrene.io/cyrene.message.connector.v1.DeliveryResult"
+        if response.type_url != expected_type:
+            raise ExchangeProductError(
+                code="EXCHANGE_TEAMS_PROVIDER_RESPONSE_INVALID",
+                title="Teams connector response invalid",
+                detail="The configured Teams connector returned an unexpected response type.",
+                status=502,
+            )
+        result = message_wire.DeliveryResult()
+        try:
+            result.ParseFromString(response.value)
+        except Exception as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_TEAMS_PROVIDER_RESPONSE_INVALID",
+                title="Teams connector response invalid",
+                detail="The configured Teams connector returned a malformed delivery result.",
+                status=502,
+            ) from exc
+        if result.status not in {
+            message_wire.DELIVERY_STATUS_ACCEPTED,
+            message_wire.DELIVERY_STATUS_REJECTED,
+            message_wire.DELIVERY_STATUS_RATE_LIMITED,
+        }:
+            raise ExchangeProductError(
+                code="EXCHANGE_TEAMS_PROVIDER_RESPONSE_INVALID",
+                title="Teams connector response invalid",
+                detail="The configured Teams connector returned an indeterminate delivery state.",
+                status=502,
+            )
+        facts = {fact.name: fact.value for fact in result.vendor_extension.facts if fact.name}
+        reason_code = facts.get("reason_code")
+        if reason_code in {"AUTH_EXPIRED", "AUTHENTICATION_FAILED", "CREDENTIAL_MISSING"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_TEAMS_AUTH_EXPIRED",
+                title="Teams authorization expired",
+                detail=(
+                    "The Teams provider reported that its configured bot authorization "
+                    "is unavailable."
+                ),
+                status=401,
+                context={"reasonCode": "auth_expired"},
+            )
+        if reason_code in {"PERMISSION_DENIED", "SCOPE_DENIED"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_TEAMS_PERMISSION_DENIED",
+                title="Teams permission denied",
+                detail="The Teams provider denied this configured channel operation.",
+                status=403,
+                context={"reasonCode": "permission_denied"},
+            )
+        evidence: dict[str, object] = {
+            "status": message_wire.DeliveryStatus.Name(result.status),
+            "reasonCode": reason_code,
+        }
+        if result.status == message_wire.DELIVERY_STATUS_RATE_LIMITED and result.HasField(
+            "retry_after"
+        ):
+            retry_after = max(
+                1,
+                int(result.retry_after.seconds) + int(result.retry_after.nanos > 0),
+            )
+            evidence["retryAfterSeconds"] = retry_after
+        return MessageEvidence(
+            accepted=result.status == message_wire.DELIVERY_STATUS_ACCEPTED,
+            vendor_message_id=(result.vendor_message_id or None),
+            transport_request_id=request_id
+            if result.status == message_wire.DELIVERY_STATUS_ACCEPTED
+            else None,
+            observed_at=datetime.now(UTC),
+            evidence=evidence,
+        )
+
+
+class PlatformConnectorAuthorizationClient:
+    """Call only the dedicated connector grant RPC over Exchange workload mTLS."""
+
+    def __init__(
+        self,
+        *,
+        target: str,
+        root_certificates_path: Path,
+        private_key_path: Path,
+        certificate_chain_path: Path,
+        deadline_seconds: float = 3.0,
+    ) -> None:
+        if not target.startswith("grpcs://"):
+            raise ValueError("connector Authority target must use grpcs:// mTLS")
+        if deadline_seconds <= 0:
+            raise ValueError("Authority RPC deadline must be positive")
+        self._target = target.removeprefix("grpcs://")
+        self._root_certificates = _read_tls_file(root_certificates_path, private=False)
+        self._private_key = _read_tls_file(private_key_path, private=True)
+        self._certificate_chain = _read_tls_file(certificate_chain_path, private=False)
+        self._deadline_seconds = deadline_seconds
+
+    def authorize_connector_operation(
+        self,
+        *,
+        workspace_id: str,
+        principal_issuer: str,
+        principal_subject: str,
+        connection_ref: str,
+        provider_id: str,
+        profile_ref: str,
+        operation_id: str,
+        resource_ref: str,
+        arguments_digest_sha256: bytes,
+        request_id: str,
+    ) -> bytes:
+        """Request one fresh Directory grant; this client has no legacy RPC stub."""
+
+        authority_wire, authority_grpc = _load_authority_wire()
+        request_type = getattr(authority_wire, "AuthorizeConnectorOperationRequest", None)
+        if request_type is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                title="Connector authorization is not configured",
+                detail="The pinned Platform Authority contract has no connector grant method.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "authority_connector_grant_contract_missing"},
+            )
+        if (
+            len(arguments_digest_sha256) != 32
+            or not request_id
+            or not all(
+                (
+                    workspace_id,
+                    principal_issuer,
+                    principal_subject,
+                    connection_ref,
+                    provider_id,
+                    profile_ref,
+                    operation_id,
+                    resource_ref,
+                )
+            )
+        ):
+            raise ValueError("connector grant request scope is incomplete")
+        rpc_request = request_type(
+            workspace_id=workspace_id,
+            principal_issuer=principal_issuer,
+            principal_subject=principal_subject,
+            connection_ref=connection_ref,
+            provider_id=provider_id,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            resource_ref=resource_ref,
+            arguments_digest_sha256=arguments_digest_sha256,
+            request_id=request_id,
+        )
+        import grpc
+
+        credentials = grpc.ssl_channel_credentials(
+            root_certificates=self._root_certificates,
+            private_key=self._private_key,
+            certificate_chain=self._certificate_chain,
+        )
+        channel = grpc.secure_channel(self._target, credentials)
+        try:
+            stub_type = getattr(
+                authority_grpc,
+                "WorkspaceConnectorAuthorizationServiceStub",
+                None,
+            )
+            if stub_type is None:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                    title="Connector authorization is not configured",
+                    detail="The pinned Platform contract has no connector-only Authority service.",
+                    status=503,
+                    retryable=True,
+                    context={"reasonCode": "authority_connector_service_missing"},
+                )
+            response = stub_type(channel).AuthorizeConnectorOperation(
+                rpc_request,
+                timeout=self._deadline_seconds,
+            )
+        except ExchangeProductError:
+            raise
+        except Exception as exc:
+            status_code = exc.code() if hasattr(exc, "code") else None
+            if status_code == grpc.StatusCode.PERMISSION_DENIED:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Connector authorization denied",
+                    detail="Platform Directory did not grant this exact connector operation.",
+                    status=403,
+                    context={"reasonCode": "directory_grant_denied"},
+                ) from exc
+            if status_code == grpc.StatusCode.INVALID_ARGUMENT:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                    title="Connector request is invalid",
+                    detail="Platform rejected the connector operation scope or request fields.",
+                    status=422,
+                    context={"reasonCode": "authority_request_invalid"},
+                ) from exc
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORITY_UNAVAILABLE",
+                title="Connector authorization unavailable",
+                detail="Platform Authority could not authorize this connector operation.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "authority_unavailable"},
+            ) from exc
+        finally:
+            channel.close()
+        grant = getattr(response, "grant", None)
+        if grant is None or not grant.grant_ref:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORITY_RESPONSE_INVALID",
+                title="Connector authorization response invalid",
+                detail="Platform Authority returned no signed connector operation grant.",
+                status=502,
+            )
+        return bytes(grant.SerializeToString(deterministic=True))
+
+
 class PlatformAuthorityDelegationClient(DelegationPort):
     """Use the registered Exchange workload profile for delegated enqueue/status."""
 
@@ -1301,6 +2122,107 @@ class PlatformAuthorityDelegationClient(DelegationPort):
         self._workload_id = workload_id
         self._audience = audience
         self._deadline_seconds = deadline_seconds
+
+    def authorize_connector_operation(
+        self,
+        *,
+        workspace_id: str,
+        principal_issuer: str,
+        principal_subject: str,
+        connection_ref: str,
+        provider_id: str,
+        profile_ref: str,
+        operation_id: str,
+        resource_ref: str,
+        arguments_digest_sha256: bytes,
+        request_id: str,
+    ) -> bytes:
+        """Ask Authority for one fresh signed connector grant over Exchange mTLS."""
+
+        authority_wire, _ = _load_authority_wire()
+        request_type = getattr(authority_wire, "AuthorizeConnectorOperationRequest", None)
+        if request_type is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                title="Connector authorization is not configured",
+                detail="The pinned Platform Authority contract has no connector grant method.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "authority_connector_grant_contract_missing"},
+            )
+        if (
+            len(arguments_digest_sha256) != 32
+            or not request_id
+            or not all(
+                (
+                    workspace_id,
+                    principal_issuer,
+                    principal_subject,
+                    connection_ref,
+                    provider_id,
+                    profile_ref,
+                    operation_id,
+                    resource_ref,
+                )
+            )
+        ):
+            raise ValueError("connector grant request scope is incomplete")
+        request = request_type(
+            workspace_id=workspace_id,
+            principal_issuer=principal_issuer,
+            principal_subject=principal_subject,
+            connection_ref=connection_ref,
+            provider_id=provider_id,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            resource_ref=resource_ref,
+            arguments_digest_sha256=arguments_digest_sha256,
+            request_id=request_id,
+        )
+        try:
+            import grpc
+
+            with self._workload_stub(connector_only=True) as stub:
+                response = stub.AuthorizeConnectorOperation(
+                    request,
+                    timeout=self._deadline_seconds,
+                )
+        except Exception as exc:
+            status_code = exc.code() if hasattr(exc, "code") else None
+            code = getattr(grpc.StatusCode, "PERMISSION_DENIED", None)
+            if status_code == code:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Connector authorization denied",
+                    detail="Platform Directory did not grant this exact connector operation.",
+                    status=403,
+                    context={"reasonCode": "directory_grant_denied"},
+                ) from exc
+            if status_code == getattr(grpc.StatusCode, "INVALID_ARGUMENT", None):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                    title="Connector request is invalid",
+                    detail="Platform rejected the connector operation scope or request fields.",
+                    status=422,
+                    context={"reasonCode": "authority_request_invalid"},
+                ) from exc
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORITY_UNAVAILABLE",
+                title="Connector authorization unavailable",
+                detail="Platform Authority could not authorize this connector operation.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "authority_unavailable"},
+            ) from exc
+        grant = getattr(response, "grant", None)
+        if grant is None or not grant.grant_ref:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORITY_RESPONSE_INVALID",
+                title="Connector authorization response invalid",
+                detail="Platform Authority returned no signed connector operation grant.",
+                status=502,
+            )
+        return bytes(grant.SerializeToString(deterministic=True))
 
     def validate_binding(
         self,
@@ -1511,7 +2433,7 @@ class PlatformAuthorityDelegationClient(DelegationPort):
             result_ref=None,
         )
 
-    def _workload_stub(self) -> Any:
+    def _workload_stub(self, *, connector_only: bool = False) -> Any:
         """Return a scoped context manager for one short-lived gRPC channel."""
 
         from contextlib import contextmanager
@@ -1531,7 +2453,24 @@ class PlatformAuthorityDelegationClient(DelegationPort):
             )
             channel = grpc.secure_channel(self._target, credentials)
             try:
-                yield authority_grpc.WorkspaceAuthorityServiceStub(channel)
+                stub_type_name = (
+                    "WorkspaceConnectorAuthorizationServiceStub"
+                    if connector_only
+                    else "WorkspaceAuthorityServiceStub"
+                )
+                stub_type = getattr(authority_grpc, stub_type_name, None)
+                if stub_type is None:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                        title="Connector authorization is not configured",
+                        detail=(
+                            "The pinned Platform contract has no connector-only Authority service."
+                        ),
+                        status=503,
+                        retryable=True,
+                        context={"reasonCode": "authority_connector_service_missing"},
+                    )
+                yield stub_type(channel)
             finally:
                 channel.close()
 
@@ -1630,6 +2569,125 @@ def _decode_tool_result(value: bytes, *, tool_id: str) -> dict[str, Any]:
     if len(results) != 1:
         raise RuntimeError("GitHub provider must return exactly one structured result")
     return results[0]
+
+
+def _decode_generic_provider_result(value: bytes, *, provider: str) -> dict[str, Any]:
+    """Map one typed connector failure to a structured Exchange HTTP problem."""
+
+    from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
+        tool_provider_pb2 as tool_wire,
+    )
+
+    try:
+        response = tool_wire.CallToolResponse.FromString(value)
+    except Exception as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_RESPONSE_INVALID",
+            title="Provider response invalid",
+            detail=f"The configured {provider} provider returned malformed response data.",
+            status=502,
+        ) from exc
+    result_kind = response.WhichOneof("result")
+    if result_kind == "error":
+        code_name = tool_wire.ToolProviderErrorCode.Name(response.error.code)
+        _raise_provider_error(code_name, retryable=response.error.retryable)
+    if result_kind != "outcome":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_RESPONSE_INVALID",
+            title="Provider response invalid",
+            detail=f"The configured {provider} provider returned no structured result.",
+            status=502,
+        )
+    if response.outcome.is_error:
+        error = _structured_tool_json(response.outcome.content).get("error")
+        if not isinstance(error, Mapping) or not isinstance(error.get("code"), str):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_RESPONSE_INVALID",
+                title="Provider response invalid",
+                detail=f"The configured {provider} provider returned an invalid structured error.",
+                status=502,
+            )
+        _raise_provider_error(
+            str(error["code"]),
+            retryable=error.get("retryable") is True,
+            unknown=error.get("outcome") == "UNKNOWN" or error.get("state") == "UNKNOWN_RESULT",
+        )
+    result = _structured_tool_json(response.outcome.content)
+    if result:
+        return result
+    raise ExchangeProductError(
+        code="EXCHANGE_CONNECTOR_PROVIDER_RESPONSE_INVALID",
+        title="Provider response invalid",
+        detail=f"The configured {provider} provider must return one structured JSON object.",
+        status=502,
+    )
+
+
+def _raise_provider_error(
+    code: str,
+    *,
+    retryable: bool,
+    unknown: bool = False,
+) -> None:
+    """Translate vendor-neutral Plugin error codes without exposing raw output."""
+
+    normalized = code.upper()
+    if unknown:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_OUTCOME_UNKNOWN",
+            title="Provider operation outcome is unknown",
+            detail=(
+                "The provider could not confirm whether this operation completed; "
+                "query its status before retrying."
+            ),
+            status=502,
+            context={"reasonCode": normalized, "resultState": "UNKNOWN_RESULT"},
+        )
+    if normalized in {
+        "AUTHENTICATION_DENIED",
+        "AUTHENTICATION_FAILED",
+        "AUTH_EXPIRED",
+        "CREDENTIAL_MISSING",
+    }:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_AUTH_EXPIRED",
+            title="Provider authorization expired",
+            detail="The provider could not authenticate with its configured server-side identity.",
+            status=401,
+            context={"reasonCode": "auth_expired"},
+        )
+    if normalized in {"AUTHORIZATION_DENIED", "PERMISSION_DENIED", "SCOPE_DENIED"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PERMISSION_DENIED",
+            title="Provider permission denied",
+            detail="The configured provider identity lacks permission for this operation.",
+            status=403,
+            context={"reasonCode": "permission_denied"},
+        )
+    if normalized in {"INVALID_ARGUMENTS", "OPERATION_NOT_FOUND", "UNSUPPORTED_OPERATION"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_OPERATION_INVALID",
+            title="Provider operation is invalid",
+            detail="The provider rejected the fixed operation or its typed arguments.",
+            status=422,
+            context={"reasonCode": normalized.lower()},
+        )
+    if normalized in {"RESOURCE_NOT_FOUND", "PROFILE_NOT_FOUND"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_RESOURCE_NOT_FOUND",
+            title="Provider resource not found",
+            detail="The configured provider did not find the selected resource or profile.",
+            status=404,
+            context={"reasonCode": normalized.lower()},
+        )
+    raise ExchangeProductError(
+        code="EXCHANGE_CONNECTOR_PROVIDER_UNAVAILABLE",
+        title="Provider operation failed",
+        detail="The configured provider could not complete the operation.",
+        status=503 if retryable else 502,
+        retryable=retryable,
+        context={"reasonCode": normalized.lower()},
+    )
 
 
 def _structured_tool_json(content: Any) -> dict[str, Any]:

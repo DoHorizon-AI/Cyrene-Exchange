@@ -60,6 +60,19 @@ class AccountAuthorization:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderCredentialLeaseEvidence:
+    """Opaque one-use lease metadata; provider tokens never enter Exchange."""
+
+    lease_ref: str
+    profile_ref: str
+    provider: str
+    operation_id: str
+    target: dict[str, object]
+    arguments_sha256: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class LinkedSender:
     """Account Center verified mapping from a vendor sender to a Cyrene actor."""
 

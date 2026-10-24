@@ -24,6 +24,11 @@ class WorkspaceAuthorityServiceStub(object):
                 request_serializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.VerifyIdentityRequest.SerializeToString,
                 response_deserializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.VerifyIdentityResponse.FromString,
                 )
+        self.AuthorizeConnectorOperation = channel.unary_unary(
+                '/cyrene.workspace.authority.v2.WorkspaceAuthorityService/AuthorizeConnectorOperation',
+                request_serializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationRequest.SerializeToString,
+                response_deserializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationResponse.FromString,
+                )
         self.GetCatalogSnapshot = channel.unary_unary(
                 '/cyrene.workspace.authority.v2.WorkspaceAuthorityService/GetCatalogSnapshot',
                 request_serializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.CatalogSnapshotRequest.SerializeToString,
@@ -101,6 +106,12 @@ class WorkspaceAuthorityServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def VerifyIdentity(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AuthorizeConnectorOperation(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -196,6 +207,11 @@ def add_WorkspaceAuthorityServiceServicer_to_server(servicer, server):
                     servicer.VerifyIdentity,
                     request_deserializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.VerifyIdentityRequest.FromString,
                     response_serializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.VerifyIdentityResponse.SerializeToString,
+            ),
+            'AuthorizeConnectorOperation': grpc.unary_unary_rpc_method_handler(
+                    servicer.AuthorizeConnectorOperation,
+                    request_deserializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationRequest.FromString,
+                    response_serializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationResponse.SerializeToString,
             ),
             'GetCatalogSnapshot': grpc.unary_unary_rpc_method_handler(
                     servicer.GetCatalogSnapshot,
@@ -303,6 +319,23 @@ class WorkspaceAuthorityService(object):
         return grpc.experimental.unary_unary(request, target, '/cyrene.workspace.authority.v2.WorkspaceAuthorityService/VerifyIdentity',
             cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.VerifyIdentityRequest.SerializeToString,
             cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.VerifyIdentityResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def AuthorizeConnectorOperation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/cyrene.workspace.authority.v2.WorkspaceAuthorityService/AuthorizeConnectorOperation',
+            cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationRequest.SerializeToString,
+            cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 
@@ -524,5 +557,75 @@ class WorkspaceAuthorityService(object):
         return grpc.experimental.unary_unary(request, target, '/cyrene.workspace.authority.v2.WorkspaceAuthorityService/WaitInvocationResult',
             cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.WaitInvocationResultRequest.SerializeToString,
             cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.WaitInvocationResultResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+
+class WorkspaceConnectorAuthorizationServiceStub(object):
+    """Explicit minimal production profile for connector-only deployments. It reuses the same
+    Directory-backed request and signed grant contract, and intentionally exposes no Product,
+    artifact, delegation, session, or execution-outbox methods.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.AuthorizeConnectorOperation = channel.unary_unary(
+                '/cyrene.workspace.authority.v2.WorkspaceConnectorAuthorizationService/AuthorizeConnectorOperation',
+                request_serializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationRequest.SerializeToString,
+                response_deserializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationResponse.FromString,
+                )
+
+
+class WorkspaceConnectorAuthorizationServiceServicer(object):
+    """Explicit minimal production profile for connector-only deployments. It reuses the same
+    Directory-backed request and signed grant contract, and intentionally exposes no Product,
+    artifact, delegation, session, or execution-outbox methods.
+    """
+
+    def AuthorizeConnectorOperation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_WorkspaceConnectorAuthorizationServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'AuthorizeConnectorOperation': grpc.unary_unary_rpc_method_handler(
+                    servicer.AuthorizeConnectorOperation,
+                    request_deserializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationRequest.FromString,
+                    response_serializer=cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'cyrene.workspace.authority.v2.WorkspaceConnectorAuthorizationService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+
+
+ # This class is part of an EXPERIMENTAL API.
+class WorkspaceConnectorAuthorizationService(object):
+    """Explicit minimal production profile for connector-only deployments. It reuses the same
+    Directory-backed request and signed grant contract, and intentionally exposes no Product,
+    artifact, delegation, session, or execution-outbox methods.
+    """
+
+    @staticmethod
+    def AuthorizeConnectorOperation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/cyrene.workspace.authority.v2.WorkspaceConnectorAuthorizationService/AuthorizeConnectorOperation',
+            cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationRequest.SerializeToString,
+            cyrene_dot_workspace_dot_authority_dot_v2_dot_workspace__authority__pb2.AuthorizeConnectorOperationResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

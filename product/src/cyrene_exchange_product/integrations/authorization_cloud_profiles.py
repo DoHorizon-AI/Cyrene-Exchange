@@ -74,9 +74,15 @@ class AuthorizationProviderProfile:
     organization_id: str
     workspace_id: str
     allowed_context_refs: frozenset[str]
+    allowed_actors: frozenset[tuple[str, str]]
     display_name: str | None
     authorization_ref: str | None
     targets: Mapping[str, CloudTargetAlias]
+    identity_ref: str | None = None
+    credential_secret_ref: str | None = None
+    account_scopes: Mapping[str, object] | None = None
+    auth_mode: str | None = None
+    access_mode: str = "actor_owned"
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,9 +140,13 @@ class AuthorizationCloudProfileRegistry:
 
         principal.require("integrationCreateConnection")
         profile = self._profile(request.provider, request.binding_ref)
-        context = self._context_for_principal(
+        if profile.access_mode == "workspace_operator":
+            principal.require("navigator.connector.operator.v1")
+        context = self._profile_actor_for_principal(
             principal,
             allowed_context_refs=profile.allowed_context_refs,
+            allowed_actors=profile.allowed_actors,
+            access_mode=profile.access_mode,
             organization_id=profile.organization_id,
             workspace_id=profile.workspace_id,
             expected_issuer=profile.expected_issuer,
@@ -152,9 +162,32 @@ class AuthorizationCloudProfileRegistry:
             raise AuthorizationCloudConfigurationError(
                 "cloud target alias is not configured for this provider binding"
             )
-        if target.allowed_context_refs and context.context_ref not in target.allowed_context_refs:
+        if target.allowed_context_refs and (
+            context is None or context.context_ref not in target.allowed_context_refs
+        ):
             raise PermissionError("cloud target is not allowed for the current actor")
         return target.display_name
+
+    def principal_allowed_for_profile(
+        self,
+        principal: IntegrationPrincipal,
+        profile: AuthorizationProviderProfile,
+    ) -> bool:
+        """Check a verified actor against either context-backed or static host pins."""
+
+        try:
+            self._profile_actor_for_principal(
+                principal,
+                allowed_context_refs=profile.allowed_context_refs,
+                allowed_actors=profile.allowed_actors,
+                access_mode=profile.access_mode,
+                organization_id=profile.organization_id,
+                workspace_id=profile.workspace_id,
+                expected_issuer=profile.expected_issuer,
+            )
+        except PermissionError:
+            return False
+        return True
 
     def profile_for_connection(
         self,
@@ -168,15 +201,22 @@ class AuthorizationCloudProfileRegistry:
         principal.require(operation_id)
         if (
             principal.issuer != connection.actor_issuer
-            or principal.subject != connection.actor_subject
+            or (
+                principal.subject != connection.actor_subject
+                and connection.access_mode != "workspace_operator"
+            )
             or principal.organization_id != connection.organization_id
             or principal.workspace_id != connection.workspace_id
         ):
-            raise PermissionError("connection owner does not match current Platform identity")
+            raise PermissionError("connection owner or access mode does not match this principal")
         profile = self._profile(connection.provider, connection.binding_ref)
-        self._context_for_principal(
+        if connection.access_mode != profile.access_mode:
+            raise PermissionError("connection access mode differs from the host profile")
+        selected_context = self._profile_actor_for_principal(
             principal,
             allowed_context_refs=profile.allowed_context_refs,
+            allowed_actors=profile.allowed_actors,
+            access_mode=profile.access_mode,
             organization_id=connection.organization_id,
             workspace_id=connection.workspace_id,
             expected_issuer=profile.expected_issuer,
@@ -191,17 +231,9 @@ class AuthorizationCloudProfileRegistry:
             target = profile.targets.get(connection.target_ref or "")
             if target is None:
                 raise PermissionError("cloud target alias is not configured")
-            target_context = self._contexts_by_identity.get(
-                (
-                    principal.issuer,
-                    principal.subject,
-                    principal.organization_id,
-                    principal.workspace_id,
-                )
-            )
             if target.allowed_context_refs and (
-                target_context is None
-                or target_context.context_ref not in target.allowed_context_refs
+                selected_context is None
+                or selected_context.context_ref not in target.allowed_context_refs
             ):
                 raise PermissionError("cloud target is not allowed for the current actor")
             target_ref = target.target_ref
@@ -359,6 +391,36 @@ class AuthorizationCloudProfileRegistry:
             raise PermissionError("current Platform identity is not allowed by this profile")
         return context
 
+    def _profile_actor_for_principal(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        allowed_context_refs: frozenset[str],
+        allowed_actors: frozenset[tuple[str, str]],
+        access_mode: str = "actor_owned",
+        organization_id: str,
+        workspace_id: str,
+        expected_issuer: str,
+    ) -> AuthorityActorContext | None:
+        """Authorize a signed caller by current context or explicit host identity pin."""
+
+        if (
+            principal.issuer != expected_issuer
+            or principal.organization_id != organization_id
+            or principal.workspace_id != workspace_id
+        ):
+            raise PermissionError("current Platform identity is outside this profile scope")
+        context = self._contexts_by_identity.get(
+            (principal.issuer, principal.subject, principal.organization_id, principal.workspace_id)
+        )
+        if context is not None and context.context_ref in allowed_context_refs:
+            return context
+        if (principal.issuer, principal.subject) in allowed_actors:
+            return None
+        if access_mode == "workspace_operator":
+            return None
+        raise PermissionError("current Platform identity is not allowed by this profile")
+
     def _profile(
         self,
         provider: str,
@@ -443,16 +505,62 @@ def parse_authorization_cloud_settings(
                 "contextKeyRef",
                 "organizationId",
                 "workspaceId",
-                "allowedContextRefs",
             },
-            optional={"displayName", "authorizationRef", "targets"},
+            optional={
+                "allowedContextRefs",
+                "allowedActors",
+                "accessMode",
+                "displayName",
+                "authorizationRef",
+                "targets",
+                "identityRef",
+                "credentialSecretRef",
+                "accountScopes",
+                "authMode",
+            },
             label=f"authorizationCloud.profiles.{profile_ref}",
         )
         provider = _text(item["provider"], "provider")
         if provider not in _PROVIDER_IDS:
             raise AuthorizationCloudConfigurationError("authorizationCloud provider is unsupported")
         endpoint = _endpoint(item["directPlugin"], f"profile {profile_ref}.directPlugin")
-        allowed_refs = _aliases(item["allowedContextRefs"], "allowedContextRefs")
+        access_mode = _text(item.get("accessMode", "actor_owned"), "accessMode")
+        if access_mode not in {"actor_owned", "workspace_operator"}:
+            raise AuthorizationCloudConfigurationError("provider profile accessMode is unsupported")
+        if access_mode == "workspace_operator" and provider not in {"azure", "gcp", "hf", "runpod"}:
+            raise AuthorizationCloudConfigurationError(
+                "workspace_operator is supported only for cloud connector profiles"
+            )
+        allowed_refs = (
+            _aliases(item["allowedContextRefs"], "allowedContextRefs")
+            if "allowedContextRefs" in item
+            else frozenset()
+        )
+        raw_actors = item.get("allowedActors", [])
+        if not isinstance(raw_actors, list):
+            raise AuthorizationCloudConfigurationError("allowedActors must be an array")
+        allowed_actors: set[tuple[str, str]] = set()
+        for actor_index, raw_actor in enumerate(raw_actors):
+            actor = _object(
+                raw_actor,
+                required={"issuer", "subject"},
+                optional=set(),
+                label=f"profile {profile_ref}.allowedActors[{actor_index}]",
+            )
+            actor_issuer = _text(actor["issuer"], "allowed actor issuer")
+            actor_subject = _text(actor["subject"], "allowed actor subject")
+            if actor_issuer != _text(item["expectedIssuer"], "expectedIssuer"):
+                raise AuthorizationCloudConfigurationError(
+                    "allowed actor issuer must match expectedIssuer"
+                )
+            identity = (actor_issuer, actor_subject)
+            if identity in allowed_actors:
+                raise AuthorizationCloudConfigurationError("allowedActors contains a duplicate")
+            allowed_actors.add(identity)
+        if not allowed_refs and not allowed_actors and access_mode != "workspace_operator":
+            raise AuthorizationCloudConfigurationError(
+                "provider profile requires at least one allowedContextRef or allowedActor"
+            )
         if not allowed_refs <= set(contexts):
             raise AuthorizationCloudConfigurationError(
                 "provider profile has an unknown actor context"
@@ -511,6 +619,29 @@ def parse_authorization_cloud_settings(
             raise AuthorizationCloudConfigurationError(
                 "cloud profiles require target aliases and cannot select authorization refs"
             )
+        identity_ref = _alias(item["identityRef"], "identityRef") if "identityRef" in item else None
+        credential_secret_ref = (
+            _secret_reference(item["credentialSecretRef"], "credentialSecretRef")
+            if "credentialSecretRef" in item
+            else None
+        )
+        account_scopes = (
+            _parse_huggingface_scopes(item["accountScopes"]) if "accountScopes" in item else None
+        )
+        auth_mode = _text(item["authMode"], "authMode") if "authMode" in item else None
+        if provider == "hf":
+            if credential_secret_ref is None or account_scopes is None:
+                raise AuthorizationCloudConfigurationError(
+                    "HF profiles require a host secret reference and explicit Account Center scopes"
+                )
+            if auth_mode not in {None, "fine_grained_token", "device_oauth"}:
+                raise AuthorizationCloudConfigurationError("HF authMode is unsupported")
+        elif (
+            credential_secret_ref is not None or account_scopes is not None or auth_mode is not None
+        ):
+            raise AuthorizationCloudConfigurationError(
+                "HF credential references, auth mode, and scopes are valid only for HF profiles"
+            )
         profiles[profile_ref] = AuthorizationProviderProfile(
             profile_ref=profile_ref,
             provider=provider,
@@ -522,9 +653,15 @@ def parse_authorization_cloud_settings(
             organization_id=organization_id,
             workspace_id=workspace_id,
             allowed_context_refs=allowed_refs,
+            allowed_actors=frozenset(allowed_actors),
             display_name=display_name,
             authorization_ref=authorization_ref,
             targets=targets,
+            identity_ref=identity_ref,
+            credential_secret_ref=credential_secret_ref,
+            account_scopes=account_scopes,
+            auth_mode=auth_mode,
+            access_mode=access_mode,
         )
 
     email = _parse_email_profile(email_value, contexts)
@@ -534,6 +671,55 @@ def parse_authorization_cloud_settings(
         profiles=profiles,
         email=email,
     )
+
+
+def _parse_huggingface_scopes(value: object) -> Mapping[str, object]:
+    """Validate explicit HF repo permissions before linking a host token reference."""
+
+    scope = _object(
+        value,
+        required={"repositories"},
+        optional=set(),
+        label="HF accountScopes",
+    )
+    repositories = scope["repositories"]
+    if not isinstance(repositories, list) or not repositories:
+        raise AuthorizationCloudConfigurationError("HF accountScopes.repositories is required")
+    output: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw_repository in enumerate(repositories):
+        label = f"HF accountScopes.repositories[{index}]"
+        repository = _object(
+            raw_repository,
+            required={"repoType", "repoId", "permissions"},
+            optional=set(),
+            label=label,
+        )
+        repo_type = _text(repository["repoType"], f"{label}.repoType")
+        repo_id = _text(repository["repoId"], f"{label}.repoId")
+        permissions = repository["permissions"]
+        if repo_type not in {"model", "dataset", "space"}:
+            raise AuthorizationCloudConfigurationError("HF repoType is unsupported")
+        if not isinstance(permissions, list) or not permissions:
+            raise AuthorizationCloudConfigurationError("HF repo permissions are required")
+        selected: set[str] = set()
+        for permission in permissions:
+            value_text = _text(permission, f"{label}.permissions")
+            if value_text not in {"read", "write"} or value_text in selected:
+                raise AuthorizationCloudConfigurationError("HF repo permission is invalid")
+            selected.add(value_text)
+        identity = (repo_type, repo_id)
+        if identity in seen:
+            raise AuthorizationCloudConfigurationError("HF repo scope is duplicated")
+        seen.add(identity)
+        output.append(
+            {
+                "repo_type": repo_type,
+                "repo_id": repo_id,
+                "permissions": sorted(selected),
+            }
+        )
+    return {"repositories": output}
 
 
 def _parse_email_profile(
@@ -669,6 +855,21 @@ def _alias(value: object, label: str) -> str:
     text = _text(value, label)
     if not _ALIAS.fullmatch(text):
         raise AuthorizationCloudConfigurationError(f"{label} must be an opaque alias")
+    return text
+
+
+def _secret_reference(value: object, label: str) -> str:
+    """Validate a stable host secret reference without resolving its value."""
+
+    text = _text(value, label)
+    if (
+        len(text) > 1024
+        or "=" in text
+        or "\\" in text
+        or any(part in {"", ".", ".."} for part in text.split("/"))
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", text)
+    ):
+        raise AuthorizationCloudConfigurationError(f"{label} must be a stable host reference")
     return text
 
 

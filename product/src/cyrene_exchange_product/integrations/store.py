@@ -13,14 +13,16 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
+from cyrene_exchange_product.integrations.connector_security import connector_canonical_json
 from cyrene_exchange_product.integrations.models import (
     ActorBinding,
     AuthorizationHealthRecord,
@@ -31,6 +33,7 @@ from cyrene_exchange_product.integrations.models import (
     CloudRefreshOperation,
     CloudRefreshState,
     CloudResourceRecord,
+    ConnectorAccessMode,
     CreateActorBinding,
     CreateIntegrationConnection,
     CreateSyncBinding,
@@ -70,6 +73,168 @@ def _json(value: Any) -> str:
     """Serialize JSON-compatible Product values deterministically."""
 
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _compact_connector_receipt(
+    *,
+    response: Mapping[str, Any],
+    response_digest: str,
+    operation_ref: str | None,
+    state: str,
+    fresh_request_required: bool,
+) -> str:
+    """Keep a bounded, replayable envelope when provider business output is large."""
+
+    request_id = response.get("requestId")
+    if "outcome" in response:
+        outcome = (
+            "pending"
+            if state == "PENDING"
+            else "uncertain"
+            if state == "UNKNOWN_RESULT"
+            else "failed"
+            if state == "FAILED"
+            else "verified"
+        )
+        summary = {
+            "state": state,
+            "receiptOnly": True,
+            "resultDigestSha256": response_digest,
+            "freshRequestRequired": fresh_request_required,
+            "replayPolicy": (
+                "fresh-read"
+                if fresh_request_required
+                else "status-reconciliation"
+                if state in {"PENDING", "UNKNOWN_RESULT"}
+                else "do-not-repeat"
+            ),
+            "reasonCode": (
+                "result_not_cached"
+                if fresh_request_required
+                else "operation_outcome_unknown"
+                if state == "UNKNOWN_RESULT"
+                else "operation_pending"
+                if state == "PENDING"
+                else "operation_already_resolved"
+            ),
+        }
+        compact: dict[str, Any] = {
+            "requestId": request_id,
+            "outcome": outcome,
+            "result": {
+                "content": [
+                    {"type": "text", "text": connector_canonical_json(summary).decode("utf-8")}
+                ],
+                "isError": outcome in {"failed", "uncertain"},
+            },
+        }
+        if operation_ref:
+            compact["operationRef"] = operation_ref
+        return _json(compact)
+    if "status" in response:
+        return _json(
+            {
+                key: response[key]
+                for key in (
+                    "requestId",
+                    "status",
+                    "vendorMessageId",
+                    "reasonCode",
+                    "retryAfterSeconds",
+                )
+                if key in response
+            }
+        )
+    return _json(
+        {
+            "requestId": request_id,
+            "state": state,
+            "operationRef": operation_ref,
+            "receiptOnly": True,
+            "resultDigestSha256": response_digest,
+        }
+    )
+
+
+def _trim_connector_receipts(
+    cursor: sqlite3.Cursor,
+    *,
+    now_epoch: int,
+    incoming_bytes: int,
+    excluded: tuple[str, str, str, str, str],
+) -> None:
+    """Evict only expired or terminal receipts within count and byte budgets."""
+
+    cursor.execute(
+        "DELETE FROM connector_invocations "
+        "WHERE state IN ('SUCCEEDED','FAILED','REJECTED','RATE_LIMITED') "
+        "AND expires_at > 0 AND expires_at <= ?",
+        (now_epoch,),
+    )
+    while True:
+        cursor.execute(
+            "SELECT organization_id,workspace_id,actor_issuer,actor_subject,request_id,"
+            "response_json FROM connector_invocations WHERE response_json IS NOT NULL"
+        )
+        rows = cursor.fetchall()
+        total_bytes = sum(len(str(row["response_json"]).encode("utf-8")) for row in rows)
+        if (
+            len(rows) < _CONNECTOR_RECEIPT_MAX_ENTRIES
+            and total_bytes + incoming_bytes <= _CONNECTOR_RECEIPT_MAX_BYTES
+        ):
+            return
+        cursor.execute(
+            "SELECT organization_id,workspace_id,actor_issuer,actor_subject,request_id "
+            "FROM connector_invocations WHERE response_json IS NOT NULL "
+            "AND NOT (organization_id=? AND workspace_id=? AND actor_issuer=? "
+            "AND actor_subject=? AND request_id=?) ORDER BY created_at ASC LIMIT 1",
+            excluded,
+        )
+        oldest = cursor.fetchone()
+        if oldest is None:
+            return
+        cursor.execute(
+            "UPDATE connector_invocations SET response_json=NULL WHERE organization_id=? "
+            "AND workspace_id=? AND actor_issuer=? AND actor_subject=? AND request_id=?",
+            tuple(
+                str(oldest[key])
+                for key in (
+                    "organization_id",
+                    "workspace_id",
+                    "actor_issuer",
+                    "actor_subject",
+                    "request_id",
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorInvocationReservation:
+    """Bounded connector idempotency result, separate from Navigator task state."""
+
+    disposition: Literal["NEW", "IN_PROGRESS", "REPLAY", "UNKNOWN"]
+    state: str | None = None
+    response: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    http_status: int = 200
+    operation_ref: str | None = None
+    grant_ref: str | None = None
+    is_mutating: bool = False
+
+
+class ConnectorInvocationLedgerFull(RuntimeError):
+    """The bounded durable connector receipt ledger cannot safely admit work."""
+
+
+_CONNECTOR_RECEIPT_TTL_SECONDS = 24 * 60 * 60
+_CONNECTOR_RECEIPT_MAX_ENTRIES = 256
+_CONNECTOR_RECEIPT_MAX_BYTES = 4 * 1024 * 1024
+_CONNECTOR_RECEIPT_MAX_ENTRY_BYTES = 16 * 1024
+_CONNECTOR_TOMBSTONE_MAX_ENTRIES = 4096
+_CONNECTOR_TOMBSTONE_MAX_BYTES = 2 * 1024 * 1024
+_CONNECTOR_LEDGER_MAX_ENTRIES = 8192
+_CONNECTOR_LEDGER_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _provider_arguments(
@@ -175,6 +340,47 @@ class IntegrationStore:
                     document TEXT NOT NULL,
                     UNIQUE(connection_id, delivery_id)
                 );
+                CREATE TABLE IF NOT EXISTS connector_request_replays (
+                    key_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    PRIMARY KEY(key_id, request_id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_connector_request_replays_expiry
+                    ON connector_request_replays(expires_at);
+                CREATE TABLE IF NOT EXISTS connector_grant_replays (
+                    grant_ref TEXT PRIMARY KEY,
+                    encoded_sha256 TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    consumed_at INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS ix_connector_grant_replays_expiry
+                    ON connector_grant_replays(expires_at);
+                CREATE TABLE IF NOT EXISTS connector_invocations (
+                    organization_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    actor_issuer TEXT NOT NULL,
+                    actor_subject TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    connection_ref TEXT NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    profile_ref TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    resource_ref TEXT NOT NULL,
+                    arguments_sha256 TEXT NOT NULL,
+                    envelope_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    operation_ref TEXT,
+                    grant_ref TEXT NOT NULL DEFAULT '',
+                    is_mutating INTEGER NOT NULL DEFAULT 0 CHECK(is_mutating IN (0,1)),
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    response_json TEXT,
+                    response_status INTEGER NOT NULL DEFAULT 200,
+                    PRIMARY KEY(organization_id,workspace_id,actor_issuer,actor_subject,request_id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_connector_invocations_expiry
+                    ON connector_invocations(expires_at);
                 CREATE TABLE IF NOT EXISTS wecom_inbound_events (
                     id TEXT PRIMARY KEY,
                     binding_id TEXT NOT NULL REFERENCES sync_bindings(id),
@@ -406,6 +612,30 @@ class IntegrationStore:
                 self._connection.execute(
                     "ALTER TABLE authorization_observations ADD COLUMN authorization_ref TEXT"
                 )
+            invocation_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(connector_invocations)"
+                ).fetchall()
+            }
+            for name, definition in (
+                ("profile_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("resource_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("envelope_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("operation_ref", "TEXT"),
+                ("grant_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("is_mutating", "INTEGER NOT NULL DEFAULT 0"),
+                ("response_status", "INTEGER NOT NULL DEFAULT 200"),
+            ):
+                if name not in invocation_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE connector_invocations ADD COLUMN {name} {definition}"
+                    )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_connector_invocations_operation "
+                "ON connector_invocations(organization_id,workspace_id,actor_issuer,"
+                "actor_subject,profile_ref,operation_ref,state)"
+            )
             self._connection.execute("DROP INDEX IF EXISTS ix_authorization_observations_latest")
             self._connection.execute(
                 """CREATE INDEX ix_authorization_observations_latest
@@ -556,16 +786,570 @@ class IntegrationStore:
         with self._lock:
             self._connection.close()
 
+    def consume_connector_request_id(
+        self,
+        *,
+        key_id: str,
+        request_id: str,
+        expires_at: int,
+        now_epoch: int,
+    ) -> bool:
+        """Atomically consume one Navigator HMAC request id until its replay window ends.
+
+        The row contains no request body, identity, credential, or task state. It only
+        prevents a valid service signature from minting duplicate connector grants.
+        中文：只保存短期 request id，用于拦截已签名请求重放，不保存主体或任务状态。
+        """
+
+        if (
+            not key_id
+            or not request_id
+            or len(key_id) > 128
+            or len(request_id) > 200
+            or expires_at <= now_epoch
+        ):
+            return False
+        with self._transaction() as cursor:
+            cursor.execute(
+                "DELETE FROM connector_request_replays WHERE expires_at <= ?",
+                (now_epoch,),
+            )
+            try:
+                cursor.execute(
+                    "INSERT INTO connector_request_replays(key_id, request_id, expires_at) "
+                    "VALUES(?,?,?)",
+                    (key_id, request_id, expires_at),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def register_connector_grant(
+        self,
+        *,
+        grant_ref: str,
+        encoded_sha256: str,
+        expires_at: int,
+        now_epoch: int,
+    ) -> bool:
+        """Persist a freshly Authority-signed grant until its one-use deadline."""
+
+        if (
+            not grant_ref.startswith("sha256:")
+            or len(grant_ref) > 80
+            or len(encoded_sha256) != 64
+            or expires_at <= now_epoch
+            or expires_at - now_epoch > 20
+        ):
+            return False
+        with self._transaction() as cursor:
+            cursor.execute(
+                "DELETE FROM connector_grant_replays WHERE expires_at <= ?",
+                (now_epoch,),
+            )
+            cursor.execute("SELECT COUNT(*) AS entry_count FROM connector_grant_replays")
+            count = cursor.fetchone()
+            if count is not None and int(count["entry_count"]) >= 8192:
+                return False
+            try:
+                cursor.execute(
+                    "INSERT INTO connector_grant_replays(grant_ref,encoded_sha256,expires_at) "
+                    "VALUES(?,?,?)",
+                    (grant_ref, encoded_sha256, expires_at),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def consume_connector_grant(
+        self,
+        *,
+        grant_ref: str,
+        encoded_sha256: str,
+        now_epoch: int,
+    ) -> bool:
+        """Atomically consume one persisted signed grant, including after restart."""
+
+        if not grant_ref or len(encoded_sha256) != 64:
+            return False
+        with self._transaction() as cursor:
+            cursor.execute(
+                "DELETE FROM connector_grant_replays WHERE expires_at <= ?",
+                (now_epoch,),
+            )
+            cursor.execute(
+                "UPDATE connector_grant_replays SET consumed_at=? WHERE grant_ref=? "
+                "AND encoded_sha256=? AND expires_at>? AND consumed_at IS NULL",
+                (now_epoch, grant_ref, encoded_sha256, now_epoch),
+            )
+            return cursor.rowcount == 1
+
+    def reserve_connector_invocation(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        request_id: str,
+        connection_ref: str,
+        provider_id: str,
+        profile_ref: str,
+        operation_id: str,
+        resource_ref: str,
+        arguments_sha256: str,
+        envelope_sha256: str,
+        grant_ref: str,
+        is_mutating: bool,
+        now_epoch: int,
+    ) -> ConnectorInvocationReservation:
+        """Reserve an exact provider attempt or return its prior receipt.
+
+        Only operation scope hashes and minimal response receipts are persisted. A
+        started, pending, or ambiguous write has `expires_at=0` and remains a
+        tombstone until a later status read reconciles it. Terminal receipts are
+        retained for at most 24 hours under fixed entry and byte budgets.
+        中文：只持久化范围摘要与最小回执；未对账操作不会因 TTL 自动重发。
+        """
+
+        if (
+            not request_id
+            or len(request_id) > 200
+            or len(connection_ref) > 300
+            or len(provider_id) > 100
+            or len(profile_ref) > 300
+            or len(operation_id) > 200
+            or len(resource_ref) > 1000
+            or len(arguments_sha256) != 64
+            or len(envelope_sha256) != 64
+            or not grant_ref.startswith("sha256:")
+            or len(grant_ref) > 80
+            or not isinstance(is_mutating, bool)
+        ):
+            raise IntegrationValidationError("connector invocation scope is invalid")
+        scope = self._scope(principal)
+        scope_bytes = sum(len(value.encode("utf-8")) for value in (*scope, request_id))
+        if scope_bytes > 4096:
+            raise IntegrationValidationError("connector invocation identity is too large")
+        with self._transaction() as cursor:
+            cursor.execute(
+                "DELETE FROM connector_invocations "
+                "WHERE state IN ('SUCCEEDED','FAILED','REJECTED','RATE_LIMITED') "
+                "AND expires_at > 0 AND expires_at <= ?",
+                (now_epoch,),
+            )
+            cursor.execute(
+                "SELECT connection_ref,provider_id,profile_ref,operation_id,resource_ref,"
+                "arguments_sha256,envelope_sha256,state,operation_ref,grant_ref,response_json,"
+                "response_status,is_mutating FROM connector_invocations "
+                "WHERE organization_id=? AND workspace_id=? AND actor_issuer=? "
+                "AND actor_subject=? AND request_id=?",
+                (*scope, request_id),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                actual_scope = (
+                    str(existing["connection_ref"]),
+                    str(existing["provider_id"]),
+                    str(existing["profile_ref"]),
+                    str(existing["operation_id"]),
+                    str(existing["resource_ref"]),
+                    str(existing["arguments_sha256"]),
+                    str(existing["envelope_sha256"]),
+                    bool(existing["is_mutating"]),
+                )
+                expected_scope = (
+                    connection_ref,
+                    provider_id,
+                    profile_ref,
+                    operation_id,
+                    resource_ref,
+                    arguments_sha256,
+                    envelope_sha256,
+                    is_mutating,
+                )
+                if actual_scope != expected_scope:
+                    raise IntegrationConflict(
+                        "connector request id was already used for a different signed operation"
+                    )
+                state = str(existing["state"])
+                response_json = existing["response_json"]
+                response = json.loads(str(response_json)) if response_json is not None else None
+                if response is not None and not isinstance(response, dict):
+                    response = None
+                disposition: Literal["IN_PROGRESS", "REPLAY", "UNKNOWN"]
+                if state == "IN_PROGRESS":
+                    disposition = "IN_PROGRESS"
+                elif state in {"PENDING", "UNKNOWN_RESULT"} and response is None:
+                    disposition = "UNKNOWN"
+                else:
+                    disposition = "REPLAY"
+                return ConnectorInvocationReservation(
+                    disposition=disposition,
+                    state=state,
+                    response=response,
+                    http_status=int(existing["response_status"]),
+                    operation_ref=(
+                        str(existing["operation_ref"])
+                        if existing["operation_ref"] is not None
+                        else None
+                    ),
+                    grant_ref=(str(existing["grant_ref"]) if existing["grant_ref"] else None),
+                    is_mutating=bool(existing["is_mutating"]),
+                )
+
+            cursor.execute(
+                "SELECT organization_id,workspace_id,actor_issuer,actor_subject,request_id,"
+                "connection_ref,provider_id,profile_ref,operation_id,resource_ref,"
+                "arguments_sha256,envelope_sha256,grant_ref,is_mutating,state "
+                "FROM connector_invocations "
+                "ORDER BY created_at ASC"
+            )
+            all_rows = cursor.fetchall()
+            terminal_states = {"SUCCEEDED", "FAILED", "REJECTED", "RATE_LIMITED"}
+            tombstones = [row for row in all_rows if str(row["state"]) not in terminal_states]
+            metadata_bytes = scope_bytes + sum(
+                len(str(value).encode("utf-8"))
+                for value in (
+                    connection_ref,
+                    provider_id,
+                    profile_ref,
+                    operation_id,
+                    resource_ref,
+                    arguments_sha256,
+                    envelope_sha256,
+                    grant_ref,
+                    is_mutating,
+                )
+            )
+            existing_tombstone_bytes = sum(
+                sum(
+                    len(str(row[key]).encode("utf-8"))
+                    for key in (
+                        "organization_id",
+                        "workspace_id",
+                        "actor_issuer",
+                        "actor_subject",
+                        "request_id",
+                        "connection_ref",
+                        "provider_id",
+                        "profile_ref",
+                        "operation_id",
+                        "resource_ref",
+                        "arguments_sha256",
+                        "envelope_sha256",
+                        "grant_ref",
+                        "is_mutating",
+                    )
+                )
+                for row in tombstones
+            )
+            if (
+                len(tombstones) >= _CONNECTOR_TOMBSTONE_MAX_ENTRIES
+                or existing_tombstone_bytes + metadata_bytes > _CONNECTOR_TOMBSTONE_MAX_BYTES
+            ):
+                raise ConnectorInvocationLedgerFull("connector invocation tombstone budget is full")
+            total_metadata_bytes = sum(
+                sum(
+                    len(str(row[key]).encode("utf-8"))
+                    for key in (
+                        "organization_id",
+                        "workspace_id",
+                        "actor_issuer",
+                        "actor_subject",
+                        "request_id",
+                        "connection_ref",
+                        "provider_id",
+                        "profile_ref",
+                        "operation_id",
+                        "resource_ref",
+                        "arguments_sha256",
+                        "envelope_sha256",
+                        "grant_ref",
+                        "is_mutating",
+                    )
+                )
+                for row in all_rows
+            )
+            while (
+                len(all_rows) >= _CONNECTOR_LEDGER_MAX_ENTRIES
+                or total_metadata_bytes + metadata_bytes > _CONNECTOR_LEDGER_MAX_BYTES
+            ):
+                oldest_terminal = next(
+                    (row for row in all_rows if str(row["state"]) in terminal_states),
+                    None,
+                )
+                if oldest_terminal is None:
+                    raise ConnectorInvocationLedgerFull(
+                        "connector invocation ledger metadata budget is full"
+                    )
+                keys = (
+                    "organization_id",
+                    "workspace_id",
+                    "actor_issuer",
+                    "actor_subject",
+                    "request_id",
+                )
+                cursor.execute(
+                    "DELETE FROM connector_invocations WHERE organization_id=? "
+                    "AND workspace_id=? AND actor_issuer=? AND actor_subject=? AND request_id=?",
+                    tuple(str(oldest_terminal[key]) for key in keys),
+                )
+                total_metadata_bytes -= sum(
+                    len(str(oldest_terminal[key]).encode("utf-8"))
+                    for key in (
+                        *keys,
+                        "connection_ref",
+                        "provider_id",
+                        "profile_ref",
+                        "operation_id",
+                        "resource_ref",
+                        "arguments_sha256",
+                        "envelope_sha256",
+                        "grant_ref",
+                        "is_mutating",
+                    )
+                )
+                all_rows.remove(oldest_terminal)
+            cursor.execute(
+                "INSERT INTO connector_invocations "
+                "(organization_id,workspace_id,actor_issuer,actor_subject,request_id,"
+                "connection_ref,provider_id,profile_ref,operation_id,resource_ref,"
+                "arguments_sha256,envelope_sha256,state,grant_ref,is_mutating,created_at,"
+                "expires_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                (
+                    *scope,
+                    request_id,
+                    connection_ref,
+                    provider_id,
+                    profile_ref,
+                    operation_id,
+                    resource_ref,
+                    arguments_sha256,
+                    envelope_sha256,
+                    "IN_PROGRESS",
+                    grant_ref,
+                    int(is_mutating),
+                    now_epoch,
+                ),
+            )
+        return ConnectorInvocationReservation(disposition="NEW", state="IN_PROGRESS")
+
+    def attach_connector_invocation_grant(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        request_id: str,
+        envelope_sha256: str,
+        grant_ref: str,
+    ) -> None:
+        """Record the exact fresh proof used by this side-effect attempt."""
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                "UPDATE connector_invocations SET grant_ref=? WHERE organization_id=? "
+                "AND workspace_id=? AND actor_issuer=? AND actor_subject=? AND request_id=? "
+                "AND envelope_sha256=?",
+                (grant_ref, *self._scope(principal), request_id, envelope_sha256),
+            )
+            if cursor.rowcount != 1:
+                raise IntegrationConflict("connector invocation reservation is missing")
+
+    def complete_connector_invocation(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        request_id: str,
+        envelope_sha256: str,
+        state: Literal[
+            "PENDING", "UNKNOWN_RESULT", "SUCCEEDED", "FAILED", "REJECTED", "RATE_LIMITED"
+        ],
+        response: Mapping[str, Any] | None,
+        operation_ref: str | None,
+        response_status: int,
+        now_epoch: int,
+    ) -> None:
+        """Record a minimal receipt, retaining unresolved operations indefinitely."""
+
+        if response_status < 200 or response_status > 599:
+            raise IntegrationValidationError("connector response status is invalid")
+        scope = self._scope(principal)
+        expiry = (
+            0
+            if state in {"PENDING", "UNKNOWN_RESULT"}
+            else now_epoch + _CONNECTOR_RECEIPT_TTL_SECONDS
+        )
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT state,is_mutating FROM connector_invocations WHERE organization_id=? "
+                "AND workspace_id=? AND actor_issuer=? AND actor_subject=? AND request_id=? "
+                "AND envelope_sha256=?",
+                (*scope, request_id, envelope_sha256),
+            )
+            reservation = cursor.fetchone()
+            if reservation is None:
+                raise IntegrationConflict("connector invocation reservation is missing")
+            is_mutating = bool(reservation["is_mutating"])
+            response_json: str | None = None
+            if response is not None:
+                encoded = connector_canonical_json(dict(response))
+                response_json = _compact_connector_receipt(
+                    response=dict(response),
+                    response_digest=hashlib.sha256(encoded).hexdigest(),
+                    operation_ref=operation_ref,
+                    state=state,
+                    fresh_request_required=(not is_mutating and state in {"SUCCEEDED", "FAILED"}),
+                )
+                if len(response_json.encode("utf-8")) > _CONNECTOR_RECEIPT_MAX_ENTRY_BYTES:
+                    response_json = None
+            if response_json is not None:
+                _trim_connector_receipts(
+                    cursor,
+                    now_epoch=now_epoch,
+                    incoming_bytes=len(response_json.encode("utf-8")),
+                    excluded=(*scope, request_id),
+                )
+                cursor.execute(
+                    "SELECT response_json FROM connector_invocations "
+                    "WHERE response_json IS NOT NULL"
+                )
+                cached = cursor.fetchall()
+                stored_response: str | None = response_json
+                if (
+                    len(cached) >= _CONNECTOR_RECEIPT_MAX_ENTRIES
+                    or sum(len(str(row["response_json"]).encode("utf-8")) for row in cached)
+                    + len(response_json.encode("utf-8"))
+                    > _CONNECTOR_RECEIPT_MAX_BYTES
+                ):
+                    stored_response = None
+                response_json = stored_response
+            cursor.execute(
+                "UPDATE connector_invocations SET state=?,operation_ref=?,expires_at=?,"
+                "response_json=?,response_status=? WHERE organization_id=? AND workspace_id=? "
+                "AND actor_issuer=? AND actor_subject=? AND request_id=? AND envelope_sha256=?",
+                (
+                    state,
+                    operation_ref,
+                    expiry,
+                    response_json,
+                    response_status,
+                    *scope,
+                    request_id,
+                    envelope_sha256,
+                ),
+            )
+
+    def discard_connector_invocation(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        request_id: str,
+        envelope_sha256: str,
+    ) -> None:
+        """Remove a reservation only when grant validation failed before dispatch."""
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                "DELETE FROM connector_invocations WHERE organization_id=? AND workspace_id=? "
+                "AND actor_issuer=? AND actor_subject=? AND request_id=? "
+                "AND envelope_sha256=? AND state='IN_PROGRESS' AND operation_ref IS NULL",
+                (*self._scope(principal), request_id, envelope_sha256),
+            )
+
+    def reconcile_connector_invocations(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        operation_ref: str,
+        terminal_state: Literal["SUCCEEDED", "FAILED"],
+        now_epoch: int,
+    ) -> int:
+        """Resolve matching pending tombstones after an authoritative status read."""
+
+        if not profile_ref or not operation_ref:
+            return 0
+        scope = self._scope(principal)
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT request_id,envelope_sha256 FROM connector_invocations "
+                "WHERE organization_id=? AND workspace_id=? AND actor_issuer=? "
+                "AND actor_subject=? AND profile_ref=? AND operation_ref=? "
+                "AND state IN ('PENDING','UNKNOWN_RESULT')",
+                (*scope, profile_ref, operation_ref),
+            )
+            rows = cursor.fetchall()
+            updated = 0
+            for row in rows:
+                request_id = str(row["request_id"])
+                envelope_sha256 = str(row["envelope_sha256"])
+                business_result = {
+                    "state": terminal_state,
+                    "operation_ref": operation_ref,
+                    "reconciled": True,
+                    "receiptOnly": True,
+                    "replayPolicy": "do-not-repeat",
+                }
+                response_json = connector_canonical_json(business_result).decode("utf-8")
+                response = _json(
+                    {
+                        "requestId": request_id,
+                        "outcome": "verified",
+                        "operationRef": operation_ref,
+                        "result": {
+                            "content": [{"type": "text", "text": response_json}],
+                            "isError": False,
+                        },
+                    }
+                )
+                _trim_connector_receipts(
+                    cursor,
+                    now_epoch=now_epoch,
+                    incoming_bytes=len(response.encode("utf-8")),
+                    excluded=(*scope, request_id),
+                )
+                cursor.execute(
+                    "SELECT response_json FROM connector_invocations "
+                    "WHERE response_json IS NOT NULL"
+                )
+                cached = cursor.fetchall()
+                stored_response: str | None = response
+                if (
+                    len(cached) >= _CONNECTOR_RECEIPT_MAX_ENTRIES
+                    or sum(len(str(row["response_json"]).encode("utf-8")) for row in cached)
+                    + len(response.encode("utf-8"))
+                    > _CONNECTOR_RECEIPT_MAX_BYTES
+                ):
+                    stored_response = None
+                cursor.execute(
+                    "UPDATE connector_invocations SET state=?,expires_at=?,response_json=?,"
+                    "response_status=200 WHERE organization_id=? AND workspace_id=? "
+                    "AND actor_issuer=? AND actor_subject=? AND request_id=? "
+                    "AND envelope_sha256=?",
+                    (
+                        terminal_state,
+                        now_epoch + _CONNECTOR_RECEIPT_TTL_SECONDS,
+                        stored_response,
+                        *scope,
+                        request_id,
+                        envelope_sha256,
+                    ),
+                )
+                updated += cursor.rowcount
+        return updated
+
     def create_connection(
         self,
         principal: IntegrationPrincipal,
         request: CreateIntegrationConnection,
         *,
         idempotency_key: str,
+        connection_id: UUID | None = None,
+        access_mode: ConnectorAccessMode = "actor_owned",
     ) -> IntegrationConnection:
-        """Create a group repository connection within the caller's workspace scope."""
+        """Create a connection, optionally using an operator-preallocated opaque ID."""
 
         principal.require(self._CONNECTION_CREATE)
+        if access_mode not in {"actor_owned", "workspace_operator"}:
+            raise IntegrationValidationError("connector access mode is unsupported")
         if not idempotency_key or len(idempotency_key) > 200:
             raise IntegrationValidationError("Idempotency-Key is required")
         request_hash = hashlib.sha256(
@@ -573,6 +1357,7 @@ class IntegrationStore:
         ).hexdigest()
         now = utc_now()
         connection = IntegrationConnection(
+            id=connection_id or uuid4(),
             organization_id=principal.organization_id,
             workspace_id=principal.workspace_id,
             actor_issuer=principal.issuer,
@@ -584,6 +1369,7 @@ class IntegrationStore:
             display_name=request.display_name or request.repository_name or request.provider,
             repository_id=request.repository_id,
             repository_name=request.repository_name,
+            access_mode=access_mode,
             created_at=now,
             updated_at=now,
         )
@@ -596,7 +1382,12 @@ class IntegrationStore:
                 request_hash=request_hash,
             )
             if existing is not None:
-                return IntegrationConnection.model_validate_json(str(existing["document"]))
+                prior = IntegrationConnection.model_validate_json(str(existing["document"]))
+                if prior.access_mode != access_mode:
+                    raise IntegrationConflict(
+                        "connector access mode changed for an existing idempotency key"
+                    )
+                return prior
             cursor.execute(
                 "INSERT INTO integration_connections VALUES(?,?,?,?,?,?,?)",
                 (
@@ -633,6 +1424,37 @@ class IntegrationStore:
             ).fetchall()
         return [IntegrationConnection.model_validate_json(str(row["document"])) for row in rows]
 
+    def connector_bindings_for_actor(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        organization_id: str | None = None,
+        workspace_id: str,
+    ) -> list[IntegrationConnection]:
+        """Return enabled actor connection metadata inside the requested exact scope."""
+
+        if not issuer or not subject or not workspace_id:
+            raise IntegrationValidationError(
+                "connector binding export requires actor and workspace"
+            )
+        query = (
+            "SELECT document FROM integration_connections WHERE actor_issuer=? "
+            "AND actor_subject=? AND workspace_id=? AND enabled=1"
+        )
+        parameters: tuple[str, ...] = (issuer, subject, workspace_id)
+        if organization_id is not None:
+            if not organization_id.strip():
+                raise IntegrationValidationError(
+                    "connector binding export organization cannot be empty"
+                )
+            query += " AND organization_id=?"
+            parameters += (organization_id,)
+        query += " ORDER BY id"
+        with self._lock:
+            rows = self._connection.execute(query, parameters).fetchall()
+        return [IntegrationConnection.model_validate_json(str(row["document"])) for row in rows]
+
     def get_connection(
         self,
         principal: IntegrationPrincipal,
@@ -659,6 +1481,36 @@ class IntegrationStore:
         if row is None:
             return None
         return IntegrationConnection.model_validate_json(str(row["document"]))
+
+    def connector_connection_for_actor(
+        self,
+        connection_id: UUID,
+        *,
+        issuer: str,
+        subject: str,
+        workspace_id: str,
+        organization_id: str | None = None,
+    ) -> IntegrationConnection:
+        """Load an owner row or opt-in shared row from verified tenant identity pins."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT document FROM integration_connections WHERE id=? AND enabled=1",
+                (str(connection_id),),
+            ).fetchone()
+        if row is None:
+            raise IntegrationNotFound("integration connection not found")
+        connection = IntegrationConnection.model_validate_json(str(row["document"]))
+        same_tenant = (
+            connection.actor_issuer == issuer
+            and connection.workspace_id == workspace_id
+            and (organization_id is None or connection.organization_id == organization_id)
+        )
+        owner_match = connection.actor_subject == subject
+        shared_match = connection.access_mode == "workspace_operator"
+        if not same_tenant or not (owner_match or shared_match):
+            raise IntegrationNotFound("integration connection not found")
+        return connection
 
     def _get_connection_scoped(
         self, principal: IntegrationPrincipal, connection_id: UUID

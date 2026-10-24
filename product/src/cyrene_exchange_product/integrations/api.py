@@ -13,18 +13,36 @@ import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Protocol
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Header, Query, Request
 from fastapi import Path as ApiPath
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_serializer,
+    model_validator,
+)
 from pydantic.alias_generators import to_camel
 
 from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations.clients import AccountCenterClient, GitHubIssuesClient
+from cyrene_exchange_product.integrations.connector_profiles import (
+    validate_teams_root_thread_id,
+    validate_teams_service_url,
+)
+from cyrene_exchange_product.integrations.connector_security import (
+    ConnectorGrantClaims,
+    connector_canonical_json,
+    digest_arguments,
+    navigator_hmac_body_limit,
+    parse_signed_json_object,
+)
 from cyrene_exchange_product.integrations.models import (
     AuthorizationHealthRecord,
     AuthorizationState,
@@ -45,7 +63,13 @@ from cyrene_exchange_product.integrations.ports import (
     PluginHealthObservation,
     ValidatedExecutionProof,
 )
-from cyrene_exchange_product.integrations.store import IntegrationStore
+from cyrene_exchange_product.integrations.store import (
+    ConnectorInvocationLedgerFull,
+    ConnectorInvocationReservation,
+    IntegrationStore,
+)
+
+_MAX_NAVIGATOR_REQUEST_BYTES = 128 * 1024
 
 
 def _http_utc_timestamp(value: datetime | None) -> str | None:
@@ -77,6 +101,44 @@ def _http_timestamp_value(value: datetime | str | None) -> str | None:
     return None
 
 
+async def _read_bounded_request_body(
+    request: Request,
+    *,
+    max_bytes: int = _MAX_NAVIGATOR_REQUEST_BYTES,
+) -> bytes:
+    """Read a request stream with a fixed upper bound before parsing JSON."""
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        if not content_length.isascii() or not content_length.isdecimal():
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail="The internal request Content-Length is invalid.",
+                status=400,
+            )
+        if int(content_length) > max_bytes:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_TOO_LARGE",
+                title="Connector request is too large",
+                detail="The signed connector request exceeds the configured size limit.",
+                status=413,
+            )
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > max_bytes:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_TOO_LARGE",
+                title="Connector request is too large",
+                detail="The signed connector request exceeds the configured size limit.",
+                status=413,
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class _HttpResponseModel(BaseModel):
     """Serialize typed datetime values to the Product HTTP UTC-Z convention."""
 
@@ -101,6 +163,27 @@ class BeginLinkBody(IntegrationRequestBody):
     """Fixed external account provider selector."""
 
     provider: str = Field(pattern="^(github|wecom)$")
+
+
+class GitHubInstallationRepositoryBody(IntegrationRequestBody):
+    """One selected repository in a verified GitHub App installation."""
+
+    repository_id: str = Field(min_length=1, max_length=200)
+    owner: str = Field(min_length=1, max_length=300)
+    name: str = Field(min_length=1, max_length=300)
+
+
+class LinkGitHubInstallationBody(IntegrationRequestBody):
+    """Non-secret App installation selector and bounded repository scope."""
+
+    installation_id: str = Field(min_length=1, max_length=100)
+    repositories: list[GitHubInstallationRepositoryBody] = Field(min_length=1, max_length=200)
+
+
+class LinkHuggingFaceProfileBody(IntegrationRequestBody):
+    """Select only a host-defined HF profile alias; token and scopes stay host-owned."""
+
+    profile_alias: str = Field(min_length=1, max_length=300)
 
 
 class ConfirmWeComBody(IntegrationRequestBody):
@@ -379,6 +462,60 @@ class ExecuteIssueBody(IntegrationRequestBody):
     argument_digest: str = Field(pattern="^[0-9a-f]{64}$")
 
 
+class ConnectorOperationGrantBody(IntegrationRequestBody):
+    """HMAC-authenticated request to mint one exact provider-operation grant."""
+
+    request_id: str = Field(min_length=1, max_length=200)
+    workspace_id: str = Field(min_length=1, max_length=200)
+    principal_issuer: str = Field(min_length=1, max_length=1000)
+    principal_subject: str = Field(min_length=1, max_length=1000)
+    connection_ref: str = Field(min_length=1, max_length=300)
+    provider_id: str = Field(min_length=1, max_length=100)
+    profile_ref: str = Field(min_length=1, max_length=300)
+    operation_id: str = Field(min_length=1, max_length=200)
+    resource_ref: str = Field(min_length=1, max_length=1000)
+    arguments: dict[str, Any]
+    arguments_digest_sha256: str = Field(pattern="^[0-9a-f]{64}$")
+
+
+class ConnectorOperationBody(IntegrationRequestBody):
+    """One exact connector operation whose authority proof is in a separate header."""
+
+    request_id: str = Field(min_length=1, max_length=200)
+    provider_id: str = Field(min_length=1, max_length=100)
+    profile_ref: str = Field(min_length=1, max_length=300)
+    operation_id: str = Field(min_length=1, max_length=200)
+    resource_ref: str = Field(min_length=1, max_length=1000)
+    arguments: dict[str, Any]
+
+
+class TeamsConversationBody(IntegrationRequestBody):
+    """One canonical Teams channel/thread route copied from the admitted activity."""
+
+    tenant_id: str = Field(min_length=1, max_length=100)
+    team_id: str = Field(min_length=1, max_length=300)
+    channel_id: str = Field(min_length=1, max_length=300)
+    conversation_id: str = Field(min_length=1, max_length=1000)
+    root_thread_id: str = Field(min_length=1, max_length=512, pattern="^[0-9]+$")
+    service_url: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_root_message_id(self) -> TeamsConversationBody:
+        """Ensure Bot Framework can address the numeric root activity id."""
+
+        validate_teams_root_thread_id(self.root_thread_id)
+        return self
+
+
+class TeamsMessageBody(IntegrationRequestBody):
+    """One exact Teams thread reply sent via the host-configured message provider."""
+
+    request_id: str = Field(min_length=1, max_length=200)
+    provider_id: Literal["msteams"] | None = None
+    conversation: TeamsConversationBody
+    text: str = Field(min_length=1, max_length=24_000)
+
+
 class IntegrationAuthorizer(Protocol):
     """Host-resolved current Platform identity verifier."""
 
@@ -420,11 +557,11 @@ class IntegrationServices:
         self,
         *,
         store: IntegrationStore,
-        authorizer: IntegrationAuthorizer,
+        authorizer: IntegrationAuthorizer | None,
         accounts: AccountCenterClient,
         github: GitHubIssuesClient,
         webhook_verifier: GitHubWebhookVerifier,
-        delegation_authorizer: DelegationAuthorizer,
+        delegation_authorizer: DelegationAuthorizer | None,
         callback_principal: IntegrationPrincipal,
         plugin_health: Any = None,
         dispatcher: Any = None,
@@ -444,6 +581,13 @@ class IntegrationServices:
         current_context_resolver: Any = None,
         email_notifications: Any = None,
         authorization_cloud_runner: Any = None,
+        navigator_hmac_authenticator: Any = None,
+        connector_grant_authority: Any = None,
+        connector_grant_verifier: Any = None,
+        connector_operation_dispatcher: Any = None,
+        teams_message_client: Any = None,
+        teams_message_profile: Any = None,
+        authorization_profile_registry: Any = None,
         transport_clients: tuple[Any, ...] = (),
     ) -> None:
         self.store = store
@@ -467,6 +611,13 @@ class IntegrationServices:
         self.current_context_resolver = current_context_resolver
         self.email_notifications = email_notifications
         self.authorization_cloud_runner = authorization_cloud_runner
+        self.navigator_hmac_authenticator = navigator_hmac_authenticator
+        self.connector_grant_authority = connector_grant_authority
+        self.connector_grant_verifier = connector_grant_verifier
+        self.connector_operation_dispatcher = connector_operation_dispatcher
+        self.teams_message_client = teams_message_client
+        self.teams_message_profile = teams_message_profile
+        self.authorization_profile_registry = authorization_profile_registry
         self.transport_clients = transport_clients
 
     def display_name_for_connection(
@@ -475,6 +626,114 @@ class IntegrationServices:
         request: CreateIntegrationConnection,
     ) -> str:
         """Authorize aliases for this current principal and resolve display metadata."""
+
+        if (
+            request.provider == "github"
+            and request.account_link_ref is None
+            and request.binding_ref is None
+            and request.target_ref is None
+        ):
+            principal.require("integrationCreateConnection")
+            return request.repository_name
+
+        if request.provider in {"github", "hf"}:
+            account_provider = "huggingface" if request.provider == "hf" else request.provider
+            if not request.account_link_ref:
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_REQUIRED",
+                    title="Provider profile required",
+                    detail="Link a verified provider profile before creating this connection.",
+                    status=403,
+                )
+            response = self.accounts.list_provider_profiles(principal)
+            profiles = response.get("profiles")
+            profile = (
+                next(
+                    (
+                        item
+                        for item in profiles
+                        if isinstance(item, Mapping)
+                        and item.get("profile_ref") == request.account_link_ref
+                        and item.get("provider") == account_provider
+                    ),
+                    None,
+                )
+                if isinstance(profiles, list)
+                else None
+            )
+            if profile is None:
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+                    title="Provider profile unavailable",
+                    detail="The selected provider profile does not belong to the verified actor.",
+                    status=403,
+                )
+            auth_status = profile.get("auth_status")
+            if auth_status not in {"configured", "healthy"}:
+                raise ExchangeProductError(
+                    code=(
+                        "EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED"
+                        if auth_status in {"reauthorization_required", "revoked"}
+                        else "EXCHANGE_ACCOUNT_PROVIDER_PROFILE_UNAVAILABLE"
+                    ),
+                    title="Provider profile is not ready",
+                    detail="The provider profile must be healthy before connecting a resource.",
+                    status=409 if auth_status in {"reauthorization_required", "revoked"} else 503,
+                    retryable=auth_status in {"unknown", "unavailable"},
+                )
+            scope = profile.get("target_scope")
+            if request.provider == "github":
+                repositories = scope.get("repositories") if isinstance(scope, Mapping) else None
+                if not isinstance(repositories, list) or not any(
+                    isinstance(repository, Mapping)
+                    and str(repository.get("repository_id", repository.get("repositoryId", "")))
+                    == request.repository_id
+                    and str(repository.get("owner", ""))
+                    == request.repository_name.partition("/")[0]
+                    and str(repository.get("name", "")) == request.repository_name.partition("/")[2]
+                    for repository in repositories
+                ):
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ACCOUNT_PROVIDER_RESOURCE_FORBIDDEN",
+                        title="Repository is outside the linked installation",
+                        detail=(
+                            "The selected GitHub repository is not in this App installation scope."
+                        ),
+                        status=403,
+                    )
+                return request.repository_name
+            registry = self.authorization_profile_registry
+            host_profile = (
+                registry.settings.profiles.get(request.binding_ref or "")
+                if registry is not None
+                else None
+            )
+            target = (
+                host_profile.targets.get(request.target_ref or "")
+                if host_profile is not None
+                else None
+            )
+            repositories = scope.get("repositories") if isinstance(scope, Mapping) else None
+            if (
+                host_profile is None
+                or host_profile.provider != "hf"
+                or target is None
+                or not isinstance(repositories, list)
+                or not any(
+                    isinstance(repository, Mapping)
+                    and repository.get("repo_id") == target.target_ref
+                    for repository in repositories
+                )
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_PROVIDER_RESOURCE_FORBIDDEN",
+                    title="HF repository is outside the linked token scope",
+                    detail=(
+                        "The selected Hugging Face resource is not in this token's "
+                        "configured scope."
+                    ),
+                    status=403,
+                )
 
         if self.connection_profile_resolver is not None:
             try:
@@ -519,6 +778,91 @@ class IntegrationServices:
             status=503,
             retryable=True,
         )
+
+    def access_mode_for_connection(
+        self,
+        principal: IntegrationPrincipal,
+        request: CreateIntegrationConnection,
+    ) -> str:
+        """Resolve sharing only from Account Center or immutable host profile metadata."""
+
+        if (
+            request.provider == "github"
+            and request.account_link_ref is None
+            and request.binding_ref is None
+            and request.target_ref is None
+        ):
+            principal.require("integrationCreateConnection")
+            return "actor_owned"
+
+        if request.provider in {"github", "hf"}:
+            account_provider = "huggingface" if request.provider == "hf" else request.provider
+            response = self.accounts.list_provider_profiles(principal)
+            profiles = response.get("profiles")
+            selected = (
+                next(
+                    (
+                        item
+                        for item in profiles
+                        if isinstance(item, Mapping)
+                        and item.get("profile_ref") == request.account_link_ref
+                        and item.get("provider") == account_provider
+                    ),
+                    None,
+                )
+                if isinstance(profiles, list)
+                else None
+            )
+            if selected is None:
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+                    title="Provider profile unavailable",
+                    detail="The selected provider profile is not available to this actor.",
+                    status=403,
+                )
+            access_mode = selected.get("access_mode", "actor_owned")
+            if not isinstance(access_mode, str) or access_mode not in {
+                "actor_owned",
+                "workspace_operator",
+            }:
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Account Center returned an unsupported provider access mode.",
+                    status=502,
+                )
+            if request.provider == "hf":
+                registry = self.authorization_profile_registry
+                host_profile = (
+                    registry.settings.profiles.get(request.binding_ref or "")
+                    if registry is not None
+                    else None
+                )
+                if host_profile is None or host_profile.access_mode != access_mode:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_CONNECTOR_PROFILE_MODE_MISMATCH",
+                        title="Provider profile access mode mismatch",
+                        detail="Account Center and the host HF profile access modes differ.",
+                        status=503,
+                    )
+            return str(access_mode)
+        if request.provider in {"azure", "gcp", "runpod"}:
+            registry = self.authorization_profile_registry
+            host_profile = (
+                registry.settings.profiles.get(request.binding_ref or "")
+                if registry is not None
+                else None
+            )
+            if host_profile is None or host_profile.provider != request.provider:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_UNAVAILABLE",
+                    title="Provider connection is not configured",
+                    detail="The selected cloud profile is not present in trusted host settings.",
+                    status=503,
+                    retryable=True,
+                )
+            return str(host_profile.access_mode)
+        return "actor_owned"
 
     def close(self) -> None:
         """Close this Product store and the resolved capability channels."""
@@ -627,6 +971,244 @@ def _notification_response(event: IntegrationNotification) -> dict[str, Any]:
         "actionRef": event.action_ref,
         "acknowledgedAt": _http_timestamp_value(event.acknowledged_at),
     }
+
+
+def _teams_resource_ref(conversation: Mapping[str, Any]) -> str:
+    """Bind a Teams grant to one canonical tenant/team/channel/root-thread route."""
+
+    encoded = connector_canonical_json(dict(conversation))
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _connector_operation_response(
+    request_id: str,
+    result: Mapping[str, Any],
+    *,
+    is_mutating: bool = False,
+) -> dict[str, Any]:
+    """Project provider business state into the stable Navigator invocation envelope."""
+
+    raw_state = result.get("state", result.get("status"))
+    state = str(raw_state).strip().upper() if raw_state is not None else ""
+    remote_state = result.get("remote_state", result.get("remoteState"))
+    remote_state_value = str(remote_state).strip().upper() if remote_state is not None else ""
+    provider_error = result.get("isError", result.get("is_error", False)) is True or isinstance(
+        result.get("error"), Mapping
+    )
+    unknown_mutation_state = state in {
+        "UNKNOWN",
+        "UNKNOWN_RESULT",
+        "UNCERTAIN",
+        "REMOTE_STATE_UNVERIFIED",
+        "COMMAND_INTERRUPTED",
+        "COMMAND_CANCELLED",
+    } or remote_state_value in {"UNKNOWN", "UNKNOWN_RESULT", "UNVERIFIED"}
+    if is_mutating and unknown_mutation_state:
+        outcome = "uncertain"
+    elif state == "COMMAND_FAILED" and remote_state_value in {"", "NOT_APPLICABLE"}:
+        outcome = "failed"
+    elif is_mutating and state in {"PENDING", "RUNNING", "SUBMITTED", "ACCEPTED"}:
+        outcome = "pending"
+    elif provider_error:
+        outcome = "failed"
+    elif is_mutating and (state in {"FAILED", "REJECTED", "ERROR"} or not state):
+        outcome = "failed" if state else "uncertain"
+    else:
+        outcome = "verified"
+    operation_ref = result.get("operation_ref", result.get("operationRef"))
+    if outcome == "pending" and not (isinstance(operation_ref, str) and operation_ref):
+        outcome = "uncertain"
+    response: dict[str, Any] = {
+        "requestId": request_id,
+        "outcome": outcome,
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": connector_canonical_json(dict(result)).decode("utf-8"),
+                }
+            ],
+            "isError": outcome in {"failed", "uncertain"},
+        },
+    }
+    if isinstance(operation_ref, str) and operation_ref:
+        response["operationRef"] = operation_ref
+    return response
+
+
+def _connector_envelope_sha256(
+    *,
+    connection_ref: str,
+    provider_id: str,
+    profile_ref: str,
+    operation_id: str,
+    resource_ref: str,
+    arguments_sha256: str,
+) -> str:
+    """Hash the exact host-bound action envelope without storing provider input."""
+
+    envelope = {
+        "connectionRef": connection_ref,
+        "providerId": provider_id,
+        "profileRef": profile_ref,
+        "operationId": operation_id,
+        "resourceRef": resource_ref,
+        "argumentsDigestSha256": arguments_sha256,
+    }
+    return hashlib.sha256(connector_canonical_json(envelope)).hexdigest()
+
+
+def _connector_replay_response(
+    *,
+    request_id: str,
+    reservation: ConnectorInvocationReservation,
+) -> dict[str, Any]:
+    """Return an exact cached receipt or a conservative unresolved receipt."""
+
+    if reservation.response is not None:
+        return reservation.response
+    state = reservation.state or "UNKNOWN_RESULT"
+    outcome = (
+        "pending"
+        if state == "PENDING"
+        else "uncertain"
+        if state == "UNKNOWN_RESULT" or state == "IN_PROGRESS"
+        else "failed"
+        if state in {"FAILED", "REJECTED"}
+        else "verified"
+    )
+    fresh_request_required = not reservation.is_mutating and state in {"SUCCEEDED", "FAILED"}
+    summary: dict[str, Any] = {
+        "state": state,
+        "receiptOnly": True,
+        "reasonCode": "connector_attempt_already_started",
+        "freshRequestRequired": fresh_request_required,
+        "replayPolicy": (
+            "fresh-read"
+            if fresh_request_required
+            else "status-reconciliation"
+            if state in {"PENDING", "UNKNOWN_RESULT", "IN_PROGRESS"}
+            else "do-not-repeat"
+        ),
+    }
+    if reservation.operation_ref:
+        summary["operation_ref"] = reservation.operation_ref
+    return {
+        "requestId": request_id,
+        "outcome": outcome,
+        **({"operationRef": reservation.operation_ref} if reservation.operation_ref else {}),
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": connector_canonical_json(summary).decode("utf-8"),
+                }
+            ],
+            "isError": outcome in {"failed", "uncertain"},
+        },
+    }
+
+
+def _connector_operation_state(result: Mapping[str, Any]) -> str | None:
+    raw_state = result.get("state", result.get("status"))
+    if not isinstance(raw_state, str):
+        return None
+    return raw_state.strip().upper()
+
+
+def _connector_operation_ref(result: Mapping[str, Any]) -> str | None:
+    raw_ref = result.get("operation_ref", result.get("operationRef"))
+    return raw_ref if isinstance(raw_ref, str) and raw_ref else None
+
+
+def _provider_profile_ref(principal: IntegrationPrincipal, idempotency_key: str) -> str:
+    """Generate a stable opaque profile idempotency reference for one actor request."""
+
+    if not idempotency_key or len(idempotency_key) > 200:
+        raise ExchangeProductError(
+            code="EXCHANGE_IDEMPOTENCY_KEY_REQUIRED",
+            title="Idempotency key required",
+            detail="Provider profile linking requires an Idempotency-Key.",
+            status=400,
+        )
+    seed = "\n".join(
+        (
+            principal.issuer,
+            principal.subject,
+            principal.organization_id,
+            principal.workspace_id,
+            idempotency_key,
+        )
+    )
+    return str(uuid5(NAMESPACE_URL, f"cyrene-provider-profile:{seed}"))
+
+
+def _linked_provider_profile_response(
+    result: Mapping[str, Any],
+    *,
+    expected_profile_ref: str,
+    expected_provider: str,
+) -> dict[str, Any]:
+    """Validate and project a non-secret Account Center profile link result."""
+
+    profile_ref = result.get("profile_ref")
+    provider = result.get("provider")
+    auth_status = result.get("auth_status")
+    external_subject = result.get("external_subject")
+    expires_at = result.get("expires_at")
+    auth_mode = result.get("auth_mode")
+    access_mode = result.get("access_mode", "actor_owned")
+    if (
+        profile_ref != expected_profile_ref
+        or provider != expected_provider
+        or not isinstance(auth_status, str)
+        or auth_status
+        not in {
+            "unknown",
+            "configured",
+            "healthy",
+            "unavailable",
+            "reauthorization_required",
+            "revoked",
+        }
+        or not isinstance(external_subject, str)
+        or not external_subject
+        or (
+            expires_at is not None
+            and (isinstance(expires_at, bool) or not isinstance(expires_at, int))
+        )
+        or not isinstance(access_mode, str)
+        or access_mode not in {"actor_owned", "workspace_operator"}
+        or (
+            auth_mode is not None
+            and (
+                expected_provider != "huggingface"
+                or not isinstance(auth_mode, str)
+                or auth_mode not in {"fine_grained_token", "device_oauth"}
+            )
+        )
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned invalid or mismatched provider profile metadata.",
+            status=502,
+        )
+    projection = {
+        "profileRef": profile_ref,
+        "provider": provider,
+        "authStatus": auth_status,
+        "accessMode": access_mode,
+        "externalSubject": external_subject,
+        "expiresAt": (
+            _http_utc_timestamp(datetime.fromtimestamp(expires_at, UTC))
+            if expires_at is not None
+            else None
+        ),
+    }
+    if isinstance(auth_mode, str):
+        projection["authMode"] = auth_mode
+    return projection
 
 
 def _connection_response(connection: Any) -> dict[str, Any]:
@@ -768,6 +1350,14 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     detail="Select a workspace for Platform Authority verification.",
                     status=400,
                 )
+            if services.authorizer is None:
+                raise ExchangeProductError(
+                    code="EXCHANGE_INTEGRATION_IDENTITY_NOT_CONFIGURED",
+                    title="First-party identity verification is unavailable",
+                    detail="This Exchange profile has no Platform identity verification channel.",
+                    status=503,
+                    retryable=True,
+                )
             return services.authorizer.principal_for(
                 bearer_token=token, workspace_id=selected_workspace
             )
@@ -889,6 +1479,70 @@ def create_router(services: IntegrationServices) -> APIRouter:
             )
         return [item for item in links if isinstance(item, Mapping)]
 
+    async def signed_navigator_body(request: Request, body_type: Any) -> Any:
+        """Validate an internal request's exact raw body with the Navigator service key."""
+
+        authenticator = services.navigator_hmac_authenticator
+        if authenticator is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                title="Connector authorization is not configured",
+                detail="Exchange has no Navigator service authentication binding.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "navigator_hmac_not_configured"},
+            )
+        if request.url.query:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail="Internal connector requests do not accept query selectors.",
+                status=400,
+            )
+        if request.headers.get("authorization") or request.headers.get(
+            "x-cyrene-execution-credential-bin"
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_AUTH_AMBIGUOUS",
+                title="Connector authentication is ambiguous",
+                detail="The internal connector route accepts only the configured Navigator HMAC.",
+                status=401,
+            )
+        content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail="Internal connector requests require application/json.",
+                status=415,
+            )
+        raw_body = await _read_bounded_request_body(
+            request,
+            max_bytes=navigator_hmac_body_limit(request.method, request.url.path),
+        )
+        timestamp = authenticator.verify(
+            method=request.method,
+            path=request.url.path,
+            headers=request.headers,
+            raw_body=raw_body,
+        )
+        payload = parse_signed_json_object(raw_body)
+        try:
+            body = body_type.model_validate(payload)
+        except ValidationError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail="The signed connector request does not match its closed schema.",
+                status=400,
+            ) from exc
+        authenticator.consume_request_id(
+            key_id=request.headers.get("x-cyrene-navigator-key-id", ""),
+            request_id=body.request_id,
+            timestamp=timestamp,
+        )
+        return body
+
     @router.post("/api/v1/accounts/link-sessions", status_code=201, operation_id="accountBeginLink")
     async def begin_link(
         body: BeginLinkBody,
@@ -912,6 +1566,260 @@ def create_router(services: IntegrationServices) -> APIRouter:
         actor = await principal(request, workspace_id, operation_id="accountListLinks")
         require(actor, "accountListLinks")
         return {"links": account_links(actor)}
+
+    @router.get(
+        "/api/v1/accounts/provider-profiles",
+        operation_id="accountListProviderProfiles",
+    )
+    async def list_provider_profiles(
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        result = services.accounts.list_provider_profiles(actor)
+        profiles = result.get("profiles") if isinstance(result, Mapping) else None
+        if not isinstance(profiles, list):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned an invalid provider profile projection.",
+                status=502,
+            )
+        projected: list[dict[str, Any]] = []
+        for item in profiles:
+            if not isinstance(item, Mapping):
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Account Center returned malformed provider profile metadata.",
+                    status=502,
+                )
+            profile_ref = item.get("profile_ref")
+            provider = item.get("provider")
+            identity_ref = item.get("identity_ref")
+            auth_status = item.get("auth_status")
+            auth_mode = item.get("auth_mode")
+            access_mode = item.get("access_mode", "actor_owned")
+            if not all(
+                isinstance(value, str) and value for value in (profile_ref, provider, auth_status)
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Account Center returned incomplete provider profile metadata.",
+                    status=502,
+                )
+            if auth_mode is not None and (
+                provider != "huggingface"
+                or not isinstance(auth_mode, str)
+                or auth_mode not in {"fine_grained_token", "device_oauth"}
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Account Center returned an unsupported Hugging Face auth mode.",
+                    status=502,
+                )
+            if not isinstance(access_mode, str) or access_mode not in {
+                "actor_owned",
+                "workspace_operator",
+            }:
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Account Center returned an unsupported provider access mode.",
+                    status=502,
+                )
+            projected.append(
+                {
+                    "profileRef": profile_ref,
+                    "provider": provider,
+                    "identityRef": identity_ref if isinstance(identity_ref, str) else None,
+                    "targetScope": item.get("target_scope")
+                    if isinstance(item.get("target_scope"), Mapping)
+                    else {},
+                    "authStatus": auth_status,
+                    "accessMode": access_mode,
+                    "externalSubject": item.get("external_subject")
+                    if isinstance(item.get("external_subject"), str)
+                    else None,
+                    "expiresAt": item.get("expires_at")
+                    if isinstance(item.get("expires_at"), int)
+                    else None,
+                    **({"authMode": auth_mode} if isinstance(auth_mode, str) else {}),
+                }
+            )
+        return {"profiles": projected}
+
+    @router.post(
+        "/api/v1/accounts/provider-profiles/github/app-installations",
+        status_code=201,
+        operation_id="accountLinkGitHubAppInstallation",
+    )
+    async def link_github_app_installation(
+        body: LinkGitHubInstallationBody,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        profile_ref = _provider_profile_ref(actor, idempotency_key)
+        linked = services.accounts.link_github_app_installation(
+            actor,
+            profile_ref=profile_ref,
+            installation_id=body.installation_id,
+            repositories=[
+                repository.model_dump(by_alias=False) for repository in body.repositories
+            ],
+            idempotency_key=idempotency_key,
+        )
+        return _linked_provider_profile_response(
+            linked,
+            expected_profile_ref=profile_ref,
+            expected_provider="github",
+        )
+
+    @router.post(
+        "/api/v1/accounts/provider-profiles/huggingface/{profile_alias}",
+        status_code=201,
+        operation_id="accountLinkHuggingFaceProfile",
+    )
+    async def link_huggingface_profile(
+        profile_alias: str,
+        request: Request,
+        body: LinkHuggingFaceProfileBody,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        if body.profile_alias != profile_alias:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROFILE_MISMATCH",
+                title="Provider profile selector mismatch",
+                detail="The body profile alias must match the route selector.",
+                status=400,
+            )
+        registry = services.authorization_profile_registry
+        profile = registry.settings.profiles.get(profile_alias) if registry is not None else None
+        if (
+            profile is None
+            or profile.provider != "hf"
+            or profile.credential_secret_ref is None
+            or profile.account_scopes is None
+            or profile.organization_id != actor.organization_id
+            or profile.workspace_id != actor.workspace_id
+            or profile.expected_issuer != actor.issuer
+            or not registry.principal_allowed_for_profile(actor, profile)
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                title="HF profile is not configured for this actor",
+                detail=(
+                    "The selected HF profile or its host secret reference is unavailable "
+                    "to this actor."
+                ),
+                status=403,
+            )
+        profile_ref = _provider_profile_ref(actor, idempotency_key)
+        linked = services.accounts.link_huggingface_profile(
+            actor,
+            profile_ref=profile_ref,
+            credential_secret_ref=profile.credential_secret_ref,
+            scopes=profile.account_scopes,
+            auth_mode=profile.auth_mode,
+            idempotency_key=idempotency_key,
+        )
+        return _linked_provider_profile_response(
+            linked,
+            expected_profile_ref=profile_ref,
+            expected_provider="huggingface",
+        )
+
+    @router.post(
+        "/api/v1/accounts/provider-profiles/huggingface/{profile_alias}/{profile_ref}/actions/rotate",
+        operation_id="accountRotateHuggingFaceProfile",
+    )
+    async def rotate_huggingface_profile(
+        profile_alias: str,
+        profile_ref: str,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        registry = services.authorization_profile_registry
+        profile = registry.settings.profiles.get(profile_alias) if registry is not None else None
+        if (
+            profile is None
+            or profile.provider != "hf"
+            or profile.credential_secret_ref is None
+            or profile.organization_id != actor.organization_id
+            or profile.workspace_id != actor.workspace_id
+            or profile.expected_issuer != actor.issuer
+            or not registry.principal_allowed_for_profile(actor, profile)
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                title="HF profile is not configured for this actor",
+                detail=(
+                    "The selected HF profile or its host secret reference is unavailable "
+                    "to this actor."
+                ),
+                status=403,
+            )
+        current_profiles = services.accounts.list_provider_profiles(actor).get("profiles")
+        existing = (
+            next(
+                (
+                    item
+                    for item in current_profiles
+                    if isinstance(item, Mapping)
+                    and item.get("profile_ref") == profile_ref
+                    and item.get("provider") == "huggingface"
+                ),
+                None,
+            )
+            if isinstance(current_profiles, list)
+            else None
+        )
+        if existing is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_PROFILE_NOT_FOUND",
+                title="HF provider profile not found",
+                detail="The selected HF profile does not belong to this verified actor.",
+                status=404,
+            )
+        linked = services.accounts.rotate_huggingface_profile(
+            actor,
+            profile_ref=profile_ref,
+            credential_secret_ref=profile.credential_secret_ref,
+            idempotency_key=idempotency_key,
+        )
+        return _linked_provider_profile_response(
+            linked,
+            expected_profile_ref=profile_ref,
+            expected_provider="huggingface",
+        )
 
     @router.get(
         "/api/v1/accounts/github/callback",
@@ -995,11 +1903,66 @@ def create_router(services: IntegrationServices) -> APIRouter:
         create_request = create_request.model_copy(
             update={"display_name": services.display_name_for_connection(actor, create_request)}
         )
-        connection = services.store.create_connection(
-            actor,
-            create_request,
-            idempotency_key=idempotency_key,
-        )
+        access_mode = services.access_mode_for_connection(actor, create_request)
+        if access_mode == "workspace_operator":
+            require(actor, "navigator.connector.operator.v1")
+        if access_mode == "workspace_operator":
+            connection = services.store.create_connection(
+                actor,
+                create_request,
+                idempotency_key=idempotency_key,
+                access_mode="workspace_operator",
+            )
+        else:
+            connection = services.store.create_connection(
+                actor,
+                create_request,
+                idempotency_key=idempotency_key,
+            )
+        if connection.provider in {"azure", "gcp", "runpod"}:
+            registry = services.authorization_profile_registry
+            host_profile = (
+                registry.settings.profiles.get(connection.binding_ref or "")
+                if registry is not None
+                else None
+            )
+            target = (
+                host_profile.targets.get(connection.target_ref or "")
+                if host_profile is not None
+                else None
+            )
+            if (
+                host_profile is None
+                or host_profile.provider != connection.provider
+                or target is None
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Cloud profile is not configured",
+                    detail="The selected cloud profile or target is not in trusted host settings.",
+                    status=403,
+                )
+            registered = services.accounts.register_host_identity_profile(
+                actor,
+                profile_ref=host_profile.profile_ref,
+                provider=connection.provider,
+                identity_ref=host_profile.identity_ref or host_profile.profile_ref,
+                target_scope={
+                    "target_ref": connection.target_ref,
+                    "provider_target_ref": target.target_ref,
+                },
+                idempotency_key=f"connection-profile:{connection.id}",
+            )
+            if (
+                registered.get("profile_ref") != host_profile.profile_ref
+                or registered.get("provider") != connection.provider
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Account Center returned a mismatched host identity profile.",
+                    status=502,
+                )
         return _connection_response(connection)
 
     @router.get(
@@ -1016,6 +1979,758 @@ def create_router(services: IntegrationServices) -> APIRouter:
             _connection_response(connection)
             for connection in services.store.list_connections(actor)
         ]
+
+    @router.post(
+        "/internal/v1/connector-operation-grants",
+        operation_id="internalMintConnectorOperationGrant",
+    )
+    async def mint_connector_operation_grant(request: Request) -> dict[str, Any]:
+        """Mint one fresh Directory proof for a signed Navigator provider request."""
+
+        body = await signed_navigator_body(request, ConnectorOperationGrantBody)
+        authority = services.connector_grant_authority
+        verifier = services.connector_grant_verifier
+        dispatcher = services.connector_operation_dispatcher
+        if authority is None or verifier is None or dispatcher is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                title="Connector authorization is not configured",
+                detail="Exchange has no complete Authority, grant verifier, or provider adapter.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "connector_authority_not_configured"},
+            )
+        try:
+            if body.connection_ref == getattr(
+                services.teams_message_profile, "connection_ref", None
+            ):
+                profile = services.teams_message_profile
+                if profile is None:
+                    raise PermissionError("Teams message profile is not configured")
+                principal_value = IntegrationPrincipal(
+                    issuer=body.principal_issuer,
+                    subject=body.principal_subject,
+                    organization_id=profile.organization_id,
+                    workspace_id=body.workspace_id,
+                    allowed_operation_ids=frozenset({body.operation_id}),
+                )
+                prepared = dispatcher.prepare_teams_reply(
+                    principal=principal_value,
+                    profile=profile,
+                    provider_id=body.provider_id,
+                    profile_ref=body.profile_ref,
+                    operation_id=body.operation_id,
+                    resource_ref=body.resource_ref,
+                    arguments=body.arguments,
+                    request_id=body.request_id,
+                )
+            else:
+                connection_id = UUID(body.connection_ref)
+                connection = services.store.connector_connection_for_actor(
+                    connection_id,
+                    issuer=body.principal_issuer,
+                    subject=body.principal_subject,
+                    workspace_id=body.workspace_id,
+                )
+                principal_value = IntegrationPrincipal(
+                    issuer=body.principal_issuer,
+                    subject=body.principal_subject,
+                    organization_id=connection.organization_id,
+                    workspace_id=connection.workspace_id,
+                    allowed_operation_ids=frozenset({body.operation_id}),
+                )
+                prepared = dispatcher.prepare_connection_operation(
+                    principal=principal_value,
+                    connection=connection,
+                    provider_id=body.provider_id,
+                    profile_ref=body.profile_ref,
+                    operation_id=body.operation_id,
+                    resource_ref=body.resource_ref,
+                    arguments=body.arguments,
+                    request_id=body.request_id,
+                )
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail=(
+                    "The selected connection or operation does not match its fixed provider "
+                    "profile."
+                ),
+                status=422,
+            ) from exc
+        except PermissionError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Connector authorization denied",
+                detail="The connector operation is outside the verified actor or host binding.",
+                status=403,
+                context={"reasonCode": "connector_scope_mismatch"},
+            ) from exc
+        calculated_digest = digest_arguments(prepared.arguments)
+        if (
+            prepared.provider_id != body.provider_id
+            or prepared.profile_ref != body.profile_ref
+            or prepared.operation_id != body.operation_id
+            or prepared.resource_ref != body.resource_ref
+            or calculated_digest != body.arguments_digest_sha256
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_ARGUMENTS_MISMATCH",
+                title="Connector request does not match its signed scope",
+                detail=(
+                    "Exchange recomputed a different profile, resource, operation, or arguments "
+                    "digest."
+                ),
+                status=403,
+            )
+        expected = {
+            "request_id": body.request_id,
+            "organization_id": prepared.expected_organization_id,
+            "workspace_id": body.workspace_id,
+            "principal_issuer": body.principal_issuer,
+            "principal_subject": body.principal_subject,
+            "connection_ref": body.connection_ref,
+            "provider_id": prepared.provider_id,
+            "profile_ref": prepared.profile_ref,
+            "operation_id": prepared.operation_id,
+            "resource_ref": prepared.resource_ref,
+            "arguments_digest_sha256": bytes.fromhex(calculated_digest),
+        }
+        grant_bytes = authority.authorize_connector_operation(
+            workspace_id=body.workspace_id,
+            principal_issuer=body.principal_issuer,
+            principal_subject=body.principal_subject,
+            connection_ref=body.connection_ref,
+            provider_id=prepared.provider_id,
+            profile_ref=prepared.profile_ref,
+            operation_id=prepared.operation_id,
+            resource_ref=prepared.resource_ref,
+            arguments_digest_sha256=bytes.fromhex(calculated_digest),
+            request_id=body.request_id,
+        )
+        claims: ConnectorGrantClaims = verifier.validate_authority_response(
+            grant_bytes,
+            expected=expected,
+        )
+        return {
+            "connectorGrantBin": base64.b64encode(grant_bytes).decode("ascii"),
+            "grantRef": claims.grant_ref,
+            "audience": claims.audience,
+            "issuedAt": claims.issued_at_epoch,
+            "expiresAt": claims.expires_at_epoch,
+            "claims": {
+                "requestId": claims.request_id,
+                "organizationId": claims.organization_id,
+                "workspaceId": claims.workspace_id,
+                "principalIssuer": claims.principal_issuer,
+                "principalSubject": claims.principal_subject,
+                "connectionRef": claims.connection_ref,
+                "providerId": claims.provider_id,
+                "profileRef": claims.profile_ref,
+                "operationId": claims.operation_id,
+                "resourceRef": claims.resource_ref,
+                "argumentsDigestSha256": claims.arguments_digest_sha256.hex(),
+            },
+        }
+
+    @router.post(
+        "/internal/v1/connector-operations/{connection_ref}",
+        operation_id="internalExecuteConnectorOperation",
+    )
+    async def execute_connector_operation(
+        connection_ref: str,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Verify one fresh signed grant and invoke a provider operation exactly once."""
+
+        if request.url.query or request.headers.get("authorization"):
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_AUTH_AMBIGUOUS",
+                title="Connector authentication is ambiguous",
+                detail="Connector invocation accepts only X-Cyrene-Connector-Grant-Bin.",
+                status=401,
+            )
+        if request.headers.get("x-cyrene-execution-credential-bin"):
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_AUTH_AMBIGUOUS",
+                title="Connector authentication is ambiguous",
+                detail="Product execution credentials cannot authorize connector operations.",
+                status=401,
+            )
+        content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail="Connector invocation requires application/json.",
+                status=415,
+            )
+        raw_body = await _read_bounded_request_body(request, max_bytes=1_500_000)
+        payload = parse_signed_json_object(raw_body)
+        try:
+            body = ConnectorOperationBody.model_validate(payload)
+        except ValidationError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail="The provider operation does not match its closed Exchange schema.",
+                status=400,
+            ) from exc
+        verifier = services.connector_grant_verifier
+        dispatcher = services.connector_operation_dispatcher
+        if verifier is None or dispatcher is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                title="Connector authorization is not configured",
+                detail="Exchange has no connector grant verifier or provider adapter.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "connector_dispatch_not_configured"},
+            )
+        encoded = request.headers.get("x-cyrene-connector-grant-bin", "")
+        try:
+            grant_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Connector authorization denied",
+                detail="The connector grant header is malformed.",
+                status=403,
+            ) from exc
+        if request.url.path != f"/internal/v1/connector-operations/{connection_ref}":
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Connector authorization denied",
+                detail="The connector grant does not target this route.",
+                status=403,
+            )
+        try:
+            connection_id = UUID(connection_ref)
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_FOUND",
+                title="Connector connection not found",
+                detail="The requested connector connection does not exist.",
+                status=404,
+            ) from exc
+        provisional = verifier.inspect(grant_bytes)
+        connection = services.store.connector_connection_for_actor(
+            connection_id,
+            issuer=provisional.principal_issuer,
+            subject=provisional.principal_subject,
+            workspace_id=provisional.workspace_id,
+            organization_id=provisional.organization_id,
+        )
+        principal_value = IntegrationPrincipal(
+            issuer=provisional.principal_issuer,
+            subject=provisional.principal_subject,
+            organization_id=provisional.organization_id,
+            workspace_id=provisional.workspace_id,
+            allowed_operation_ids=frozenset({body.operation_id}),
+        )
+        try:
+            prepared = dispatcher.prepare_connection_operation(
+                principal=principal_value,
+                connection=connection,
+                provider_id=body.provider_id,
+                profile_ref=body.profile_ref,
+                operation_id=body.operation_id,
+                resource_ref=body.resource_ref,
+                arguments=body.arguments,
+                request_id=body.request_id,
+            )
+        except PermissionError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Connector authorization denied",
+                detail="The connector operation is outside the verified actor or host binding.",
+                status=403,
+                context={"reasonCode": "connector_scope_mismatch"},
+            ) from exc
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail="The provider operation does not match its fixed argument schema.",
+                status=422,
+            ) from exc
+        calculated_digest = digest_arguments(prepared.arguments)
+        expected = {
+            "request_id": body.request_id,
+            "organization_id": connection.organization_id,
+            "workspace_id": connection.workspace_id,
+            "principal_issuer": provisional.principal_issuer,
+            "principal_subject": provisional.principal_subject,
+            "connection_ref": str(connection.id),
+            "provider_id": prepared.provider_id,
+            "profile_ref": prepared.profile_ref,
+            "operation_id": prepared.operation_id,
+            "resource_ref": prepared.resource_ref,
+            "arguments_digest_sha256": bytes.fromhex(calculated_digest),
+        }
+        claims = verifier.inspect(
+            grant_bytes,
+            expected=expected,
+        )
+        envelope_sha256 = _connector_envelope_sha256(
+            connection_ref=str(connection.id),
+            provider_id=prepared.provider_id,
+            profile_ref=prepared.profile_ref,
+            operation_id=prepared.operation_id,
+            resource_ref=prepared.resource_ref,
+            arguments_sha256=calculated_digest,
+        )
+        try:
+            reservation = services.store.reserve_connector_invocation(
+                principal_value,
+                request_id=body.request_id,
+                connection_ref=str(connection.id),
+                provider_id=prepared.provider_id,
+                profile_ref=prepared.profile_ref,
+                operation_id=prepared.operation_id,
+                resource_ref=prepared.resource_ref,
+                arguments_sha256=calculated_digest,
+                envelope_sha256=envelope_sha256,
+                grant_ref=claims.grant_ref,
+                is_mutating=prepared.is_mutating,
+                now_epoch=int(datetime.now(UTC).timestamp()),
+            )
+        except ConnectorInvocationLedgerFull as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_RECEIPT_CAPACITY_EXCEEDED",
+                title="Connector receipt capacity reached",
+                detail=(
+                    "Exchange cannot safely admit another provider attempt until receipts are "
+                    "reconciled or expire."
+                ),
+                status=503,
+                retryable=True,
+            ) from exc
+        if reservation.disposition != "NEW":
+            if reservation.grant_ref != claims.grant_ref:
+                claims = verifier.consume(grant_bytes, expected=expected)
+                services.store.attach_connector_invocation_grant(
+                    principal_value,
+                    request_id=body.request_id,
+                    envelope_sha256=envelope_sha256,
+                    grant_ref=claims.grant_ref,
+                )
+            return _connector_replay_response(
+                request_id=body.request_id,
+                reservation=reservation,
+            )
+        try:
+            claims = verifier.consume(grant_bytes, expected=expected)
+        except ExchangeProductError:
+            services.store.discard_connector_invocation(
+                principal_value,
+                request_id=body.request_id,
+                envelope_sha256=envelope_sha256,
+            )
+            raise
+        services.store.attach_connector_invocation_grant(
+            principal_value,
+            request_id=body.request_id,
+            envelope_sha256=envelope_sha256,
+            grant_ref=claims.grant_ref,
+        )
+        try:
+            result = dispatcher.invoke(prepared, principal=principal_value, claims=claims)
+        except ExchangeProductError as exc:
+            result = {
+                "state": "UNKNOWN_RESULT" if prepared.is_mutating else "FAILED",
+                "error": {"code": exc.code, "retryable": exc.retryable},
+            }
+        except Exception:
+            result = {
+                "state": "UNKNOWN_RESULT" if prepared.is_mutating else "FAILED",
+                "error": {"code": "PROVIDER_UNAVAILABLE", "retryable": True},
+            }
+        response = _connector_operation_response(
+            claims.request_id,
+            result,
+            is_mutating=prepared.is_mutating,
+        )
+        outcome = response["outcome"]
+        receipt_state = {
+            "verified": "SUCCEEDED",
+            "pending": "PENDING",
+            "uncertain": "UNKNOWN_RESULT",
+            "failed": "FAILED",
+        }[str(outcome)]
+        operation_ref = _connector_operation_ref(result)
+        services.store.complete_connector_invocation(
+            principal_value,
+            request_id=body.request_id,
+            envelope_sha256=envelope_sha256,
+            state=receipt_state,  # type: ignore[arg-type]
+            response=response,
+            operation_ref=operation_ref,
+            response_status=200,
+            now_epoch=int(datetime.now(UTC).timestamp()),
+        )
+        if prepared.operation_id == "cloud.operation.status.read" and _connector_operation_state(
+            result
+        ) in {"SUCCEEDED", "FAILED"}:
+            requested_ref = body.arguments.get("operation_ref")
+            reconciled_ref = operation_ref or (
+                requested_ref if isinstance(requested_ref, str) else None
+            )
+            if reconciled_ref:
+                services.store.reconcile_connector_invocations(
+                    principal_value,
+                    profile_ref=prepared.profile_ref,
+                    operation_ref=reconciled_ref,
+                    terminal_state=_connector_operation_state(result),  # type: ignore[arg-type]
+                    now_epoch=int(datetime.now(UTC).timestamp()),
+                )
+        return response
+
+    @router.post(
+        "/internal/v1/teams/messages",
+        operation_id="internalSendTeamsMessage",
+        response_model=None,
+    )
+    async def send_teams_message(
+        request: Request,
+    ) -> dict[str, Any] | JSONResponse:
+        """Reply to one fixed Teams thread under a fresh signed Authority grant."""
+
+        if request.url.query or request.headers.get("authorization"):
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_AUTH_AMBIGUOUS",
+                title="Connector authentication is ambiguous",
+                detail="Teams egress accepts only X-Cyrene-Connector-Grant-Bin.",
+                status=401,
+            )
+        if request.headers.get("x-cyrene-execution-credential-bin"):
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_AUTH_AMBIGUOUS",
+                title="Connector authentication is ambiguous",
+                detail="Product execution credentials cannot authorize Teams egress.",
+                status=401,
+            )
+        content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail="Teams egress requires application/json.",
+                status=415,
+            )
+        raw_body = await _read_bounded_request_body(request, max_bytes=64 * 1024)
+        payload = parse_signed_json_object(raw_body)
+        try:
+            body = TeamsMessageBody.model_validate(payload)
+        except ValidationError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Connector request is invalid",
+                detail="The Teams message does not match its closed Exchange schema.",
+                status=400,
+            ) from exc
+        verifier = services.connector_grant_verifier
+        profile = services.teams_message_profile
+        client = services.teams_message_client
+        if verifier is None or profile is None or client is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                title="Teams connector is not configured",
+                detail="Exchange has no complete Teams provider binding or grant verifier.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "teams_provider_not_configured"},
+            )
+        if body.provider_id is not None and body.provider_id != "msteams":
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_MISMATCH",
+                title="Teams provider mismatch",
+                detail="The egress request must use the configured msteams provider.",
+                status=403,
+            )
+        try:
+            profile.authorize_conversation(
+                tenant_id=body.conversation.tenant_id,
+                team_id=body.conversation.team_id,
+                channel_id=body.conversation.channel_id,
+            )
+            validate_teams_service_url(
+                body.conversation.service_url,
+                tenant_id=body.conversation.tenant_id,
+            )
+        except PermissionError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The requested Teams channel is outside the host-configured allowlist.",
+                status=403,
+                context={"reasonCode": "teams_channel_scope_mismatch"},
+            ) from exc
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Teams service URL is invalid",
+                detail="The Teams serviceUrl is outside the fixed official Bot Framework routes.",
+                status=400,
+            ) from exc
+        arguments = {
+            "conversation": {
+                "tenantId": body.conversation.tenant_id,
+                "teamId": body.conversation.team_id,
+                "channelId": body.conversation.channel_id,
+                "conversationId": body.conversation.conversation_id,
+                "rootThreadId": body.conversation.root_thread_id,
+                "serviceUrl": body.conversation.service_url,
+            },
+            "text": body.text,
+        }
+        conversation = arguments["conversation"]
+        if not isinstance(conversation, Mapping):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Teams connector request is invalid",
+                detail="The Teams conversation route must be a structured object.",
+                status=400,
+            )
+        resource_ref = _teams_resource_ref(conversation)
+        encoded = request.headers.get("x-cyrene-connector-grant-bin", "")
+        try:
+            grant_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The connector grant header is malformed.",
+                status=403,
+            ) from exc
+        provisional = verifier.inspect(grant_bytes)
+        if provisional.principal_issuer != profile.expected_issuer:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The signed Teams actor issuer does not match the configured tenant.",
+                status=403,
+            )
+        expected = {
+            "request_id": body.request_id,
+            "organization_id": profile.organization_id,
+            "workspace_id": profile.workspace_id,
+            "principal_issuer": profile.expected_issuer,
+            "principal_subject": provisional.principal_subject,
+            "connection_ref": profile.connection_ref,
+            "provider_id": "msteams",
+            "profile_ref": profile.profile_ref,
+            "operation_id": "msteams.message.reply",
+            "resource_ref": resource_ref,
+            "arguments_digest_sha256": bytes.fromhex(digest_arguments(arguments)),
+        }
+        claims = verifier.inspect(
+            grant_bytes,
+            expected=expected,
+        )
+        principal_value = IntegrationPrincipal(
+            issuer=claims.principal_issuer,
+            subject=claims.principal_subject,
+            organization_id=profile.organization_id,
+            workspace_id=profile.workspace_id,
+            allowed_operation_ids=frozenset({"msteams.message.reply"}),
+        )
+        arguments_sha256 = digest_arguments(arguments)
+        envelope_sha256 = _connector_envelope_sha256(
+            connection_ref=profile.connection_ref,
+            provider_id="msteams",
+            profile_ref=profile.profile_ref,
+            operation_id="msteams.message.reply",
+            resource_ref=resource_ref,
+            arguments_sha256=arguments_sha256,
+        )
+        try:
+            reservation = services.store.reserve_connector_invocation(
+                principal_value,
+                request_id=body.request_id,
+                connection_ref=profile.connection_ref,
+                provider_id="msteams",
+                profile_ref=profile.profile_ref,
+                operation_id="msteams.message.reply",
+                resource_ref=resource_ref,
+                arguments_sha256=arguments_sha256,
+                envelope_sha256=envelope_sha256,
+                grant_ref=claims.grant_ref,
+                is_mutating=True,
+                now_epoch=int(datetime.now(UTC).timestamp()),
+            )
+        except ConnectorInvocationLedgerFull as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_RECEIPT_CAPACITY_EXCEEDED",
+                title="Connector receipt capacity reached",
+                detail=(
+                    "Exchange cannot safely admit another Teams delivery attempt until prior "
+                    "receipts expire."
+                ),
+                status=503,
+                retryable=True,
+            ) from exc
+        if reservation.disposition != "NEW":
+            if reservation.grant_ref != claims.grant_ref:
+                claims = verifier.consume(grant_bytes, expected=expected)
+                services.store.attach_connector_invocation_grant(
+                    principal_value,
+                    request_id=body.request_id,
+                    envelope_sha256=envelope_sha256,
+                    grant_ref=claims.grant_ref,
+                )
+            response = reservation.response or {
+                "requestId": body.request_id,
+                "status": ("rate_limited" if reservation.state == "RATE_LIMITED" else "uncertain"),
+                "reasonCode": "teams_delivery_receipt_unavailable",
+                **({"retryAfterSeconds": 1} if reservation.state == "RATE_LIMITED" else {}),
+            }
+            if reservation.http_status == 429:
+                retry_after = response.get("retryAfterSeconds", 1)
+                retry_after_seconds = (
+                    retry_after if isinstance(retry_after, int) and retry_after > 0 else 1
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content=response,
+                    headers={"Retry-After": str(retry_after_seconds)},
+                )
+            return response
+        try:
+            claims = verifier.consume(grant_bytes, expected=expected)
+        except ExchangeProductError:
+            services.store.discard_connector_invocation(
+                principal_value,
+                request_id=body.request_id,
+                envelope_sha256=envelope_sha256,
+            )
+            raise
+        services.store.attach_connector_invocation_grant(
+            principal_value,
+            request_id=body.request_id,
+            envelope_sha256=envelope_sha256,
+            grant_ref=claims.grant_ref,
+        )
+        try:
+            evidence = client.send_reply(
+                bot_app_id=profile.bot_app_id,
+                tenant_id=body.conversation.tenant_id,
+                team_id=body.conversation.team_id,
+                channel_id=body.conversation.channel_id,
+                conversation_id=body.conversation.conversation_id,
+                root_thread_id=body.conversation.root_thread_id,
+                service_url=body.conversation.service_url,
+                text=body.text,
+                request_id=body.request_id,
+            )
+        except ExchangeProductError as exc:
+            known_rejection = {
+                "EXCHANGE_TEAMS_AUTH_EXPIRED": "auth_expired",
+                "EXCHANGE_TEAMS_PERMISSION_DENIED": "permission_denied",
+            }.get(exc.code)
+            if known_rejection is not None:
+                response = {
+                    "requestId": claims.request_id,
+                    "status": "rejected",
+                    "reasonCode": known_rejection,
+                }
+                services.store.complete_connector_invocation(
+                    principal_value,
+                    request_id=body.request_id,
+                    envelope_sha256=envelope_sha256,
+                    state="REJECTED",
+                    response=response,
+                    operation_ref=None,
+                    response_status=200,
+                    now_epoch=int(datetime.now(UTC).timestamp()),
+                )
+                return response
+            response = {
+                "requestId": claims.request_id,
+                "status": "uncertain",
+                "reasonCode": "teams_delivery_outcome_unknown",
+            }
+            services.store.complete_connector_invocation(
+                principal_value,
+                request_id=body.request_id,
+                envelope_sha256=envelope_sha256,
+                state="UNKNOWN_RESULT",
+                response=response,
+                operation_ref=None,
+                response_status=200,
+                now_epoch=int(datetime.now(UTC).timestamp()),
+            )
+            return response
+        except Exception:
+            response = {
+                "requestId": claims.request_id,
+                "status": "uncertain",
+                "reasonCode": "teams_delivery_outcome_unknown",
+            }
+            services.store.complete_connector_invocation(
+                principal_value,
+                request_id=body.request_id,
+                envelope_sha256=envelope_sha256,
+                state="UNKNOWN_RESULT",
+                response=response,
+                operation_ref=None,
+                response_status=200,
+                now_epoch=int(datetime.now(UTC).timestamp()),
+            )
+            return response
+        status_by_proto = {
+            "ACCEPTED": "accepted",
+            "REJECTED": "rejected",
+            "RATE_LIMITED": "rate_limited",
+        }
+        status = (
+            "accepted"
+            if evidence.accepted
+            else status_by_proto.get(str(evidence.evidence.get("status", "REJECTED")), "rejected")
+        )
+        response = {
+            "requestId": claims.request_id,
+            "status": status,
+            "vendorMessageId": evidence.vendor_message_id,
+            "reasonCode": evidence.evidence.get("reasonCode"),
+        }
+        retry_after = evidence.evidence.get("retryAfterSeconds")
+        retry_after_seconds = 1
+        if status == "rate_limited":
+            retry_after_seconds = (
+                min(retry_after, 300)
+                if (
+                    isinstance(retry_after, int)
+                    and not isinstance(retry_after, bool)
+                    and retry_after > 0
+                )
+                else 1
+            )
+            response["retryAfterSeconds"] = retry_after_seconds
+        state = {
+            "accepted": "SUCCEEDED",
+            "rejected": "REJECTED",
+            "rate_limited": "RATE_LIMITED",
+        }[status]
+        status_code = 429 if status == "rate_limited" else 200
+        services.store.complete_connector_invocation(
+            principal_value,
+            request_id=body.request_id,
+            envelope_sha256=envelope_sha256,
+            state=state,  # type: ignore[arg-type]
+            response=response,
+            operation_ref=None,
+            response_status=status_code,
+            now_epoch=int(datetime.now(UTC).timestamp()),
+        )
+        if status == "rate_limited":
+            return JSONResponse(
+                status_code=429,
+                content=response,
+                headers={"Retry-After": str(retry_after_seconds)},
+            )
+        return response
 
     @router.get(
         "/api/v1/integrations/connections/{connection_id}/authorization-health",
@@ -1674,6 +3389,14 @@ def create_router(services: IntegrationServices) -> APIRouter:
         )
         if authority_execution_credential is None:
             authority_bearer = bearer_token(request)
+        if services.delegation_authorizer is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_PLATFORM_DELEGATION_UNAVAILABLE",
+                title="Platform delegation is unavailable",
+                detail="This Exchange profile has no ProductWorkload delegation channel.",
+                status=503,
+                retryable=True,
+            )
         try:
             services.delegation_authorizer.validate_binding(
                 actor,

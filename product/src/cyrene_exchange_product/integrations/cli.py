@@ -67,8 +67,22 @@ def build_production_services(
         IntegrationAccountCenterPort,
         IntegrationGitHubPort,
         PlatformAuthorityDelegationClient,
+        PlatformConnectorAuthorizationClient,
+        TeamsMessageClient,
         WeComMessageClient,
         direct_plugin_client_from_connection,
+    )
+    from cyrene_exchange_product.integrations.connector_operations import (
+        ConnectorOperationDispatcher,
+    )
+    from cyrene_exchange_product.integrations.connector_profiles import (
+        ConnectorHostConfigurationError,
+        parse_connector_host_settings,
+    )
+    from cyrene_exchange_product.integrations.connector_security import (
+        ConnectorOperationGrantVerifier,
+        NavigatorHmacAuthenticator,
+        NavigatorHmacSettings,
     )
     from cyrene_exchange_product.integrations.dispatcher import (
         DispatcherRunner,
@@ -83,6 +97,10 @@ def build_production_services(
     configuration = _read_configuration(source)
     refs = _secret_refs(configuration.get("hostSecretRefs"))
     used_refs: set[str] = set()
+    try:
+        connector_settings = parse_connector_host_settings(configuration.get("connectorHost", {}))
+    except ConnectorHostConfigurationError as exc:
+        raise IntegrationConfigurationError(str(exc)) from exc
 
     try:
         authorization_settings = (
@@ -174,82 +192,119 @@ def build_production_services(
     # ── Phase 1: Validate the authority channels and workload profile ─────
     authority = _config_object(
         configuration["platformAuthority"],
-        required={"audience", "identity", "productWorkload"},
-        optional=set(),
+        required=set(),
+        optional={"audience", "identity", "productWorkload", "connectorWorkload"},
         label="platformAuthority",
     )
-    identity_profile = _config_object(
-        authority["identity"],
-        required={"connectionRef", "transport"},
-        optional={"mtls"},
-        label="Platform identity profile",
-    )
-    identity_ref = _text(identity_profile["connectionRef"], "identity.connectionRef")
-    if identity_profile["transport"] == "local":
-        if not identity_ref.startswith("unix://") or "mtls" in identity_profile:
-            raise IntegrationConfigurationError(
-                "local Platform identity verification requires a protected Unix socket"
-            )
-        identity_verifier = PlatformAuthorityIdentityVerifier.from_unix_socket(
-            Path(identity_ref.removeprefix("unix://"))
-        )
-    elif identity_profile["transport"] == "mtls":
-        if not identity_ref.startswith("grpcs://"):
-            raise IntegrationConfigurationError("remote Platform identity must use grpcs://")
-        tls = _config_object(
-            identity_profile.get("mtls"),
-            required={"rootCertificateRef", "clientCertificateRef", "clientKeyRef"},
-            optional=set(),
-            label="Platform identity mTLS profile",
-        )
-        identity_verifier = PlatformAuthorityIdentityVerifier.from_managed_tls_files(
-            target=identity_ref.removeprefix("grpcs://"),
-            root_certificates_path=secret_path(tls["rootCertificateRef"]),
-            private_key_path=secret_path(tls["clientKeyRef"]),
-            certificate_chain_path=secret_path(tls["clientCertificateRef"]),
-        )
-    else:
-        raise IntegrationConfigurationError("Platform identity transport is unsupported")
+    identity_verifier = None
+    authority_client = None
+    connector_authority = None
+    execution_verifier = None
+    workload_id = "exchange-connectors"
 
-    workload = _config_object(
-        authority["productWorkload"],
-        required={
-            "connectionRef",
-            "workloadId",
-            "audience",
-            "rootCertificateRef",
-            "clientCertificateRef",
-            "clientKeyRef",
-        },
-        optional=set(),
-        label="Platform ProductWorkload profile",
-    )
-    workload_ref = _text(workload["connectionRef"], "productWorkload.connectionRef")
-    if not workload_ref.startswith("grpcs://"):
-        raise IntegrationConfigurationError("Platform ProductWorkload must use grpcs:// mTLS")
-    authority_target = workload_ref.removeprefix("grpcs://")
-    authority_root = secret_path(workload["rootCertificateRef"])
-    authority_key = secret_path(workload["clientKeyRef"])
-    authority_chain = secret_path(workload["clientCertificateRef"])
-    workload_id = _text(workload["workloadId"], "productWorkload.workloadId")
-    audience = _text(authority["audience"], "platformAuthority.audience")
-    if _text(workload["audience"], "productWorkload.audience") != audience:
-        raise IntegrationConfigurationError("Platform workload audience does not match authority")
-    authority_client = PlatformAuthorityDelegationClient(
-        identity_verifier=identity_verifier,
-        target=workload_ref,
-        root_certificates_path=authority_root,
-        private_key_path=authority_key,
-        certificate_chain_path=authority_chain,
-        workload_id=workload_id,
-        audience=audience,
-    )
-    execution_verifier = PlatformExecutionAuthorizationVerifier.from_managed_tls_files(
-        target=authority_target,
-        root_certificates_path=authority_root,
-        private_key_path=authority_key,
-        certificate_chain_path=authority_chain,
-    )
+    if "productWorkload" in authority:
+        if "identity" not in authority or "audience" not in authority:
+            raise IntegrationConfigurationError(
+                "legacy ProductWorkload requires Platform identity and audience profiles"
+            )
+        identity_profile = _config_object(
+            authority["identity"],
+            required={"connectionRef", "transport"},
+            optional={"mtls"},
+            label="Platform identity profile",
+        )
+        identity_ref = _text(identity_profile["connectionRef"], "identity.connectionRef")
+        if identity_profile["transport"] == "local":
+            if not identity_ref.startswith("unix://") or "mtls" in identity_profile:
+                raise IntegrationConfigurationError(
+                    "local Platform identity verification requires a protected Unix socket"
+                )
+            identity_verifier = PlatformAuthorityIdentityVerifier.from_unix_socket(
+                Path(identity_ref.removeprefix("unix://"))
+            )
+        elif identity_profile["transport"] == "mtls":
+            if not identity_ref.startswith("grpcs://"):
+                raise IntegrationConfigurationError("remote Platform identity must use grpcs://")
+            tls = _config_object(
+                identity_profile.get("mtls"),
+                required={"rootCertificateRef", "clientCertificateRef", "clientKeyRef"},
+                optional=set(),
+                label="Platform identity mTLS profile",
+            )
+            identity_verifier = PlatformAuthorityIdentityVerifier.from_managed_tls_files(
+                target=identity_ref.removeprefix("grpcs://"),
+                root_certificates_path=secret_path(tls["rootCertificateRef"]),
+                private_key_path=secret_path(tls["clientKeyRef"]),
+                certificate_chain_path=secret_path(tls["clientCertificateRef"]),
+            )
+        else:
+            raise IntegrationConfigurationError("Platform identity transport is unsupported")
+
+        workload = _config_object(
+            authority["productWorkload"],
+            required={
+                "connectionRef",
+                "workloadId",
+                "audience",
+                "rootCertificateRef",
+                "clientCertificateRef",
+                "clientKeyRef",
+            },
+            optional=set(),
+            label="Platform ProductWorkload profile",
+        )
+        workload_ref = _text(workload["connectionRef"], "productWorkload.connectionRef")
+        if not workload_ref.startswith("grpcs://"):
+            raise IntegrationConfigurationError("Platform ProductWorkload must use grpcs:// mTLS")
+        authority_target = workload_ref.removeprefix("grpcs://")
+        authority_root = secret_path(workload["rootCertificateRef"])
+        authority_key = secret_path(workload["clientKeyRef"])
+        authority_chain = secret_path(workload["clientCertificateRef"])
+        workload_id = _text(workload["workloadId"], "productWorkload.workloadId")
+        audience = _text(authority["audience"], "platformAuthority.audience")
+        if _text(workload["audience"], "productWorkload.audience") != audience:
+            raise IntegrationConfigurationError(
+                "Platform workload audience does not match authority"
+            )
+        authority_client = PlatformAuthorityDelegationClient(
+            identity_verifier=identity_verifier,
+            target=workload_ref,
+            root_certificates_path=authority_root,
+            private_key_path=authority_key,
+            certificate_chain_path=authority_chain,
+            workload_id=workload_id,
+            audience=audience,
+        )
+        execution_verifier = PlatformExecutionAuthorizationVerifier.from_managed_tls_files(
+            target=authority_target,
+            root_certificates_path=authority_root,
+            private_key_path=authority_key,
+            certificate_chain_path=authority_chain,
+        )
+
+    if "connectorWorkload" in authority:
+        connector_workload = _config_object(
+            authority["connectorWorkload"],
+            required={
+                "connectionRef",
+                "rootCertificateRef",
+                "clientCertificateRef",
+                "clientKeyRef",
+            },
+            optional={"deadlineSeconds"},
+            label="Platform connector workload",
+        )
+        connector_authority = PlatformConnectorAuthorizationClient(
+            target=_text(connector_workload["connectionRef"], "connectorWorkload.connectionRef"),
+            root_certificates_path=secret_path(connector_workload["rootCertificateRef"]),
+            certificate_chain_path=secret_path(connector_workload["clientCertificateRef"]),
+            private_key_path=secret_path(connector_workload["clientKeyRef"]),
+            deadline_seconds=float(connector_workload.get("deadlineSeconds", 3.0)),
+        )
+    if authority_client is None and connector_authority is None:
+        raise IntegrationConfigurationError(
+            "platformAuthority requires connectorWorkload or legacy productWorkload"
+        )
 
     # ── Phase 2: Resolve the caller, provider, webhook, and notification ports ──
     account_settings = _config_object(
@@ -260,12 +315,15 @@ def build_production_services(
             "transport",
             "callerId",
             "signingKeyRef",
+        },
+        optional={
+            "mtls",
+            "deadlineSeconds",
             "callbackCallerId",
             "callbackSigningKeyRef",
             "wecomSourceCallerId",
             "wecomSourceSigningKeyRef",
         },
-        optional={"mtls", "deadlineSeconds"},
         label="accountCenter",
     )
     account_binding = _text(account_settings["bindingId"], "accountCenter.bindingId")
@@ -274,16 +332,28 @@ def build_production_services(
         caller_id=_text(account_settings["callerId"], "accountCenter.callerId"),
         key=hmac_key(account_settings["signingKeyRef"]),
     )
-    callback_signer = AccountCenterRequestSigner(
-        caller_id=_text(account_settings["callbackCallerId"], "accountCenter.callbackCallerId"),
-        key=hmac_key(account_settings["callbackSigningKeyRef"]),
-    )
-    wecom_source_signer = AccountCenterRequestSigner(
-        caller_id=_text(
-            account_settings["wecomSourceCallerId"], "accountCenter.wecomSourceCallerId"
-        ),
-        key=hmac_key(account_settings["wecomSourceSigningKeyRef"]),
-    )
+    callback_signer = None
+    if "callbackCallerId" in account_settings or "callbackSigningKeyRef" in account_settings:
+        if not {"callbackCallerId", "callbackSigningKeyRef"} <= set(account_settings):
+            raise IntegrationConfigurationError(
+                "GitHub callback caller and signing key must be configured together"
+            )
+        callback_signer = AccountCenterRequestSigner(
+            caller_id=_text(account_settings["callbackCallerId"], "accountCenter.callbackCallerId"),
+            key=hmac_key(account_settings["callbackSigningKeyRef"]),
+        )
+    wecom_source_signer = None
+    if "wecomSourceCallerId" in account_settings or "wecomSourceSigningKeyRef" in account_settings:
+        if not {"wecomSourceCallerId", "wecomSourceSigningKeyRef"} <= set(account_settings):
+            raise IntegrationConfigurationError(
+                "WeCom source caller and signing key must be configured together"
+            )
+        wecom_source_signer = AccountCenterRequestSigner(
+            caller_id=_text(
+                account_settings["wecomSourceCallerId"], "accountCenter.wecomSourceCallerId"
+            ),
+            key=hmac_key(account_settings["wecomSourceSigningKeyRef"]),
+        )
     accounts = AccountCenterClient(
         account_runtime,
         exchange_signer=account_signer,
@@ -314,38 +384,43 @@ def build_production_services(
     )
     webhook_verifier = GitHubWebhookClient(github_runtime)
 
-    wecom_settings = _config_object(
-        configuration["wecom"],
-        required={"bindingId", "connectionRef", "transport", "targets", "inboundSources"},
-        optional={"mtls", "deadlineSeconds"},
-        label="wecom",
-    )
-    wecom_runtime = direct_client(wecom_settings)
-    raw_targets = wecom_settings["targets"]
-    if not isinstance(raw_targets, Mapping):
-        raise IntegrationConfigurationError("wecom.targets must be an object")
+    wecom_runtime = None
     targets: dict[str, dict[str, str]] = {}
-    for reference, target in raw_targets.items():
-        fields = _config_object(
-            target,
-            required={"botId", "conversationId", "kind"},
-            optional=set(),
-            label="WeCom message target",
+    if "wecom" in configuration:
+        wecom_settings = _config_object(
+            configuration["wecom"],
+            required={"bindingId", "connectionRef", "transport", "targets", "inboundSources"},
+            optional={"mtls", "deadlineSeconds"},
+            label="wecom",
         )
-        kind = _text(fields["kind"], "wecom target kind").upper()
-        if kind not in {"PRIVATE", "GROUP"}:
-            raise IntegrationConfigurationError("WeCom target kind must be PRIVATE or GROUP")
-        targets[_text(reference, "wecom target reference")] = {
-            "bot_id": _text(fields["botId"], "wecom target botId"),
-            "conversation_id": _text(fields["conversationId"], "wecom target conversationId"),
-            "kind": kind,
-        }
-    if not targets:
-        raise IntegrationConfigurationError("wecom.targets must contain at least one fixed target")
-
-    raw_sources = wecom_settings["inboundSources"]
-    if not isinstance(raw_sources, Mapping) or not raw_sources:
-        raise IntegrationConfigurationError("wecom.inboundSources must be a non-empty object")
+        wecom_runtime = direct_client(wecom_settings)
+        raw_targets = wecom_settings["targets"]
+        if not isinstance(raw_targets, Mapping) or not raw_targets:
+            raise IntegrationConfigurationError("wecom.targets must be a non-empty object")
+        for reference, target in raw_targets.items():
+            fields = _config_object(
+                target,
+                required={"botId", "conversationId", "kind"},
+                optional=set(),
+                label="WeCom message target",
+            )
+            kind = _text(fields["kind"], "wecom target kind").upper()
+            if kind not in {"PRIVATE", "GROUP"}:
+                raise IntegrationConfigurationError("WeCom target kind must be PRIVATE or GROUP")
+            targets[_text(reference, "wecom target reference")] = {
+                "bot_id": _text(fields["botId"], "wecom target botId"),
+                "conversation_id": _text(fields["conversationId"], "wecom target conversationId"),
+                "kind": kind,
+            }
+        raw_sources = wecom_settings["inboundSources"]
+        if not isinstance(raw_sources, Mapping) or not raw_sources:
+            raise IntegrationConfigurationError("wecom.inboundSources must be a non-empty object")
+        if wecom_source_signer is None:
+            raise IntegrationConfigurationError(
+                "WeCom requires accountCenter.wecomSourceCallerId and signing key"
+            )
+    else:
+        raw_sources = {}
     wecom_sources: dict[str, WeComInboundSource] = {}
     wecom_source_accounts: dict[str, dict[str, str]] = {}
     source_principals: dict[str, IntegrationPrincipal] = {}
@@ -406,12 +481,55 @@ def build_production_services(
             "account_id": account_id,
             "group_conversation_id": group_conversation_id,
         }
-    message = WeComMessageClient(
-        wecom_runtime,
-        targets=targets,
-        source_accounts=wecom_source_accounts,
+    message = (
+        WeComMessageClient(
+            wecom_runtime,
+            targets=targets,
+            source_accounts=wecom_source_accounts,
+        )
+        if wecom_runtime is not None
+        else None
     )
     integration_store = IntegrationStore(database_path)
+
+    navigator_hmac_settings = None
+    if connector_settings.navigator is not None:
+        key_file_ref = connector_settings.navigator.key_file_ref
+        env_name = refs.get(key_file_ref)
+        if env_name is None:
+            raise IntegrationConfigurationError(
+                "connectorHost.navigatorConnector keyFileRef must resolve through hostSecretRefs"
+            )
+        used_refs.add(key_file_ref)
+        key_file_value = source.get(env_name, "").strip()
+        if key_file_value:
+            navigator_hmac_settings = NavigatorHmacSettings(
+                key_id=connector_settings.navigator.key_id,
+                key_file=Path(key_file_value).expanduser(),
+            )
+    navigator_hmac_authenticator = NavigatorHmacAuthenticator(
+        navigator_hmac_settings,
+        replay_guard=integration_store,
+    )
+    signing_keys_file = source.get("CYRENE_EXCHANGE_AUTHORITY_SIGNING_KEYS_FILE", "").strip()
+    connector_grant_verifier = ConnectorOperationGrantVerifier(
+        keyring_file=Path(signing_keys_file).expanduser() if signing_keys_file else None,
+        expected_audience=source.get("CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE", "exchange"),
+        grant_registry=integration_store,
+    )
+    teams_message_client = None
+    teams_runtime = None
+    teams_message_profile = connector_settings.teams_messages
+    if teams_message_profile is not None:
+        teams_endpoint: dict[str, Any] = {
+            "bindingId": teams_message_profile.endpoint.binding_id,
+            "connectionRef": teams_message_profile.endpoint.connection_ref,
+            "transport": teams_message_profile.endpoint.transport,
+        }
+        if teams_message_profile.endpoint.mtls is not None:
+            teams_endpoint["mtls"] = dict(teams_message_profile.endpoint.mtls)
+        teams_runtime = direct_client(teams_endpoint)
+        teams_message_client = TeamsMessageClient(teams_runtime)
 
     authorization_clients: dict[str, Any] = {}
     email_notification_client = None
@@ -424,14 +542,14 @@ def build_production_services(
     if authorization_settings is not None:
         authorization_registry = AuthorizationCloudProfileRegistry(authorization_settings)
         for profile_ref, profile in authorization_settings.profiles.items():
-            endpoint: dict[str, Any] = {
+            profile_endpoint: dict[str, Any] = {
                 "bindingId": profile.endpoint.binding_id,
                 "connectionRef": profile.endpoint.connection_ref,
                 "transport": profile.endpoint.transport,
             }
             if profile.endpoint.mtls is not None:
-                endpoint["mtls"] = dict(profile.endpoint.mtls)
-            authorization_clients[profile_ref] = direct_client(endpoint)
+                profile_endpoint["mtls"] = dict(profile.endpoint.mtls)
+            authorization_clients[profile_ref] = direct_client(profile_endpoint)
             hmac_key(profile.context_key_ref)
             used_refs.add(profile.context_key_ref)
         email_profile = authorization_settings.email
@@ -463,12 +581,13 @@ def build_production_services(
             token = source.get(env_ref, "") if env_ref is not None else ""
             return token if token.strip() else None
 
-        current_context_resolver = PlatformCurrentAuthorizationContextResolver(
-            store=integration_store,
-            identity_verifier=identity_verifier,
-            registry=authorization_registry,
-            bearer_token=current_bearer,
-        )
+        if identity_verifier is not None and authorization_settings.contexts:
+            current_context_resolver = PlatformCurrentAuthorizationContextResolver(
+                store=integration_store,
+                identity_verifier=identity_verifier,
+                registry=authorization_registry,
+                bearer_token=current_bearer,
+            )
         authorization_cloud_provider = AuthorizationCloudDirectProvider(
             store=integration_store,
             registry=authorization_registry,
@@ -477,19 +596,24 @@ def build_production_services(
             current_context_resolver=current_context_resolver,
             context_key=hmac_key,
         )
-        authorization_cloud_runner = AuthorizationCloudRunner(
-            store=integration_store,
-            contexts=current_context_resolver,
-            provider=authorization_cloud_provider,
-            email=authorization_cloud_provider if email_profile.enabled else None,
-            worker_id=workload_id,
-            email_recipient_resolver=(
-                current_context_resolver.email_recipient_for_connection
-                if email_profile.enabled
-                else None
-            ),
-            monitor_interval_seconds=authorization_settings.monitor_interval_seconds,
-        )
+        if current_context_resolver is not None:
+            authorization_cloud_runner = AuthorizationCloudRunner(
+                store=integration_store,
+                contexts=current_context_resolver,
+                provider=authorization_cloud_provider,
+                email=authorization_cloud_provider if email_profile.enabled else None,
+                worker_id=workload_id,
+                email_recipient_resolver=(
+                    current_context_resolver.email_recipient_for_connection
+                    if email_profile.enabled
+                    else None
+                ),
+                monitor_interval_seconds=authorization_settings.monitor_interval_seconds,
+            )
+        elif email_profile.enabled:
+            raise IntegrationConfigurationError(
+                "email notifications require a configured Platform identity context"
+            )
         connection_profile_resolver = authorization_registry.display_name_for_connection
         if email_profile.enabled:
             email_delivery_recipient_resolver = authorization_registry.email_recipient_for_principal
@@ -503,14 +627,24 @@ def build_production_services(
     )
     account_port = IntegrationAccountCenterPort(accounts)
     github_port = IntegrationGitHubPort(github)
-    dispatcher = IntegrationDispatcher(
+    connector_operation_dispatcher = ConnectorOperationDispatcher(
         store=integration_store,
-        account_center=account_port,
-        github=github_port,
-        message=message,
-        delegation=authority_client,
+        accounts=account_port,
+        github=github,
+        authorization_cloud=authorization_cloud_provider,
+        registry=authorization_registry,
     )
-    runner = DispatcherRunner(dispatcher, worker_id=workload_id)
+    dispatcher = None
+    runner = None
+    if authority_client is not None and message is not None:
+        dispatcher = IntegrationDispatcher(
+            store=integration_store,
+            account_center=account_port,
+            github=github_port,
+            message=message,
+            delegation=authority_client,
+        )
+        runner = DispatcherRunner(dispatcher, worker_id=workload_id)
 
     # ── Phase 3: Validate every secret reference was consumed exactly once ──
     if used_refs != set(refs):
@@ -543,10 +677,18 @@ def build_production_services(
         ),
         email_delivery_recipient_resolver=email_delivery_recipient_resolver,
         authorization_cloud_runner=authorization_cloud_runner,
+        navigator_hmac_authenticator=navigator_hmac_authenticator,
+        connector_grant_authority=connector_authority,
+        connector_grant_verifier=connector_grant_verifier,
+        connector_operation_dispatcher=connector_operation_dispatcher,
+        teams_message_client=teams_message_client,
+        teams_message_profile=teams_message_profile,
+        authorization_profile_registry=authorization_registry,
         transport_clients=(
             account_runtime,
             github_runtime,
-            wecom_runtime,
+            *((wecom_runtime,) if wecom_runtime is not None else ()),
+            *((teams_runtime,) if teams_runtime is not None else ()),
             github_health,
             *authorization_clients.values(),
             *((email_notification_client,) if email_notification_client is not None else ()),
@@ -606,6 +748,10 @@ def validate_host_configuration(
         AuthorizationCloudConfigurationError,
         parse_authorization_cloud_settings,
     )
+    from cyrene_exchange_product.integrations.connector_profiles import (
+        ConnectorHostConfigurationError,
+        parse_connector_host_settings,
+    )
 
     try:
         authorization_settings = (
@@ -617,6 +763,10 @@ def validate_host_configuration(
             else None
         )
     except AuthorizationCloudConfigurationError as exc:
+        raise IntegrationConfigurationError(str(exc)) from exc
+    try:
+        connector_settings = parse_connector_host_settings(configuration.get("connectorHost", {}))
+    except ConnectorHostConfigurationError as exc:
         raise IntegrationConfigurationError(str(exc)) from exc
     if authorization_settings is None and configuration.get("emailNotifications") is not None:
         raise IntegrationConfigurationError(
@@ -677,63 +827,120 @@ def validate_host_configuration(
 
     authority = _config_object(
         configuration["platformAuthority"],
-        required={"audience", "identity", "productWorkload"},
-        optional=set(),
+        required=set(),
+        optional={"audience", "identity", "productWorkload", "connectorWorkload"},
         label="platformAuthority",
     )
-    audience = _text(authority["audience"], "platformAuthority.audience")
-    identity = _config_object(
-        authority["identity"],
-        required={"connectionRef", "transport"},
-        optional={"mtls"},
-        label="Platform identity profile",
-    )
-    identity_ref = _text(identity["connectionRef"], "identity.connectionRef")
-    if identity["transport"] == "local":
-        if not identity_ref.startswith("unix://") or "mtls" in identity:
-            raise IntegrationConfigurationError(
-                "local identity verification requires protected unix://"
-            )
-    elif identity["transport"] == "mtls":
-        if not identity_ref.startswith("grpcs://"):
-            raise IntegrationConfigurationError("remote identity verification requires grpcs://")
-        identity_tls = _config_object(
-            identity.get("mtls"),
-            required={"rootCertificateRef", "clientCertificateRef", "clientKeyRef"},
-            optional=set(),
-            label="Platform identity mTLS profile",
-        )
-        check_path(identity_tls["rootCertificateRef"])
-        check_path(identity_tls["clientCertificateRef"])
-        check_path(identity_tls["clientKeyRef"], private=True)
-    else:
-        raise IntegrationConfigurationError("Platform identity transport is unsupported")
-
-    workload = _config_object(
-        authority["productWorkload"],
-        required={
-            "connectionRef",
-            "workloadId",
-            "audience",
-            "rootCertificateRef",
-            "clientCertificateRef",
-            "clientKeyRef",
-        },
-        optional=set(),
-        label="Platform ProductWorkload profile",
-    )
-    workload_ref = _text(workload["connectionRef"], "productWorkload.connectionRef")
-    workload_id = _text(workload["workloadId"], "productWorkload.workloadId")
-    if (
-        not workload_ref.startswith("grpcs://")
-        or _text(workload["audience"], "productWorkload.audience") != audience
-    ):
+    if not ({"productWorkload", "connectorWorkload"} & set(authority)):
         raise IntegrationConfigurationError(
-            "Platform ProductWorkload target or audience is invalid"
+            "platformAuthority requires connectorWorkload or legacy productWorkload"
         )
-    check_path(workload["rootCertificateRef"])
-    product_cert_path = check_path(workload["clientCertificateRef"])
-    check_path(workload["clientKeyRef"], private=True)
+    workload_id = "exchange-connectors"
+    audience: str | None = None
+    product_cert_path: Path | None = None
+    workload: dict[str, Any] | None = None
+    if "connectorWorkload" in authority:
+        connector_workload = _config_object(
+            authority["connectorWorkload"],
+            required={
+                "connectionRef",
+                "rootCertificateRef",
+                "clientCertificateRef",
+                "clientKeyRef",
+            },
+            optional={"deadlineSeconds"},
+            label="Platform connector workload",
+        )
+        if not _text(
+            connector_workload["connectionRef"], "connectorWorkload.connectionRef"
+        ).startswith("grpcs://"):
+            raise IntegrationConfigurationError(
+                "Platform connector workload must use grpcs:// mTLS"
+            )
+        check_path(connector_workload["rootCertificateRef"])
+        check_path(connector_workload["clientCertificateRef"])
+        check_path(connector_workload["clientKeyRef"], private=True)
+        keyring_name = "CYRENE_EXCHANGE_AUTHORITY_SIGNING_KEYS_FILE"
+        keyring_value = source.get(keyring_name, "").strip()
+        if not keyring_value:
+            raise IntegrationConfigurationError(
+                "the pinned Platform Authority connector signing keyring is unavailable"
+            )
+        keyring_path = Path(keyring_value).expanduser()
+        try:
+            from cyrene_exchange_product.integrations.connector_security import (
+                decode_authority_keyring,
+            )
+
+            if not decode_authority_keyring(keyring_path):
+                raise ValueError("Authority signing keyring has no keys")
+        except (OSError, ValueError) as exc:
+            raise IntegrationConfigurationError(
+                "the pinned Platform Authority connector signing keyring is invalid"
+            ) from exc
+        if not source.get("CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE", "exchange").strip():
+            raise IntegrationConfigurationError("connector Authority audience is empty")
+
+    if "productWorkload" in authority:
+        if "identity" not in authority or "audience" not in authority:
+            raise IntegrationConfigurationError(
+                "legacy ProductWorkload requires Platform identity and audience profiles"
+            )
+        audience = _text(authority["audience"], "platformAuthority.audience")
+        identity = _config_object(
+            authority["identity"],
+            required={"connectionRef", "transport"},
+            optional={"mtls"},
+            label="Platform identity profile",
+        )
+        identity_ref = _text(identity["connectionRef"], "identity.connectionRef")
+        if identity["transport"] == "local":
+            if not identity_ref.startswith("unix://") or "mtls" in identity:
+                raise IntegrationConfigurationError(
+                    "local identity verification requires protected unix://"
+                )
+        elif identity["transport"] == "mtls":
+            if not identity_ref.startswith("grpcs://"):
+                raise IntegrationConfigurationError(
+                    "remote identity verification requires grpcs://"
+                )
+            identity_tls = _config_object(
+                identity.get("mtls"),
+                required={"rootCertificateRef", "clientCertificateRef", "clientKeyRef"},
+                optional=set(),
+                label="Platform identity mTLS profile",
+            )
+            check_path(identity_tls["rootCertificateRef"])
+            check_path(identity_tls["clientCertificateRef"])
+            check_path(identity_tls["clientKeyRef"], private=True)
+        else:
+            raise IntegrationConfigurationError("Platform identity transport is unsupported")
+
+        workload = _config_object(
+            authority["productWorkload"],
+            required={
+                "connectionRef",
+                "workloadId",
+                "audience",
+                "rootCertificateRef",
+                "clientCertificateRef",
+                "clientKeyRef",
+            },
+            optional=set(),
+            label="Platform ProductWorkload profile",
+        )
+        workload_ref = _text(workload["connectionRef"], "productWorkload.connectionRef")
+        workload_id = _text(workload["workloadId"], "productWorkload.workloadId")
+        if (
+            not workload_ref.startswith("grpcs://")
+            or _text(workload["audience"], "productWorkload.audience") != audience
+        ):
+            raise IntegrationConfigurationError(
+                "Platform ProductWorkload target or audience is invalid"
+            )
+        check_path(workload["rootCertificateRef"])
+        product_cert_path = check_path(workload["clientCertificateRef"])
+        check_path(workload["clientKeyRef"], private=True)
 
     account = _config_object(
         configuration["accountCenter"],
@@ -743,12 +950,15 @@ def validate_host_configuration(
             "transport",
             "callerId",
             "signingKeyRef",
+        },
+        optional={
+            "mtls",
+            "deadlineSeconds",
             "callbackCallerId",
             "callbackSigningKeyRef",
             "wecomSourceCallerId",
             "wecomSourceSigningKeyRef",
         },
-        optional={"mtls", "deadlineSeconds"},
         label="accountCenter",
     )
     github = _config_object(
@@ -765,55 +975,75 @@ def validate_host_configuration(
             "GitHub provider and Account Center Exchange caller keys differ"
         )
     check_hmac(account["signingKeyRef"])
-    check_hmac(account["callbackSigningKeyRef"])
-    check_hmac(account["wecomSourceSigningKeyRef"])
-
-    wecom = _config_object(
-        configuration["wecom"],
-        required={"bindingId", "connectionRef", "transport", "targets", "inboundSources"},
-        optional={"mtls", "deadlineSeconds"},
-        label="wecom",
-    )
-    targets = wecom["targets"]
-    sources = wecom["inboundSources"]
-    if (
-        not isinstance(targets, Mapping)
-        or not targets
-        or not isinstance(sources, Mapping)
-        or not sources
+    for caller_key in (
+        ("callbackCallerId", "callbackSigningKeyRef"),
+        ("wecomSourceCallerId", "wecomSourceSigningKeyRef"),
     ):
-        raise IntegrationConfigurationError("WeCom fixed targets and inboundSources are required")
-    for reference, target in targets.items():
-        _text(reference, "WeCom target reference")
-        item = _config_object(
-            target,
-            required={"botId", "conversationId", "kind"},
-            optional=set(),
-            label="WeCom target",
+        if any(field in account for field in caller_key):
+            if not set(caller_key) <= set(account):
+                raise IntegrationConfigurationError(
+                    "optional Account Center caller ID and signing key must be configured together"
+                )
+            check_hmac(account[caller_key[1]])
+
+    wecom: dict[str, Any] | None = None
+    sources: Mapping[str, Any] = {}
+    if "wecom" in configuration:
+        wecom = _config_object(
+            configuration["wecom"],
+            required={"bindingId", "connectionRef", "transport", "targets", "inboundSources"},
+            optional={"mtls", "deadlineSeconds"},
+            label="wecom",
         )
-        if _text(item["kind"], "WeCom target kind").upper() not in {"PRIVATE", "GROUP"}:
-            raise IntegrationConfigurationError("WeCom target kind is invalid")
-    for binding_id, raw_source in sources.items():
-        _text(binding_id, "WeCom source binding ID")
-        source_profile = _config_object(
-            raw_source,
-            required={
-                "organizationId",
-                "workspaceId",
-                "sourceAuthority",
-                "botNamespace",
-                "accountId",
-                "groupConversationId",
-                "requestHmacSecretRef",
-            },
-            optional=set(),
-            label="WeCom inbound source",
-        )
-        if not _text(source_profile["accountId"], "WeCom source accountId").startswith("bot:"):
-            raise IntegrationConfigurationError("WeCom inbound source must identify a bot account")
-        request_key = resolve(source_profile["requestHmacSecretRef"]).encode("utf-8")
-        if len(request_key) < 32:
-            raise IntegrationConfigurationError("WeCom inbound request HMAC key is too short")
+        targets = wecom["targets"]
+        sources_value = wecom["inboundSources"]
+        if (
+            not isinstance(targets, Mapping)
+            or not targets
+            or not isinstance(sources_value, Mapping)
+            or not sources_value
+        ):
+            raise IntegrationConfigurationError(
+                "WeCom fixed targets and inboundSources are required"
+            )
+        sources = sources_value
+        if "wecomSourceSigningKeyRef" not in account:
+            raise IntegrationConfigurationError(
+                "WeCom requires Account Center source caller and signing key references"
+            )
+        for reference, target in targets.items():
+            _text(reference, "WeCom target reference")
+            item = _config_object(
+                target,
+                required={"botId", "conversationId", "kind"},
+                optional=set(),
+                label="WeCom target",
+            )
+            if _text(item["kind"], "WeCom target kind").upper() not in {"PRIVATE", "GROUP"}:
+                raise IntegrationConfigurationError("WeCom target kind is invalid")
+        for binding_id, raw_source in sources.items():
+            _text(binding_id, "WeCom source binding ID")
+            source_profile = _config_object(
+                raw_source,
+                required={
+                    "organizationId",
+                    "workspaceId",
+                    "sourceAuthority",
+                    "botNamespace",
+                    "accountId",
+                    "groupConversationId",
+                    "requestHmacSecretRef",
+                },
+                optional=set(),
+                label="WeCom inbound source",
+            )
+            if not _text(source_profile["accountId"], "WeCom source accountId").startswith("bot:"):
+                raise IntegrationConfigurationError(
+                    "WeCom inbound source must identify a bot account"
+                )
+            request_key = resolve(source_profile["requestHmacSecretRef"]).encode("utf-8")
+            if len(request_key) < 32:
+                raise IntegrationConfigurationError("WeCom inbound request HMAC key is too short")
 
     if authorization_settings is not None:
         for actor_context in authorization_settings.contexts.values():
@@ -838,15 +1068,39 @@ def validate_host_configuration(
                 check_path,
             )
 
+    if connector_settings.navigator is not None:
+        key_file_ref = connector_settings.navigator.key_file_ref
+        if key_file_ref not in refs:
+            raise IntegrationConfigurationError(
+                "Navigator connector keyFileRef must resolve through hostSecretRefs"
+            )
+        # The value is a mounted-file path; the raw key is never loaded into JSON.
+        check_path(key_file_ref, private=True)
+
+    if connector_settings.teams_messages is not None:
+        teams_endpoint_config = connector_settings.teams_messages.endpoint
+        _validate_direct_endpoint(
+            endpoint_mapping(teams_endpoint_config),
+            "connectorHost.teamsMessages",
+            check_path,
+        )
+
     # Validate direct Plugin endpoint profiles without dialing the runtime.
-    for label, endpoint in (("accountCenter", account), ("githubIssues", github), ("wecom", wecom)):
-        _validate_direct_endpoint(endpoint, label, check_path)
+    endpoints = [("accountCenter", account), ("githubIssues", github)]
+    if wecom is not None:
+        endpoints.append(("wecom", wecom))
+    for label, provider_endpoint in endpoints:
+        _validate_direct_endpoint(provider_endpoint, label, check_path)
     if used != set(refs):
         raise IntegrationConfigurationError(
             "hostSecretRefs contains unused or unreferenced entries"
         )
 
-    if require_platform_workload_profile:
+    if require_platform_workload_profile and workload is not None:
+        if product_cert_path is None:
+            raise IntegrationConfigurationError(
+                "Platform ProductWorkload certificate was not validated"
+            )
         encoded = source.get("CYRENE_AUTHORITY_PRODUCT_WORKLOAD_PROFILES_JSON", "")
         try:
             profiles = json.loads(encoded)
@@ -882,7 +1136,7 @@ def validate_host_configuration(
         "workloadId": workload_id,
         "accountCenterBindingId": str(account["bindingId"]),
         "githubIssuesBindingId": str(github["bindingId"]),
-        "wecomBindingId": str(wecom["bindingId"]),
+        "wecomBindingId": str(wecom["bindingId"]) if wecom is not None else None,
         "wecomInboundSourceCount": len(sources),
         "authorizationCloudProfileCount": (
             len(authorization_settings.profiles) if authorization_settings is not None else 0
@@ -893,6 +1147,8 @@ def validate_host_configuration(
         "emailNotificationsEnabled": bool(
             authorization_settings is not None and authorization_settings.email.enabled
         ),
+        "navigatorConnectorConfigured": connector_settings.navigator is not None,
+        "teamsMessagesConfigured": connector_settings.teams_messages is not None,
     }
 
 
@@ -920,9 +1176,8 @@ def _read_configuration(environ: Mapping[str, str]) -> dict[str, Any]:
             "platformAuthority",
             "accountCenter",
             "githubIssues",
-            "wecom",
         },
-        optional={"authorizationCloud", "emailNotifications"},
+        optional={"authorizationCloud", "emailNotifications", "connectorHost", "wecom"},
         label="Exchange integration configuration",
         expected_version=1,
     )

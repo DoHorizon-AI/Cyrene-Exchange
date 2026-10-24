@@ -7,11 +7,13 @@ Role: Verify production builder configuration and per-call bearer revalidation.
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 from jsonschema import Draft202012Validator
 
 import cyrene_exchange_product.integrations.auth as auth_module
@@ -26,6 +28,7 @@ from cyrene_exchange_product.integrations.models import (
     CreateIntegrationConnection,
     IntegrationPrincipal,
 )
+from cyrene_exchange_product.server import build_integration_app
 
 
 def _config(tmp_path: Path) -> tuple[dict[str, Any], dict[str, str]]:
@@ -314,6 +317,16 @@ def test_documented_configuration_schema_accepts_default_and_enabled_email_examp
     )
     Draft202012Validator(schema).validate(enabled_email)
 
+    teams_connectors = json.loads(
+        (examples / "integration-configuration.teams-connectors.json").read_text(encoding="utf-8")
+    )
+    connector_fragment = {
+        "authorizationCloud": teams_connectors["authorizationCloud"],
+        "connectorHost": teams_connectors["connectorHost"],
+        "hostSecretRefs": teams_connectors["hostSecretRefs"],
+    }
+    Draft202012Validator(schema).validate(connector_fragment)
+
 
 class _FakeAuthority:
     def __init__(self, principals: dict[str, IntegrationPrincipal]) -> None:
@@ -447,5 +460,125 @@ def test_production_builder_wires_profiles_and_rechecks_rotating_bearer(
         assert authority.calls == ["token-v1", "token-v2", "revoked"]
         assert services.email_delivery_recipient_resolver(principal) == "oncall"
         assert direct_clients and all(client.invokes == 0 for client in direct_clients)
+    finally:
+        services.close()
+
+
+def test_minimal_teams_github_huggingface_profile_builds_without_legacy_services(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Connector-only cold start needs no WeCom or Product identity/workload service."""
+
+    example = (
+        Path(__file__).parents[1] / "examples" / "integration-configuration.teams-connectors.json"
+    )
+    configuration = json.loads(example.read_text(encoding="utf-8"))
+    paths: dict[str, Path] = {}
+    for secret_ref in configuration["hostSecretRefs"]:
+        if secret_ref in {"account/signing", "keys/hf"}:
+            continue
+        path = tmp_path / secret_ref.replace("/", "-")
+        path.write_text("synthetic material", encoding="ascii")
+        paths[secret_ref] = path
+    for secret_ref in {
+        "platform/connector-client-key",
+        "tls/exchange-account-center-client-key",
+        "tls/exchange-plugin-client-key",
+        "navigator/exchange-hmac",
+    }:
+        paths[secret_ref].chmod(0o600)
+    keyring = tmp_path / "authority-keyring.json"
+    keyring.write_text(
+        json.dumps(
+            {"keys": {"test-authority": base64.b64encode(b"k" * 32).decode("ascii")}},
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    keyring.chmod(0o600)
+    environ = {
+        integration_cli.CONFIGURATION_ENV: json.dumps(configuration),
+        "CYRENE_EXCHANGE_AUTHORITY_SIGNING_KEYS_FILE": str(keyring),
+        "CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE": "exchange",
+        "EXCHANGE_ACCOUNT_CONTEXT_HMAC_KEY": "a" * 64,
+        "EXCHANGE_HF_AUTH_CONTEXT_HMAC_KEY": "b" * 64,
+    }
+    environ.update(
+        {
+            environment_name: str(paths[secret_ref])
+            for secret_ref, environment_name in configuration["hostSecretRefs"].items()
+            if secret_ref not in {"account/signing", "keys/hf"}
+        }
+    )
+
+    report = integration_cli.validate_host_configuration(environ=environ)
+    assert report["valid"] is True
+    assert report["wecomBindingId"] is None
+    assert report["currentAuthorityContextCount"] == 0
+    assert report["teamsMessagesConfigured"] is True
+    assert "identity" not in configuration["platformAuthority"]
+    assert "productWorkload" not in configuration["platformAuthority"]
+    assert "wecom" not in configuration
+
+    class _NoNetworkClient:
+        def close(self) -> None:
+            pass
+
+        def invoke(self, **_kwargs: Any) -> Any:
+            raise AssertionError("cold start must not contact a provider")
+
+    class _FakeGrantClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+    class _FakeHealth:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        clients_module,
+        "direct_plugin_client_from_connection",
+        lambda *_args, **_kwargs: _NoNetworkClient(),
+    )
+    monkeypatch.setattr(clients_module, "PlatformConnectorAuthorizationClient", _FakeGrantClient)
+    monkeypatch.setattr(clients_module, "DirectPluginHealthClient", _FakeHealth)
+    services = integration_cli.build_production_services(
+        tmp_path / "minimal-connectors.sqlite3",
+        environ=environ,
+    )
+    try:
+        assert services.authorizer is None
+        assert services.delegation_authorizer is None
+        assert services.dispatcher is None
+        assert services.dispatcher_runner is None
+        assert services.connector_grant_authority is not None
+        assert services.connector_grant_verifier.configured is True
+        assert services.teams_message_profile is not None
+        assert services.authorization_profile_registry.settings.contexts == {}
+        assert services.wecom_sources == {}
+        hf_profile = services.authorization_profile_registry.settings.profiles["hf-primary"]
+        assert hf_profile.auth_mode == "device_oauth"
+        hf_actor = IntegrationPrincipal(
+            issuer=hf_profile.expected_issuer,
+            subject="aad-object-id-from-directory-bootstrap",
+            organization_id=hf_profile.organization_id,
+            workspace_id=hf_profile.workspace_id,
+            allowed_operation_ids=frozenset({"huggingface.models.list"}),
+        )
+        assert services.authorization_profile_registry.principal_allowed_for_profile(
+            hf_actor,
+            hf_profile,
+        )
+        app = build_integration_app(
+            database_path=tmp_path / "minimal-connectors.sqlite3",
+            integrations=services,
+        )
+        with TestClient(app) as client:
+            assert client.get("/healthz").json() == {"status": "ok"}
+            assert client.get("/readyz").json() == {"status": "ready"}
     finally:
         services.close()

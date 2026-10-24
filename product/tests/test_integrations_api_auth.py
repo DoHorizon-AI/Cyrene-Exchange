@@ -3,18 +3,36 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
+import ipaddress
 import json
+import ssl
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 import grpc
+import httpx
 import pytest
+import uvicorn
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi.testclient import TestClient
 
+import cyrene_exchange_product.cli as exchange_cli
+import cyrene_exchange_product.integrations.cli as integration_cli
+import cyrene_exchange_product.server as product_server
 from cyrene_exchange_product.api import create_app
+from cyrene_exchange_product.cli import _integration_listener_tls_options
+from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations._generated.cyrene.workspace.authority.v2 import (
     workspace_authority_pb2 as authority_wire,
 )
@@ -27,10 +45,23 @@ from cyrene_exchange_product.integrations._generated.cyrene.workspace.product.v2
 from cyrene_exchange_product.integrations.api import IntegrationServices
 from cyrene_exchange_product.integrations.auth import PlatformAuthorityIdentityVerifier
 from cyrene_exchange_product.integrations.clients import DirectPluginHealthClient
+from cyrene_exchange_product.integrations.connector_operations import (
+    ConnectorOperationDispatcher,
+    _resource_projection,
+    _resource_ref,
+)
+from cyrene_exchange_product.integrations.connector_security import (
+    ConnectorGrantClaims,
+    NavigatorHmacAuthenticator,
+    NavigatorHmacSettings,
+    digest_arguments,
+    navigator_hmac_body_limit,
+)
 from cyrene_exchange_product.integrations.models import (
     CreateActorBinding,
     CreateIntegrationConnection,
     CreateSyncBinding,
+    IntegrationConnection,
     IntegrationPrincipal,
     ResourceSnapshot,
     SnapshotFreshness,
@@ -79,6 +110,23 @@ class _Accounts:
                     "provider": "github",
                     "status": "active",
                     "workspace_id": workspace_id,
+                }
+            ]
+        }
+
+    def list_provider_profiles(self, principal: IntegrationPrincipal) -> dict[str, Any]:
+        del principal
+        return {
+            "profiles": [
+                {
+                    "profile_ref": "gh-profile-1",
+                    "provider": "github",
+                    "auth_status": "healthy",
+                    "target_scope": {
+                        "repositories": [
+                            {"repository_id": "17", "owner": "owner", "name": "repository"}
+                        ]
+                    },
                 }
             ]
         }
@@ -218,6 +266,113 @@ def _services(
         authorizer,
         accounts,
     )
+
+
+def _https_server_credentials(tmp_path: Path) -> tuple[Path, Path, Path]:
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.now(UTC)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Exchange test CA")])
+    ca_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+    server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    server_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    server_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(server_name)
+        .issuer_name(ca_certificate.subject)
+        .public_key(server_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                ]
+            ),
+            critical=False,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "exchange-tls-cert.pem"
+    key_path = tmp_path / "exchange-tls-key.pem"
+    ca_path = tmp_path / "exchange-root-ca.pem"
+    cert_path.write_bytes(server_certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        server_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    ca_path.write_bytes(ca_certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.chmod(0o600)
+    cert_path.chmod(0o600)
+    ca_path.chmod(0o600)
+    return cert_path, key_path, ca_path
+
+
+@pytest.mark.parametrize("configured_through_environment", [False, True])
+def test_integration_only_cli_passes_valid_listener_tls_files_to_uvicorn(
+    tmp_path: Path,
+    monkeypatch: Any,
+    configured_through_environment: bool,
+) -> None:
+    cert_path, key_path, _ca_path = _https_server_credentials(tmp_path)
+    monkeypatch.delenv("CYRENE_EXCHANGE_TLS_CERT_FILE", raising=False)
+    monkeypatch.delenv("CYRENE_EXCHANGE_TLS_KEY_FILE", raising=False)
+    services = SimpleNamespace(close=lambda: None)
+    app = SimpleNamespace()
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(integration_cli, "build_production_services", lambda _path: services)
+    monkeypatch.setattr(
+        product_server,
+        "build_integration_app",
+        lambda **_kwargs: app,
+    )
+    monkeypatch.setattr(
+        exchange_cli.uvicorn,
+        "run",
+        lambda selected_app, **kwargs: captured.update(app=selected_app, **kwargs),
+    )
+    command = [
+        "serve",
+        "--mode",
+        "integration-only",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8081",
+        "--integration-database",
+        str(tmp_path / "exchange.sqlite3"),
+    ]
+    if configured_through_environment:
+        monkeypatch.setenv("CYRENE_EXCHANGE_TLS_CERT_FILE", str(cert_path))
+        monkeypatch.setenv("CYRENE_EXCHANGE_TLS_KEY_FILE", str(key_path))
+    else:
+        command.extend(["--tls-cert-file", str(cert_path), "--tls-key-file", str(key_path)])
+    result = exchange_cli.run(command)
+
+    assert result == 0
+    assert captured["app"] is app
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 8081
+    assert captured["ssl_certfile"] == str(cert_path)
+    assert captured["ssl_keyfile"] == str(key_path)
 
 
 def test_account_link_uses_platform_identity_and_ignores_body_identity(tmp_path: Path) -> None:
@@ -619,7 +774,9 @@ def test_catalog_mutation_accepts_signed_proof_only_for_approved_raw_body(
 ) -> None:
     path = "/api/v1/integrations/connections"
     idem = "approved-create-connection"
-    body = b'{"repositoryId":"17","repositoryName":"owner/repository"}'
+    body = (
+        b'{"repositoryId":"17","repositoryName":"owner/repository","accountLinkRef":"gh-profile-1"}'
+    )
     envelope = authority_wire.CanonicalInvocationEnvelope(
         invocation_id="79b9a8f7-9fee-4cc6-8b4d-b94a53d322d3",
         invocation=product_wire.ProductApiInvocationV2(
@@ -660,17 +817,21 @@ def test_catalog_mutation_accepts_signed_proof_only_for_approved_raw_body(
             assert actor.subject == "approved-member"
             assert actor.allowed_operation_ids == frozenset({"integrationCreateConnection"})
             assert request.repository_id == "17"
+            assert request.account_link_ref == "gh-profile-1"
             assert idempotency_key == idem
-            return {
-                "id": "b7649d78-8daf-4be3-b429-e98d9d2d9c92",
-                "provider": "github",
-                "displayName": "owner/repository",
-                "repositoryId": "17",
-                "repositoryName": "owner/repository",
-                "enabled": True,
-                "createdAt": "2026-10-14T00:00:00Z",
-                "updatedAt": "2026-10-14T00:00:00Z",
-            }
+            return IntegrationConnection(
+                id=UUID("b7649d78-8daf-4be3-b429-e98d9d2d9c92"),
+                organization_id=actor.organization_id,
+                workspace_id=actor.workspace_id,
+                actor_issuer=actor.issuer,
+                actor_subject=actor.subject,
+                provider="github",
+                display_name="owner/repository",
+                repository_id="17",
+                repository_name="owner/repository",
+                created_at=datetime(2026, 10, 14, tzinfo=UTC),
+                updated_at=datetime(2026, 10, 14, tzinfo=UTC),
+            )
 
     services, authorizer, _ = _services(
         IntegrationPrincipal(
@@ -1115,3 +1276,236 @@ def test_offline_plugin_health_does_not_fail_gateway_readiness(tmp_path: Path) -
         assert observation.json()["errorCode"] == "plugin_health_unavailable"
     finally:
         health.close()
+
+
+def test_large_huggingface_upload_grant_uses_route_scoped_hmac_limit(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    key = b"n" * 32
+    key_file = tmp_path / "navigator-hmac.key"
+    key_file.write_bytes(key)
+    key_file.chmod(0o600)
+
+    class CountingHmacAuthenticator(NavigatorHmacAuthenticator):
+        verify_calls = 0
+
+        def verify(self, **kwargs: Any) -> int:
+            self.verify_calls += 1
+            return super().verify(**kwargs)
+
+    class Authority:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def authorize_connector_operation(self, **kwargs: Any) -> bytes:
+            self.calls.append(kwargs)
+            return b"signed-synthetic-authority-grant"
+
+    class GrantVerifier:
+        def validate_authority_response(
+            self,
+            _grant: bytes,
+            *,
+            expected: dict[str, Any],
+        ) -> ConnectorGrantClaims:
+            now = int(time.time())
+            return ConnectorGrantClaims(
+                request_id=str(expected["request_id"]),
+                audience="exchange",
+                organization_id=str(expected["organization_id"]),
+                workspace_id=str(expected["workspace_id"]),
+                principal_issuer=str(expected["principal_issuer"]),
+                principal_subject=str(expected["principal_subject"]),
+                connection_ref=str(expected["connection_ref"]),
+                provider_id=str(expected["provider_id"]),
+                profile_ref=str(expected["profile_ref"]),
+                operation_id=str(expected["operation_id"]),
+                resource_ref=str(expected["resource_ref"]),
+                arguments_digest_sha256=expected["arguments_digest_sha256"],
+                issued_at_epoch=now,
+                expires_at_epoch=now + 15,
+                grant_ref="sha256:" + "a" * 64,
+            )
+
+    owner = IntegrationPrincipal(
+        issuer="https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0",
+        subject="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        organization_id="org-large-upload",
+        workspace_id="workspace-large-upload",
+        allowed_operation_ids=frozenset({"integrationCreateConnection"}),
+    )
+    store = IntegrationStore(tmp_path / "large-upload.sqlite3")
+    connection = store.create_connection(
+        owner,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-primary",
+            target_ref="hf-target",
+            account_link_ref="30000000-0000-4000-8000-000000000001",
+        ),
+        idempotency_key="large-hf-upload-connection",
+    )
+    profile = SimpleNamespace(
+        provider="hf",
+        account_scopes={
+            "repositories": [
+                {
+                    "repo_type": "model",
+                    "repo_id": "example-org/private-model",
+                    "permissions": ["read", "write"],
+                }
+            ]
+        },
+        targets={"hf-target": object()},
+    )
+    dispatcher = ConnectorOperationDispatcher(
+        store=store,
+        accounts=None,
+        github=None,
+        authorization_cloud=None,
+        registry=SimpleNamespace(settings=SimpleNamespace(profiles={"hf-primary": profile})),
+    )
+    authority = Authority()
+    authenticator = CountingHmacAuthenticator(
+        NavigatorHmacSettings(key_id="navigator-test-v1", key_file=key_file),
+        replay_guard=store,
+    )
+    services = IntegrationServices(
+        store=store,
+        authorizer=None,
+        accounts=SimpleNamespace(),  # type: ignore[arg-type]
+        github=SimpleNamespace(),  # type: ignore[arg-type]
+        webhook_verifier=SimpleNamespace(),  # type: ignore[arg-type]
+        delegation_authorizer=None,
+        callback_principal=owner,
+        navigator_hmac_authenticator=authenticator,
+        connector_grant_authority=authority,
+        connector_grant_verifier=GrantVerifier(),
+        connector_operation_dispatcher=dispatcher,
+    )
+    app = create_app(database_path=tmp_path / "large-upload-product.sqlite3", integrations=services)
+
+    def headers(raw_body: bytes) -> dict[str, str]:
+        timestamp = str(int(time.time()))
+        message = (
+            b"POST\n/internal/v1/connector-operation-grants\n"
+            + timestamp.encode("ascii")
+            + b"\n"
+            + raw_body
+        )
+        return {
+            "content-type": "application/json",
+            "x-cyrene-navigator-key-id": "navigator-test-v1",
+            "x-cyrene-navigator-timestamp": timestamp,
+            "x-cyrene-navigator-signature": hmac.new(key, message, hashlib.sha256).hexdigest(),
+        }
+
+    file_content = b"x" * 1_048_576
+    arguments: dict[str, Any] = {
+        "repo_type": "model",
+        "repo_id": "example-org/private-model",
+        "path": "upload.bin",
+        "content_base64": base64.b64encode(file_content).decode("ascii"),
+    }
+    profile_ref = connection.account_link_ref
+    assert profile_ref is not None
+    resource_projection = _resource_projection(
+        provider_id="huggingface",
+        profile_ref=profile_ref,
+        operation_id="huggingface.file.upload",
+        arguments=arguments,
+    )
+    request_body = {
+        "request_id": "large-hf-upload-grant",
+        "workspace_id": owner.workspace_id,
+        "principal_issuer": owner.issuer,
+        "principal_subject": owner.subject,
+        "connection_ref": str(connection.id),
+        "provider_id": "huggingface",
+        "profile_ref": profile_ref,
+        "operation_id": "huggingface.file.upload",
+        "resource_ref": _resource_ref(
+            provider_id="huggingface",
+            profile_ref=profile_ref,
+            operation_id="huggingface.file.upload",
+            target=resource_projection,
+        ),
+        "arguments": arguments,
+        "arguments_digest_sha256": digest_arguments(arguments),
+    }
+    raw_body = json.dumps(request_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    assert len(arguments["content_base64"]) == 1_398_104
+    assert 128 * 1024 < len(raw_body) < 1_500_000
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_TLS_CERT_FILE", raising=False)
+    monkeypatch.delenv("CYRENE_EXCHANGE_TLS_KEY_FILE", raising=False)
+    cert_path, key_path, ca_path = _https_server_credentials(tmp_path)
+    listener_tls = _integration_listener_tls_options(
+        SimpleNamespace(tls_cert_file=cert_path, tls_key_file=key_path),
+        runtime_mode="integration-only",
+    )
+    assert listener_tls == {"ssl_certfile": str(cert_path), "ssl_keyfile": str(key_path)}
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=0,
+            access_log=False,
+            log_level="critical",
+            **listener_tls,
+        )
+    )
+    server_thread = threading.Thread(target=server.run, daemon=True)
+    server_thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.started
+        assert server.servers
+        port = server.servers[0].sockets[0].getsockname()[1]
+        with httpx.Client(
+            verify=ssl.create_default_context(cafile=str(ca_path)),
+            trust_env=False,
+            timeout=10.0,
+        ) as client:
+            accepted = client.post(
+                f"https://127.0.0.1:{port}/internal/v1/connector-operation-grants",
+                headers=headers(raw_body),
+                content=raw_body,
+            )
+            assert accepted.status_code == 200, accepted.text
+            assert accepted.json()["claims"]["argumentsDigestSha256"] == digest_arguments(arguments)
+            assert authenticator.verify_calls == 1
+            assert len(authority.calls) == 1
+            assert authority.calls[0]["arguments_digest_sha256"] == bytes.fromhex(
+                digest_arguments(arguments)
+            )
+
+            body_limit = navigator_hmac_body_limit(
+                "POST", "/internal/v1/connector-operation-grants"
+            )
+            oversized = raw_body + b" " * (body_limit + 1 - len(raw_body))
+            rejected = client.post(
+                f"https://127.0.0.1:{port}/internal/v1/connector-operation-grants",
+                headers=headers(oversized),
+                content=oversized,
+            )
+        assert rejected.status_code == 413, rejected.text
+        assert authenticator.verify_calls == 1
+        assert len(authority.calls) == 1
+        assert navigator_hmac_body_limit("POST", "/internal/v1/teams/events") == 128 * 1024
+        ordinary_hmac_body = b"x" * (128 * 1024 + 1)
+        with pytest.raises(ExchangeProductError) as oversized_default:
+            authenticator.verify(
+                method="POST",
+                path="/internal/v1/another-hmac-route",
+                headers=headers(ordinary_hmac_body),
+                raw_body=ordinary_hmac_body,
+            )
+        assert oversized_default.value.status == 413
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
+        services.close()

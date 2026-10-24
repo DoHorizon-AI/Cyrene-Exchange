@@ -22,6 +22,8 @@ from uuid import uuid4
 from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations.models import IntegrationPrincipal
 
+_CONNECTOR_OPERATOR_ROLE = "navigator.connector.operator.v1"
+
 
 @dataclass(frozen=True, slots=True)
 class VerifiedPlatformIdentity:
@@ -32,6 +34,7 @@ class VerifiedPlatformIdentity:
     organization_id: str
     workspace_id: str
     granted_operation_ids: frozenset[str]
+    directory_roles: frozenset[str] = frozenset()
 
 
 class IdentityVerifier(Protocol):
@@ -181,6 +184,7 @@ class PlatformAuthorityIdentityVerifier:
                 if exchange_owner is not None
                 else frozenset()
             ),
+            directory_roles=frozenset(response.directory_roles),
         )
         if (
             not identity.issuer
@@ -195,15 +199,21 @@ class PlatformAuthorityIdentityVerifier:
         return identity
 
     def principal_for(self, *, bearer_token: str, workspace_id: str) -> IntegrationPrincipal:
-        """Build a frozen principal from fresh Platform identity and catalog evidence."""
+        """Build a principal from fresh Platform identity, catalog, and exact setup role."""
 
         identity = self.verify(bearer_token=bearer_token, workspace_id=workspace_id)
+        granted_operations = set(identity.granted_operation_ids)
+        # Connector profile linking is setup/maintenance; Platform returns this
+        # dedicated Directory role in the freshly verified identity response.
+        # Provider execution still requires a separate exact signed grant.
+        if _CONNECTOR_OPERATOR_ROLE in identity.directory_roles:
+            granted_operations.add(_CONNECTOR_OPERATOR_ROLE)
         return IntegrationPrincipal(
             issuer=identity.issuer,
             subject=identity.subject,
             organization_id=identity.organization_id,
             workspace_id=identity.workspace_id,
-            allowed_operation_ids=identity.granted_operation_ids,
+            allowed_operation_ids=frozenset(granted_operations),
         )
 
     def get_delegation(
