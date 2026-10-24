@@ -8,6 +8,7 @@
     "account/callback": "EXCHANGE_CALLBACK_CONTEXT_HMAC_KEY",
     "account/wecom-source": "EXCHANGE_WECOM_SOURCE_CONTEXT_HMAC_KEY",
     "wecom/inbound": "EXCHANGE_WECOM_INBOUND_HMAC_KEY",
+    "navigator/exchange-hmac": "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE",
     "bearers/member-a": "EXCHANGE_MEMBER_A_CURRENT_BEARER",
     "keys/wecom": "EXCHANGE_WECOM_AUTH_CONTEXT_HMAC_KEY",
     "keys/azure": "EXCHANGE_CLOUD_AUTH_CONTEXT_HMAC_KEY",
@@ -88,6 +89,33 @@
         "accountId": "bot:exchange",
         "groupConversationId": "configured-conversation-id",
         "requestHmacSecretRef": "wecom/inbound"
+      }
+    }
+  },
+  "connectorHost": {
+    "navigatorConnector": {
+      "keyId": "navigator-v1",
+      "keyFileRef": "navigator/exchange-hmac"
+    },
+    "teamsMessages": {
+      "profileRef": "teams-primary",
+      "connectionRef": "teams-messages-primary",
+      "organizationId": "org-a",
+      "workspaceId": "workspace-a",
+      "tenantId": "00000000-0000-4000-8000-000000000002",
+      "allowedTeamIds": ["team-ops"],
+      "allowedChannelIds": ["channel-ops"],
+      "botAppId": "00000000-0000-4000-8000-000000000003",
+      "expectedIssuer": "https://login.microsoftonline.com/00000000-0000-4000-8000-000000000002/v2.0",
+      "directPlugin": {
+        "bindingId": "host-teams-message-binding",
+        "connectionRef": "grpcs://teams-connector.example.invalid:7443",
+        "transport": "mtls",
+        "mtls": {
+          "rootCertificateRef": "tls/plugin-root",
+          "clientCertificateRef": "tls/exchange-client-cert",
+          "clientKeyRef": "tls/exchange-client-key"
+        }
       }
     }
   },

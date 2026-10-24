@@ -31,7 +31,10 @@ from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
 from cyrene_exchange_product.integrations.clients import (
     PROVIDER_CAPABILITY,
     DirectInvoker,
+    ProviderToolDefinition,
     _direct_payload,
+    _raise_provider_error,
+    list_provider_tool_catalog,
 )
 from cyrene_exchange_product.integrations.models import (
     AuthorizationCapabilityRecord,
@@ -214,14 +217,6 @@ class PlatformCurrentAuthorizationContextResolver:
         return principal
 
 
-_TOOL_OPERATIONS = {
-    "wecom_authorization_health": "wecom.authorization.health.read",
-    "wecom_reauthorization_start": "wecom.authorization.renewal.start",
-    "wecom_reauthorization_status": "wecom.authorization.renewal.status",
-    "cloud_resources_query": "cloud.resources.query",
-    "cloud_authorization_health": "cloud.authorization.health.read",
-    "email_notification_send": "email.notification.send",
-}
 _OFFICIAL_WECOM_QR_URL = re.compile(
     r"^https://work\.weixin\.qq\.com/ai/qc/gen\?source=wecom_cli_external&scode=[A-Za-z0-9_-]{8,256}$"
 )
@@ -273,6 +268,22 @@ class AuthorizationCloudDirectProvider:
         self._email_client = email_client
         self._current_context_resolver = current_context_resolver
         self._context_key = context_key
+
+    def list_tool_catalog(self, profile_ref: str) -> tuple[ProviderToolDefinition, ...]:
+        """Read catalog metadata from one configured tool-provider profile endpoint."""
+
+        profile = self._registry.settings.profiles.get(profile_ref)
+        client = self._provider_clients.get(profile_ref)
+        if (
+            profile is None
+            or profile.provider not in {"hf", "azure", "gcp", "runpod"}
+            or client is None
+        ):
+            raise ProviderObservationUnavailable("provider tool catalog binding is unavailable")
+        return list_provider_tool_catalog(
+            client,
+            binding_id=profile.endpoint.binding_id,
+        )
 
     def authorization_health(
         self,
@@ -334,6 +345,44 @@ class AuthorizationCloudDirectProvider:
                 )
                 for item in observed.capabilities
             ],
+        )
+
+    def invoke_connector_tool(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        *,
+        operation_id: str,
+        tool_id: str,
+        arguments: Mapping[str, object],
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Sign and invoke one fixed cloud or HF tool after exact connection checks."""
+
+        principal.require(operation_id)
+        current = self._store.current_connection_for_provider_call(connection.id)
+        if current is None or current != connection or not current.enabled:
+            raise PermissionError("connection changed before connector provider call")
+        if current.provider not in {"azure", "gcp", "hf", "runpod"}:
+            raise PermissionError("connection provider has no cloud connector tool binding")
+        profile, _target_ref = self._registry.profile_for_connection(
+            principal,
+            current,
+            operation_id=operation_id,
+        )
+        if profile.provider != current.provider:
+            raise PermissionError("provider profile does not match the connection")
+        expected_profile_ref = (
+            current.account_link_ref if current.provider == "hf" else current.binding_ref
+        )
+        if arguments.get("profile_ref") != expected_profile_ref:
+            raise PermissionError("provider profile argument does not match the connection")
+        return self._call_profile(
+            profile,
+            principal,
+            tool_id=tool_id,
+            arguments=arguments,
+            request_id=request_id,
         )
 
     def cloud_resources(
@@ -768,9 +817,9 @@ def _invoke_signed_tool(
         raise PermissionError("current provider signing context is incomplete")
     try:
         sdk = _sdk()
-        operation_id = _TOOL_OPERATIONS[tool_id]
-        if sdk.TOOL_OPERATIONS.get(tool_id) != operation_id:
-            raise ValueError("shared provider operation map changed")
+        operation_id = sdk.TOOL_OPERATIONS.get(tool_id)
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("shared provider operation map has no fixed tool")
         typed_arguments = _typed_arguments(sdk, tool_id, arguments)
         trusted_context = sdk.sign_context(
             method=tool_id,
@@ -832,9 +881,33 @@ def _invoke_signed_tool(
             raise EmailDeliveryRetryableError(
                 "email provider confirmed a retryable pre-send failure"
             )
-        raise IntegrationToolCallUnavailable(retryable=typed_response.error.retryable)
+        try:
+            code = tool_wire.ToolProviderErrorCode.Name(typed_response.error.code)
+        except ValueError:
+            code = "PROVIDER_UNAVAILABLE"
+        _raise_provider_error(code, retryable=typed_response.error.retryable)
     if result_kind != "outcome" or typed_response.outcome.is_error:
-        raise IntegrationToolCallUnavailable()
+        error_value: Mapping[str, Any] | None = None
+        for part in typed_response.outcome.content:
+            if part.WhichOneof("content") != "json":
+                continue
+            try:
+                decoded = json.loads(part.json.json)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded, Mapping) and isinstance(decoded.get("error"), Mapping):
+                error_value = decoded["error"]
+                break
+        if error_value is None or not isinstance(error_value.get("code"), str):
+            raise IntegrationToolCallUnavailable()
+        _raise_provider_error(
+            str(error_value["code"]),
+            retryable=error_value.get("retryable") is True,
+            unknown=(
+                error_value.get("outcome") == "UNKNOWN"
+                or error_value.get("state") == "UNKNOWN_RESULT"
+            ),
+        )
     values: list[dict[str, Any]] = []
     for part in typed_response.outcome.content:
         if part.WhichOneof("content") != "json":
@@ -895,12 +968,51 @@ def _typed_arguments(
     }
     parser_serializer = pairs.get(tool_id)
     if parser_serializer is None:
-        raise ValueError("provider tool is not allowlisted")
+        if tool_id not in sdk.TOOL_OPERATIONS:
+            raise ValueError("provider tool is not allowlisted")
+        value = dict(arguments)
+        _validate_generic_connector_arguments(value)
+        return value
     parser, serializer = parser_serializer
     value = serializer(parser(arguments))
     if not isinstance(value, Mapping):
         raise ValueError("provider arguments did not serialize to an object")
     return cast(dict[str, object], dict(value))
+
+
+def _validate_generic_connector_arguments(arguments: Mapping[str, object]) -> None:
+    """Bound the shared Plugin DTO and reject caller-supplied credential fields."""
+
+    encoded = json.dumps(
+        dict(arguments),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(encoded) > 64 * 1024:
+        raise ValueError("connector provider arguments exceed the configured size limit")
+    forbidden_keys = {
+        "access_token",
+        "api_key",
+        "authorization",
+        "client_secret",
+        "password",
+        "secret",
+        "token",
+    }
+
+    def inspect(value: object) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if isinstance(key, str) and key.lower() in forbidden_keys:
+                    raise ValueError("provider arguments cannot carry credential fields")
+                inspect(child)
+        elif isinstance(value, list):
+            for child in value:
+                inspect(child)
+
+    inspect(arguments)
 
 
 def _same_email_request(current: EmailNotificationJob, requested: EmailNotificationJob) -> bool:

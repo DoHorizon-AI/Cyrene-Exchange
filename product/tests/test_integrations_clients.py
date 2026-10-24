@@ -23,6 +23,9 @@ from cyrene_exchange_product.integrations._generated.cyrene.message.connector.v1
 from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
     tool_provider_pb2 as tool_wire,
 )
+from cyrene_exchange_product.integrations._generated.cyrene.workspace.authority.v2 import (
+    workspace_authority_pb2 as authority_wire,
+)
 from cyrene_exchange_product.integrations.auth import (
     AccountCenterRequestSigner,
     IntegrationPrincipal,
@@ -33,6 +36,7 @@ from cyrene_exchange_product.integrations.clients import (
     GitHubIssuesClient,
     GitHubWebhookClient,
     PlatformAuthorityDelegationClient,
+    TeamsMessageClient,
     WeComMessageClient,
     _decode_tool_result,
 )
@@ -118,6 +122,65 @@ def test_account_center_direct_call_uses_fixed_method_and_signed_context() -> No
         context["signature"],
         hmac.new(b"a" * 32, canonical_json(unsigned), hashlib.sha256).hexdigest(),
     )
+
+
+@pytest.mark.parametrize(
+    ("domain_code", "message", "expected_code", "expected_status"),
+    [
+        (
+            "PERMISSION_DENIED",
+            "connector_grant_replayed",
+            "EXCHANGE_CONNECTOR_REQUEST_REPLAYED",
+            409,
+        ),
+        (
+            "PERMISSION_DENIED",
+            "authorization_denied",
+            "EXCHANGE_ACCOUNT_CENTER_AUTHORIZATION_DENIED",
+            403,
+        ),
+        (
+            "INVALID_REQUEST",
+            "invalid_request",
+            "EXCHANGE_ACCOUNT_CENTER_REQUEST_INVALID",
+            422,
+        ),
+    ],
+)
+def test_account_center_denials_are_not_reported_as_retryable_outages(
+    domain_code: str,
+    message: str,
+    expected_code: str,
+    expected_status: int,
+) -> None:
+    class DirectFailure(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__(message)
+            self.domain_code = domain_code
+            self.message = message
+
+    class FailingDirectClient:
+        def invoke(self, **_kwargs: Any) -> Any:
+            raise DirectFailure()
+
+    client = AccountCenterClient(
+        FailingDirectClient(),  # type: ignore[arg-type]
+        exchange_signer=AccountCenterRequestSigner(caller_id="exchange-service", key=b"a" * 32),
+        binding_id="account-center-binding",
+    )
+
+    with pytest.raises(ExchangeProductError) as captured:
+        client.begin_link(
+            _principal(),
+            provider="github",
+            workspace_id="workspace-9",
+            idempotency_key="connector-denial-test",
+        )
+
+    assert captured.value.code == expected_code
+    assert captured.value.status == expected_status
+    assert captured.value.retryable is False
+    assert message not in captured.value.detail
 
 
 def test_linked_sender_lookup_uses_exchange_role_with_configured_tenant_scope() -> None:
@@ -631,6 +694,61 @@ def test_signed_self_grant_lookup_uses_real_product_mtls_channel(tmp_path: Path)
         server.stop(0).wait()
 
 
+def test_connector_authority_client_calls_only_dedicated_rpc() -> None:
+    """Connector-only Authority stub has one RPC and receives no version probe."""
+
+    service = authority_wire.DESCRIPTOR.services_by_name["WorkspaceConnectorAuthorizationService"]
+    assert [method.name for method in service.methods] == ["AuthorizeConnectorOperation"]
+
+    class _Stub:
+        def __init__(self) -> None:
+            self.request: Any = None
+            self.calls = 0
+
+        def AuthorizeConnectorOperation(self, request: Any, *, timeout: float) -> Any:
+            assert timeout == 3.0
+            self.request = request
+            self.calls += 1
+            return authority_wire.AuthorizeConnectorOperationResponse(
+                grant=authority_wire.ConnectorOperationGrantV1(grant_ref="sha256:" + "1" * 64)
+            )
+
+    class _Channel:
+        def __init__(self, stub: _Stub) -> None:
+            self.stub = stub
+
+        def __enter__(self) -> _Stub:
+            return self.stub
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    stub = _Stub()
+    client = PlatformAuthorityDelegationClient.__new__(PlatformAuthorityDelegationClient)
+    client._deadline_seconds = 3.0
+
+    def _connector_stub(*, connector_only: bool) -> _Channel:
+        assert connector_only is True
+        return _Channel(stub)
+
+    client._workload_stub = _connector_stub  # type: ignore[method-assign]
+    encoded = client.authorize_connector_operation(
+        workspace_id="workspace-9",
+        principal_issuer="https://login.microsoftonline.com/tenant/v2.0",
+        principal_subject="11111111-1111-4111-8111-111111111111",
+        connection_ref="9dca6ec0-4874-4d09-8e37-c3f4718e619c",
+        provider_id="github",
+        profile_ref="gh-profile-1",
+        operation_id="github.repository.list",
+        resource_ref="sha256:" + "2" * 64,
+        arguments_digest_sha256=b"\x03" * 32,
+        request_id="request-1",
+    )
+    assert stub.calls == 1
+    assert stub.request.operation_id == "github.repository.list"
+    assert b"sha256:" in encoded
+
+
 def test_github_explicit_acl_denial_is_a_known_rejection() -> None:
     response = tool_wire.CallToolResponse(
         outcome=tool_wire.ToolCallOutcome(
@@ -678,6 +796,41 @@ def test_wecom_explicit_rejected_ack_has_no_fabricated_receipt_ids() -> None:
     assert evidence.accepted is False
     assert evidence.vendor_message_id is None
     assert evidence.transport_request_id is None
+
+
+def test_teams_reply_forwards_validated_regional_service_url() -> None:
+    delivery = message_wire.DeliveryResult(
+        status=message_wire.DELIVERY_STATUS_ACCEPTED,
+        vendor_message_id="message-1",
+    )
+    transport = _DirectClient(
+        [
+            DirectPayload(
+                "type.cyrene.io/cyrene.message.connector.v1.DeliveryResult",
+                delivery.SerializeToString(deterministic=True),
+            )
+        ]
+    )
+    client = TeamsMessageClient(transport)
+    service_url = "https://smba.trafficmanager.net/emea/"
+    evidence = client.send_reply(
+        bot_app_id="00000000-0000-4000-8000-000000000003",
+        tenant_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        team_id="team-1",
+        channel_id="channel-1",
+        conversation_id="19:channel-conversation",
+        root_thread_id="1698765432101",
+        service_url=service_url,
+        text="The task completed.",
+        request_id="notification-1:attempt:1",
+    )
+    request = message_wire.SendMessageRequest.FromString(transport.calls[0]["request"].value)
+    service_facts = {
+        fact.value for fact in request.vendor_extension.facts if fact.name == "service_url"
+    }
+    assert service_facts == {service_url}
+    assert request.reply.message_id == "1698765432101"
+    assert evidence.accepted is True
 
 
 def test_github_webhook_verifier_sends_original_bytes_without_connection_claim() -> None:

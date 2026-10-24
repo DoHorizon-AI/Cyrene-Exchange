@@ -144,6 +144,7 @@ class IntegrationValidationError(IntegrationError):
 
 
 ProviderId = Literal["github", "wecom", "azure", "gcp", "hf", "runpod", "tailscale"]
+ConnectorAccessMode = Literal["actor_owned", "workspace_operator"]
 
 
 class IntegrationConnection(ContractModel):
@@ -161,6 +162,7 @@ class IntegrationConnection(ContractModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=300)
     repository_id: str = Field(default="", max_length=200, exclude_if=lambda value: not value)
     repository_name: str = Field(default="", max_length=300, exclude_if=lambda value: not value)
+    access_mode: ConnectorAccessMode = "actor_owned"
     enabled: bool = True
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -181,6 +183,14 @@ class IntegrationConnection(ContractModel):
             raise ValueError("targetRef is only valid for cloud resource connections")
         if self.provider == "wecom" and not self.binding_ref:
             raise ValueError("WeCom authorization connections require bindingRef")
+        if self.access_mode == "workspace_operator" and self.provider not in {
+            "github",
+            "hf",
+            "azure",
+            "gcp",
+            "runpod",
+        }:
+            raise ValueError("workspace_operator access is valid only for connector providers")
         return self
 
 

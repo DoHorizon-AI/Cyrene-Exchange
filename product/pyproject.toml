@@ -12,18 +12,20 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
   "cyrene-exchange",
+  "cryptography==48.0.1",
   "fastapi==0.141.1",
   "grpcio==1.62.3",
   "httpx==0.28.1",
   "pydantic==2.13.5",
   "protobuf==4.25.9",
   "uvicorn==0.52.4",
+  "rfc8785==0.1.4",
 ]
 
 [project.optional-dependencies]
 integrations = [
-  "cyrene-account-center-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@a8a4b7eae15a7e69ec141ffe9de98b97cb596bf0#subdirectory=sdk/python/cyrene_account_center_contracts",
-  "cyrene-integration-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@0b13fad9106045c4a9aa9e6cee226e18fc14def8#subdirectory=sdk/python/cyrene_integration_contracts",
+  "cyrene-account-center-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d#subdirectory=sdk/python/cyrene_account_center_contracts",
+  "cyrene-integration-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d#subdirectory=sdk/python/cyrene_integration_contracts",
 ]
 
 [project.scripts]

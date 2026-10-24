@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import signal
+import ssl
 import sys
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -40,6 +41,9 @@ from cyrene_exchange_product.server import (
 )
 from cyrene_exchange_product.service import ExchangeProductService
 from cyrene_exchange_product.store import ExchangeStore
+
+_INTEGRATION_TLS_CERT_ENV = "CYRENE_EXCHANGE_TLS_CERT_FILE"
+_INTEGRATION_TLS_KEY_ENV = "CYRENE_EXCHANGE_TLS_KEY_FILE"
 
 
 def _bindings(entries: list[str]) -> dict[str, OpenAICompatibleProvider]:
@@ -136,6 +140,7 @@ def _serve(arguments: argparse.Namespace) -> int:
         )
     if runtime_mode in {"gateway-only", "combined"} and arguments.database is None:
         raise SystemExit("--database is required for gateway-only and combined modes")
+    listener_tls = _integration_listener_tls_options(arguments, runtime_mode=runtime_mode)
     integrations = None
     if runtime_mode != "gateway-only":
         from cyrene_exchange_product.integrations.cli import (
@@ -154,7 +159,17 @@ def _serve(arguments: argparse.Namespace) -> int:
                 database_path=integration_database,
                 integrations=integrations,
             )
-            uvicorn.run(app, host=arguments.host, port=arguments.port, access_log=False)
+            if listener_tls:
+                uvicorn.run(
+                    app,
+                    host=arguments.host,
+                    port=arguments.port,
+                    access_log=False,
+                    ssl_certfile=listener_tls["ssl_certfile"],
+                    ssl_keyfile=listener_tls["ssl_keyfile"],
+                )
+            else:
+                uvicorn.run(app, host=arguments.host, port=arguments.port, access_log=False)
             return 0
 
     if arguments.database is None:
@@ -284,6 +299,70 @@ def _serve(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _integration_listener_tls_options(
+    arguments: argparse.Namespace,
+    *,
+    runtime_mode: str,
+) -> dict[str, str]:
+    """Validate the optional TLS pair used only by the integration-only listener."""
+
+    cert_option = getattr(arguments, "tls_cert_file", None)
+    key_option = getattr(arguments, "tls_key_file", None)
+    cert_environment = os.environ.get(_INTEGRATION_TLS_CERT_ENV, "").strip()
+    key_environment = os.environ.get(_INTEGRATION_TLS_KEY_ENV, "").strip()
+    cert_environment_path = Path(cert_environment) if cert_environment else None
+    key_environment_path = Path(key_environment) if key_environment else None
+    cert_path = _coalesce_tls_path(
+        cert_option,
+        cert_environment_path,
+        option_name="--tls-cert-file",
+        environment_name=_INTEGRATION_TLS_CERT_ENV,
+    )
+    key_path = _coalesce_tls_path(
+        key_option,
+        key_environment_path,
+        option_name="--tls-key-file",
+        environment_name=_INTEGRATION_TLS_KEY_ENV,
+    )
+    if (cert_path is None) != (key_path is None):
+        raise SystemExit(
+            "Exchange listener TLS requires both CYRENE_EXCHANGE_TLS_CERT_FILE and "
+            "CYRENE_EXCHANGE_TLS_KEY_FILE"
+        )
+    if cert_path is None or key_path is None:
+        return {}
+    if runtime_mode != "integration-only":
+        raise SystemExit("Exchange listener TLS files are supported only in integration-only mode")
+    cert_path = cert_path.expanduser()
+    key_path = key_path.expanduser()
+    if not cert_path.is_file() or not key_path.is_file():
+        raise SystemExit("Exchange listener TLS certificate and key must be regular files")
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+    except (OSError, ssl.SSLError, ValueError) as exc:
+        raise SystemExit("Exchange listener TLS certificate/key pair is invalid") from exc
+    return {"ssl_certfile": str(cert_path), "ssl_keyfile": str(key_path)}
+
+
+def _coalesce_tls_path(
+    option: Path | None,
+    environment: Path | None,
+    *,
+    option_name: str,
+    environment_name: str,
+) -> Path | None:
+    """Reject conflicting CLI and host paths instead of silently choosing one."""
+
+    if (
+        option is not None
+        and environment is not None
+        and option.expanduser().resolve() != environment.expanduser().resolve()
+    ):
+        raise SystemExit(f"{option_name} and {environment_name} refer to different TLS files")
+    return option or environment
+
+
 def _integration_dispatch(arguments: argparse.Namespace, *, once: bool) -> int:
     """Run the durable worker as its own host unit, never in the API process."""
 
@@ -346,6 +425,180 @@ def _integration_authorization_cloud(arguments: argparse.Namespace, *, once: boo
         services.close()
 
 
+def _integration_connector_bindings(arguments: argparse.Namespace) -> int:
+    """Export the launcher-owned connection map from trusted Exchange SQLite rows."""
+
+    from cyrene_exchange_product.integrations.connector_operations import (
+        connector_binding_tools,
+    )
+    from cyrene_exchange_product.integrations.store import IntegrationStore
+
+    database_path = Path(arguments.integration_database).expanduser().resolve()
+    if not database_path.is_file():
+        raise SystemExit("Exchange integration database does not exist")
+    store = IntegrationStore(database_path)
+    try:
+        connections = store.connector_bindings_for_actor(
+            issuer=arguments.issuer,
+            subject=arguments.subject,
+            workspace_id=arguments.workspace_id,
+        )
+    finally:
+        store.close()
+    bindings: list[dict[str, object]] = []
+    skipped = 0
+    for connection in connections:
+        provider_id = "huggingface" if connection.provider == "hf" else connection.provider
+        tools = connector_binding_tools(provider_id)
+        if not tools:
+            continue
+        profile_ref = (
+            connection.account_link_ref
+            if connection.provider in {"github", "hf"}
+            else connection.binding_ref
+        )
+        if not profile_ref or (connection.provider != "github" and not connection.target_ref):
+            skipped += 1
+            continue
+        bindings.append(
+            {
+                "bindingId": f"exchange-{provider_id}-{connection.id}",
+                "connectionRef": str(connection.id),
+                "providerId": provider_id,
+                "profileRef": profile_ref,
+                "tools": tools,
+            }
+        )
+    if skipped:
+        print(
+            f"Skipped {skipped} provider connection(s) without a configured profile or target.",
+            file=sys.stderr,
+        )
+    payload = json.dumps(
+        {"schemaVersion": 1, "bindings": bindings},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    print(payload)
+    return 0
+
+
+def _integration_connector_tool_catalog(arguments: argparse.Namespace) -> int:
+    """Export actual Plugin tool schemas for Exchange-owned connections.
+
+    The command is a private host bootstrap operation. It uses the configured
+    DirectPluginRuntime channels and SQLite records, and emits JSON only after
+    every selected provider catalog passes validation.
+    中文：只从真实插件目录与 Exchange 持久连接导出，不查询时不伪造空工具。
+    """
+
+    from cyrene_exchange_product.integrations.cli import build_production_services
+    from cyrene_exchange_product.integrations.clients import ProviderToolDefinition
+    from cyrene_exchange_product.integrations.connector_operations import (
+        connector_binding_tools,
+    )
+
+    database_path = Path(arguments.integration_database).expanduser().resolve()
+    if not database_path.is_file():
+        raise SystemExit("Exchange integration database does not exist")
+    services = build_production_services(database_path)
+    try:
+        connections = services.store.connector_bindings_for_actor(
+            issuer=arguments.issuer,
+            subject=arguments.subject,
+            organization_id=arguments.organization_id,
+            workspace_id=arguments.workspace_id,
+        )
+        items: list[dict[str, object]] = []
+        catalog_cache: dict[tuple[str, str], dict[str, ProviderToolDefinition]] = {}
+        for connection in connections:
+            if connection.organization_id != arguments.organization_id:
+                continue
+            provider_id = "huggingface" if connection.provider == "hf" else connection.provider
+            operation_map = connector_binding_tools(provider_id)
+            if not operation_map:
+                continue
+            profile_ref = (
+                connection.account_link_ref
+                if connection.provider in {"github", "hf"}
+                else connection.binding_ref
+            )
+            if (
+                provider_id == "github"
+                and profile_ref is None
+                and connection.binding_ref is None
+                and connection.target_ref is None
+            ):
+                continue
+            if not profile_ref or (connection.provider != "github" and not connection.target_ref):
+                raise SystemExit(
+                    "an enabled connector connection has no complete host profile scope"
+                )
+
+            source_binding = "github" if provider_id == "github" else str(connection.binding_ref)
+            cache_key = (provider_id, source_binding)
+            descriptors = catalog_cache.get(cache_key)
+            if descriptors is None:
+                if provider_id == "github":
+                    provider_catalog = services.github.list_tool_catalog()
+                else:
+                    if services.authorization_cloud is None:
+                        raise SystemExit("configured connector provider catalog is unavailable")
+                    provider_catalog = services.authorization_cloud.list_tool_catalog(
+                        str(connection.binding_ref)
+                    )
+                descriptors = {descriptor.tool_id: descriptor for descriptor in provider_catalog}
+                catalog_cache[cache_key] = descriptors
+
+            expected = {str(entry["toolId"]): entry for entry in operation_map}
+            if len(expected) != len(operation_map):
+                raise SystemExit("Exchange connector operation map contains duplicate tool IDs")
+            missing = set(expected) - set(descriptors)
+            if missing:
+                raise SystemExit(
+                    "configured provider catalog is missing required Exchange operations"
+                )
+            tools: list[dict[str, object]] = []
+            for tool_id in sorted(expected):
+                definition = descriptors[tool_id]
+                mapping = expected[tool_id]
+                mutating = mapping.get("mutating")
+                if not isinstance(mutating, bool):
+                    raise SystemExit("Exchange connector operation map has invalid mutability")
+                tools.append(
+                    {
+                        "id": definition.tool_id,
+                        "name": definition.name,
+                        "description": definition.description,
+                        "readOnly": not mutating,
+                        "inputSchema": definition.input_schema,
+                    }
+                )
+            items.append(
+                {
+                    "bindingId": f"exchange-{provider_id}-{connection.id}",
+                    "capabilityId": "tool.provider.v1",
+                    "providerId": provider_id,
+                    "connectionRef": str(connection.id),
+                    "profileRef": profile_ref,
+                    "tools": tools,
+                }
+            )
+
+        output = json.dumps(
+            {"schemaVersion": 1, "items": items},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(output.encode("utf-8")) > 16 * 1024 * 1024:
+            raise SystemExit("provider tool catalog snapshot exceeds its size limit")
+    finally:
+        services.close()
+    print(output)
+    return 0
+
+
 def _integration_check_config() -> int:
     """Run offline config and Platform-profile preflight without side effects."""
 
@@ -369,6 +622,25 @@ def _integration_check_config() -> int:
         )
         return 2
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def _integration_connector_bootstrap(arguments: argparse.Namespace) -> int:
+    """Provision initial provider profiles through the privileged local host path."""
+
+    from cyrene_exchange_product.integrations.bootstrap import provision_connector_profiles
+    from cyrene_exchange_product.integrations.cli import build_production_services
+
+    services = build_production_services(arguments.integration_database)
+    try:
+        result = provision_connector_profiles(
+            services,
+            arguments.private_config,
+            plan_only=arguments.plan_only,
+        )
+    finally:
+        services.close()
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
 
 
@@ -565,6 +837,22 @@ def parser() -> argparse.ArgumentParser:
         help="Separate SQLite path for integration inbox, outbox, and operation state",
     )
     serve.add_argument(
+        "--tls-cert-file",
+        type=Path,
+        help=(
+            "Optional integration-only HTTPS certificate file; can also use "
+            "CYRENE_EXCHANGE_TLS_CERT_FILE"
+        ),
+    )
+    serve.add_argument(
+        "--tls-key-file",
+        type=Path,
+        help=(
+            "Optional integration-only HTTPS private key file; can also use "
+            "CYRENE_EXCHANGE_TLS_KEY_FILE"
+        ),
+    )
+    serve.add_argument(
         "--control-token",
         help=(
             "Legacy compatibility only; this value is also a Gateway credential. "
@@ -710,6 +998,37 @@ def parser() -> argparse.ArgumentParser:
             type=Path,
             help="Separate SQLite path for integration inbox, outbox, and operation state",
         )
+    binding_export = integration_commands.add_parser(
+        "connector-bindings",
+        help="Export a Navigator launcher binding map for one exact actor and workspace",
+    )
+    binding_export.add_argument("--integration-database", type=Path, required=True)
+    binding_export.add_argument("--issuer", required=True)
+    binding_export.add_argument("--subject", required=True)
+    binding_export.add_argument("--workspace-id", required=True)
+    catalog_export = integration_commands.add_parser(
+        "connector-tool-catalog",
+        help="Export actual provider tool schemas for one exact actor, organization, and workspace",
+    )
+    catalog_export.add_argument("--integration-database", type=Path, required=True)
+    catalog_export.add_argument("--issuer", required=True)
+    catalog_export.add_argument("--subject", required=True)
+    catalog_export.add_argument("--organization-id", required=True)
+    catalog_export.add_argument("--workspace-id", required=True)
+    bootstrap_connectors = integration_commands.add_parser(
+        "bootstrap-connectors",
+        help="Provision initial GitHub and Hugging Face profiles from a private operator file",
+    )
+    bootstrap_connectors.add_argument("--integration-database", type=Path, required=True)
+    bootstrap_connectors.add_argument("--private-config", type=Path, required=True)
+    bootstrap_connectors.add_argument(
+        "--plan-only",
+        action="store_true",
+        help=(
+            "Verify the current Directory role and print refs without linking profiles "
+            "or saving connections"
+        ),
+    )
     return value
 
 
@@ -728,6 +1047,12 @@ def run(argv: list[str] | None = None) -> int:
     if arguments.command == "integrations":
         if arguments.integration_command == "check-config":
             return _integration_check_config()
+        if arguments.integration_command == "connector-bindings":
+            return _integration_connector_bindings(arguments)
+        if arguments.integration_command == "connector-tool-catalog":
+            return _integration_connector_tool_catalog(arguments)
+        if arguments.integration_command == "bootstrap-connectors":
+            return _integration_connector_bootstrap(arguments)
         if arguments.integration_command.startswith("authorization-cloud"):
             return _integration_authorization_cloud(
                 arguments,
