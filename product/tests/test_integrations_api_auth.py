@@ -1278,7 +1278,7 @@ def test_offline_plugin_health_does_not_fail_gateway_readiness(tmp_path: Path) -
         health.close()
 
 
-def test_large_huggingface_upload_grant_uses_route_scoped_hmac_limit(
+def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_scoped_hmac_limit(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -1286,6 +1286,8 @@ def test_large_huggingface_upload_grant_uses_route_scoped_hmac_limit(
     key_file = tmp_path / "navigator-hmac.key"
     key_file.write_bytes(key)
     key_file.chmod(0o600)
+    issued_at_epoch = float(int(time.time())) + 0.25
+    expires_at_epoch = issued_at_epoch + 15.0
 
     class CountingHmacAuthenticator(NavigatorHmacAuthenticator):
         verify_calls = 0
@@ -1309,7 +1311,6 @@ def test_large_huggingface_upload_grant_uses_route_scoped_hmac_limit(
             *,
             expected: dict[str, Any],
         ) -> ConnectorGrantClaims:
-            now = int(time.time())
             return ConnectorGrantClaims(
                 request_id=str(expected["request_id"]),
                 audience="exchange",
@@ -1323,8 +1324,8 @@ def test_large_huggingface_upload_grant_uses_route_scoped_hmac_limit(
                 operation_id=str(expected["operation_id"]),
                 resource_ref=str(expected["resource_ref"]),
                 arguments_digest_sha256=expected["arguments_digest_sha256"],
-                issued_at_epoch=now,
-                expires_at_epoch=now + 15,
+                issued_at_epoch=issued_at_epoch,
+                expires_at_epoch=expires_at_epoch,
                 grant_ref="sha256:" + "a" * 64,
             )
 
@@ -1476,7 +1477,14 @@ def test_large_huggingface_upload_grant_uses_route_scoped_hmac_limit(
                 content=raw_body,
             )
             assert accepted.status_code == 200, accepted.text
-            assert accepted.json()["claims"]["argumentsDigestSha256"] == digest_arguments(arguments)
+            grant = accepted.json()
+            assert grant["claims"]["argumentsDigestSha256"] == digest_arguments(arguments)
+            assert type(grant["issuedAt"]) is int
+            assert type(grant["expiresAt"]) is int
+            assert grant["issuedAt"] == int(issued_at_epoch)
+            assert grant["expiresAt"] == int(expires_at_epoch)
+            assert 0 < grant["expiresAt"] - grant["issuedAt"] <= 15
+            assert grant["expiresAt"] > int(time.time())
             assert authenticator.verify_calls == 1
             assert len(authority.calls) == 1
             assert authority.calls[0]["arguments_digest_sha256"] == bytes.fromhex(

@@ -12,6 +12,7 @@ import hashlib
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
+from math import floor
 from typing import Annotated, Any, Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -2113,12 +2114,15 @@ def create_router(services: IntegrationServices) -> APIRouter:
             grant_bytes,
             expected=expected,
         )
+        # Navigator's private JSON uses integer Unix seconds.
+        # Flooring never extends the signed grant window.
+        # Navigator 私有 JSON 契约采用整数 Unix 秒。向下取整不会延长签名授权窗口。
         return {
             "connectorGrantBin": base64.b64encode(grant_bytes).decode("ascii"),
             "grantRef": claims.grant_ref,
             "audience": claims.audience,
-            "issuedAt": claims.issued_at_epoch,
-            "expiresAt": claims.expires_at_epoch,
+            "issuedAt": floor(claims.issued_at_epoch),
+            "expiresAt": floor(claims.expires_at_epoch),
             "claims": {
                 "requestId": claims.request_id,
                 "organizationId": claims.organization_id,
