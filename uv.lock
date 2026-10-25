@@ -28,8 +28,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cyrene-model-provider-contracts", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_model_provider_contracts&rev=0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d" },
-    { name = "cyrene-plugin-runtime", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_plugin_runtime&rev=0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d" },
+    { name = "cyrene-model-provider-contracts", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_model_provider_contracts&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e" },
+    { name = "cyrene-plugin-runtime", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_plugin_runtime&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11.0" },
 ]
@@ -38,12 +38,12 @@ provides-extras = ["dev"]
 [[package]]
 name = "cyrene-model-provider-contracts"
 version = "0.1.0"
-source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_model_provider_contracts&rev=0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d#0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d" }
+source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_model_provider_contracts&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e#b977dbca6a0889be64a617ee79cea1d47a0f327e" }
 
 [[package]]
 name = "cyrene-plugin-runtime"
 version = "0.2.2"
-source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_plugin_runtime&rev=0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d#0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d" }
+source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_plugin_runtime&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e#b977dbca6a0889be64a617ee79cea1d47a0f327e" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },
