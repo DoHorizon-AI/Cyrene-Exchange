@@ -21,7 +21,7 @@ evidence. It never stores provider credentials or invokes a model or agent.
 | `authorization_cloud_provider.py` | Signed DirectPlugin calls and per-call Platform authority revalidation. |
 | `connector_profiles.py` | Closed Navigator HMAC and Teams egress host bindings, including Bot Framework route validation. |
 | `connector_security.py` | Raw-body Navigator HMAC, pinned Platform grant verification, and RFC 8785 connector digests. |
-| `connector_operations.py` | Closed GitHub, Hugging Face, cloud, and Teams operation/resource maps and safe provider-result projection. |
+| `connector_operations.py` | Closed GitHub (including proactive task/CI operations), Hugging Face, cloud, and Teams operation/resource maps and safe provider-result projection. |
 | `api.py` | Fixed HTTP routes for account profiles, connector authorization/invocation, Teams egress, connections, and webhooks. |
 | `auth.py` | Verified Platform identity and signed Product-to-capability caller context. |
 | `clients.py` | Typed DirectPlugin invokers for Account Center, GitHub Issues, Teams, and webhook verification. |
@@ -283,6 +283,23 @@ configure Account Center's private OAuth seed file for the stable
 own the access/refresh tokens and automatic renewal; Exchange sends only that
 stable reference and the declared repository scopes.
 
+## Proactive GitHub provider tools
+
+Exchange exposes the provider catalog's `tool.provider.v1` GitHub tools only
+when their exact IDs appear in the fixed operation map. The new reads are issue
+search, Actions job listing, and bounded job-log excerpts. The new writes create
+or delete task branches, commit a bounded file on a task branch, open a draft
+pull request, and rerun failed jobs for an exact CI attempt. Three additional
+readbacks locate an exact branch, branch file, or draft pull request after an
+uncertain write. Resource targets
+use the stable GitHub repository ID/name plus the exact branch, file, or run
+locator; the full argument digest also binds queries, content, and optimistic
+preconditions. GitHub App calls still require a fresh Directory grant and
+one-use Account Center lease. Ambiguous writes remain blocked until readback;
+they are never retried automatically. See the
+[`connector-operations.md`](../../../../contracts/product/v1/connector-operations.md)
+contract for the target map.
+
 ## Private Navigator tool catalog snapshot
 
 Before Navigator starts, export tool schemas from the configured provider
@@ -413,6 +430,18 @@ Exchange 把已验证的 grant claims 随 GitHub/Hugging Face lease 请求交给
 actor、workspace 和参数摘要完全匹配且 grant 未过期、未使用时签发 lease。后续增补维护者只需在同一组织和
 workspace 授予 `navigator.connector.operator.v1`；其操作使用本人的验证身份，撤权会影响下一次 grant 检查。
 其他 issuer、组织或 workspace 不能使用该共享连接。
+
+## 主动 GitHub Provider 工具
+
+只有固定 operation map 中的精确 ID 会从 Provider `tool.provider.v1` catalog 暴露给
+Exchange。新增读取操作包括 Issue 搜索、Actions job 列表和有行数上限的 job 日志摘要；
+新增写入操作包括创建/删除任务分支、向任务分支提交有限大小文件、创建 Draft PR，以及
+针对精确 CI attempt 重跑失败 job。另有三个读取操作分别按准确分支、分支文件和 Draft PR
+定位，供写入结果不明时独立回读。资源 target 使用稳定 GitHub 仓库 ID/name 和准确的
+branch、file 或 run 定位符；完整参数 digest 还绑定查询文本、内容和乐观并发前置条件。
+GitHub App 调用仍要求新的 Directory grant 与 Account Center 一次性 lease。写入结果有歧义时
+保持阻塞，等待回读，不会自动重试。目标映射见
+[`connector-operations.md`](../../../../contracts/product/v1/connector-operations.md)。
 
 ## Navigator 私有工具目录快照
 

@@ -32,6 +32,7 @@ from cyrene_exchange_product.integrations.auth import (
     canonical_json,
 )
 from cyrene_exchange_product.integrations.clients import (
+    GITHUB_TOOL_IDS,
     AccountCenterClient,
     GitHubIssuesClient,
     GitHubWebhookClient,
@@ -279,6 +280,72 @@ def test_github_tool_call_signs_fixed_tool_and_exact_public_args() -> None:
         context["signature"],
         hmac.new(b"g" * 32, canonical_json(unsigned), hashlib.sha256).hexdigest(),
     )
+
+
+def test_github_proactive_tool_call_uses_the_existing_provider_capability() -> None:
+    """New GitHub operations use the same signed tool.provider.v1 call envelope."""
+
+    response = tool_wire.CallToolResponse(
+        outcome=tool_wire.ToolCallOutcome(
+            content=[
+                tool_wire.ToolContentPart(
+                    json=tool_wire.ToolJsonContent(json='{"status":"CREATED","verified":true}')
+                )
+            ],
+            is_error=False,
+        )
+    )
+    transport = _DirectClient(
+        [
+            DirectPayload(
+                "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse",
+                response.SerializeToString(deterministic=True),
+            )
+        ]
+    )
+    client = GitHubIssuesClient(
+        transport,
+        signer=AccountCenterRequestSigner(caller_id="exchange-service", key=b"g" * 32),
+        binding_id="github-provider-binding",
+    )
+    arguments = {
+        "repository_id": "42",
+        "repository": "acme/demo",
+        "branch": "task/assistant-v1",
+        "from_sha": "a" * 40,
+    }
+    assert {
+        "github.issues.search",
+        "github.actions.jobs.list",
+        "github.actions.job.logs.read",
+        "github.branch.create",
+        "github.branch.delete",
+        "github.branch.get",
+        "github.file.commit",
+        "github.file.get",
+        "github.pull_request.draft.create",
+        "github.pull_request.draft.find",
+        "github.actions.rerun_failed",
+    } <= GITHUB_TOOL_IDS
+
+    result = client.call_provider_tool(
+        _principal(),
+        tool_id="github.branch.create",
+        profile_ref="github-app-profile",
+        lease_ref="provider-lease-ref",
+        payload=arguments,
+    )
+
+    call = transport.calls[0]
+    request = tool_wire.CallToolRequest.FromString(call["request"].value)
+    envelope = json.loads(request.arguments_json)
+    assert result == {"status": "CREATED", "verified": True}
+    assert call["capability"] == "tool.provider.v1"
+    assert call["method"] == "call_tool"
+    assert request.provider_tool_id == "github.branch.create"
+    assert envelope["profile_ref"] == "github-app-profile"
+    assert envelope["lease_ref"] == "provider-lease-ref"
+    assert envelope["payload"] == arguments
 
 
 def test_provider_context_expires_within_short_operation_window() -> None:

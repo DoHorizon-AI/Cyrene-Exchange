@@ -13,8 +13,10 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from cyrene_exchange_product.errors import ExchangeProductError
@@ -40,6 +42,17 @@ _TOOL_IDS_BY_PROVIDER: Mapping[str, Mapping[str, str]] = {
         "github.pull_requests.list": "github.pull_requests.list",
         "github.pull_request.get": "github.pull_request.get",
         "github.actions.runs.list": "github.actions.runs.list",
+        "github.issues.search": "github.issues.search",
+        "github.actions.jobs.list": "github.actions.jobs.list",
+        "github.actions.job.logs.read": "github.actions.job.logs.read",
+        "github.branch.create": "github.branch.create",
+        "github.branch.delete": "github.branch.delete",
+        "github.branch.get": "github.branch.get",
+        "github.file.commit": "github.file.commit",
+        "github.file.get": "github.file.get",
+        "github.pull_request.draft.create": "github.pull_request.draft.create",
+        "github.pull_request.draft.find": "github.pull_request.draft.find",
+        "github.actions.rerun_failed": "github.actions.rerun_failed",
         "github.ci.status": "github.ci.status",
         "github.vendor.cli.execute": "github_vendor_cli",
         "github.issue.get": "github.issue.get",
@@ -106,6 +119,11 @@ _MUTATING_OPERATIONS = frozenset(
     {
         "github.issue.comment.create",
         "github.issue.state.update",
+        "github.branch.create",
+        "github.branch.delete",
+        "github.file.commit",
+        "github.pull_request.draft.create",
+        "github.actions.rerun_failed",
         "github.vendor.cli.execute",
         "huggingface.file.upload",
         "huggingface.vendor.cli.execute",
@@ -135,6 +153,56 @@ _CLI_EXPORT_PATTERNS = (
     ("configure",),
     ("config", "show"),
     ("credentials", "list"),
+)
+_GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
+_GITHUB_BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,255}\Z")
+_GITHUB_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
+_GITHUB_PROTECTED_BRANCHES = frozenset(
+    {"main", "master", "develop", "release", "production", "staging"}
+)
+_GITHUB_PROTECTED_BRANCH_PREFIXES = (
+    "main/",
+    "master/",
+    "develop/",
+    "release/",
+    "production/",
+    "prod/",
+    "staging/",
+)
+_GITHUB_PROTECTED_PATH_DIRECTORIES = frozenset(
+    {
+        ".github",
+        ".git",
+        ".gitlab",
+        ".circleci",
+        ".azure",
+        "deploy",
+        "deployment",
+        "infra",
+        "infrastructure",
+        "terraform",
+        "helm",
+        "k8s",
+        "kubernetes",
+        "production",
+        "prod",
+        "permissions",
+    }
+)
+_GITHUB_PROTECTED_PATH_FILES = frozenset(
+    {
+        "codeowners",
+        "azure-pipelines.yml",
+        "azure-pipelines.yaml",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+        ".gitmodules",
+    }
+)
+_GITHUB_SENSITIVE_PATH_SEGMENT = re.compile(
+    r"^(?:prod|production|permissions|authorization|access-control)(?:[._-]|$)"
 )
 
 
@@ -605,6 +673,22 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
                 if operation_id == "github.pull_request.get"
                 else "github_commit"
                 if operation_id == "github.ci.status"
+                else "github_actions_run"
+                if operation_id in {"github.actions.jobs.list", "github.actions.rerun_failed"}
+                else "github_actions_job"
+                if operation_id == "github.actions.job.logs.read"
+                else "github_branch"
+                if operation_id
+                in {
+                    "github.branch.create",
+                    "github.branch.delete",
+                    "github.branch.get",
+                }
+                else "github_file"
+                if operation_id in {"github.file.commit", "github.file.get"}
+                else "github_pull_request_draft"
+                if operation_id
+                in {"github.pull_request.draft.create", "github.pull_request.draft.find"}
                 else "github_issue"
                 if operation_id.startswith("github.issue.")
                 else "github_repository"
@@ -688,6 +772,25 @@ def _resource_projection(
             target.update(_fields(arguments, {"commit_sha"}))
         elif operation_id.startswith("github.issue."):
             target.update(_fields(arguments, {"issue_number"}))
+        elif operation_id == "github.actions.jobs.list":
+            target.update(_fields(arguments, {"run_id"}))
+        elif operation_id == "github.actions.job.logs.read":
+            target.update(_fields(arguments, {"run_id", "job_id"}))
+        elif operation_id == "github.actions.rerun_failed":
+            target.update(_fields(arguments, {"run_id"}))
+        elif operation_id in {
+            "github.branch.create",
+            "github.branch.delete",
+            "github.branch.get",
+        }:
+            target.update(_fields(arguments, {"branch"}))
+        elif operation_id in {"github.file.commit", "github.file.get"}:
+            target.update(_fields(arguments, {"branch", "path"}))
+        elif operation_id in {
+            "github.pull_request.draft.create",
+            "github.pull_request.draft.find",
+        }:
+            target.update(_fields(arguments, {"head_branch", "base_branch"}))
         return target
     if provider_id == "huggingface":
         if operation_id in {
@@ -794,6 +897,35 @@ def _validate_github_target(
         optional_fields = {"pull_number"}
     elif operation_id == "github.actions.runs.list":
         optional_fields = {"branch", "commit_sha"}
+    elif operation_id == "github.issues.search":
+        optional_fields = {
+            "state",
+            "limit",
+            "query",
+            "labels",
+            "updated_since",
+            "page_cursor",
+        }
+    elif operation_id == "github.actions.jobs.list":
+        optional_fields = {"run_id", "limit"}
+    elif operation_id == "github.actions.job.logs.read":
+        optional_fields = {"run_id", "job_id", "max_lines"}
+    elif operation_id == "github.branch.create":
+        optional_fields = {"branch", "from_sha"}
+    elif operation_id == "github.branch.delete":
+        optional_fields = {"branch", "expected_sha"}
+    elif operation_id == "github.branch.get":
+        optional_fields = {"branch"}
+    elif operation_id == "github.file.commit":
+        optional_fields = {"branch", "path", "message", "content_base64", "expected_sha"}
+    elif operation_id == "github.file.get":
+        optional_fields = {"branch", "path"}
+    elif operation_id == "github.pull_request.draft.create":
+        optional_fields = {"head_branch", "base_branch", "title", "body"}
+    elif operation_id == "github.pull_request.draft.find":
+        optional_fields = {"head_branch", "base_branch"}
+    elif operation_id == "github.actions.rerun_failed":
+        optional_fields = {"run_id", "expected_head_sha", "expected_attempt"}
     elif operation_id == "github.ci.status":
         optional_fields = {"commit_sha"}
     elif operation_id in {
@@ -822,9 +954,49 @@ def _validate_github_target(
     elif operation_id == "github.ci.status":
         required_fields |= {"commit_sha"}
         optional_fields = set()
+    elif operation_id == "github.issues.search":
+        required_fields |= {"state", "limit"}
+        optional_fields = {"query", "labels", "updated_since", "page_cursor"}
+    elif operation_id == "github.actions.jobs.list":
+        required_fields |= {"run_id", "limit"}
+        optional_fields = set()
+    elif operation_id == "github.actions.job.logs.read":
+        required_fields |= {"run_id", "job_id", "max_lines"}
+        optional_fields = set()
+    elif operation_id == "github.branch.create":
+        required_fields |= {"branch", "from_sha"}
+        optional_fields = set()
+    elif operation_id == "github.branch.delete":
+        required_fields |= {"branch", "expected_sha"}
+        optional_fields = set()
+    elif operation_id == "github.branch.get":
+        required_fields |= {"branch"}
+        optional_fields = set()
+    elif operation_id == "github.file.commit":
+        required_fields |= {"branch", "path", "message", "content_base64"}
+        optional_fields = {"expected_sha"}
+    elif operation_id == "github.file.get":
+        required_fields |= {"branch", "path"}
+        optional_fields = set()
+    elif operation_id == "github.pull_request.draft.create":
+        required_fields |= {"head_branch", "base_branch", "title", "body"}
+        optional_fields = set()
+    elif operation_id == "github.pull_request.draft.find":
+        required_fields |= {"head_branch", "base_branch"}
+        optional_fields = set()
+    elif operation_id == "github.actions.rerun_failed":
+        required_fields |= {"run_id", "expected_head_sha", "expected_attempt"}
+        optional_fields = set()
     _exact_optional_fields(arguments, required=required_fields, optional=optional_fields)
     repository_id = arguments.get("repository_id")
     repository = arguments.get("repository")
+    if (
+        not isinstance(repository_id, str)
+        or not re.fullmatch(r"[0-9]+", repository_id)
+        or not isinstance(repository, str)
+        or not _GITHUB_REPOSITORY.fullmatch(repository)
+    ):
+        raise ValueError("GitHub repository identity is malformed")
     if repository_id != connection.repository_id or repository != connection.repository_name:
         raise PermissionError("GitHub repository does not match the selected connection")
     if operation_id == "github.pull_request.get":
@@ -847,8 +1019,193 @@ def _validate_github_target(
         for field in ("branch", "commit_sha"):
             if field in arguments:
                 _text(arguments[field], field)
+    elif operation_id == "github.issues.search":
+        if arguments.get("state") not in {"OPEN", "CLOSED", "ALL"}:
+            raise ValueError("GitHub issue search state is invalid")
+        limit = _bounded_int(arguments.get("limit"), "limit", minimum=1, maximum=50)
+        if "query" in arguments:
+            query = _text(arguments["query"], "query", maximum=128)
+            if not query.isascii() or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}", query):
+                raise ValueError("GitHub issue search query has an invalid format")
+        if "labels" in arguments:
+            labels = arguments["labels"]
+            if (
+                not isinstance(labels, list)
+                or len(labels) > 10
+                or any(
+                    not isinstance(label, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,49}", label)
+                    for label in labels
+                )
+                or len(set(labels)) != len(labels)
+            ):
+                raise ValueError("GitHub issue search labels are invalid")
+        if "updated_since" in arguments:
+            updated_since = arguments["updated_since"]
+            if not isinstance(updated_since, str) or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z",
+                updated_since,
+            ):
+                raise ValueError("GitHub updated_since must be a UTC RFC 3339 timestamp")
+            try:
+                datetime.fromisoformat(updated_since[:-1] + "+00:00")
+            except ValueError as exc:
+                raise ValueError("GitHub updated_since is not a valid timestamp") from exc
+        if "page_cursor" in arguments:
+            page_cursor = arguments["page_cursor"]
+            if not isinstance(page_cursor, str) or not re.fullmatch(
+                r"[1-9][0-9]{0,3}", page_cursor
+            ):
+                raise ValueError("GitHub issue search page_cursor must be a positive page number")
+            maximum_page = (1000 + limit - 1) // limit
+            if int(page_cursor) > maximum_page:
+                raise ValueError(
+                    "GitHub issue search page_cursor exceeds the bounded result window"
+                )
+    elif operation_id == "github.actions.jobs.list":
+        _numeric_resource_id(arguments.get("run_id"), "run_id")
+        _bounded_int(arguments.get("limit"), "limit", minimum=1, maximum=100)
+    elif operation_id == "github.actions.job.logs.read":
+        _numeric_resource_id(arguments.get("run_id"), "run_id")
+        _numeric_resource_id(arguments.get("job_id"), "job_id")
+        _bounded_int(arguments.get("max_lines"), "max_lines", minimum=1, maximum=200)
+    elif operation_id == "github.branch.create":
+        _validate_github_branch(arguments.get("branch"), allow_protected=False)
+        _validate_github_sha(arguments.get("from_sha"), "from_sha")
+    elif operation_id == "github.branch.delete":
+        _validate_github_branch(arguments.get("branch"), allow_protected=False)
+        _validate_github_sha(arguments.get("expected_sha"), "expected_sha")
+    elif operation_id == "github.branch.get":
+        _validate_github_branch(arguments.get("branch"), allow_protected=True)
+    elif operation_id == "github.file.commit":
+        _validate_github_branch(arguments.get("branch"), allow_protected=False)
+        _validate_github_path(arguments.get("path"))
+        _text(arguments.get("message"), "message", maximum=200)
+        if "expected_sha" in arguments:
+            _validate_github_sha(arguments["expected_sha"], "expected_sha")
+        _validate_github_content(arguments.get("content_base64"))
+    elif operation_id == "github.file.get":
+        _validate_github_branch(arguments.get("branch"), allow_protected=True)
+        _validate_github_path(arguments.get("path"))
+    elif operation_id == "github.pull_request.draft.create":
+        _validate_github_branch(arguments.get("head_branch"), allow_protected=False)
+        _validate_github_branch(arguments.get("base_branch"), allow_protected=True)
+        if arguments["head_branch"] == arguments["base_branch"]:
+            raise ValueError("GitHub pull request branches must differ")
+        _text(arguments.get("title"), "title", maximum=256)
+        body = arguments.get("body")
+        if not isinstance(body, str) or len(body) > 65_536:
+            raise ValueError("GitHub pull request body exceeds the configured limit")
+    elif operation_id == "github.pull_request.draft.find":
+        _validate_github_branch(arguments.get("head_branch"), allow_protected=False)
+        _validate_github_branch(arguments.get("base_branch"), allow_protected=True)
+        if arguments["head_branch"] == arguments["base_branch"]:
+            raise ValueError("GitHub pull request branches must differ")
+    elif operation_id == "github.actions.rerun_failed":
+        _numeric_resource_id(arguments.get("run_id"), "run_id")
+        _validate_github_sha(arguments.get("expected_head_sha"), "expected_head_sha")
+        _bounded_int(
+            arguments.get("expected_attempt"),
+            "expected_attempt",
+            minimum=1,
+            maximum=2_147_483_647,
+        )
     elif operation_id == "github.pull_request.get" or operation_id == "github.repository.get":
         return
+
+
+def _bounded_int(value: object, label: str, *, minimum: int, maximum: int) -> int:
+    """Require one bounded JSON integer without accepting bool as an integer."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{label} must be between {minimum} and {maximum}")
+    return value
+
+
+def _numeric_resource_id(value: object, label: str) -> str:
+    """Require a decimal resource id as text to preserve 64-bit precision."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) > 20
+        or not re.fullmatch(r"[1-9][0-9]{0,19}", value)
+    ):
+        raise ValueError(f"{label} must be a positive decimal resource id string")
+    return value
+
+
+def _validate_github_sha(value: object, label: str) -> str:
+    """Require the full GitHub SHA form used for optimistic write checks."""
+
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+        raise ValueError(f"{label} must be a full 40-character hexadecimal SHA")
+    return value
+
+
+def _validate_github_branch(value: object, *, allow_protected: bool) -> str:
+    """Reject malformed refs and prevent protected names from branch writes."""
+
+    if not isinstance(value, str) or len(value) > 255 or not value:
+        raise ValueError("GitHub branch must be bounded non-empty text")
+    parts = value.split("/")
+    if (
+        not _GITHUB_BRANCH.fullmatch(value)
+        or value.startswith("/")
+        or value.endswith(("/", "."))
+        or "//" in value
+        or "@{" in value
+        or any(
+            part in {"", ".", ".."} or part.startswith(".") or part.endswith(".lock")
+            for part in parts
+        )
+    ):
+        raise ValueError("GitHub branch is not a safe Git reference")
+    if not allow_protected and _is_protected_branch(value):
+        raise PermissionError("protected branch names are outside the task-branch write allowlist")
+    return value
+
+
+def _is_protected_branch(value: str) -> bool:
+    """Identify branch names reserved for primary, release, or deployment targets."""
+
+    lowered = value.casefold()
+    return lowered in _GITHUB_PROTECTED_BRANCHES or lowered.startswith(
+        _GITHUB_PROTECTED_BRANCH_PREFIXES
+    )
+
+
+def _validate_github_path(value: object) -> str:
+    """Reject hidden and deployment/configuration paths from assistant file operations."""
+
+    if not isinstance(value, str) or len(value) > 512 or not _GITHUB_PATH.fullmatch(value):
+        raise ValueError("GitHub file path is invalid")
+    parts = value.split("/")
+    lowered_parts = [part.casefold() for part in parts]
+    if (
+        any(part in {"", ".", ".."} or part.startswith(".") for part in parts)
+        or any(part in _GITHUB_PROTECTED_PATH_DIRECTORIES for part in lowered_parts)
+        or lowered_parts[-1] in _GITHUB_PROTECTED_PATH_FILES
+        or lowered_parts[-1].startswith("dockerfile")
+        or any(_GITHUB_SENSITIVE_PATH_SEGMENT.search(part) for part in lowered_parts)
+    ):
+        raise PermissionError("hidden or deployment configuration paths are blocked")
+    return value
+
+
+def _validate_github_content(value: object) -> bytes:
+    """Decode a bounded base64 file body without retaining it in the lease target."""
+
+    if not isinstance(value, str) or len(value) > 666_668:
+        raise ValueError("GitHub file content exceeds the configured limit")
+    try:
+        content = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("GitHub file content must be valid base64") from exc
+    if len(content) > 500_000:
+        raise ValueError("GitHub file content exceeds the configured limit")
+    if base64.b64encode(content).decode("ascii") != value:
+        raise ValueError("GitHub file content must use canonical base64 encoding")
+    return content
 
 
 def _positive_int(value: object, label: str) -> int:

@@ -195,6 +195,301 @@ def test_github_actions_lease_binds_optional_branch_and_commit_filters(
     )
 
 
+def test_proactive_github_tools_use_exact_resource_targets_and_mutability() -> None:
+    """New GitHub tools share provider schemas, stable targets, and fixed write policy."""
+
+    principal = actor()
+    connection = IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="github",
+        repository_id="42",
+        repository_name="acme/demo",
+        account_link_ref="gh-profile-1",
+    )
+    cases: list[tuple[str, dict[str, object], str, dict[str, object], bool]] = [
+        (
+            "github.issues.search",
+            {
+                "state": "OPEN",
+                "query": "bug report",
+                "limit": 25,
+                "labels": ["bug"],
+                "updated_since": "2026-10-24T09:15:30.125Z",
+                "page_cursor": "2",
+            },
+            "github_repository",
+            {"repository_id": "42", "repository": "acme/demo"},
+            False,
+        ),
+        (
+            "github.actions.jobs.list",
+            {"run_id": "9001", "limit": 50},
+            "github_actions_run",
+            {"repository_id": "42", "repository": "acme/demo", "run_id": "9001"},
+            False,
+        ),
+        (
+            "github.actions.job.logs.read",
+            {"run_id": "9001", "job_id": "9002", "max_lines": 100},
+            "github_actions_job",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "run_id": "9001",
+                "job_id": "9002",
+            },
+            False,
+        ),
+        (
+            "github.branch.create",
+            {"branch": "task/assistant-v1", "from_sha": "a" * 40},
+            "github_branch",
+            {"repository_id": "42", "repository": "acme/demo", "branch": "task/assistant-v1"},
+            True,
+        ),
+        (
+            "github.branch.delete",
+            {"branch": "task/assistant-v1", "expected_sha": "b" * 40},
+            "github_branch",
+            {"repository_id": "42", "repository": "acme/demo", "branch": "task/assistant-v1"},
+            True,
+        ),
+        (
+            "github.branch.get",
+            {"branch": "task/assistant-v1"},
+            "github_branch",
+            {"repository_id": "42", "repository": "acme/demo", "branch": "task/assistant-v1"},
+            False,
+        ),
+        (
+            "github.file.commit",
+            {
+                "branch": "task/assistant-v1",
+                "path": "docs/assistant.md",
+                "message": "Add assistant notes",
+                "content_base64": "c21hbGw=",
+                "expected_sha": "c" * 40,
+            },
+            "github_file",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": "docs/assistant.md",
+            },
+            True,
+        ),
+        (
+            "github.file.get",
+            {"branch": "task/assistant-v1", "path": "docs/assistant.md"},
+            "github_file",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": "docs/assistant.md",
+            },
+            False,
+        ),
+        (
+            "github.pull_request.draft.create",
+            {
+                "head_branch": "task/assistant-v1",
+                "base_branch": "develop",
+                "title": "Assistant work",
+                "body": "Review this change",
+            },
+            "github_pull_request_draft",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "head_branch": "task/assistant-v1",
+                "base_branch": "develop",
+            },
+            True,
+        ),
+        (
+            "github.pull_request.draft.find",
+            {"head_branch": "task/assistant-v1", "base_branch": "develop"},
+            "github_pull_request_draft",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "head_branch": "task/assistant-v1",
+                "base_branch": "develop",
+            },
+            False,
+        ),
+        (
+            "github.actions.rerun_failed",
+            {
+                "run_id": "9001",
+                "expected_head_sha": "d" * 40,
+                "expected_attempt": 2,
+            },
+            "github_actions_run",
+            {"repository_id": "42", "repository": "acme/demo", "run_id": "9001"},
+            True,
+        ),
+    ]
+    operation_policy = {
+        str(item["operationId"]): item for item in connector_binding_tools("github")
+    }
+
+    for operation_id, operation_arguments, projection_name, target, mutating in cases:
+        arguments = {
+            "repository_id": connection.repository_id,
+            "repository": connection.repository_name,
+            **operation_arguments,
+        }
+        _validate_github_target(connection, operation_id, arguments)
+        actual_projection = _resource_projection(
+            provider_id="github",
+            profile_ref="gh-profile-1",
+            operation_id=operation_id,
+            arguments=arguments,
+        )
+        assert actual_projection == target
+        assert _account_lease_target("github", operation_id, actual_projection, arguments) == target
+        assert operation_policy[operation_id] == {
+            "toolId": operation_id,
+            "operationId": operation_id,
+            "resourceProjection": projection_name,
+            "mutating": mutating,
+        }
+
+    rerun_arguments = {
+        "repository_id": "42",
+        "repository": "acme/demo",
+        "run_id": "9001",
+        "expected_head_sha": "d" * 40,
+        "expected_attempt": 2,
+    }
+    jobs_arguments = {
+        "repository_id": "42",
+        "repository": "acme/demo",
+        "run_id": "9001",
+        "limit": 50,
+    }
+    assert _resource_projection(
+        provider_id="github",
+        profile_ref="gh-profile-1",
+        operation_id="github.actions.rerun_failed",
+        arguments=rerun_arguments,
+    ) == _resource_projection(
+        provider_id="github",
+        profile_ref="gh-profile-1",
+        operation_id="github.actions.jobs.list",
+        arguments=jobs_arguments,
+    )
+    changed_attempt = {**rerun_arguments, "expected_attempt": 3}
+    assert digest_arguments(changed_attempt) != digest_arguments(rerun_arguments)
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "arguments"),
+    [
+        (
+            "github.branch.delete",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "main",
+                "expected_sha": "a" * 40,
+            },
+        ),
+        (
+            "github.file.commit",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": ".github/workflows/build.yml",
+                "message": "Change workflow",
+                "content_base64": "YQ==",
+            },
+        ),
+        (
+            "github.file.commit",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": "config/production.yaml",
+                "message": "Change config",
+                "content_base64": "YQ==",
+            },
+        ),
+        (
+            "github.file.commit",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": "docs/assistant.md",
+                "message": "Commit content",
+                "content_base64": "YR==",
+            },
+        ),
+        (
+            "github.actions.jobs.list",
+            {"repository_id": "42", "repository": "acme/demo", "run_id": "01", "limit": 10},
+        ),
+        (
+            "github.issues.search",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "state": "OPEN",
+                "limit": 50,
+                "page_cursor": "21",
+            },
+        ),
+        (
+            "github.issues.search",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "state": "OPEN",
+                "limit": 25,
+                "labels": ["bug", "bug"],
+            },
+        ),
+        (
+            "github.issues.search",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "state": "OPEN",
+                "limit": 25,
+                "query": "is:open",
+            },
+        ),
+    ],
+)
+def test_proactive_github_tools_reject_protected_or_malformed_targets(
+    operation_id: str, arguments: dict[str, object]
+) -> None:
+    """Provider write preconditions and stable target fields fail closed in Exchange."""
+
+    principal = actor()
+    connection = IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="github",
+        repository_id="42",
+        repository_name="acme/demo",
+        account_link_ref="gh-profile-1",
+    )
+    with pytest.raises((PermissionError, ValueError)):
+        _validate_github_target(connection, operation_id, arguments)
+
+
 def test_runpod_resource_bindings_use_the_navigator_cloud_target_projection() -> None:
     """The generated RunPod map uses the same typed target shape as Navigator."""
 

@@ -79,6 +79,17 @@ GITHUB_TOOL_IDS = frozenset(
         "github.pull_requests.list",
         "github.pull_request.get",
         "github.actions.runs.list",
+        "github.issues.search",
+        "github.actions.jobs.list",
+        "github.actions.job.logs.read",
+        "github.branch.create",
+        "github.branch.delete",
+        "github.branch.get",
+        "github.file.commit",
+        "github.file.get",
+        "github.pull_request.draft.create",
+        "github.pull_request.draft.find",
+        "github.actions.rerun_failed",
         "github.ci.status",
         "github_vendor_cli",
         "github.issue.get",
@@ -1293,7 +1304,7 @@ def _principal_for_authorization(authorization: AccountAuthorization) -> Integra
 
 
 class GitHubIssuesClient:
-    """Invoke only the three allowlisted GitHub issue tools through Plugins."""
+    """Read and invoke fixed GitHub provider tools through Plugins."""
 
     def __init__(
         self,

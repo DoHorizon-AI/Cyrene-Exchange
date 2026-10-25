@@ -131,7 +131,9 @@ def _post_gateway(server: ThreadingHTTPServer) -> tuple[int, dict[str, Any]]:
     connection.request(
         "POST",
         "/v1/chat/completions",
-        json.dumps({"model": "demo-model", "messages": [{"role": "user", "content": "hello"}]}),
+        json.dumps(
+            {"model": "enterprise-chat", "messages": [{"role": "user", "content": "hello"}]}
+        ),
         {"Authorization": "Bearer acceptance", "Content-Type": "application/json"},
     )
     response = connection.getresponse()
@@ -140,7 +142,7 @@ def _post_gateway(server: ThreadingHTTPServer) -> tuple[int, dict[str, Any]]:
     return response.status, body
 
 
-def test_persisted_route_drives_real_gateway_http_after_restart(tmp_path: Path) -> None:
+def test_persisted_enterprise_model_binding_drives_gateway_after_restart(tmp_path: Path) -> None:
     database = tmp_path / "exchange.sqlite3"
     control = create_app(database_path=database)
     with TestClient(control) as client:
@@ -160,9 +162,9 @@ def test_persisted_route_drives_real_gateway_http_after_restart(tmp_path: Path) 
             headers={"Idempotency-Key": "route-demo"},
             json={
                 "endpointId": endpoint["id"],
-                "modelPattern": "demo-*",
-                "targetBindingId": "binding:local-http",
-                "targetModel": "upstream-model",
+                "modelPattern": "enterprise-*",
+                "targetBindingId": "binding:enterprise-model-profile",
+                "targetModel": "enterprise-chat",
                 "priority": 10,
             },
         )
@@ -181,7 +183,7 @@ def test_persisted_route_drives_real_gateway_http_after_restart(tmp_path: Path) 
         gateway = build_gateway_from_store(
             restarted.state.exchange_store,
             UUID(endpoint["id"]),
-            ProviderResolver("binding:local-http", LocalHttpProvider(upstream)),
+            ProviderResolver("binding:enterprise-model-profile", LocalHttpProvider(upstream)),
             credentials={
                 "acceptance": ProductPrincipal(
                     "actor-acceptance", "workspace-acceptance", "credential-acceptance"

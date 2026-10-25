@@ -99,6 +99,21 @@ notification binding 是群组资源；每位成员通过 actor binding 附加�
 | `POST /api/v1/integrations/operations/{operation_id}/actions/reconcile` | Read provider state for safe reconciliation; never resends a write |
 | `POST /api/v1/integrations/hooks/github/{connection_id}` | Verify the original GitHub HMAC in the GitHub Plugin before inbox persistence |
 
+The private `/internal/v1/connector-operations/{connectionRef}` facade now
+supports the fixed proactive GitHub tool set documented in
+[`contracts/product/v1/connector-operations.md`](../contracts/product/v1/connector-operations.md).
+It continues through the existing `tool.provider.v1` provider catalog/call path.
+Each call requires a fresh exact Directory grant and one-use Account Center
+lease. Mutating operations preserve an unknown outcome until independent provider
+readback; Exchange does not replay an uncertain write.
+
+私有 `/internal/v1/connector-operations/{connectionRef}` facade 支持的主动 GitHub
+工具，以及各自的资源 target，见
+[`contracts/product/v1/connector-operations.md`](../contracts/product/v1/connector-operations.md)。
+调用仍沿用现有 `tool.provider.v1` provider catalog/call 路径。每次调用都要求新的精确
+Directory grant 与 Account Center 一次性 lease。写操作结果未知时会等待独立 Provider
+回读；Exchange 不会重放结果不明的写入。
+
 Public Product HTTP timestamps use RFC3339 UTC with a trailing `Z`. Exchange
 normalizes stored or provider timestamps at the HTTP serialization boundary; it
 does not rewrite persistence or provider SDK values.
@@ -258,9 +273,23 @@ structured tool calls, provider-reported usage, and cancellation. The route
 planner reads ACTIVE Product routes, while each `targetBindingId` remains opaque
 to Exchange and is resolved through the Platform/Plugins boundary.
 
+Enterprise and self-hosted inference use this same route and provider seam:
+the Plugin deployment owns the upstream service endpoint and its credential
+reference, while Product stores only the opaque `targetBindingId` and target
+model. The caller-facing `GatewayEndpoint` is separate from the upstream model
+endpoint. Exchange records the provider and model facts it receives and leaves
+usage aggregation to the existing billing capability. This configuration path
+does not by itself prove private-network inference or a deployed private model.
+
 `POST /v1/chat/completions` 支持 OpenAI-compatible 普通与 SSE Chat、结构化工具
 调用、Provider 报告的用量与取消。Route planner 只读取 ACTIVE Product Route；
 `targetBindingId` 对 Exchange 保持不透明，并经 Platform/Plugins 边界解析。
+
+企业及自托管推理沿用同一 Route 和 Provider 边界：Plugin 部署管理上游服务地址与凭据
+引用，Product 只保存不透明的 `targetBindingId` 和目标模型。面向调用方的
+`GatewayEndpoint` 与上游模型地址分开。Exchange 记录 Provider 返回的实际 Provider 与
+模型事实，并由现有 billing 能力汇总用量。仅有配置路径不能证明私有网络推理或私有模型
+已经部署。
 
 Every transport response receives a server-generated `X-Request-Id`. Once a
 request enters Product execution, the same ID indexes the content-free durable
