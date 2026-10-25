@@ -31,7 +31,8 @@
       "clientKeyRef": "tls/exchange-account-center-client-key"
     },
     "callerId": "exchange-service",
-    "signingKeyRef": "account/signing"
+    "signingKeyRef": "account/signing",
+    "githubAppInstallationDeadlineSeconds": 50
   },
   "githubIssues": {
     "bindingId": "host-github-issues-binding",
