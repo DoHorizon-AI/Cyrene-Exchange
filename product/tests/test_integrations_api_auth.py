@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -43,7 +44,10 @@ from cyrene_exchange_product.integrations._generated.cyrene.workspace.authority.
 from cyrene_exchange_product.integrations._generated.cyrene.workspace.product.v2 import (
     product_api_pb2 as product_wire,
 )
-from cyrene_exchange_product.integrations.api import IntegrationServices
+from cyrene_exchange_product.integrations.api import (
+    IntegrationServices,
+    _invoke_connector_dispatcher,
+)
 from cyrene_exchange_product.integrations.auth import PlatformAuthorityIdentityVerifier
 from cyrene_exchange_product.integrations.clients import DirectPluginHealthClient
 from cyrene_exchange_product.integrations.connector_operations import (
@@ -69,6 +73,79 @@ from cyrene_exchange_product.integrations.models import (
     SnapshotFreshness,
 )
 from cyrene_exchange_product.integrations.store import IntegrationStore
+
+
+def test_slow_connector_dispatch_keeps_event_loop_responsive() -> None:
+    """A bounded provider wait must not stall concurrent async requests."""
+
+    release = threading.Event()
+    watchdog = threading.Timer(2.0, release.set)
+    principal = IntegrationPrincipal(
+        issuer="https://identity.example.test",
+        subject="member-a",
+        organization_id="org-a",
+        workspace_id="workspace-a",
+        allowed_operation_ids=frozenset(),
+    )
+    claims = ConnectorGrantClaims(
+        request_id="slow-provider-request",
+        audience="exchange",
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        principal_issuer=principal.issuer,
+        principal_subject=principal.subject,
+        connection_ref="github-connection",
+        provider_id="github",
+        profile_ref="github-profile",
+        operation_id="github.repository.list",
+        resource_ref="sha256:" + "a" * 64,
+        arguments_digest_sha256=b"a" * 32,
+        issued_at_epoch=int(time.time()),
+        expires_at_epoch=int(time.time()) + 15,
+        grant_ref="sha256:" + "b" * 64,
+    )
+
+    class SlowDispatcher:
+        def invoke(
+            self,
+            _prepared: object,
+            *,
+            principal: IntegrationPrincipal,
+            claims: ConnectorGrantClaims,
+        ) -> dict[str, Any]:
+            assert principal is not None and claims is not None
+            if not release.wait(timeout=3.0):
+                raise TimeoutError("test provider was not released")
+            return {"state": "SUCCEEDED"}
+
+    async def run_probe() -> tuple[bool, dict[str, Any]]:
+        watchdog.start()
+        dispatch = asyncio.create_task(
+            _invoke_connector_dispatcher(
+                SlowDispatcher(),
+                object(),
+                principal=principal,
+                claims=claims,
+            )
+        )
+
+        async def quick_request() -> bool:
+            await asyncio.sleep(0.01)
+            return not release.is_set()
+
+        responsive = await quick_request()
+        release.set()
+        watchdog.cancel()
+        return responsive, await dispatch
+
+    try:
+        responsive, result = asyncio.run(run_probe())
+    finally:
+        release.set()
+        watchdog.cancel()
+
+    assert responsive
+    assert result == {"state": "SUCCEEDED"}
 
 
 class _Authorizer:

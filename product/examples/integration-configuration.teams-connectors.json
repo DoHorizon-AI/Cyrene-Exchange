@@ -38,6 +38,7 @@
     "bindingId": "host-github-issues-binding",
     "connectionRef": "grpcs://github-issues.internal.example:7443",
     "transport": "mtls",
+    "deadlineSeconds": 50,
     "mtls": {
       "rootCertificateRef": "tls/plugin-root",
       "clientCertificateRef": "tls/exchange-plugin-client-cert",

@@ -56,6 +56,8 @@ ACCOUNT_CAPABILITY = "account.center.v1"
 PROVIDER_CAPABILITY = "tool.provider.v1"
 DEFAULT_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS = 50.0
 MAX_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS = 120.0
+DEFAULT_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS = 50.0
+MAX_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS = 120.0
 ACCOUNT_METHODS = {
     "begin_link": "BeginLink",
     "complete_github_link": "CompleteGitHubLink",
@@ -1349,10 +1351,18 @@ class GitHubIssuesClient:
         *,
         signer: AccountCenterRequestSigner,
         binding_id: str,
-        deadline_seconds: float = 10.0,
+        deadline_seconds: float = DEFAULT_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS,
     ) -> None:
-        if deadline_seconds <= 0 or not binding_id.strip():
-            raise ValueError("binding_id and a positive deadline are required")
+        if (
+            not binding_id.strip()
+            or isinstance(deadline_seconds, bool)
+            or not isinstance(deadline_seconds, (int, float))
+            or not 0 < deadline_seconds <= MAX_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS
+            or not math.isfinite(deadline_seconds)
+        ):
+            raise ValueError(
+                "binding_id and a finite GitHub deadline between zero and 120 seconds are required"
+            )
         self._client = client
         self._signer = signer
         self._binding_id = binding_id

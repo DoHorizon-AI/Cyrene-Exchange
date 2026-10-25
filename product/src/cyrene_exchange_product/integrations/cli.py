@@ -23,6 +23,10 @@ from typing import Any
 from uuid import UUID
 
 from cyrene_exchange_product.integrations.api import IntegrationServices
+from cyrene_exchange_product.integrations.clients import (
+    DEFAULT_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS,
+    MAX_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS,
+)
 
 CONFIGURATION_ENV = "CYRENE_EXCHANGE_INTEGRATION_CONFIGURATION_JSON"
 MAX_CONFIGURATION_BYTES = 64 * 1024
@@ -382,6 +386,11 @@ def build_production_services(
         optional={"mtls", "deadlineSeconds"},
         label="githubIssues",
     )
+    github_deadline_seconds = _bounded_deadline_seconds(
+        github_settings.get("deadlineSeconds", DEFAULT_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS),
+        "githubIssues.deadlineSeconds",
+        maximum=MAX_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS,
+    )
     if (
         _text(github_settings["callerId"], "githubIssues.callerId") != account_signer.caller_id
         or github_settings["signingKeyRef"] != account_settings["signingKeyRef"]
@@ -395,6 +404,7 @@ def build_production_services(
         github_runtime,
         signer=account_signer,
         binding_id=_text(github_settings["bindingId"], "githubIssues.bindingId"),
+        deadline_seconds=github_deadline_seconds,
     )
     webhook_verifier = GitHubWebhookClient(github_runtime)
 
@@ -1017,6 +1027,11 @@ def validate_host_configuration(
         optional={"mtls", "deadlineSeconds"},
         label="githubIssues",
     )
+    _bounded_deadline_seconds(
+        github.get("deadlineSeconds", DEFAULT_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS),
+        "githubIssues.deadlineSeconds",
+        maximum=MAX_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS,
+    )
     if (
         github["callerId"] != account["callerId"]
         or github["signingKeyRef"] != account["signingKeyRef"]
@@ -1325,8 +1340,8 @@ def _bounded_deadline_seconds(value: object, label: str, *, maximum: float) -> f
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
-        or not math.isfinite(value)
         or not 0 < value <= maximum
+        or not math.isfinite(value)
     ):
         raise IntegrationConfigurationError(
             f"{label} must be greater than zero and at most {maximum:g} seconds"

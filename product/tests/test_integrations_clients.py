@@ -313,6 +313,7 @@ def test_github_tool_call_signs_fixed_tool_and_exact_public_args() -> None:
         transport,
         signer=AccountCenterRequestSigner(caller_id="exchange-service", key=b"g" * 32),
         binding_id="github-provider-binding",
+        deadline_seconds=27.0,
     )
 
     result = client.get_issue(
@@ -332,6 +333,7 @@ def test_github_tool_call_signs_fixed_tool_and_exact_public_args() -> None:
     assert result["issue_id"] == "42"
     assert call["capability"] == "tool.provider.v1"
     assert call["method"] == "call_tool"
+    assert call["deadline_seconds"] == 27.0
     assert call_request.binding_id == "github-provider-binding"
     assert call_request.provider_tool_id == "github.issue.get"
     assert tool_envelope["payload"] == {

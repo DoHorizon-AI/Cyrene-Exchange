@@ -13,12 +13,14 @@ import hashlib
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
+from functools import partial
 from math import floor
 from typing import Annotated, Any, Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Header, Query, Request
 from fastapi import Path as ApiPath
+from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
@@ -72,6 +74,25 @@ from cyrene_exchange_product.integrations.store import (
 )
 
 _MAX_NAVIGATOR_REQUEST_BYTES = 128 * 1024
+
+
+async def _invoke_connector_dispatcher(
+    dispatcher: Any,
+    prepared: Any,
+    *,
+    principal: IntegrationPrincipal,
+    claims: ConnectorGrantClaims,
+) -> dict[str, Any]:
+    """Run blocking provider RPCs on FastAPI's bounded worker pool.
+
+    Provider calls can span Account Center lease minting and vendor HTTPS I/O.
+    Keeping that synchronous chain off the event loop lets chat and health
+    requests continue while the fixed RPC deadline is in flight.
+    中文：连接器调用会串行访问租约服务与供应商 API，不能阻塞聊天事件循环。
+    """
+
+    invoke = partial(dispatcher.invoke, prepared, principal=principal, claims=claims)
+    return await run_in_threadpool(invoke)
 
 
 def _http_utc_timestamp(value: datetime | None) -> str | None:
@@ -2402,7 +2423,12 @@ def create_router(services: IntegrationServices) -> APIRouter:
             grant_ref=claims.grant_ref,
         )
         try:
-            result = dispatcher.invoke(prepared, principal=principal_value, claims=claims)
+            result = await _invoke_connector_dispatcher(
+                dispatcher,
+                prepared,
+                principal=principal_value,
+                claims=claims,
+            )
         except ExchangeProductError as exc:
             result = {
                 "state": "UNKNOWN_RESULT" if prepared.is_mutating else "FAILED",
