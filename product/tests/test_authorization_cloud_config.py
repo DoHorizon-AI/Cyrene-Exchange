@@ -508,6 +508,7 @@ def test_minimal_teams_github_huggingface_profile_builds_without_legacy_services
         Path(__file__).parents[1] / "examples" / "integration-configuration.teams-connectors.json"
     )
     configuration = json.loads(example.read_text(encoding="utf-8"))
+    configuration["accountCenter"]["githubAppInstallationDeadlineSeconds"] = 37.5
     paths: dict[str, Path] = {}
     for secret_ref in configuration["hostSecretRefs"]:
         if secret_ref in {"account/signing", "keys/hf"}:
@@ -555,6 +556,18 @@ def test_minimal_teams_github_huggingface_profile_builds_without_legacy_services
     assert "productWorkload" not in configuration["platformAuthority"]
     assert "wecom" not in configuration
 
+    invalid_configuration = json.loads(json.dumps(configuration))
+    invalid_configuration["accountCenter"]["githubAppInstallationDeadlineSeconds"] = 121
+    invalid_environ = {
+        **environ,
+        integration_cli.CONFIGURATION_ENV: json.dumps(invalid_configuration),
+    }
+    with pytest.raises(
+        integration_cli.IntegrationConfigurationError,
+        match="githubAppInstallationDeadlineSeconds",
+    ):
+        integration_cli.validate_host_configuration(environ=invalid_environ)
+
     class _NoNetworkClient:
         def close(self) -> None:
             pass
@@ -585,6 +598,7 @@ def test_minimal_teams_github_huggingface_profile_builds_without_legacy_services
         environ=environ,
     )
     try:
+        assert services.accounts._github_app_installation_deadline_seconds == 37.5
         assert services.authorizer is None
         assert services.delegation_authorizer is None
         assert services.dispatcher is None

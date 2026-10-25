@@ -130,6 +130,66 @@ def test_account_center_direct_call_uses_fixed_method_and_signed_context() -> No
 
 
 @pytest.mark.parametrize(
+    ("configured_deadline", "expected_deadline"),
+    [(None, 50.0), (42.0, 42.0)],
+)
+def test_github_app_installation_uses_its_own_bounded_deadline(
+    configured_deadline: float | None,
+    expected_deadline: float,
+) -> None:
+    responses = [
+        DirectPayload(
+            "type.googleapis.com/cyrene.account.center.v1.LinkGitHubAppInstallationResponse",
+            b'{"profile_ref":"profile-1"}',
+        ),
+        DirectPayload(
+            "type.googleapis.com/cyrene.account.center.v1.BeginLinkResponse",
+            b'{"link_session_ref":"opaque"}',
+        ),
+    ]
+    transport = _DirectClient(responses)
+    options: dict[str, Any] = {"deadline_seconds": 3.0}
+    if configured_deadline is not None:
+        options["github_app_installation_deadline_seconds"] = configured_deadline
+    account_client = AccountCenterClient(
+        transport,
+        exchange_signer=AccountCenterRequestSigner(caller_id="exchange-service", key=b"a" * 32),
+        binding_id="account-center-binding",
+        **options,
+    )
+
+    account_client.link_github_app_installation(
+        _principal(),
+        profile_ref="00000000-0000-4000-8000-000000000001",
+        installation_id="99",
+        repositories=[{"repository_id": "12345", "owner": "owner", "name": "project"}],
+        idempotency_key="github-app-link-1",
+    )
+    account_client.begin_link(
+        _principal(),
+        provider="github",
+        workspace_id="workspace-9",
+        idempotency_key="oauth-link-1",
+    )
+
+    assert transport.calls[0]["method"] == "link_github_app_installation"
+    assert transport.calls[0]["deadline_seconds"] == expected_deadline
+    assert transport.calls[1]["method"] == "begin_link"
+    assert transport.calls[1]["deadline_seconds"] == 3.0
+
+
+@pytest.mark.parametrize("deadline", [0, -1, 121, True, float("inf"), float("nan")])
+def test_github_app_installation_deadline_rejects_unbounded_values(deadline: object) -> None:
+    with pytest.raises(ValueError, match="github_app_installation_deadline_seconds"):
+        AccountCenterClient(
+            _DirectClient([]),
+            exchange_signer=AccountCenterRequestSigner(caller_id="exchange-service", key=b"a" * 32),
+            binding_id="account-center-binding",
+            github_app_installation_deadline_seconds=deadline,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
     ("domain_code", "message", "expected_code", "expected_status"),
     [
         (

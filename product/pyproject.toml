@@ -24,8 +24,8 @@ dependencies = [
 
 [project.optional-dependencies]
 integrations = [
-  "cyrene-account-center-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d#subdirectory=sdk/python/cyrene_account_center_contracts",
-  "cyrene-integration-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@0d13c78dd8c0ebcb0fd9f873b7680d4c8dd53c0d#subdirectory=sdk/python/cyrene_integration_contracts",
+  "cyrene-account-center-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@b977dbca6a0889be64a617ee79cea1d47a0f327e#subdirectory=sdk/python/cyrene_account_center_contracts",
+  "cyrene-integration-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@b977dbca6a0889be64a617ee79cea1d47a0f327e#subdirectory=sdk/python/cyrene_integration_contracts",
 ]
 
 [project.scripts]

@@ -54,7 +54,7 @@ jobs:
       # Platform follows Workspace's release lock; Plugins follows the Exchange
       # message consumer lock so the same exact source drives its protocol TCK.
       CYRENE_PLATFORM_REVISION: 54abee6d3f51719f6fcea5de94141ce7910f6316
-      CYRENE_PLUGINS_REVISION: 8a2aa5a174a184c37b0112d822ddfe70c3f1f512
+      CYRENE_PLUGINS_REVISION: b977dbca6a0889be64a617ee79cea1d47a0f327e
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6

@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import ssl
@@ -60,6 +61,8 @@ def build_production_services(
         PlatformCurrentAuthorizationContextResolver,
     )
     from cyrene_exchange_product.integrations.clients import (
+        DEFAULT_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS,
+        MAX_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS,
         AccountCenterClient,
         ComputerRunnerClient,
         DirectPluginHealthClient,
@@ -320,6 +323,7 @@ def build_production_services(
         optional={
             "mtls",
             "deadlineSeconds",
+            "githubAppInstallationDeadlineSeconds",
             "callbackCallerId",
             "callbackSigningKeyRef",
             "wecomSourceCallerId",
@@ -328,6 +332,14 @@ def build_production_services(
         label="accountCenter",
     )
     account_binding = _text(account_settings["bindingId"], "accountCenter.bindingId")
+    github_app_installation_deadline_seconds = _bounded_deadline_seconds(
+        account_settings.get(
+            "githubAppInstallationDeadlineSeconds",
+            DEFAULT_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS,
+        ),
+        "accountCenter.githubAppInstallationDeadlineSeconds",
+        maximum=MAX_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS,
+    )
     account_runtime = direct_client(account_settings)
     account_signer = AccountCenterRequestSigner(
         caller_id=_text(account_settings["callerId"], "accountCenter.callerId"),
@@ -361,6 +373,7 @@ def build_production_services(
         binding_id=account_binding,
         callback_signer=callback_signer,
         wecom_source_signer=wecom_source_signer,
+        github_app_installation_deadline_seconds=github_app_installation_deadline_seconds,
     )
 
     github_settings = _config_object(
@@ -772,6 +785,10 @@ def validate_host_configuration(
         AuthorizationCloudConfigurationError,
         parse_authorization_cloud_settings,
     )
+    from cyrene_exchange_product.integrations.clients import (
+        DEFAULT_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS,
+        MAX_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS,
+    )
     from cyrene_exchange_product.integrations.connector_profiles import (
         ConnectorHostConfigurationError,
         parse_connector_host_settings,
@@ -978,12 +995,21 @@ def validate_host_configuration(
         optional={
             "mtls",
             "deadlineSeconds",
+            "githubAppInstallationDeadlineSeconds",
             "callbackCallerId",
             "callbackSigningKeyRef",
             "wecomSourceCallerId",
             "wecomSourceSigningKeyRef",
         },
         label="accountCenter",
+    )
+    _bounded_deadline_seconds(
+        account.get(
+            "githubAppInstallationDeadlineSeconds",
+            DEFAULT_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS,
+        ),
+        "accountCenter.githubAppInstallationDeadlineSeconds",
+        maximum=MAX_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS,
     )
     github = _config_object(
         configuration["githubIssues"],
@@ -1293,6 +1319,19 @@ def _text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > 1024:
         raise IntegrationConfigurationError(f"{label} must be bounded non-empty text")
     return value.strip()
+
+
+def _bounded_deadline_seconds(value: object, label: str, *, maximum: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 < value <= maximum
+    ):
+        raise IntegrationConfigurationError(
+            f"{label} must be greater than zero and at most {maximum:g} seconds"
+        )
+    return float(value)
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

@@ -437,6 +437,17 @@ Teams/GitHub/Hugging Face 最小部署可使用
 指定，格式为 `{"keys":{"key-id":"<base64 raw 32-byte Ed25519 public key>"}}`；Exchange
 不得挂载 Authority 私钥。
 
+`accountCenter.githubAppInstallationDeadlineSeconds` bounds only GitHub App installation
+linking. Its 50-second default covers installation verification, installation-token minting,
+and repository-scope verification; each GitHub HTTP request is limited to 15 seconds. The
+setting accepts values greater than zero and no more than 120 seconds. Other Account Center
+RPCs retain the 3-second default.
+
+`accountCenter.githubAppInstallationDeadlineSeconds` 只限制 GitHub App installation 绑定操作。
+默认值为 50 秒，用于覆盖 installation 验证、短期 token 签发和仓库范围验证；每次 GitHub
+HTTP 请求最多 15 秒。该值必须大于 0 且不超过 120 秒。其他 Account Center RPC 仍使用
+3 秒默认时限。
+
 生产环境的 integration-only listener 需运行 `serve --mode integration-only`，并同时设置
 `CYRENE_EXCHANGE_TLS_CERT_FILE` 与 `CYRENE_EXCHANGE_TLS_KEY_FILE` 指向挂载的证书和私钥文件，
 也可使用 `--tls-cert-file` / `--tls-key-file`。证书 SAN 必须覆盖内部 DNS 名 `exchange`。

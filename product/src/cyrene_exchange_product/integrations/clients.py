@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -53,6 +54,8 @@ if TYPE_CHECKING:
 
 ACCOUNT_CAPABILITY = "account.center.v1"
 PROVIDER_CAPABILITY = "tool.provider.v1"
+DEFAULT_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS = 50.0
+MAX_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS = 120.0
 ACCOUNT_METHODS = {
     "begin_link": "BeginLink",
     "complete_github_link": "CompleteGitHubLink",
@@ -468,9 +471,26 @@ class AccountCenterClient:
         callback_signer: AccountCenterRequestSigner | None = None,
         wecom_source_signer: AccountCenterRequestSigner | None = None,
         deadline_seconds: float = 3.0,
+        github_app_installation_deadline_seconds: float = (
+            DEFAULT_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS
+        ),
     ) -> None:
         if deadline_seconds <= 0:
             raise ValueError("deadline_seconds must be positive")
+        if (
+            isinstance(github_app_installation_deadline_seconds, bool)
+            or not isinstance(github_app_installation_deadline_seconds, (int, float))
+            or not math.isfinite(github_app_installation_deadline_seconds)
+            or not (
+                0
+                < github_app_installation_deadline_seconds
+                <= MAX_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS
+            )
+        ):
+            raise ValueError(
+                "github_app_installation_deadline_seconds must be greater than zero "
+                "and at most 120 seconds"
+            )
         self._client = client
         self._exchange_signer = exchange_signer
         if not binding_id.strip():
@@ -479,6 +499,9 @@ class AccountCenterClient:
         self._callback_signer = callback_signer
         self._wecom_source_signer = wecom_source_signer
         self._deadline_seconds = deadline_seconds
+        self._github_app_installation_deadline_seconds = float(
+            github_app_installation_deadline_seconds
+        )
 
     def begin_link(
         self,
@@ -822,13 +845,18 @@ class AccountCenterClient:
         request = {"payload": dict(payload), "trusted_context": trusted_context}
         request_type = f"type.googleapis.com/cyrene.account.center.v1.{method_name}Request"
         response_type = f"type.googleapis.com/cyrene.account.center.v1.{method_name}Response"
+        deadline_seconds = (
+            self._github_app_installation_deadline_seconds
+            if method == "link_github_app_installation"
+            else self._deadline_seconds
+        )
         try:
             response = self._client.invoke(
                 capability=ACCOUNT_CAPABILITY,
                 interface_version="1",
                 method=method,
                 request=_direct_payload(request_type, canonical_json(request)),
-                deadline_seconds=self._deadline_seconds,
+                deadline_seconds=deadline_seconds,
                 request_id=request_id,
             )
         except Exception as exc:
