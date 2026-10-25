@@ -13,12 +13,16 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations.connector_profiles import (
+    ComputerRunnerProfile,
     validate_teams_root_thread_id,
     validate_teams_service_url,
 )
@@ -40,6 +44,17 @@ _TOOL_IDS_BY_PROVIDER: Mapping[str, Mapping[str, str]] = {
         "github.pull_requests.list": "github.pull_requests.list",
         "github.pull_request.get": "github.pull_request.get",
         "github.actions.runs.list": "github.actions.runs.list",
+        "github.issues.search": "github.issues.search",
+        "github.actions.jobs.list": "github.actions.jobs.list",
+        "github.actions.job.logs.read": "github.actions.job.logs.read",
+        "github.branch.create": "github.branch.create",
+        "github.branch.delete": "github.branch.delete",
+        "github.branch.get": "github.branch.get",
+        "github.file.commit": "github.file.commit",
+        "github.file.get": "github.file.get",
+        "github.pull_request.draft.create": "github.pull_request.draft.create",
+        "github.pull_request.draft.find": "github.pull_request.draft.find",
+        "github.actions.rerun_failed": "github.actions.rerun_failed",
         "github.ci.status": "github.ci.status",
         "github.vendor.cli.execute": "github_vendor_cli",
         "github.issue.get": "github.issue.get",
@@ -101,11 +116,24 @@ _TOOL_IDS_BY_PROVIDER: Mapping[str, Mapping[str, str]] = {
         "cloud.operation.cancel": "cloud_operation_cancel",
         "cloud.vendor.cli.execute": "cloud_vendor_cli",
     },
+    "computer": {
+        "computer.command.execute": "computer.command.execute",
+        "computer.file.read": "computer.file.read",
+        "computer.file.write": "computer.file.write",
+        "computer.directory.list": "computer.directory.list",
+    },
 }
 _MUTATING_OPERATIONS = frozenset(
     {
         "github.issue.comment.create",
         "github.issue.state.update",
+        "github.branch.create",
+        "github.branch.delete",
+        "github.file.commit",
+        "github.pull_request.draft.create",
+        "github.actions.rerun_failed",
+        "computer.command.execute",
+        "computer.file.write",
         "github.vendor.cli.execute",
         "huggingface.file.upload",
         "huggingface.vendor.cli.execute",
@@ -136,6 +164,61 @@ _CLI_EXPORT_PATTERNS = (
     ("config", "show"),
     ("credentials", "list"),
 )
+_GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
+_GITHUB_BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,255}\Z")
+_GITHUB_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
+_GITHUB_PROTECTED_BRANCHES = frozenset(
+    {"main", "master", "develop", "release", "production", "staging"}
+)
+_GITHUB_PROTECTED_BRANCH_PREFIXES = (
+    "main/",
+    "master/",
+    "develop/",
+    "release/",
+    "production/",
+    "prod/",
+    "staging/",
+)
+_GITHUB_PROTECTED_PATH_DIRECTORIES = frozenset(
+    {
+        ".github",
+        ".git",
+        ".gitlab",
+        ".circleci",
+        ".azure",
+        "deploy",
+        "deployment",
+        "infra",
+        "infrastructure",
+        "terraform",
+        "helm",
+        "k8s",
+        "kubernetes",
+        "production",
+        "prod",
+        "permissions",
+    }
+)
+_GITHUB_PROTECTED_PATH_FILES = frozenset(
+    {
+        "codeowners",
+        "azure-pipelines.yml",
+        "azure-pipelines.yaml",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+        ".gitmodules",
+    }
+)
+_GITHUB_SENSITIVE_PATH_SEGMENT = re.compile(
+    r"^(?:prod|production|permissions|authorization|access-control)(?:[._-]|$)"
+)
+_COMPUTER_MAX_COMMAND_CHARS = 8_192
+_COMPUTER_MAX_COMMAND_BYTES = 32_768
+_COMPUTER_MAX_PATH_CHARS = 1_024
+_COMPUTER_MAX_PATH_BYTES = 4_096
+_COMPUTER_MAX_READ_BYTES = 65_536
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +226,7 @@ class PreparedConnectorOperation:
     """One validated, grant-bound provider operation ready for a one-time call."""
 
     connection: IntegrationConnection | None
+    connection_ref: str
     principal: IntegrationPrincipal
     provider_id: str
     profile_ref: str
@@ -169,12 +253,16 @@ class ConnectorOperationDispatcher:
         github: Any,
         authorization_cloud: Any,
         registry: Any,
+        computer: Any = None,
+        computer_runner_profile: ComputerRunnerProfile | None = None,
     ) -> None:
         self._store = store
         self._accounts = accounts
         self._github = github
         self._authorization_cloud = authorization_cloud
         self._registry = registry
+        self._computer = computer
+        self._computer_runner_profile = computer_runner_profile
 
     def prepare_connection_operation(
         self,
@@ -263,6 +351,7 @@ class ConnectorOperationDispatcher:
         )
         return PreparedConnectorOperation(
             connection=current,
+            connection_ref=str(current.id),
             principal=principal,
             provider_id=canonical_provider,
             profile_ref=profile_ref,
@@ -350,6 +439,7 @@ class ConnectorOperationDispatcher:
             raise PermissionError("Teams resource ref does not match the canonical thread")
         return PreparedConnectorOperation(
             connection=None,
+            connection_ref=profile.connection_ref,
             principal=principal,
             provider_id=provider_id,
             profile_ref=profile_ref,
@@ -365,6 +455,74 @@ class ConnectorOperationDispatcher:
             is_mutating=False,
         )
 
+    def prepare_computer_operation(
+        self,
+        *,
+        principal: IntegrationPrincipal,
+        profile: ComputerRunnerProfile,
+        connection_ref: str,
+        provider_id: str,
+        profile_ref: str,
+        operation_id: str,
+        resource_ref: str,
+        arguments: Mapping[str, object],
+        request_id: str,
+    ) -> PreparedConnectorOperation:
+        """Validate one exact Directory-authorized operation for the host runner."""
+
+        if (
+            provider_id != "computer"
+            or profile != self._computer_runner_profile
+            or connection_ref != profile.connection_ref
+            or profile_ref != profile.profile_ref
+        ):
+            raise PermissionError("computer runner does not match its host-owned profile")
+        connection_lookup = getattr(self._store, "current_connection_for_provider_call", None)
+        if (
+            callable(connection_lookup)
+            and connection_lookup(UUID(profile.connection_ref)) is not None
+        ):
+            raise PermissionError("computer runner reference collides with an external connection")
+        profile.authorize_principal(principal)
+        principal.require(operation_id)
+        tool_id = _TOOL_IDS_BY_PROVIDER["computer"].get(operation_id)
+        if tool_id is None:
+            raise PermissionError("computer operation is not in the fixed Exchange tool map")
+        selected = dict(arguments)
+        _validate_computer_target(profile, operation_id, selected)
+        target_projection = _resource_projection(
+            provider_id="computer",
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            arguments=selected,
+            workspace_ref=profile.connection_ref,
+        )
+        expected_resource_ref = _resource_ref(
+            provider_id="computer",
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            target=target_projection,
+        )
+        if resource_ref != expected_resource_ref:
+            raise PermissionError("computer resource ref does not match its host workspace target")
+        return PreparedConnectorOperation(
+            connection=None,
+            connection_ref=profile.connection_ref,
+            principal=principal,
+            provider_id=provider_id,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            resource_ref=resource_ref,
+            arguments=selected,
+            tool_id=tool_id,
+            request_id=request_id,
+            target_projection=target_projection,
+            account_lease_target=None,
+            expected_organization_id=profile.organization_id,
+            expected_workspace_id=profile.workspace_id,
+            is_mutating=operation_id in _MUTATING_OPERATIONS,
+        )
+
     def invoke(
         self,
         prepared: PreparedConnectorOperation,
@@ -375,7 +533,12 @@ class ConnectorOperationDispatcher:
         """Invoke a one-use grant-bound provider call and return only safe structured JSON."""
 
         connection = prepared.connection
-        if connection is None or prepared.provider_id == "msteams":
+        if prepared.provider_id == "computer":
+            if connection is not None or self._computer is None:
+                raise ValueError("computer provider is not configured for the host runner")
+            if prepared.account_lease_target is not None:
+                raise ValueError("computer operations do not use Account Center leases")
+        elif connection is None or prepared.provider_id == "msteams":
             raise ValueError("Teams replies use the dedicated message connector route")
         if (
             not claims.grant_ref
@@ -384,7 +547,7 @@ class ConnectorOperationDispatcher:
             or claims.workspace_id != principal.workspace_id
             or claims.principal_issuer != principal.issuer
             or claims.principal_subject != principal.subject
-            or claims.connection_ref != str(connection.id)
+            or claims.connection_ref != prepared.connection_ref
             or claims.provider_id != prepared.provider_id
             or claims.profile_ref != prepared.profile_ref
             or claims.operation_id != prepared.operation_id
@@ -392,7 +555,14 @@ class ConnectorOperationDispatcher:
             or claims.arguments_digest_sha256 != bytes.fromhex(digest_arguments(prepared.arguments))
         ):
             raise PermissionError("grant does not match the prepared operation")
-        if prepared.provider_id in {"github", "huggingface"}:
+        if prepared.provider_id == "computer":
+            result = self._computer.call_provider_tool(
+                tool_id=prepared.tool_id,
+                payload=prepared.arguments,
+            )
+        elif prepared.provider_id in {"github", "huggingface"}:
+            if connection is None:
+                raise ValueError("provider connection is missing")
             if prepared.account_lease_target is None:
                 raise ValueError("Account Center lease target is missing")
             payload = dict(prepared.arguments)
@@ -605,9 +775,33 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
                 if operation_id == "github.pull_request.get"
                 else "github_commit"
                 if operation_id == "github.ci.status"
+                else "github_actions_run"
+                if operation_id in {"github.actions.jobs.list", "github.actions.rerun_failed"}
+                else "github_actions_job"
+                if operation_id == "github.actions.job.logs.read"
+                else "github_branch"
+                if operation_id
+                in {
+                    "github.branch.create",
+                    "github.branch.delete",
+                    "github.branch.get",
+                }
+                else "github_file"
+                if operation_id in {"github.file.commit", "github.file.get"}
+                else "github_pull_request_draft"
+                if operation_id
+                in {"github.pull_request.draft.create", "github.pull_request.draft.find"}
                 else "github_issue"
                 if operation_id.startswith("github.issue.")
                 else "github_repository"
+            )
+        elif provider == "computer":
+            projection = (
+                "computer_workspace"
+                if operation_id == "computer.command.execute"
+                else "computer_file"
+                if operation_id in {"computer.file.read", "computer.file.write"}
+                else "computer_directory"
             )
         elif provider == "huggingface":
             projection = (
@@ -651,6 +845,7 @@ def _resource_projection(
     profile_ref: str,
     operation_id: str,
     arguments: Mapping[str, object],
+    workspace_ref: str | None = None,
 ) -> dict[str, object]:
     """Project only the provider resource selector used by the Directory grant."""
 
@@ -673,6 +868,21 @@ def _resource_projection(
         "huggingface.vendor.cli.execute",
     }:
         return {"profile_ref": profile_ref}
+    if provider_id == "computer":
+        if not isinstance(workspace_ref, str) or not workspace_ref:
+            raise ValueError("computer workspace target is not host-bound")
+        if operation_id == "computer.command.execute":
+            return {"workspace_ref": workspace_ref}
+        if operation_id in {
+            "computer.file.read",
+            "computer.file.write",
+            "computer.directory.list",
+        }:
+            return {
+                "workspace_ref": workspace_ref,
+                "path": _text(arguments.get("path"), "path", maximum=4096),
+            }
+        raise PermissionError("computer operation is not in the fixed Exchange target map")
     if "target" in arguments:
         target = arguments["target"]
         if not isinstance(target, Mapping) or not target:
@@ -688,6 +898,25 @@ def _resource_projection(
             target.update(_fields(arguments, {"commit_sha"}))
         elif operation_id.startswith("github.issue."):
             target.update(_fields(arguments, {"issue_number"}))
+        elif operation_id == "github.actions.jobs.list":
+            target.update(_fields(arguments, {"run_id"}))
+        elif operation_id == "github.actions.job.logs.read":
+            target.update(_fields(arguments, {"run_id", "job_id"}))
+        elif operation_id == "github.actions.rerun_failed":
+            target.update(_fields(arguments, {"run_id"}))
+        elif operation_id in {
+            "github.branch.create",
+            "github.branch.delete",
+            "github.branch.get",
+        }:
+            target.update(_fields(arguments, {"branch"}))
+        elif operation_id in {"github.file.commit", "github.file.get"}:
+            target.update(_fields(arguments, {"branch", "path"}))
+        elif operation_id in {
+            "github.pull_request.draft.create",
+            "github.pull_request.draft.find",
+        }:
+            target.update(_fields(arguments, {"head_branch", "base_branch"}))
         return target
     if provider_id == "huggingface":
         if operation_id in {
@@ -794,6 +1023,41 @@ def _validate_github_target(
         optional_fields = {"pull_number"}
     elif operation_id == "github.actions.runs.list":
         optional_fields = {"branch", "commit_sha"}
+    elif operation_id == "github.issues.search":
+        optional_fields = {
+            "state",
+            "limit",
+            "query",
+            "labels",
+            "updated_since",
+            "page_cursor",
+        }
+    elif operation_id == "github.actions.jobs.list":
+        optional_fields = {"run_id", "limit"}
+    elif operation_id == "github.actions.job.logs.read":
+        optional_fields = {"run_id", "job_id", "max_lines"}
+    elif operation_id == "github.branch.create":
+        optional_fields = {"branch", "from_sha"}
+    elif operation_id == "github.branch.delete":
+        optional_fields = {"branch", "expected_sha"}
+    elif operation_id == "github.branch.get":
+        optional_fields = {"branch"}
+    elif operation_id == "github.file.commit":
+        optional_fields = {"branch", "path", "message", "content_base64", "expected_sha"}
+    elif operation_id == "github.file.get":
+        optional_fields = {"branch", "path"}
+    elif operation_id == "github.pull_request.draft.create":
+        optional_fields = {"head_branch", "base_branch", "title", "body"}
+    elif operation_id == "github.pull_request.draft.find":
+        optional_fields = {"head_branch", "base_branch"}
+    elif operation_id == "github.actions.rerun_failed":
+        optional_fields = {
+            "run_id",
+            "expected_workflow_id",
+            "expected_head_branch",
+            "expected_head_sha",
+            "expected_attempt",
+        }
     elif operation_id == "github.ci.status":
         optional_fields = {"commit_sha"}
     elif operation_id in {
@@ -822,9 +1086,55 @@ def _validate_github_target(
     elif operation_id == "github.ci.status":
         required_fields |= {"commit_sha"}
         optional_fields = set()
+    elif operation_id == "github.issues.search":
+        required_fields |= {"state", "limit"}
+        optional_fields = {"query", "labels", "updated_since", "page_cursor"}
+    elif operation_id == "github.actions.jobs.list":
+        required_fields |= {"run_id", "limit"}
+        optional_fields = set()
+    elif operation_id == "github.actions.job.logs.read":
+        required_fields |= {"run_id", "job_id", "max_lines"}
+        optional_fields = set()
+    elif operation_id == "github.branch.create":
+        required_fields |= {"branch", "from_sha"}
+        optional_fields = set()
+    elif operation_id == "github.branch.delete":
+        required_fields |= {"branch", "expected_sha"}
+        optional_fields = set()
+    elif operation_id == "github.branch.get":
+        required_fields |= {"branch"}
+        optional_fields = set()
+    elif operation_id == "github.file.commit":
+        required_fields |= {"branch", "path", "message", "content_base64"}
+        optional_fields = {"expected_sha"}
+    elif operation_id == "github.file.get":
+        required_fields |= {"branch", "path"}
+        optional_fields = set()
+    elif operation_id == "github.pull_request.draft.create":
+        required_fields |= {"head_branch", "base_branch", "title", "body"}
+        optional_fields = set()
+    elif operation_id == "github.pull_request.draft.find":
+        required_fields |= {"head_branch", "base_branch"}
+        optional_fields = set()
+    elif operation_id == "github.actions.rerun_failed":
+        required_fields |= {
+            "run_id",
+            "expected_workflow_id",
+            "expected_head_branch",
+            "expected_head_sha",
+            "expected_attempt",
+        }
+        optional_fields = set()
     _exact_optional_fields(arguments, required=required_fields, optional=optional_fields)
     repository_id = arguments.get("repository_id")
     repository = arguments.get("repository")
+    if (
+        not isinstance(repository_id, str)
+        or not re.fullmatch(r"[0-9]+", repository_id)
+        or not isinstance(repository, str)
+        or not _GITHUB_REPOSITORY.fullmatch(repository)
+    ):
+        raise ValueError("GitHub repository identity is malformed")
     if repository_id != connection.repository_id or repository != connection.repository_name:
         raise PermissionError("GitHub repository does not match the selected connection")
     if operation_id == "github.pull_request.get":
@@ -847,8 +1157,427 @@ def _validate_github_target(
         for field in ("branch", "commit_sha"):
             if field in arguments:
                 _text(arguments[field], field)
+    elif operation_id == "github.issues.search":
+        if arguments.get("state") not in {"OPEN", "CLOSED", "ALL"}:
+            raise ValueError("GitHub issue search state is invalid")
+        limit = _bounded_int(arguments.get("limit"), "limit", minimum=1, maximum=50)
+        if "query" in arguments:
+            query = _text(arguments["query"], "query", maximum=128)
+            if not query.isascii() or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}", query):
+                raise ValueError("GitHub issue search query has an invalid format")
+        if "labels" in arguments:
+            labels = arguments["labels"]
+            if (
+                not isinstance(labels, list)
+                or len(labels) > 10
+                or any(
+                    not isinstance(label, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,49}", label)
+                    for label in labels
+                )
+                or len(set(labels)) != len(labels)
+            ):
+                raise ValueError("GitHub issue search labels are invalid")
+        if "updated_since" in arguments:
+            updated_since = arguments["updated_since"]
+            if not isinstance(updated_since, str) or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)",
+                updated_since,
+            ):
+                raise ValueError("GitHub updated_since must be a UTC RFC 3339 timestamp")
+            try:
+                parsed_timestamp = (
+                    updated_since[:-1] + "+00:00" if updated_since.endswith("Z") else updated_since
+                )
+                datetime.fromisoformat(parsed_timestamp)
+            except ValueError as exc:
+                raise ValueError("GitHub updated_since is not a valid timestamp") from exc
+        if "page_cursor" in arguments:
+            page_cursor = arguments["page_cursor"]
+            if not isinstance(page_cursor, str) or not re.fullmatch(
+                r"[1-9][0-9]{0,3}", page_cursor
+            ):
+                raise ValueError("GitHub issue search page_cursor must be a positive page number")
+            maximum_page = (1000 + limit - 1) // limit
+            if int(page_cursor) > maximum_page:
+                raise ValueError(
+                    "GitHub issue search page_cursor exceeds the bounded result window"
+                )
+    elif operation_id == "github.actions.jobs.list":
+        _numeric_resource_id(arguments.get("run_id"), "run_id")
+        _bounded_int(arguments.get("limit"), "limit", minimum=1, maximum=100)
+    elif operation_id == "github.actions.job.logs.read":
+        _numeric_resource_id(arguments.get("run_id"), "run_id")
+        _numeric_resource_id(arguments.get("job_id"), "job_id")
+        _bounded_int(arguments.get("max_lines"), "max_lines", minimum=1, maximum=200)
+    elif operation_id == "github.branch.create":
+        _validate_github_branch(arguments.get("branch"), allow_protected=False)
+        _validate_github_sha(arguments.get("from_sha"), "from_sha")
+    elif operation_id == "github.branch.delete":
+        _validate_github_branch(arguments.get("branch"), allow_protected=False)
+        _validate_github_sha(arguments.get("expected_sha"), "expected_sha")
+    elif operation_id == "github.branch.get":
+        _validate_github_branch(arguments.get("branch"), allow_protected=True)
+    elif operation_id == "github.file.commit":
+        _validate_github_branch(arguments.get("branch"), allow_protected=False)
+        _validate_github_path(arguments.get("path"))
+        _text(arguments.get("message"), "message", maximum=200)
+        if "expected_sha" in arguments:
+            _validate_github_sha(arguments["expected_sha"], "expected_sha")
+        _validate_github_content(arguments.get("content_base64"))
+    elif operation_id == "github.file.get":
+        _validate_github_branch(arguments.get("branch"), allow_protected=True)
+        _validate_github_path(arguments.get("path"))
+    elif operation_id == "github.pull_request.draft.create":
+        _validate_github_branch(arguments.get("head_branch"), allow_protected=False)
+        _validate_github_branch(arguments.get("base_branch"), allow_protected=True)
+        if arguments["head_branch"] == arguments["base_branch"]:
+            raise ValueError("GitHub pull request branches must differ")
+        _text(arguments.get("title"), "title", maximum=256)
+        body = arguments.get("body")
+        if not isinstance(body, str) or len(body) > 65_536:
+            raise ValueError("GitHub pull request body exceeds the configured limit")
+    elif operation_id == "github.pull_request.draft.find":
+        _validate_github_branch(arguments.get("head_branch"), allow_protected=False)
+        _validate_github_branch(arguments.get("base_branch"), allow_protected=True)
+        if arguments["head_branch"] == arguments["base_branch"]:
+            raise ValueError("GitHub pull request branches must differ")
+    elif operation_id == "github.actions.rerun_failed":
+        _numeric_resource_id(arguments.get("run_id"), "run_id")
+        _numeric_resource_id(arguments.get("expected_workflow_id"), "expected_workflow_id")
+        expected_head_branch = _validate_github_branch(
+            arguments.get("expected_head_branch"), allow_protected=False
+        )
+        if not expected_head_branch.casefold().startswith("cyrene/assistant/"):
+            raise PermissionError("GitHub workflow reruns require an assistant task branch")
+        _validate_github_sha(arguments.get("expected_head_sha"), "expected_head_sha")
+        _bounded_int(
+            arguments.get("expected_attempt"),
+            "expected_attempt",
+            minimum=1,
+            maximum=2_147_483_647,
+        )
     elif operation_id == "github.pull_request.get" or operation_id == "github.repository.get":
         return
+
+
+def _bounded_int(value: object, label: str, *, minimum: int, maximum: int) -> int:
+    """Require one bounded JSON integer without accepting bool as an integer."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{label} must be between {minimum} and {maximum}")
+    return value
+
+
+def _numeric_resource_id(value: object, label: str) -> str:
+    """Require a decimal resource id as text to preserve 64-bit precision."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) > 20
+        or not re.fullmatch(r"[1-9][0-9]{0,19}", value)
+    ):
+        raise ValueError(f"{label} must be a positive decimal resource id string")
+    return value
+
+
+def _validate_github_sha(value: object, label: str) -> str:
+    """Require the full GitHub SHA form used for optimistic write checks."""
+
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+        raise ValueError(f"{label} must be a full 40-character hexadecimal SHA")
+    return value
+
+
+def _validate_github_branch(value: object, *, allow_protected: bool) -> str:
+    """Reject malformed refs and prevent protected names from branch writes."""
+
+    if not isinstance(value, str) or len(value) > 255 or not value:
+        raise ValueError("GitHub branch must be bounded non-empty text")
+    parts = value.split("/")
+    if (
+        not _GITHUB_BRANCH.fullmatch(value)
+        or value.startswith("/")
+        or value.endswith(("/", "."))
+        or "//" in value
+        or "@{" in value
+        or any(
+            part in {"", ".", ".."} or part.startswith(".") or part.endswith(".lock")
+            for part in parts
+        )
+    ):
+        raise ValueError("GitHub branch is not a safe Git reference")
+    if not allow_protected and _is_protected_branch(value):
+        raise PermissionError("protected branch names are outside the task-branch write allowlist")
+    return value
+
+
+def _is_protected_branch(value: str) -> bool:
+    """Identify branch names reserved for primary, release, or deployment targets."""
+
+    lowered = value.casefold()
+    return lowered in _GITHUB_PROTECTED_BRANCHES or lowered.startswith(
+        _GITHUB_PROTECTED_BRANCH_PREFIXES
+    )
+
+
+def _validate_github_path(value: object) -> str:
+    """Reject hidden and deployment/configuration paths from assistant file operations."""
+
+    if not isinstance(value, str) or len(value) > 512 or not _GITHUB_PATH.fullmatch(value):
+        raise ValueError("GitHub file path is invalid")
+    parts = value.split("/")
+    lowered_parts = [part.casefold() for part in parts]
+    if (
+        any(part in {"", ".", ".."} or part.startswith(".") for part in parts)
+        or any(part in _GITHUB_PROTECTED_PATH_DIRECTORIES for part in lowered_parts)
+        or lowered_parts[-1] in _GITHUB_PROTECTED_PATH_FILES
+        or lowered_parts[-1].startswith("dockerfile")
+        or any(_GITHUB_SENSITIVE_PATH_SEGMENT.search(part) for part in lowered_parts)
+    ):
+        raise PermissionError("hidden or deployment configuration paths are blocked")
+    return value
+
+
+def _validate_github_content(value: object) -> bytes:
+    """Decode a bounded base64 file body without retaining it in the lease target."""
+
+    if not isinstance(value, str) or len(value) > 666_668:
+        raise ValueError("GitHub file content exceeds the configured limit")
+    try:
+        content = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("GitHub file content must be valid base64") from exc
+    if len(content) > 500_000:
+        raise ValueError("GitHub file content exceeds the configured limit")
+    if base64.b64encode(content).decode("ascii") != value:
+        raise ValueError("GitHub file content must use canonical base64 encoding")
+    return content
+
+
+def _validate_computer_target(
+    profile: ComputerRunnerProfile,
+    operation_id: str,
+    arguments: Mapping[str, object],
+) -> None:
+    """Validate fixed computer operations before they receive a Directory grant."""
+
+    path_max_bytes = _COMPUTER_MAX_PATH_BYTES
+    if operation_id == "computer.command.execute":
+        _exact_optional_fields(arguments, required={"command"}, optional={"cwd", "timeout_ms"})
+        command = arguments["command"]
+        if (
+            not isinstance(command, str)
+            or not command.strip()
+            or "\x00" in command
+            or len(command) > _COMPUTER_MAX_COMMAND_CHARS
+            or len(command.encode("utf-8")) > _COMPUTER_MAX_COMMAND_BYTES
+        ):
+            raise ValueError("computer command must be bounded non-empty text without NUL")
+        if "cwd" in arguments:
+            _validate_computer_path(
+                arguments["cwd"], "cwd", max_bytes=path_max_bytes, allow_root=True
+            )
+        if "timeout_ms" in arguments:
+            _bounded_int(
+                arguments["timeout_ms"],
+                "timeout_ms",
+                minimum=1,
+                maximum=profile.max_command_timeout_ms,
+            )
+        return
+    if operation_id == "computer.file.read":
+        _exact_optional_fields(
+            arguments,
+            required={"path", "length"},
+            optional={"offset"},
+        )
+        _validate_computer_path(arguments["path"], "path", max_bytes=path_max_bytes)
+        _bounded_int(
+            arguments["length"],
+            "length",
+            minimum=0,
+            maximum=min(profile.max_read_bytes, _COMPUTER_MAX_READ_BYTES),
+        )
+        if "offset" in arguments:
+            _bounded_int(arguments["offset"], "offset", minimum=0, maximum=(1 << 63) - 1)
+        return
+    if operation_id == "computer.file.write":
+        _exact_fields(arguments, required={"path", "content_base64", "overwrite"})
+        _validate_computer_path(arguments["path"], "path", max_bytes=path_max_bytes)
+        if not isinstance(arguments["overwrite"], bool):
+            raise ValueError("computer overwrite must be boolean")
+        _validate_bounded_base64(
+            arguments["content_base64"],
+            label="content_base64",
+            maximum_bytes=profile.max_file_bytes,
+        )
+        return
+    if operation_id == "computer.directory.list":
+        _exact_optional_fields(arguments, required={"path"}, optional={"max_depth"})
+        _validate_computer_path(
+            arguments["path"], "path", max_bytes=path_max_bytes, allow_root=True
+        )
+        if "max_depth" in arguments:
+            _bounded_int(
+                arguments["max_depth"],
+                "max_depth",
+                minimum=1,
+                maximum=profile.max_directory_depth,
+            )
+        return
+    raise PermissionError("computer operation is not in the fixed Exchange argument map")
+
+
+def _validate_computer_path(
+    value: object,
+    label: str,
+    *,
+    max_bytes: int,
+    allow_root: bool = False,
+) -> str:
+    """Require a workspace-relative path that cannot traverse above the fixed root."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or value.startswith("/")
+        or len(value) > _COMPUTER_MAX_PATH_CHARS
+        or len(value.encode("utf-8")) > max_bytes
+        or (value == "." and not allow_root)
+        or (value != "." and any(segment in {"", ".", ".."} for segment in value.split("/")))
+    ):
+        raise ValueError(f"{label} must be a bounded workspace-relative path")
+    return value
+
+
+def _validate_bounded_base64(value: object, *, label: str, maximum_bytes: int) -> bytes:
+    """Decode canonical base64 only after applying the host profile's byte limit."""
+
+    encoded_limit = ((maximum_bytes + 2) // 3) * 4
+    if not isinstance(value, str) or len(value) > encoded_limit:
+        raise ValueError(f"{label} exceeds the configured content limit")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError(f"{label} must be valid base64") from exc
+    if len(decoded) > maximum_bytes or base64.b64encode(decoded).decode("ascii") != value:
+        raise ValueError(f"{label} must use canonical base64 within the configured limit")
+    return decoded
+
+
+def validate_computer_tool_schema(
+    profile: ComputerRunnerProfile,
+    *,
+    tool_id: str,
+    input_schema: Mapping[str, Any],
+) -> None:
+    """Require provider-advertised tool schemas to stay within host limits."""
+
+    schema_properties = input_schema.get("properties")
+    schema_required = input_schema.get("required")
+    if (
+        input_schema.get("type") != "object"
+        or input_schema.get("additionalProperties") is not False
+        or not isinstance(schema_properties, Mapping)
+        or not isinstance(schema_required, list)
+    ):
+        raise ValueError("computer tool schema must be a closed object")
+
+    operation_fields: dict[str, tuple[set[str], set[str]]] = {
+        "computer.command.execute": ({"command"}, {"cwd", "timeout_ms"}),
+        "computer.file.read": ({"path", "length"}, {"offset"}),
+        "computer.file.write": ({"path", "content_base64", "overwrite"}, set()),
+        "computer.directory.list": ({"path"}, {"max_depth"}),
+    }
+    fields = operation_fields.get(tool_id)
+    if fields is None:
+        raise ValueError("computer tool schema is outside the fixed operation map")
+    required, optional = fields
+    properties = set(schema_properties)
+    if properties != required | optional or set(schema_required) != required:
+        raise ValueError("computer tool schema fields do not match the fixed operation contract")
+
+    def integer_bound(field_name: str, *, minimum: int, maximum: int) -> None:
+        field = schema_properties.get(field_name)
+        if (
+            not isinstance(field, Mapping)
+            or field.get("type") != "integer"
+            or isinstance(field.get("minimum"), bool)
+            or not isinstance(field.get("minimum"), int)
+            or field["minimum"] < minimum
+            or isinstance(field.get("maximum"), bool)
+            or not isinstance(field.get("maximum"), int)
+            or field["maximum"] > maximum
+        ):
+            raise ValueError(f"computer tool {field_name} schema exceeds the host limit")
+
+    if "command" in required:
+        command = schema_properties.get("command")
+        if (
+            not isinstance(command, Mapping)
+            or command.get("type") != "string"
+            or isinstance(command.get("maxLength"), bool)
+            or not isinstance(command.get("maxLength"), int)
+            or command["maxLength"] > _COMPUTER_MAX_COMMAND_CHARS
+            or isinstance(command.get("x-maxUtf8Bytes"), bool)
+            or not isinstance(command.get("x-maxUtf8Bytes"), int)
+            or command["x-maxUtf8Bytes"] > _COMPUTER_MAX_COMMAND_BYTES
+        ):
+            raise ValueError("computer command schema exceeds the host text limits")
+        if "cwd" in optional:
+            path_schema = schema_properties.get("cwd")
+            if (
+                not isinstance(path_schema, Mapping)
+                or path_schema.get("type") != "string"
+                or isinstance(path_schema.get("maxLength"), bool)
+                or not isinstance(path_schema.get("maxLength"), int)
+                or path_schema["maxLength"] > _COMPUTER_MAX_PATH_CHARS
+                or isinstance(path_schema.get("x-maxUtf8Bytes"), bool)
+                or not isinstance(path_schema.get("x-maxUtf8Bytes"), int)
+                or path_schema["x-maxUtf8Bytes"] > _COMPUTER_MAX_PATH_BYTES
+            ):
+                raise ValueError("computer cwd schema exceeds the host path limits")
+        if "timeout_ms" in optional:
+            integer_bound(
+                "timeout_ms",
+                minimum=1,
+                maximum=profile.max_command_timeout_ms,
+            )
+    if "path" in required:
+        path = schema_properties.get("path")
+        if (
+            not isinstance(path, Mapping)
+            or path.get("type") != "string"
+            or isinstance(path.get("maxLength"), bool)
+            or not isinstance(path.get("maxLength"), int)
+            or path["maxLength"] > _COMPUTER_MAX_PATH_CHARS
+            or isinstance(path.get("x-maxUtf8Bytes"), bool)
+            or not isinstance(path.get("x-maxUtf8Bytes"), int)
+            or path["x-maxUtf8Bytes"] > _COMPUTER_MAX_PATH_BYTES
+        ):
+            raise ValueError("computer path schema exceeds the host path limits")
+    if tool_id == "computer.file.read":
+        integer_bound("length", minimum=0, maximum=profile.max_read_bytes)
+        if "offset" in optional:
+            integer_bound("offset", minimum=0, maximum=(1 << 63) - 1)
+    elif tool_id == "computer.file.write":
+        content = schema_properties.get("content_base64")
+        encoded_limit = ((profile.max_file_bytes + 2) // 3) * 4
+        overwrite = schema_properties.get("overwrite")
+        if (
+            not isinstance(content, Mapping)
+            or content.get("type") != "string"
+            or isinstance(content.get("maxLength"), bool)
+            or not isinstance(content.get("maxLength"), int)
+            or content["maxLength"] > encoded_limit
+            or not isinstance(overwrite, Mapping)
+            or overwrite.get("type") != "boolean"
+        ):
+            raise ValueError("computer file.write schema exceeds the host file limits")
+    elif tool_id == "computer.directory.list" and "max_depth" in optional:
+        integer_bound("max_depth", minimum=1, maximum=profile.max_directory_depth)
 
 
 def _positive_int(value: object, label: str) -> int:

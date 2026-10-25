@@ -26,8 +26,11 @@ from cyrene_exchange_product.integrations.connector_operations import (
     _validate_github_target,
     _without_cli_output,
     connector_binding_tools,
+    validate_computer_tool_schema,
 )
 from cyrene_exchange_product.integrations.connector_profiles import (
+    ComputerRunnerProfile,
+    parse_connector_host_settings,
     validate_teams_service_url,
 )
 from cyrene_exchange_product.integrations.connector_security import (
@@ -58,6 +61,34 @@ def actor() -> IntegrationPrincipal:
         workspace_id="workspace-test",
         allowed_operation_ids=frozenset({"navigator.connector.operator.v1"}),
     )
+
+
+def computer_profile() -> ComputerRunnerProfile:
+    """Return one host-owned runner profile without any provider account identity."""
+
+    parsed = parse_connector_host_settings(
+        {
+            "computerRunner": {
+                "profileRef": "local-runner-profile",
+                "connectionRef": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "organizationId": "org-test",
+                "workspaceId": "workspace-test",
+                "expectedIssuer": "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0",
+                "directPlugin": {
+                    "bindingId": "computer-runtime",
+                    "connectionRef": "grpcs://computer-runner.test:443",
+                    "transport": "mtls",
+                    "mtls": {
+                        "rootCertificateRef": "test/root-ca",
+                        "clientCertificateRef": "test/client-cert",
+                        "clientKeyRef": "test/client-key",
+                    },
+                },
+            }
+        }
+    )
+    assert parsed.computer_runner is not None
+    return parsed.computer_runner
 
 
 def reserve(
@@ -193,6 +224,633 @@ def test_github_actions_lease_binds_optional_branch_and_commit_filters(
         )
         == expected
     )
+
+
+def test_proactive_github_tools_use_exact_resource_targets_and_mutability() -> None:
+    """New GitHub tools share provider schemas, stable targets, and fixed write policy."""
+
+    principal = actor()
+    connection = IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="github",
+        repository_id="42",
+        repository_name="acme/demo",
+        account_link_ref="gh-profile-1",
+    )
+    cases: list[tuple[str, dict[str, object], str, dict[str, object], bool]] = [
+        (
+            "github.issues.search",
+            {
+                "state": "OPEN",
+                "query": "bug report",
+                "limit": 25,
+                "labels": ["bug"],
+                "updated_since": "2026-10-24T09:15:30.125+00:00",
+                "page_cursor": "2",
+            },
+            "github_repository",
+            {"repository_id": "42", "repository": "acme/demo"},
+            False,
+        ),
+        (
+            "github.actions.jobs.list",
+            {"run_id": "9001", "limit": 50},
+            "github_actions_run",
+            {"repository_id": "42", "repository": "acme/demo", "run_id": "9001"},
+            False,
+        ),
+        (
+            "github.actions.job.logs.read",
+            {"run_id": "9001", "job_id": "9002", "max_lines": 100},
+            "github_actions_job",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "run_id": "9001",
+                "job_id": "9002",
+            },
+            False,
+        ),
+        (
+            "github.branch.create",
+            {"branch": "task/assistant-v1", "from_sha": "a" * 40},
+            "github_branch",
+            {"repository_id": "42", "repository": "acme/demo", "branch": "task/assistant-v1"},
+            True,
+        ),
+        (
+            "github.branch.delete",
+            {"branch": "task/assistant-v1", "expected_sha": "b" * 40},
+            "github_branch",
+            {"repository_id": "42", "repository": "acme/demo", "branch": "task/assistant-v1"},
+            True,
+        ),
+        (
+            "github.branch.get",
+            {"branch": "task/assistant-v1"},
+            "github_branch",
+            {"repository_id": "42", "repository": "acme/demo", "branch": "task/assistant-v1"},
+            False,
+        ),
+        (
+            "github.file.commit",
+            {
+                "branch": "task/assistant-v1",
+                "path": "docs/assistant.md",
+                "message": "Add assistant notes",
+                "content_base64": "c21hbGw=",
+                "expected_sha": "c" * 40,
+            },
+            "github_file",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": "docs/assistant.md",
+            },
+            True,
+        ),
+        (
+            "github.file.get",
+            {"branch": "task/assistant-v1", "path": "docs/assistant.md"},
+            "github_file",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": "docs/assistant.md",
+            },
+            False,
+        ),
+        (
+            "github.pull_request.draft.create",
+            {
+                "head_branch": "task/assistant-v1",
+                "base_branch": "develop",
+                "title": "Assistant work",
+                "body": "Review this change",
+            },
+            "github_pull_request_draft",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "head_branch": "task/assistant-v1",
+                "base_branch": "develop",
+            },
+            True,
+        ),
+        (
+            "github.pull_request.draft.find",
+            {"head_branch": "task/assistant-v1", "base_branch": "develop"},
+            "github_pull_request_draft",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "head_branch": "task/assistant-v1",
+                "base_branch": "develop",
+            },
+            False,
+        ),
+        (
+            "github.actions.rerun_failed",
+            {
+                "run_id": "9001",
+                "expected_workflow_id": "9002",
+                "expected_head_branch": "cyrene/assistant/task-1",
+                "expected_head_sha": "d" * 40,
+                "expected_attempt": 2,
+            },
+            "github_actions_run",
+            {"repository_id": "42", "repository": "acme/demo", "run_id": "9001"},
+            True,
+        ),
+    ]
+    operation_policy = {
+        str(item["operationId"]): item for item in connector_binding_tools("github")
+    }
+
+    for operation_id, operation_arguments, projection_name, target, mutating in cases:
+        arguments = {
+            "repository_id": connection.repository_id,
+            "repository": connection.repository_name,
+            **operation_arguments,
+        }
+        _validate_github_target(connection, operation_id, arguments)
+        actual_projection = _resource_projection(
+            provider_id="github",
+            profile_ref="gh-profile-1",
+            operation_id=operation_id,
+            arguments=arguments,
+        )
+        assert actual_projection == target
+        assert _account_lease_target("github", operation_id, actual_projection, arguments) == target
+        assert operation_policy[operation_id] == {
+            "toolId": operation_id,
+            "operationId": operation_id,
+            "resourceProjection": projection_name,
+            "mutating": mutating,
+        }
+
+    _validate_github_target(
+        connection,
+        "github.issues.search",
+        {
+            "repository_id": "42",
+            "repository": "acme/demo",
+            "state": "ALL",
+            "limit": 25,
+            "updated_since": "2026-10-24T09:15:30Z",
+        },
+    )
+
+    rerun_arguments = {
+        "repository_id": "42",
+        "repository": "acme/demo",
+        "run_id": "9001",
+        "expected_workflow_id": "9002",
+        "expected_head_branch": "cyrene/assistant/task-1",
+        "expected_head_sha": "d" * 40,
+        "expected_attempt": 2,
+    }
+    jobs_arguments = {
+        "repository_id": "42",
+        "repository": "acme/demo",
+        "run_id": "9001",
+        "limit": 50,
+    }
+    assert _resource_projection(
+        provider_id="github",
+        profile_ref="gh-profile-1",
+        operation_id="github.actions.rerun_failed",
+        arguments=rerun_arguments,
+    ) == _resource_projection(
+        provider_id="github",
+        profile_ref="gh-profile-1",
+        operation_id="github.actions.jobs.list",
+        arguments=jobs_arguments,
+    )
+    changed_attempt = {**rerun_arguments, "expected_attempt": 3}
+    assert digest_arguments(changed_attempt) != digest_arguments(rerun_arguments)
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "arguments"),
+    [
+        (
+            "github.branch.delete",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "main",
+                "expected_sha": "a" * 40,
+            },
+        ),
+        (
+            "github.file.commit",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": ".github/workflows/build.yml",
+                "message": "Change workflow",
+                "content_base64": "YQ==",
+            },
+        ),
+        (
+            "github.file.commit",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": "config/production.yaml",
+                "message": "Change config",
+                "content_base64": "YQ==",
+            },
+        ),
+        (
+            "github.file.commit",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "branch": "task/assistant-v1",
+                "path": "docs/assistant.md",
+                "message": "Commit content",
+                "content_base64": "YR==",
+            },
+        ),
+        (
+            "github.actions.jobs.list",
+            {"repository_id": "42", "repository": "acme/demo", "run_id": "01", "limit": 10},
+        ),
+        (
+            "github.issues.search",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "state": "OPEN",
+                "limit": 50,
+                "page_cursor": "21",
+            },
+        ),
+        (
+            "github.issues.search",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "state": "OPEN",
+                "limit": 25,
+                "labels": ["bug", "bug"],
+            },
+        ),
+        (
+            "github.issues.search",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "state": "OPEN",
+                "limit": 25,
+                "query": "is:open",
+            },
+        ),
+        (
+            "github.actions.rerun_failed",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "run_id": "9001",
+                "expected_head_sha": "d" * 40,
+                "expected_attempt": 2,
+            },
+        ),
+        (
+            "github.actions.rerun_failed",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "run_id": "9001",
+                "expected_workflow_id": "9002",
+                "expected_head_branch": "bot/assistant-task",
+                "expected_head_sha": "d" * 40,
+                "expected_attempt": 2,
+            },
+        ),
+        (
+            "github.actions.rerun_failed",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "run_id": "9001",
+                "expected_workflow_id": "0",
+                "expected_head_branch": "cyrene/assistant/task-1",
+                "expected_head_sha": "d" * 40,
+                "expected_attempt": 2,
+            },
+        ),
+    ],
+)
+def test_proactive_github_tools_reject_protected_or_malformed_targets(
+    operation_id: str, arguments: dict[str, object]
+) -> None:
+    """Provider write preconditions and stable target fields fail closed in Exchange."""
+
+    principal = actor()
+    connection = IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="github",
+        repository_id="42",
+        repository_name="acme/demo",
+        account_link_ref="gh-profile-1",
+    )
+    with pytest.raises((PermissionError, ValueError)):
+        _validate_github_target(connection, operation_id, arguments)
+
+
+def test_computer_host_profile_is_closed_scoped_and_has_transport_safe_limits() -> None:
+    """The local runner profile is host-owned and does not create an OAuth connection."""
+
+    assert parse_connector_host_settings({}).computer_runner is None
+    profile = computer_profile()
+    assert profile.connection_ref == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    assert profile.profile_ref == "local-runner-profile"
+    assert profile.endpoint.binding_id == "computer-runtime"
+    assert profile.max_file_bytes == 1_048_576
+    assert profile.max_read_bytes == 65_536
+    assert profile.max_directory_depth == 32
+    operation_policy = {
+        str(item["operationId"]): item for item in connector_binding_tools("computer")
+    }
+    assert {operation_id: item["mutating"] for operation_id, item in operation_policy.items()} == {
+        "computer.command.execute": True,
+        "computer.file.read": False,
+        "computer.file.write": True,
+        "computer.directory.list": False,
+    }
+
+    with pytest.raises(ValueError):
+        parse_connector_host_settings(
+            {
+                "computerRunner": {
+                    "profileRef": "local-runner-profile",
+                    "connectionRef": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "organizationId": "org-test",
+                    "workspaceId": "workspace-test",
+                    "expectedIssuer": actor().issuer,
+                    "directPlugin": {
+                        "bindingId": "untrusted-provider",
+                        "connectionRef": "grpc://127.0.0.1:50051",
+                        "transport": "local",
+                    },
+                }
+            }
+        )
+
+    with pytest.raises(ValueError, match="private mTLS"):
+        parse_connector_host_settings(
+            {
+                "computerRunner": {
+                    "profileRef": "local-runner-profile",
+                    "connectionRef": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "organizationId": "org-test",
+                    "workspaceId": "workspace-test",
+                    "expectedIssuer": actor().issuer,
+                    "directPlugin": {
+                        "bindingId": "computer-runtime",
+                        "connectionRef": "grpc://127.0.0.1:50051",
+                        "transport": "local",
+                    },
+                }
+            }
+        )
+
+
+def test_computer_tool_catalog_schemas_cannot_exceed_the_host_profile_limits() -> None:
+    """Host export rejects catalog bounds that the internal routes cannot carry."""
+
+    profile = computer_profile()
+    schemas: dict[str, dict[str, object]] = {
+        "computer.command.execute": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "maxLength": 8192,
+                    "x-maxUtf8Bytes": 32768,
+                },
+                "cwd": {"type": "string", "maxLength": 1024, "x-maxUtf8Bytes": 4096},
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+        "computer.file.read": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "maxLength": 1024, "x-maxUtf8Bytes": 4096},
+                "length": {"type": "integer", "minimum": 0, "maximum": 65536},
+                "offset": {"type": "integer", "minimum": 0, "maximum": (1 << 63) - 1},
+            },
+            "required": ["path", "length"],
+            "additionalProperties": False,
+        },
+        "computer.file.write": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "maxLength": 1024, "x-maxUtf8Bytes": 4096},
+                "content_base64": {"type": "string", "maxLength": 1_398_104},
+                "overwrite": {"type": "boolean"},
+            },
+            "required": ["path", "content_base64", "overwrite"],
+            "additionalProperties": False,
+        },
+        "computer.directory.list": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "maxLength": 1024, "x-maxUtf8Bytes": 4096},
+                "max_depth": {"type": "integer", "minimum": 1, "maximum": 32},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    }
+    for tool_id, schema in schemas.items():
+        validate_computer_tool_schema(profile, tool_id=tool_id, input_schema=schema)
+
+    over_limit = dict(schemas["computer.file.write"])
+    over_limit["properties"] = {
+        **schemas["computer.file.write"]["properties"],  # type: ignore[dict-item]
+        "content_base64": {"type": "string", "maxLength": 1_398_108},
+    }
+    with pytest.raises(ValueError, match=r"file\.write schema"):
+        validate_computer_tool_schema(
+            profile,
+            tool_id="computer.file.write",
+            input_schema=over_limit,
+        )
+
+
+def test_computer_dispatch_uses_exact_workspace_grants_and_no_account_lease() -> None:
+    """Typed local runner calls reuse the same exact Directory grant envelope."""
+
+    profile = computer_profile()
+    principal = IntegrationPrincipal(
+        issuer=profile.expected_issuer,
+        subject=actor().subject,
+        organization_id=profile.organization_id,
+        workspace_id=profile.workspace_id,
+        allowed_operation_ids=frozenset({"computer.command.execute"}),
+    )
+    arguments: dict[str, object] = {
+        "command": "printf done",
+        "cwd": ".",
+        "timeout_ms": 1_000,
+    }
+    workspace_target = {"workspace_ref": profile.connection_ref}
+    resource_ref = _resource_ref(
+        provider_id="computer",
+        profile_ref=profile.profile_ref,
+        operation_id="computer.command.execute",
+        target=workspace_target,
+    )
+    calls: list[dict[str, object]] = []
+
+    class _Computer:
+        def call_provider_tool(
+            self,
+            *,
+            tool_id: str,
+            payload: dict[str, object],
+        ) -> dict[str, object]:
+            calls.append({"tool_id": tool_id, "payload": payload})
+            return {
+                "status": "COMMAND_COMPLETED",
+                "exit_code": 0,
+                "duration_ms": 3,
+                "stdout": "done",
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "sha256_hash": "a" * 64,
+                "resource_usage": None,
+                "isError": False,
+            }
+
+    dispatcher = ConnectorOperationDispatcher(
+        store=SimpleNamespace(),
+        accounts=SimpleNamespace(),
+        github=SimpleNamespace(),
+        authorization_cloud=None,
+        registry=None,
+        computer=_Computer(),
+        computer_runner_profile=profile,
+    )
+    prepared = dispatcher.prepare_computer_operation(
+        principal=principal,
+        profile=profile,
+        connection_ref=profile.connection_ref,
+        provider_id="computer",
+        profile_ref=profile.profile_ref,
+        operation_id="computer.command.execute",
+        resource_ref=resource_ref,
+        arguments=arguments,
+        request_id="computer-command-1",
+    )
+    claims = ConnectorGrantClaims(
+        request_id=prepared.request_id,
+        audience="exchange",
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        principal_issuer=principal.issuer,
+        principal_subject=principal.subject,
+        connection_ref=profile.connection_ref,
+        provider_id="computer",
+        profile_ref=profile.profile_ref,
+        operation_id=prepared.operation_id,
+        resource_ref=prepared.resource_ref,
+        arguments_digest_sha256=bytes.fromhex(digest_arguments(arguments)),
+        issued_at_epoch=1_000.0,
+        expires_at_epoch=1_015.0,
+        grant_ref="sha256:" + "a" * 64,
+    )
+
+    result = dispatcher.invoke(prepared, principal=principal, claims=claims)
+
+    assert prepared.connection is None
+    assert prepared.account_lease_target is None
+    assert prepared.is_mutating is True
+    assert calls == [{"tool_id": "computer.command.execute", "payload": arguments}]
+    assert result["status"] == "COMMAND_COMPLETED"
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "arguments"),
+    [
+        ("computer.command.execute", {"command": "echo hi", "cwd": "../outside"}),
+        ("computer.command.execute", {"command": "\x00bad"}),
+        (
+            "computer.file.read",
+            {"path": "src/main.py", "length": 65_537},
+        ),
+        (
+            "computer.file.write",
+            {"path": "../outside.txt", "content_base64": "YQ==", "overwrite": True},
+        ),
+        (
+            "computer.directory.list",
+            {"path": "src", "max_depth": 33},
+        ),
+    ],
+)
+def test_computer_dispatch_rejects_paths_and_limits_outside_the_host_profile(
+    operation_id: str,
+    arguments: dict[str, object],
+) -> None:
+    """Path traversal and profile limit violations fail before provider authorization."""
+
+    profile = computer_profile()
+    principal = IntegrationPrincipal(
+        issuer=profile.expected_issuer,
+        subject=actor().subject,
+        organization_id=profile.organization_id,
+        workspace_id=profile.workspace_id,
+        allowed_operation_ids=frozenset({operation_id}),
+    )
+    dispatcher = ConnectorOperationDispatcher(
+        store=SimpleNamespace(),
+        accounts=SimpleNamespace(),
+        github=SimpleNamespace(),
+        authorization_cloud=None,
+        registry=None,
+        computer=SimpleNamespace(),
+        computer_runner_profile=profile,
+    )
+    target = {
+        "workspace_ref": profile.connection_ref,
+        **({"path": str(arguments.get("path"))} if "path" in arguments else {}),
+    }
+    resource_ref = _resource_ref(
+        provider_id="computer",
+        profile_ref=profile.profile_ref,
+        operation_id=operation_id,
+        target=target,
+    )
+    with pytest.raises(ValueError):
+        dispatcher.prepare_computer_operation(
+            principal=principal,
+            profile=profile,
+            connection_ref=profile.connection_ref,
+            provider_id="computer",
+            profile_ref=profile.profile_ref,
+            operation_id=operation_id,
+            resource_ref=resource_ref,
+            arguments=arguments,
+            request_id="computer-invalid-1",
+        )
 
 
 def test_runpod_resource_bindings_use_the_navigator_cloud_target_projection() -> None:

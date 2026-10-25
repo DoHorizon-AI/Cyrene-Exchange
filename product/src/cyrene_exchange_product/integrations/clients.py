@@ -1,4 +1,4 @@
-"""Production clients for fixed Account Center and GitHub capabilities.
+"""Production clients for fixed Account Center, GitHub, and computer capabilities.
 
 Every call targets a host-resolved DirectPluginRuntime endpoint and a fixed
 capability method. Payloads contain only the capability contract, never a
@@ -8,6 +8,7 @@ caller-selected endpoint or credential.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import re
@@ -79,11 +80,30 @@ GITHUB_TOOL_IDS = frozenset(
         "github.pull_requests.list",
         "github.pull_request.get",
         "github.actions.runs.list",
+        "github.issues.search",
+        "github.actions.jobs.list",
+        "github.actions.job.logs.read",
+        "github.branch.create",
+        "github.branch.delete",
+        "github.branch.get",
+        "github.file.commit",
+        "github.file.get",
+        "github.pull_request.draft.create",
+        "github.pull_request.draft.find",
+        "github.actions.rerun_failed",
         "github.ci.status",
         "github_vendor_cli",
         "github.issue.get",
         "github.issue.comment.create",
         "github.issue.state.update",
+    }
+)
+COMPUTER_TOOL_IDS = frozenset(
+    {
+        "computer.command.execute",
+        "computer.file.read",
+        "computer.file.write",
+        "computer.directory.list",
     }
 )
 
@@ -1293,7 +1313,7 @@ def _principal_for_authorization(authorization: AccountAuthorization) -> Integra
 
 
 class GitHubIssuesClient:
-    """Invoke only the three allowlisted GitHub issue tools through Plugins."""
+    """Read and invoke fixed GitHub provider tools through Plugins."""
 
     def __init__(
         self,
@@ -1506,6 +1526,111 @@ class GitHubIssuesClient:
         if response.type_url != "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse":
             raise RuntimeError("GitHub provider returned an unexpected response type")
         return _decode_tool_result(response.value, tool_id=tool_id)
+
+
+class ComputerRunnerClient:
+    """Invoke only the fixed, mTLS-bound computer tools without passing caller or profile data."""
+
+    def __init__(
+        self,
+        client: DirectInvoker,
+        *,
+        binding_id: str,
+        deadline_seconds: float = 605.0,
+    ) -> None:
+        if binding_id != "computer-runtime" or deadline_seconds <= 0:
+            raise ValueError("computer runtime requires its fixed binding and positive deadline")
+        self._client = client
+        self._binding_id = binding_id
+        self._deadline_seconds = deadline_seconds
+
+    def list_tool_catalog(self) -> tuple[ProviderToolDefinition, ...]:
+        """Read the actual computer tool schemas from the configured private plugin peer."""
+
+        return list_provider_tool_catalog(
+            self._client,
+            binding_id=self._binding_id,
+            deadline_seconds=min(self._deadline_seconds, 10.0),
+        )
+
+    def call_provider_tool(
+        self,
+        *,
+        tool_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, Any]:
+        """Send schema arguments only over the host-configured mTLS plugin channel."""
+
+        if tool_id not in COMPUTER_TOOL_IDS:
+            raise ValueError("computer provider tool is not in the fixed Exchange allowlist")
+        from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
+            tool_provider_pb2 as tool_wire,
+        )
+
+        call = tool_wire.CallToolRequest(
+            binding_id=self._binding_id,
+            provider_tool_id=tool_id,
+            arguments_json=canonical_json(dict(payload)).decode("utf-8"),
+        )
+        try:
+            response = self._client.invoke(
+                capability=PROVIDER_CAPABILITY,
+                interface_version="1",
+                method="call_tool",
+                request=_direct_payload(
+                    "type.cyrene.io/cyrene.tool.provider.v1.CallToolRequest",
+                    call.SerializeToString(deterministic=True),
+                ),
+                deadline_seconds=self._deadline_seconds,
+                request_id=str(uuid4()),
+            )
+        except Exception as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_COMPUTER_PROVIDER_UNAVAILABLE",
+                title="Computer runner unavailable",
+                detail="The configured isolated computer runtime did not complete the request.",
+                status=503,
+                retryable=True,
+            ) from exc
+        if response.type_url != "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse":
+            raise ExchangeProductError(
+                code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                title="Computer runner response invalid",
+                detail="The configured computer runtime returned an unexpected response type.",
+                status=502,
+            )
+        result = _decode_computer_provider_result(response.value, tool_id=tool_id)
+        if tool_id == "computer.file.write":
+            encoded = payload.get("content_base64")
+            if not isinstance(encoded, str):
+                raise ValueError("computer file.write payload is malformed")
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (TypeError, ValueError, binascii.Error) as exc:
+                raise ValueError("computer file.write payload is malformed") from exc
+            if base64.b64encode(content).decode("ascii") != encoded or result.get(
+                "bytes_written"
+            ) != len(content):
+                raise ExchangeProductError(
+                    code="EXCHANGE_COMPUTER_WRITE_UNCONFIRMED",
+                    title="Computer file write could not be confirmed",
+                    detail="The runtime did not report the expected number of written bytes.",
+                    status=502,
+                )
+        elif tool_id == "computer.file.read":
+            requested_length = payload.get("length")
+            if (
+                isinstance(requested_length, bool)
+                or not isinstance(requested_length, int)
+                or result.get("size_bytes", requested_length + 1) > requested_length
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                    title="Computer runner response invalid",
+                    detail="The file read result exceeds its requested chunk size.",
+                    status=502,
+                )
+        return result
 
 
 class GitHubWebhookClient:
@@ -2621,6 +2746,258 @@ def _decode_generic_provider_result(value: bytes, *, provider: str) -> dict[str,
         detail=f"The configured {provider} provider must return one structured JSON object.",
         status=502,
     )
+
+
+def _decode_computer_provider_result(value: bytes, *, tool_id: str) -> dict[str, Any]:
+    """Validate one computer tool result and keep the serialized reply bounded."""
+
+    from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
+        tool_provider_pb2 as tool_wire,
+    )
+
+    if len(value) > 1_000_000:
+        raise ExchangeProductError(
+            code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_TOO_LARGE",
+            title="Computer result is too large",
+            detail="The computer runtime response exceeds Exchange's bounded transport size.",
+            status=502,
+        )
+    try:
+        response = tool_wire.CallToolResponse.FromString(value)
+    except Exception as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+            title="Computer runner response invalid",
+            detail="The computer runtime returned malformed response data.",
+            status=502,
+        ) from exc
+    result_kind = response.WhichOneof("result")
+    if result_kind == "error":
+        try:
+            code_name = tool_wire.ToolProviderErrorCode.Name(response.error.code)
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                title="Computer runner response invalid",
+                detail="The computer runtime returned an unknown protocol error.",
+                status=502,
+            ) from exc
+        _raise_provider_error(code_name, retryable=response.error.retryable)
+    if result_kind != "outcome":
+        raise ExchangeProductError(
+            code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+            title="Computer runner response invalid",
+            detail="The computer runtime returned no structured result.",
+            status=502,
+        )
+    try:
+        result = _computer_structured_tool_json(response.outcome.content)
+    except Exception as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+            title="Computer runner response invalid",
+            detail="The computer runtime must return one structured JSON object.",
+            status=502,
+        ) from exc
+    if response.outcome.is_error and not (
+        tool_id == "computer.command.execute" and "exit_code" in result
+    ):
+        error = result.get("error")
+        retryable = error.get("retryable") is True if isinstance(error, Mapping) else False
+        code_value = error.get("code") if isinstance(error, Mapping) else None
+        code_detail = str(code_value) if isinstance(code_value, (str, int)) else "runtime_failure"
+        raise ExchangeProductError(
+            code=(
+                "EXCHANGE_COMPUTER_PROVIDER_UNAVAILABLE"
+                if retryable
+                else "EXCHANGE_COMPUTER_OPERATION_FAILED"
+            ),
+            title="Computer operation failed",
+            detail="The isolated computer runtime could not complete the fixed operation.",
+            status=503 if retryable else 502,
+            retryable=retryable,
+            context={"reasonCode": code_detail[:64]},
+        )
+
+    safe = dict(result)
+    if tool_id == "computer.command.execute":
+        expected_fields = {
+            "exit_code",
+            "duration_ms",
+            "stdout",
+            "stderr",
+            "stdout_truncated",
+            "stderr_truncated",
+            "sha256_hash",
+            "resource_usage",
+        }
+        exit_code = safe.get("exit_code")
+        duration_ms = safe.get("duration_ms")
+        stdout = safe.get("stdout")
+        stderr = safe.get("stderr")
+        if (
+            set(safe) != expected_fields
+            or isinstance(exit_code, bool)
+            or not isinstance(exit_code, int)
+            or isinstance(duration_ms, bool)
+            or not isinstance(duration_ms, int)
+            or duration_ms < 0
+            or not isinstance(stdout, str)
+            or not isinstance(stderr, str)
+            or len(stdout.encode("utf-8")) > 65_536
+            or len(stderr.encode("utf-8")) > 65_536
+            or not isinstance(safe.get("stdout_truncated"), bool)
+            or not isinstance(safe.get("stderr_truncated"), bool)
+            or not isinstance(safe.get("sha256_hash"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(safe.get("sha256_hash")))
+            or safe.get("resource_usage") is not None
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                title="Computer runner response invalid",
+                detail="The command result exceeds its fixed output contract.",
+                status=502,
+            )
+        safe["status"] = "COMMAND_COMPLETED" if exit_code == 0 else "COMMAND_FAILED"
+        safe["isError"] = exit_code != 0
+    elif tool_id == "computer.file.write":
+        bytes_written = safe.get("bytes_written")
+        if (
+            set(safe) != {"bytes_written"}
+            or isinstance(bytes_written, bool)
+            or not isinstance(bytes_written, int)
+            or bytes_written < 0
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                title="Computer runner response invalid",
+                detail="The file write result is invalid.",
+                status=502,
+            )
+        safe["status"] = "WRITE_COMPLETED"
+    elif tool_id == "computer.file.read":
+        if set(safe) not in ({"size_bytes", "content_text"}, {"size_bytes", "content_base64"}):
+            raise ExchangeProductError(
+                code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                title="Computer runner response invalid",
+                detail="The bounded file read result contains unexpected fields.",
+                status=502,
+            )
+        size_bytes = safe.get("size_bytes")
+        text_content = safe.get("content_text")
+        base64_content = safe.get("content_base64")
+        has_text = isinstance(text_content, str)
+        has_base64 = isinstance(base64_content, str)
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+            or has_text == has_base64
+            or (isinstance(text_content, str) and len(text_content.encode("utf-8")) > 65_536)
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                title="Computer runner response invalid",
+                detail="The bounded file read result is invalid.",
+                status=502,
+            )
+        if has_text:
+            assert isinstance(text_content, str)
+            if len(text_content.encode("utf-8")) != size_bytes:
+                raise ExchangeProductError(
+                    code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                    title="Computer runner response invalid",
+                    detail="The file read size does not match its returned UTF-8 content.",
+                    status=502,
+                )
+        else:
+            assert isinstance(base64_content, str)
+            try:
+                decoded = base64.b64decode(base64_content, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                    title="Computer runner response invalid",
+                    detail="The file read content is not valid base64.",
+                    status=502,
+                ) from exc
+            if (
+                len(decoded) > 65_536
+                or len(decoded) != size_bytes
+                or base64.b64encode(decoded).decode("ascii") != base64_content
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                    title="Computer runner response invalid",
+                    detail="The file read exceeds its chunk limit or uses non-canonical base64.",
+                    status=502,
+                )
+    elif tool_id == "computer.directory.list":
+        entries = safe.get("entries")
+        if set(safe) != {"entries"} or not isinstance(entries, list):
+            raise ExchangeProductError(
+                code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                title="Computer runner response invalid",
+                detail="The directory list result is invalid.",
+                status=502,
+            )
+        for entry in entries:
+            if (
+                not isinstance(entry, Mapping)
+                or set(entry) != {"name", "is_directory", "size_bytes", "modified_at_ms"}
+                or not isinstance(entry.get("name"), str)
+                or not entry["name"]
+                or "\x00" in entry["name"]
+                or len(entry["name"].encode("utf-8")) > 1024
+                or not isinstance(entry.get("is_directory"), bool)
+                or isinstance(entry.get("size_bytes"), bool)
+                or not isinstance(entry.get("size_bytes"), int)
+                or entry["size_bytes"] < 0
+                or isinstance(entry.get("modified_at_ms"), bool)
+                or not isinstance(entry.get("modified_at_ms"), int)
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+                    title="Computer runner response invalid",
+                    detail="A directory entry does not match the fixed result contract.",
+                    status=502,
+                )
+
+    try:
+        response_bytes = len(canonical_json(safe))
+    except (TypeError, ValueError) as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_INVALID",
+            title="Computer runner response invalid",
+            detail="The computer result is outside the JSON response contract.",
+            status=502,
+        ) from exc
+    if response_bytes > 800_000:
+        raise ExchangeProductError(
+            code="EXCHANGE_COMPUTER_PROVIDER_RESPONSE_TOO_LARGE",
+            title="Computer result is too large",
+            detail="The computer result exceeds Exchange's bounded response size.",
+            status=502,
+        )
+    return safe
+
+
+def _computer_structured_tool_json(content: Any) -> dict[str, Any]:
+    """Read exactly one duplicate-free JSON result from the fixed host runner."""
+
+    if len(content) != 1 or content[0].WhichOneof("content") != "json":
+        raise ValueError("computer provider must return one structured JSON result")
+    try:
+        decoded = json.loads(
+            content[0].json.json,
+            object_pairs_hook=_reject_duplicate_json_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise ValueError("computer provider returned malformed structured JSON") from exc
+    if not isinstance(decoded, Mapping):
+        raise ValueError("computer provider result must be a JSON object")
+    return dict(decoded)
 
 
 def _raise_provider_error(

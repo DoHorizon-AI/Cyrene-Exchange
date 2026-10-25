@@ -32,12 +32,17 @@ from cyrene_exchange_product.integrations.auth import (
     canonical_json,
 )
 from cyrene_exchange_product.integrations.clients import (
+    COMPUTER_TOOL_IDS,
+    GITHUB_TOOL_IDS,
     AccountCenterClient,
+    ComputerRunnerClient,
     GitHubIssuesClient,
     GitHubWebhookClient,
     PlatformAuthorityDelegationClient,
     TeamsMessageClient,
     WeComMessageClient,
+    _computer_structured_tool_json,
+    _decode_computer_provider_result,
     _decode_tool_result,
 )
 
@@ -279,6 +284,224 @@ def test_github_tool_call_signs_fixed_tool_and_exact_public_args() -> None:
         context["signature"],
         hmac.new(b"g" * 32, canonical_json(unsigned), hashlib.sha256).hexdigest(),
     )
+
+
+def test_github_proactive_tool_call_uses_the_existing_provider_capability() -> None:
+    """New GitHub operations use the same signed tool.provider.v1 call envelope."""
+
+    response = tool_wire.CallToolResponse(
+        outcome=tool_wire.ToolCallOutcome(
+            content=[
+                tool_wire.ToolContentPart(
+                    json=tool_wire.ToolJsonContent(json='{"status":"CREATED","verified":true}')
+                )
+            ],
+            is_error=False,
+        )
+    )
+    transport = _DirectClient(
+        [
+            DirectPayload(
+                "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse",
+                response.SerializeToString(deterministic=True),
+            )
+        ]
+    )
+    client = GitHubIssuesClient(
+        transport,
+        signer=AccountCenterRequestSigner(caller_id="exchange-service", key=b"g" * 32),
+        binding_id="github-provider-binding",
+    )
+    arguments = {
+        "repository_id": "42",
+        "repository": "acme/demo",
+        "branch": "task/assistant-v1",
+        "from_sha": "a" * 40,
+    }
+    assert {
+        "github.issues.search",
+        "github.actions.jobs.list",
+        "github.actions.job.logs.read",
+        "github.branch.create",
+        "github.branch.delete",
+        "github.branch.get",
+        "github.file.commit",
+        "github.file.get",
+        "github.pull_request.draft.create",
+        "github.pull_request.draft.find",
+        "github.actions.rerun_failed",
+    } <= GITHUB_TOOL_IDS
+
+    result = client.call_provider_tool(
+        _principal(),
+        tool_id="github.branch.create",
+        profile_ref="github-app-profile",
+        lease_ref="provider-lease-ref",
+        payload=arguments,
+    )
+
+    call = transport.calls[0]
+    request = tool_wire.CallToolRequest.FromString(call["request"].value)
+    envelope = json.loads(request.arguments_json)
+    assert result == {"status": "CREATED", "verified": True}
+    assert call["capability"] == "tool.provider.v1"
+    assert call["method"] == "call_tool"
+    assert request.provider_tool_id == "github.branch.create"
+    assert envelope["profile_ref"] == "github-app-profile"
+    assert envelope["lease_ref"] == "provider-lease-ref"
+    assert envelope["payload"] == arguments
+
+
+@pytest.mark.parametrize(("exit_code", "tool_error"), [(0, False), (2, True)])
+def test_computer_runner_call_passes_only_typed_args_over_the_fixed_plugin_binding(
+    exit_code: int, tool_error: bool
+) -> None:
+    """No model profile, account lease, or other identity field reaches the runner."""
+
+    result_value = {
+        "exit_code": exit_code,
+        "duration_ms": 9,
+        "stdout": "done",
+        "stderr": "" if exit_code == 0 else "failed",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "sha256_hash": "a" * 64,
+        "resource_usage": None,
+    }
+    response = tool_wire.CallToolResponse(
+        outcome=tool_wire.ToolCallOutcome(
+            content=[
+                tool_wire.ToolContentPart(
+                    json=tool_wire.ToolJsonContent(
+                        json=json.dumps(result_value, separators=(",", ":"))
+                    )
+                )
+            ],
+            is_error=tool_error,
+        )
+    )
+    transport = _DirectClient(
+        [
+            DirectPayload(
+                "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse",
+                response.SerializeToString(deterministic=True),
+            )
+        ]
+    )
+    client = ComputerRunnerClient(transport, binding_id="computer-runtime")
+    arguments = {"command": "printf done", "cwd": ".", "timeout_ms": 1_000}
+
+    result = client.call_provider_tool(
+        tool_id="computer.command.execute",
+        payload=arguments,
+    )
+
+    call = transport.calls[0]
+    request = tool_wire.CallToolRequest.FromString(call["request"].value)
+    assert call["capability"] == "tool.provider.v1"
+    assert call["method"] == "call_tool"
+    assert request.binding_id == "computer-runtime"
+    assert request.provider_tool_id == "computer.command.execute"
+    assert request.arguments_json == canonical_json(arguments).decode("utf-8")
+    assert set(json.loads(request.arguments_json)) == {"command", "cwd", "timeout_ms"}
+    assert set(COMPUTER_TOOL_IDS) == {
+        "computer.command.execute",
+        "computer.file.read",
+        "computer.file.write",
+        "computer.directory.list",
+    }
+    assert result["status"] == ("COMMAND_COMPLETED" if exit_code == 0 else "COMMAND_FAILED")
+    assert result["isError"] is (exit_code != 0)
+
+
+def test_computer_file_write_rejects_unconfirmed_byte_count() -> None:
+    """A provider response cannot claim a complete file write with a partial count."""
+
+    response = tool_wire.CallToolResponse(
+        outcome=tool_wire.ToolCallOutcome(
+            content=[
+                tool_wire.ToolContentPart(
+                    json=tool_wire.ToolJsonContent(json='{"bytes_written":0}')
+                )
+            ]
+        )
+    )
+    transport = _DirectClient(
+        [
+            DirectPayload(
+                "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse",
+                response.SerializeToString(deterministic=True),
+            )
+        ]
+    )
+    client = ComputerRunnerClient(transport, binding_id="computer-runtime")
+
+    with pytest.raises(ExchangeProductError, match="expected number of written bytes"):
+        client.call_provider_tool(
+            tool_id="computer.file.write",
+            payload={"path": "src/file.txt", "content_base64": "YQ==", "overwrite": True},
+        )
+
+
+def test_computer_file_read_size_matches_returned_chunk() -> None:
+    """The read receipt reports the bytes in this bounded chunk, not file size."""
+
+    def client_for(result: dict[str, Any]) -> ComputerRunnerClient:
+        response = tool_wire.CallToolResponse(
+            outcome=tool_wire.ToolCallOutcome(
+                content=[
+                    tool_wire.ToolContentPart(
+                        json=tool_wire.ToolJsonContent(json=json.dumps(result))
+                    )
+                ]
+            )
+        )
+        return ComputerRunnerClient(
+            _DirectClient(
+                [
+                    DirectPayload(
+                        "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse",
+                        response.SerializeToString(deterministic=True),
+                    )
+                ]
+            ),
+            binding_id="computer-runtime",
+        )
+
+    result = client_for({"size_bytes": 3, "content_text": "abc"}).call_provider_tool(
+        tool_id="computer.file.read",
+        payload={"path": "src/file.txt", "length": 3},
+    )
+    assert result["size_bytes"] == 3
+    assert result["content_text"] == "abc"
+
+    with pytest.raises(ExchangeProductError, match="does not match"):
+        client_for({"size_bytes": 4, "content_text": "abc"}).call_provider_tool(
+            tool_id="computer.file.read",
+            payload={"path": "src/file.txt", "length": 3},
+        )
+
+
+def test_computer_response_is_bounded_before_protobuf_decode() -> None:
+    """Reject an oversized private runner response before parsing its protobuf body."""
+
+    with pytest.raises(ExchangeProductError, match="bounded transport size"):
+        _decode_computer_provider_result(
+            b"x" * 1_000_001,
+            tool_id="computer.command.execute",
+        )
+
+
+def test_computer_provider_result_rejects_duplicate_json_members() -> None:
+    """Duplicate provider fields cannot bypass closed result checks."""
+
+    content = [
+        tool_wire.ToolContentPart(
+            json=tool_wire.ToolJsonContent(json='{"bytes_written":1,"bytes_written":2}')
+        )
+    ]
+    with pytest.raises(ValueError, match="malformed structured JSON"):
+        _computer_structured_tool_json(content)
 
 
 def test_provider_context_expires_within_short_operation_window() -> None:

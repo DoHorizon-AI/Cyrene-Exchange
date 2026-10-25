@@ -327,6 +327,40 @@ def test_documented_configuration_schema_accepts_default_and_enabled_email_examp
     }
     Draft202012Validator(schema).validate(connector_fragment)
 
+    computer_fragment = {
+        "hostSecretRefs": {
+            "tls/plugin-root": "PLUGIN_RUNTIME_ROOT_CERTIFICATE_PATH",
+            "tls/exchange-plugin-client-cert": "EXCHANGE_PLUGIN_CLIENT_CERTIFICATE_PATH",
+            "tls/exchange-plugin-client-key": "EXCHANGE_PLUGIN_CLIENT_PRIVATE_KEY_PATH",
+        },
+        "connectorHost": {
+            "computerRunner": {
+                "profileRef": "computer-workspace-main",
+                "connectionRef": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "organizationId": "organization-id",
+                "workspaceId": "workspace-id",
+                "expectedIssuer": (
+                    "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0"
+                ),
+                "directPlugin": {
+                    "bindingId": "computer-runtime",
+                    "connectionRef": "grpcs://computer-runtime-proxy:7443",
+                    "transport": "mtls",
+                    "mtls": {
+                        "rootCertificateRef": "tls/plugin-root",
+                        "clientCertificateRef": "tls/exchange-plugin-client-cert",
+                        "clientKeyRef": "tls/exchange-plugin-client-key",
+                    },
+                },
+                "maxCommandTimeoutMs": 600000,
+                "maxFileBytes": 1048576,
+                "maxReadBytes": 65536,
+                "maxDirectoryDepth": 32,
+            }
+        },
+    }
+    Draft202012Validator(schema).validate(computer_fragment)
+
 
 class _FakeAuthority:
     def __init__(self, principals: dict[str, IntegrationPrincipal]) -> None:

@@ -8,6 +8,26 @@ Exchange owns externally published `GatewayEndpoint` and `GatewayRoute`
 resources plus request policy. It reuses generic `model.routing.v1` and
 `model.provider.v1` capabilities for selection and execution.
 
+## Enterprise model providers
+
+An enterprise or self-hosted inference provider uses the existing
+`model.provider.v1` execution contract and opaque Platform binding. Product
+routes already carry `targetBindingId` and `targetModel`; provider deployment
+configuration owns the real endpoint and credential reference. `GatewayEndpoint`
+continues to describe the caller-facing API publication surface and is not the
+upstream inference endpoint. Exchange routes and audits calls and preserves
+provider-reported model/usage facts; the existing Plugins billing capability
+remains responsible for usage aggregation. This interface can represent a
+private provider binding, but it does not claim that a private model endpoint
+has been deployed or acceptance-tested.
+
+企业或自托管推理 Provider 沿用现有 `model.provider.v1` 执行契约和不透明 Platform
+binding。Product Route 已包含 `targetBindingId` 和 `targetModel`；实际服务地址与凭据
+引用由 Provider 部署配置管理。`GatewayEndpoint` 仍表示面向调用方发布的 API 表面，不是
+上游推理地址。Exchange 负责路由、审计并保留 Provider 报告的模型与用量事实；用量汇总
+仍由现有 Plugins billing 能力负责。该接口可表达私有 Provider binding，但不能据此声称
+私有模型端点已经部署或完成验收。
+
 ## Authority
 
 - A `GatewayEndpoint` is the external model API publication surface. It is not a
@@ -169,3 +189,16 @@ to the same repository commit. This catalog declares operation contracts only;
 Workspace policy controls access independently.
 
 本 Product 在 [../v2/catalog.json](../v2/catalog.json) 发布 Workspace 操作目录。每个目录项都将准确的 owner operationId 绑定到对应的 OpenAPI 文档和 schema pointer。发布清单会将目录及其完整 OpenAPI 引用闭包固定到同一仓库提交。目录只声明操作契约；访问权限由独立的 Workspace policy 控制。
+
+## Connector operation contract
+
+The internal connector operation allowlist and resource/digest semantics are
+documented in [`connector-operations.md`](connector-operations.md). These
+provider operations use the existing `tool.provider.v1` call path and are not
+part of the public Workspace operation catalog.
+
+## Connector 操作契约
+
+内部 connector operation allowlist 及资源/digest 语义见
+[`connector-operations.md`](connector-operations.md)。这些 Provider 操作沿用现有
+`tool.provider.v1` 调用路径，不属于公开 Workspace 操作目录。

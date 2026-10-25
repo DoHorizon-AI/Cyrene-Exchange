@@ -18,11 +18,13 @@ from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 imp
 )
 from cyrene_exchange_product.integrations.auth import AccountCenterRequestSigner
 from cyrene_exchange_product.integrations.clients import (
+    COMPUTER_TOOL_IDS,
     GitHubIssuesClient,
     ProviderToolDefinition,
     list_provider_tool_catalog,
 )
 from cyrene_exchange_product.integrations.connector_operations import connector_binding_tools
+from cyrene_exchange_product.integrations.connector_profiles import parse_connector_host_settings
 
 
 class _DirectClient:
@@ -348,6 +350,213 @@ def test_connector_tool_catalog_cli_allows_a_teams_only_empty_snapshot(
         == 0
     )
     assert json.loads(capsys.readouterr().out) == {"items": [], "schemaVersion": 1}
+
+
+def test_connector_tool_catalog_exports_host_computer_profile_without_account_connection(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The private tool catalog binds a host runner without fabricating OAuth state."""
+
+    database_path = tmp_path / "integrations.sqlite3"
+    database_path.touch()
+    issuer = "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0"
+    profile_value = {
+        "profileRef": "computer-workspace-profile",
+        "connectionRef": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "organizationId": "org-1",
+        "workspaceId": "workspace-1",
+        "expectedIssuer": issuer,
+        "directPlugin": {
+            "bindingId": "computer-runtime",
+            "connectionRef": "grpcs://computer-runner.test:443",
+            "transport": "mtls",
+            "mtls": {
+                "rootCertificateRef": "test/root-ca",
+                "clientCertificateRef": "test/client-cert",
+                "clientKeyRef": "test/client-key",
+            },
+        },
+    }
+    profile = parse_connector_host_settings({"computerRunner": profile_value}).computer_runner
+    assert profile is not None
+    schemas: dict[str, dict[str, Any]] = {
+        "computer.command.execute": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "maxLength": 8192, "x-maxUtf8Bytes": 32768},
+                "cwd": {"type": "string", "maxLength": 1024, "x-maxUtf8Bytes": 4096},
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+        "computer.file.read": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "maxLength": 1024, "x-maxUtf8Bytes": 4096},
+                "length": {"type": "integer", "minimum": 0, "maximum": 65536},
+                "offset": {"type": "integer", "minimum": 0, "maximum": (1 << 63) - 1},
+            },
+            "required": ["path", "length"],
+            "additionalProperties": False,
+        },
+        "computer.file.write": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "maxLength": 1024, "x-maxUtf8Bytes": 4096},
+                "content_base64": {"type": "string", "maxLength": 1_398_104},
+                "overwrite": {"type": "boolean"},
+            },
+            "required": ["path", "content_base64", "overwrite"],
+            "additionalProperties": False,
+        },
+        "computer.directory.list": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "maxLength": 1024, "x-maxUtf8Bytes": 4096},
+                "max_depth": {"type": "integer", "minimum": 1, "maximum": 32},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    }
+    tool_definitions = tuple(
+        ProviderToolDefinition(
+            tool_id=tool_id,
+            name=f"Computer {tool_id}",
+            description="Host-bound isolated operation.",
+            input_schema=schemas[tool_id],
+        )
+        for tool_id in COMPUTER_TOOL_IDS
+    )
+
+    class _Store:
+        def connector_bindings_for_actor(self, **_kwargs: Any) -> list[Any]:
+            return []
+
+    class _Services:
+        store = _Store()
+        computer_runner_profile = profile
+        computer_runner_client = SimpleNamespace(list_tool_catalog=lambda: tool_definitions)
+        github = SimpleNamespace()
+        authorization_cloud = None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
+    monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
+
+    result = exchange_cli.run(
+        [
+            "integrations",
+            "connector-tool-catalog",
+            "--integration-database",
+            str(database_path),
+            "--issuer",
+            issuer,
+            "--subject",
+            "actor-1",
+            "--organization-id",
+            "org-1",
+            "--workspace-id",
+            "workspace-1",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert output["schemaVersion"] == 1
+    assert len(output["items"]) == 1
+    item = output["items"][0]
+    assert item["bindingId"] == f"exchange-computer-{profile.connection_ref}"
+    assert item["capabilityId"] == "tool.provider.v1"
+    assert item["providerId"] == "computer"
+    assert item["connectionRef"] == profile.connection_ref
+    tools = {tool["id"]: tool for tool in item["tools"]}
+    assert set(tools) == COMPUTER_TOOL_IDS
+    assert tools["computer.command.execute"]["readOnly"] is False
+    assert tools["computer.file.write"]["readOnly"] is False
+    assert tools["computer.file.read"]["readOnly"] is True
+    assert tools["computer.directory.list"]["readOnly"] is True
+
+
+def test_connector_binding_map_exports_host_computer_profile_without_database_row(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Navigator receives the host runner's fixed map without an OAuth connection row."""
+
+    database_path = tmp_path / "integrations.sqlite3"
+    database_path.touch()
+    issuer = "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0"
+    profile = parse_connector_host_settings(
+        {
+            "computerRunner": {
+                "profileRef": "computer-workspace-profile",
+                "connectionRef": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "organizationId": "org-1",
+                "workspaceId": "workspace-1",
+                "expectedIssuer": issuer,
+                "directPlugin": {
+                    "bindingId": "computer-runtime",
+                    "connectionRef": "grpcs://computer-runner.test:443",
+                    "transport": "mtls",
+                    "mtls": {
+                        "rootCertificateRef": "test/root-ca",
+                        "clientCertificateRef": "test/client-cert",
+                        "clientKeyRef": "test/client-key",
+                    },
+                },
+            }
+        }
+    ).computer_runner
+    assert profile is not None
+
+    class _Store:
+        def connector_bindings_for_actor(self, **_kwargs: Any) -> list[Any]:
+            return []
+
+    class _Services:
+        store = _Store()
+        computer_runner_profile = profile
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
+    monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
+
+    result = exchange_cli.run(
+        [
+            "integrations",
+            "connector-bindings",
+            "--integration-database",
+            str(database_path),
+            "--issuer",
+            issuer,
+            "--subject",
+            "actor-1",
+            "--organization-id",
+            "org-1",
+            "--workspace-id",
+            "workspace-1",
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert len(output["bindings"]) == 1
+    binding = output["bindings"][0]
+    assert binding == {
+        "bindingId": f"exchange-computer-{profile.connection_ref}",
+        "connectionRef": profile.connection_ref,
+        "providerId": "computer",
+        "profileRef": profile.profile_ref,
+        "tools": connector_binding_tools("computer"),
+    }
 
 
 def test_connector_tool_catalog_cli_omits_legacy_oauth_issue_connections(

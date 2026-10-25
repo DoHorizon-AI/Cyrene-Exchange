@@ -1174,6 +1174,7 @@ def _make_hub(directory: Path, plugins_root: Path) -> _Hub:
         allowed_installation_ids=frozenset({"99"}),
         allowed_events=frozenset({"issues"}),
         allowed_actions=frozenset({"opened", "edited"}),
+        source_workflow_ids={},
         timeout_seconds=1.0,
     )
     lease_client = AccountCenterDirectLeaseClient(provider_settings, client=account_direct)
