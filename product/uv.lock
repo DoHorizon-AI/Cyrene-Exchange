@@ -278,7 +278,7 @@ wheels = [
 [[package]]
 name = "cyrene-account-center-contracts"
 version = "0.1.1"
-source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_account_center_contracts&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e#b977dbca6a0889be64a617ee79cea1d47a0f327e" }
+source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_account_center_contracts&rev=be048068f09b84d1b661395451aa5c54a551a86e#be048068f09b84d1b661395451aa5c54a551a86e" }
 dependencies = [
     { name = "rfc8785" },
 ]
@@ -294,8 +294,8 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cyrene-model-provider-contracts", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_model_provider_contracts&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e" },
-    { name = "cyrene-plugin-runtime", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_plugin_runtime&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e" },
+    { name = "cyrene-model-provider-contracts", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_model_provider_contracts&rev=be048068f09b84d1b661395451aa5c54a551a86e" },
+    { name = "cyrene-plugin-runtime", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_plugin_runtime&rev=be048068f09b84d1b661395451aa5c54a551a86e" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11.0" },
 ]
@@ -337,9 +337,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = "==48.0.1" },
-    { name = "cyrene-account-center-contracts", marker = "extra == 'integrations'", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_account_center_contracts&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e" },
+    { name = "cyrene-account-center-contracts", marker = "extra == 'integrations'", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_account_center_contracts&rev=be048068f09b84d1b661395451aa5c54a551a86e" },
     { name = "cyrene-exchange", editable = "../" },
-    { name = "cyrene-integration-contracts", marker = "extra == 'integrations'", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e" },
+    { name = "cyrene-integration-contracts", marker = "extra == 'integrations'", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=be048068f09b84d1b661395451aa5c54a551a86e" },
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "grpcio", specifier = "==1.62.3" },
     { name = "httpx", specifier = "==0.28.1" },
@@ -364,7 +364,7 @@ dev = [
 [[package]]
 name = "cyrene-integration-contracts"
 version = "0.1.0"
-source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e#b977dbca6a0889be64a617ee79cea1d47a0f327e" }
+source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=be048068f09b84d1b661395451aa5c54a551a86e#be048068f09b84d1b661395451aa5c54a551a86e" }
 dependencies = [
     { name = "jsonschema" },
 ]
@@ -372,12 +372,12 @@ dependencies = [
 [[package]]
 name = "cyrene-model-provider-contracts"
 version = "0.1.0"
-source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_model_provider_contracts&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e#b977dbca6a0889be64a617ee79cea1d47a0f327e" }
+source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_model_provider_contracts&rev=be048068f09b84d1b661395451aa5c54a551a86e#be048068f09b84d1b661395451aa5c54a551a86e" }
 
 [[package]]
 name = "cyrene-plugin-runtime"
 version = "0.2.2"
-source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_plugin_runtime&rev=b977dbca6a0889be64a617ee79cea1d47a0f327e#b977dbca6a0889be64a617ee79cea1d47a0f327e" }
+source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_plugin_runtime&rev=be048068f09b84d1b661395451aa5c54a551a86e#be048068f09b84d1b661395451aa5c54a551a86e" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },
