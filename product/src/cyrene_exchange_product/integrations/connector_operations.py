@@ -1043,12 +1043,15 @@ def _validate_github_target(
         if "updated_since" in arguments:
             updated_since = arguments["updated_since"]
             if not isinstance(updated_since, str) or not re.fullmatch(
-                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z",
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)",
                 updated_since,
             ):
                 raise ValueError("GitHub updated_since must be a UTC RFC 3339 timestamp")
             try:
-                datetime.fromisoformat(updated_since[:-1] + "+00:00")
+                parsed_timestamp = (
+                    updated_since[:-1] + "+00:00" if updated_since.endswith("Z") else updated_since
+                )
+                datetime.fromisoformat(parsed_timestamp)
             except ValueError as exc:
                 raise ValueError("GitHub updated_since is not a valid timestamp") from exc
         if "page_cursor" in arguments:

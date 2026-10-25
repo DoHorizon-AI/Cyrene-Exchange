@@ -217,7 +217,7 @@ def test_proactive_github_tools_use_exact_resource_targets_and_mutability() -> N
                 "query": "bug report",
                 "limit": 25,
                 "labels": ["bug"],
-                "updated_since": "2026-10-24T09:15:30.125Z",
+                "updated_since": "2026-10-24T09:15:30.125+00:00",
                 "page_cursor": "2",
             },
             "github_repository",
@@ -360,6 +360,18 @@ def test_proactive_github_tools_use_exact_resource_targets_and_mutability() -> N
             "resourceProjection": projection_name,
             "mutating": mutating,
         }
+
+    _validate_github_target(
+        connection,
+        "github.issues.search",
+        {
+            "repository_id": "42",
+            "repository": "acme/demo",
+            "state": "ALL",
+            "limit": 25,
+            "updated_since": "2026-10-24T09:15:30Z",
+        },
+    )
 
     rerun_arguments = {
         "repository_id": "42",
