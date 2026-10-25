@@ -448,6 +448,16 @@ RPCs retain the 3-second default.
 HTTP 请求最多 15 秒。该值必须大于 0 且不超过 120 秒。其他 Account Center RPC 仍使用
 3 秒默认时限。
 
+`githubIssues.deadlineSeconds` bounds one Exchange-to-GitHub provider RPC. It defaults to 50
+seconds to cover the provider's Account Center lease request and GitHub HTTPS call in sequence;
+the host may configure a finite value up to 120 seconds. Exchange runs this synchronous provider
+call on its bounded worker pool so it does not block chat or health requests. A timed-out write
+remains `uncertain` and is not automatically repeated.
+
+`githubIssues.deadlineSeconds` 限制一次 Exchange 到 GitHub Provider 的 RPC。默认 50 秒，覆盖 Provider
+串行请求 Account Center 租约与 GitHub HTTPS API；Host 可配置不超过 120 秒的有限值。Exchange 会在线程池
+中执行同步 Provider 调用，避免阻塞聊天和健康检查。写操作超时会保持 `uncertain`，不会自动重试。
+
 生产环境的 integration-only listener 需运行 `serve --mode integration-only`，并同时设置
 `CYRENE_EXCHANGE_TLS_CERT_FILE` 与 `CYRENE_EXCHANGE_TLS_KEY_FILE` 指向挂载的证书和私钥文件，
 也可使用 `--tls-cert-file` / `--tls-key-file`。证书 SAN 必须覆盖内部 DNS 名 `exchange`。

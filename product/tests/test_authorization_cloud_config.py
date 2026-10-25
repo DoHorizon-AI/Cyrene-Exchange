@@ -395,11 +395,21 @@ class _FakeHealth:
         self.closed = True
 
 
+@pytest.mark.parametrize(
+    ("github_deadline_seconds", "expected_deadline_seconds"),
+    [(None, 50.0), (37.5, 37.5)],
+    ids=("default-provider-budget", "configured-provider-budget"),
+)
 def test_production_builder_wires_profiles_and_rechecks_rotating_bearer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    github_deadline_seconds: float | None,
+    expected_deadline_seconds: float,
 ) -> None:
-    _, environ = _config(tmp_path)
+    configuration, environ = _config(tmp_path)
+    if github_deadline_seconds is not None:
+        configuration["githubIssues"]["deadlineSeconds"] = github_deadline_seconds
+        environ[integration_cli.CONFIGURATION_ENV] = json.dumps(configuration)
     operations = {
         "integrationCreateConnection",
         "integrationGetAuthorizationHealth",
@@ -450,6 +460,7 @@ def test_production_builder_wires_profiles_and_rechecks_rotating_bearer(
         assert services.email_notifications is not None
         assert services.authorization_cloud_runner is not None
         assert services.email_delivery_recipient_resolver is not None
+        assert services.github._deadline_seconds == expected_deadline_seconds
 
         request = CreateIntegrationConnection(
             provider="azure",
@@ -496,6 +507,22 @@ def test_production_builder_wires_profiles_and_rechecks_rotating_bearer(
         assert direct_clients and all(client.invokes == 0 for client in direct_clients)
     finally:
         services.close()
+
+
+@pytest.mark.parametrize("deadline_seconds", [0, 121, True, "25", 10**1000])
+def test_host_preflight_rejects_invalid_github_provider_deadline(
+    tmp_path: Path,
+    deadline_seconds: object,
+) -> None:
+    configuration, environ = _config(tmp_path)
+    configuration["githubIssues"]["deadlineSeconds"] = deadline_seconds
+    environ[integration_cli.CONFIGURATION_ENV] = json.dumps(configuration)
+
+    with pytest.raises(
+        integration_cli.IntegrationConfigurationError,
+        match=r"githubIssues\.deadlineSeconds",
+    ):
+        integration_cli.validate_host_configuration(environ=environ)
 
 
 def test_minimal_teams_github_huggingface_profile_builds_without_legacy_services(
