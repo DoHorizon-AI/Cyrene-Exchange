@@ -1,7 +1,8 @@
-"""Versioned HTTP facade for linked accounts and fixed GitHub workflows.
+"""Versioned HTTP facade for linked accounts and fixed connector operations.
 
 Public identity is derived only from Platform verification. Webhook bytes are
-verified by the configured GitHub capability before Exchange persists events.
+verified by the configured GitHub capability before Exchange persists events;
+host runner operations remain tied to one private binding and exact grant.
 """
 
 from __future__ import annotations
@@ -588,6 +589,8 @@ class IntegrationServices:
         connector_operation_dispatcher: Any = None,
         teams_message_client: Any = None,
         teams_message_profile: Any = None,
+        computer_runner_client: Any = None,
+        computer_runner_profile: Any = None,
         authorization_profile_registry: Any = None,
         transport_clients: tuple[Any, ...] = (),
     ) -> None:
@@ -618,6 +621,8 @@ class IntegrationServices:
         self.connector_operation_dispatcher = connector_operation_dispatcher
         self.teams_message_client = teams_message_client
         self.teams_message_profile = teams_message_profile
+        self.computer_runner_client = computer_runner_client
+        self.computer_runner_profile = computer_runner_profile
         self.authorization_profile_registry = authorization_profile_registry
         self.transport_clients = transport_clients
 
@@ -2025,6 +2030,32 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     arguments=body.arguments,
                     request_id=body.request_id,
                 )
+            elif body.connection_ref == getattr(
+                services.computer_runner_profile, "connection_ref", None
+            ):
+                profile = services.computer_runner_profile
+                if profile is None:
+                    raise PermissionError("computer runner profile is not configured")
+                if body.workspace_id != profile.workspace_id:
+                    raise PermissionError("computer runner workspace is outside the host binding")
+                principal_value = IntegrationPrincipal(
+                    issuer=body.principal_issuer,
+                    subject=body.principal_subject,
+                    organization_id=profile.organization_id,
+                    workspace_id=profile.workspace_id,
+                    allowed_operation_ids=frozenset({body.operation_id}),
+                )
+                prepared = dispatcher.prepare_computer_operation(
+                    principal=principal_value,
+                    profile=profile,
+                    connection_ref=body.connection_ref,
+                    provider_id=body.provider_id,
+                    profile_ref=body.profile_ref,
+                    operation_id=body.operation_id,
+                    resource_ref=body.resource_ref,
+                    arguments=body.arguments,
+                    request_id=body.request_id,
+                )
             else:
                 connection_id = UUID(body.connection_ref)
                 connection = services.store.connector_connection_for_actor(
@@ -2088,10 +2119,10 @@ def create_router(services: IntegrationServices) -> APIRouter:
         expected = {
             "request_id": body.request_id,
             "organization_id": prepared.expected_organization_id,
-            "workspace_id": body.workspace_id,
+            "workspace_id": prepared.expected_workspace_id,
             "principal_issuer": body.principal_issuer,
             "principal_subject": body.principal_subject,
-            "connection_ref": body.connection_ref,
+            "connection_ref": prepared.connection_ref,
             "provider_id": prepared.provider_id,
             "profile_ref": prepared.profile_ref,
             "operation_id": prepared.operation_id,
@@ -2209,23 +2240,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 detail="The connector grant does not target this route.",
                 status=403,
             )
-        try:
-            connection_id = UUID(connection_ref)
-        except ValueError as exc:
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_NOT_FOUND",
-                title="Connector connection not found",
-                detail="The requested connector connection does not exist.",
-                status=404,
-            ) from exc
         provisional = verifier.inspect(grant_bytes)
-        connection = services.store.connector_connection_for_actor(
-            connection_id,
-            issuer=provisional.principal_issuer,
-            subject=provisional.principal_subject,
-            workspace_id=provisional.workspace_id,
-            organization_id=provisional.organization_id,
-        )
         principal_value = IntegrationPrincipal(
             issuer=provisional.principal_issuer,
             subject=provisional.principal_subject,
@@ -2233,40 +2248,87 @@ def create_router(services: IntegrationServices) -> APIRouter:
             workspace_id=provisional.workspace_id,
             allowed_operation_ids=frozenset({body.operation_id}),
         )
-        try:
-            prepared = dispatcher.prepare_connection_operation(
-                principal=principal_value,
-                connection=connection,
-                provider_id=body.provider_id,
-                profile_ref=body.profile_ref,
-                operation_id=body.operation_id,
-                resource_ref=body.resource_ref,
-                arguments=body.arguments,
-                request_id=body.request_id,
+        computer_profile = services.computer_runner_profile
+        if computer_profile is not None and connection_ref == computer_profile.connection_ref:
+            try:
+                prepared = dispatcher.prepare_computer_operation(
+                    principal=principal_value,
+                    profile=computer_profile,
+                    connection_ref=connection_ref,
+                    provider_id=body.provider_id,
+                    profile_ref=body.profile_ref,
+                    operation_id=body.operation_id,
+                    resource_ref=body.resource_ref,
+                    arguments=body.arguments,
+                    request_id=body.request_id,
+                )
+            except PermissionError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Connector authorization denied",
+                    detail="The computer operation is outside the verified host workspace.",
+                    status=403,
+                    context={"reasonCode": "computer_scope_mismatch"},
+                ) from exc
+            except ValueError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                    title="Connector request is invalid",
+                    detail="The computer operation does not match its fixed argument schema.",
+                    status=422,
+                ) from exc
+            connection = None
+        else:
+            try:
+                connection_id = UUID(connection_ref)
+            except ValueError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_NOT_FOUND",
+                    title="Connector connection not found",
+                    detail="The requested connector connection does not exist.",
+                    status=404,
+                ) from exc
+            connection = services.store.connector_connection_for_actor(
+                connection_id,
+                issuer=provisional.principal_issuer,
+                subject=provisional.principal_subject,
+                workspace_id=provisional.workspace_id,
+                organization_id=provisional.organization_id,
             )
-        except PermissionError as exc:
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
-                title="Connector authorization denied",
-                detail="The connector operation is outside the verified actor or host binding.",
-                status=403,
-                context={"reasonCode": "connector_scope_mismatch"},
-            ) from exc
-        except ValueError as exc:
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
-                title="Connector request is invalid",
-                detail="The provider operation does not match its fixed argument schema.",
-                status=422,
-            ) from exc
+            try:
+                prepared = dispatcher.prepare_connection_operation(
+                    principal=principal_value,
+                    connection=connection,
+                    provider_id=body.provider_id,
+                    profile_ref=body.profile_ref,
+                    operation_id=body.operation_id,
+                    resource_ref=body.resource_ref,
+                    arguments=body.arguments,
+                    request_id=body.request_id,
+                )
+            except PermissionError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Connector authorization denied",
+                    detail="The connector operation is outside the verified actor or host binding.",
+                    status=403,
+                    context={"reasonCode": "connector_scope_mismatch"},
+                ) from exc
+            except ValueError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                    title="Connector request is invalid",
+                    detail="The provider operation does not match its fixed argument schema.",
+                    status=422,
+                ) from exc
         calculated_digest = digest_arguments(prepared.arguments)
         expected = {
             "request_id": body.request_id,
-            "organization_id": connection.organization_id,
-            "workspace_id": connection.workspace_id,
+            "organization_id": prepared.expected_organization_id,
+            "workspace_id": prepared.expected_workspace_id,
             "principal_issuer": provisional.principal_issuer,
             "principal_subject": provisional.principal_subject,
-            "connection_ref": str(connection.id),
+            "connection_ref": prepared.connection_ref,
             "provider_id": prepared.provider_id,
             "profile_ref": prepared.profile_ref,
             "operation_id": prepared.operation_id,
@@ -2278,7 +2340,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             expected=expected,
         )
         envelope_sha256 = _connector_envelope_sha256(
-            connection_ref=str(connection.id),
+            connection_ref=prepared.connection_ref,
             provider_id=prepared.provider_id,
             profile_ref=prepared.profile_ref,
             operation_id=prepared.operation_id,
@@ -2289,7 +2351,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             reservation = services.store.reserve_connector_invocation(
                 principal_value,
                 request_id=body.request_id,
-                connection_ref=str(connection.id),
+                connection_ref=prepared.connection_ref,
                 provider_id=prepared.provider_id,
                 profile_ref=prepared.profile_ref,
                 operation_id=prepared.operation_id,

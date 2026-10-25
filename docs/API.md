@@ -114,6 +114,20 @@ readback; Exchange does not replay an uncertain write.
 Directory grant 与 Account Center 一次性 lease。写操作结果未知时会等待独立 Provider
 回读；Exchange 不会重放结果不明的写入。
 
+The same private facade also accepts the four fixed `computer.*` operations only
+when a host-owned `connectorHost.computerRunner` profile is configured. It binds
+one mTLS DirectPlugin endpoint to one organization/workspace and logical runner
+workspace. Directory authorization remains per caller and exact operation;
+Exchange sends only typed tool arguments over mTLS and does not create an
+external account link. Command and file-write results use durable operation
+receipts, and uncertain effects are never automatically replayed.
+
+同一私有 facade 还支持四个固定 `computer.*` 操作，但必须由 Host 配置
+`connectorHost.computerRunner` profile。该 profile 将一个 mTLS DirectPlugin endpoint 固定
+到一个组织/workspace 与逻辑 runner workspace。Directory 仍按当前调用者和精确 operation
+授权；Exchange 只通过 mTLS 发送类型化工具参数，不创建外部账号关联。命令和文件写入保存持久
+operation 回执，效果不明时不会自动重放。
+
 Public Product HTTP timestamps use RFC3339 UTC with a trailing `Z`. Exchange
 normalizes stored or provider timestamps at the HTTP serialization boundary; it
 does not rewrite persistence or provider SDK values.

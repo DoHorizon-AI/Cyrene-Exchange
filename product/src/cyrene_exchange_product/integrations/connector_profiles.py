@@ -2,9 +2,9 @@
 ┌─────────────────────────────────────────────────────────────────────┐
 │  📄 connector_profiles.py                                           │
 │  Module: cyrene_exchange_product.integrations.connector_profiles    │
-│  Role: Parse fixed Navigator and Teams connector host bindings.      │
+│  Role: Parse Navigator, Teams, and isolated computer host bindings.  │
 │                                                                      │
-│  模块职责：解析 Navigator HMAC 与 Teams 出站 connector 的 Host 固定绑定。│
+│  模块职责：解析 Navigator HMAC、Teams 与 computer runner Host 绑定。  │
 └─────────────────────────────────────────────────────────────────────┘
 """
 
@@ -33,7 +33,7 @@ _UUID_PATH = re.compile(
 
 
 class ConnectorHostConfigurationError(ValueError):
-    """Navigator or Teams connector host settings are incomplete or ambiguous."""
+    """Navigator or host connector settings are incomplete or ambiguous."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,11 +77,38 @@ class TeamsMessageProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class ComputerRunnerProfile:
+    """Host-owned logical workspace bound to one isolated computer provider."""
+
+    profile_ref: str
+    connection_ref: str
+    organization_id: str
+    workspace_id: str
+    expected_issuer: str
+    endpoint: DirectPluginEndpointConfig
+    max_command_timeout_ms: int
+    max_file_bytes: int
+    max_read_bytes: int
+    max_directory_depth: int
+
+    def authorize_principal(self, principal: Any) -> None:
+        """Bind a verified Directory principal to this exact host workspace."""
+
+        if (
+            principal.issuer != self.expected_issuer
+            or principal.organization_id != self.organization_id
+            or principal.workspace_id != self.workspace_id
+        ):
+            raise PermissionError("computer runner is outside the configured actor scope")
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectorHostSettings:
     """Validated optional connector settings; absence leaves all paths closed."""
 
     navigator: NavigatorConnectorSettings | None
     teams_messages: TeamsMessageProfile | None
+    computer_runner: ComputerRunnerProfile | None
 
 
 def validate_teams_service_url(service_url: str, *, tenant_id: str) -> str:
@@ -154,17 +181,22 @@ def validate_teams_root_thread_id(root_thread_id: str) -> str:
 
 
 def parse_connector_host_settings(value: object) -> ConnectorHostSettings:
-    """Parse the exact host-owned Navigator/Teams profiles, never request data."""
+    """Parse the exact host-owned Navigator, Teams, and computer profiles."""
 
     root = _object(
         value,
         required=set(),
-        optional={"navigatorConnector", "teamsMessages"},
+        optional={"navigatorConnector", "teamsMessages", "computerRunner"},
         label="connectorHost",
     )
     navigator = _parse_navigator(root.get("navigatorConnector"))
     teams = _parse_teams(root.get("teamsMessages"))
-    return ConnectorHostSettings(navigator=navigator, teams_messages=teams)
+    computer = _parse_computer_runner(root.get("computerRunner"))
+    return ConnectorHostSettings(
+        navigator=navigator,
+        teams_messages=teams,
+        computer_runner=computer,
+    )
 
 
 def _parse_navigator(value: object) -> NavigatorConnectorSettings | None:
@@ -229,6 +261,92 @@ def _parse_teams(value: object) -> TeamsMessageProfile | None:
         endpoint=_endpoint(item["directPlugin"], "teamsMessages.directPlugin"),
         expected_issuer=issuer,
     )
+
+
+def _parse_computer_runner(value: object) -> ComputerRunnerProfile | None:
+    """Parse one host-fixed isolated computer binding and its narrow limits."""
+
+    if value is None:
+        return None
+    item = _object(
+        value,
+        required={
+            "profileRef",
+            "connectionRef",
+            "organizationId",
+            "workspaceId",
+            "expectedIssuer",
+            "directPlugin",
+        },
+        optional={
+            "maxCommandTimeoutMs",
+            "maxFileBytes",
+            "maxReadBytes",
+            "maxDirectoryDepth",
+        },
+        label="connectorHost.computerRunner",
+    )
+    profile_ref = _alias(item["profileRef"], "computerRunner.profileRef")
+    connection_ref = _text(item["connectionRef"], "computerRunner.connectionRef").lower()
+    if not _UUID_PATH.fullmatch(connection_ref):
+        raise ConnectorHostConfigurationError("computerRunner.connectionRef must be a UUID")
+    try:
+        endpoint = _endpoint(item["directPlugin"], "computerRunner.directPlugin")
+    except ValueError as exc:
+        raise ConnectorHostConfigurationError(
+            "computerRunner DirectPlugin endpoint is invalid"
+        ) from exc
+    if endpoint.binding_id != "computer-runtime":
+        raise ConnectorHostConfigurationError(
+            "computerRunner DirectPlugin bindingId must be computer-runtime"
+        )
+    if endpoint.transport != "mtls" or not endpoint.connection_ref.startswith("grpcs://"):
+        raise ConnectorHostConfigurationError(
+            "computerRunner DirectPlugin endpoint must use the private mTLS transport"
+        )
+    expected_issuer = _text(item["expectedIssuer"], "computerRunner.expectedIssuer")
+    if _AAD_ISSUER.fullmatch(expected_issuer) is None:
+        raise ConnectorHostConfigurationError(
+            "computerRunner expectedIssuer must be a Microsoft Entra issuer"
+        )
+    return ComputerRunnerProfile(
+        profile_ref=profile_ref,
+        connection_ref=connection_ref,
+        organization_id=_text(item["organizationId"], "computerRunner.organizationId"),
+        workspace_id=_text(item["workspaceId"], "computerRunner.workspaceId"),
+        expected_issuer=expected_issuer,
+        endpoint=endpoint,
+        max_command_timeout_ms=_bounded_integer(
+            item.get("maxCommandTimeoutMs", 600_000),
+            "computerRunner.maxCommandTimeoutMs",
+            minimum=1,
+            maximum=600_000,
+        ),
+        max_file_bytes=_bounded_integer(
+            item.get("maxFileBytes", 1_048_576),
+            "computerRunner.maxFileBytes",
+            minimum=1,
+            maximum=1_048_576,
+        ),
+        max_read_bytes=_bounded_integer(
+            item.get("maxReadBytes", 65_536),
+            "computerRunner.maxReadBytes",
+            minimum=0,
+            maximum=65_536,
+        ),
+        max_directory_depth=_bounded_integer(
+            item.get("maxDirectoryDepth", 32),
+            "computerRunner.maxDirectoryDepth",
+            minimum=1,
+            maximum=32,
+        ),
+    )
+
+
+def _bounded_integer(value: object, label: str, *, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ConnectorHostConfigurationError(f"{label} is outside its fixed range")
+    return value
 
 
 def _string_set(

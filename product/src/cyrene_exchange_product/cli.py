@@ -428,57 +428,75 @@ def _integration_authorization_cloud(arguments: argparse.Namespace, *, once: boo
 def _integration_connector_bindings(arguments: argparse.Namespace) -> int:
     """Export the launcher-owned connection map from trusted Exchange SQLite rows."""
 
+    from cyrene_exchange_product.integrations.cli import build_production_services
     from cyrene_exchange_product.integrations.connector_operations import (
         connector_binding_tools,
     )
-    from cyrene_exchange_product.integrations.store import IntegrationStore
 
     database_path = Path(arguments.integration_database).expanduser().resolve()
     if not database_path.is_file():
         raise SystemExit("Exchange integration database does not exist")
-    store = IntegrationStore(database_path)
+    services = build_production_services(database_path)
     try:
-        connections = store.connector_bindings_for_actor(
+        connections = services.store.connector_bindings_for_actor(
             issuer=arguments.issuer,
             subject=arguments.subject,
             workspace_id=arguments.workspace_id,
         )
+        bindings: list[dict[str, object]] = []
+        skipped = 0
+        for connection in connections:
+            provider_id = "huggingface" if connection.provider == "hf" else connection.provider
+            tools = connector_binding_tools(provider_id)
+            if not tools:
+                continue
+            profile_ref = (
+                connection.account_link_ref
+                if connection.provider in {"github", "hf"}
+                else connection.binding_ref
+            )
+            if not profile_ref or (connection.provider != "github" and not connection.target_ref):
+                skipped += 1
+                continue
+            bindings.append(
+                {
+                    "bindingId": f"exchange-{provider_id}-{connection.id}",
+                    "connectionRef": str(connection.id),
+                    "providerId": provider_id,
+                    "profileRef": profile_ref,
+                    "tools": tools,
+                }
+            )
+        computer_profile = getattr(services, "computer_runner_profile", None)
+        if (
+            computer_profile is not None
+            and computer_profile.expected_issuer == arguments.issuer
+            and computer_profile.workspace_id == arguments.workspace_id
+        ):
+            if not arguments.organization_id:
+                raise SystemExit("computer connector binding export requires --organization-id")
+            if computer_profile.organization_id == arguments.organization_id:
+                bindings.append(
+                    {
+                        "bindingId": f"exchange-computer-{computer_profile.connection_ref}",
+                        "connectionRef": computer_profile.connection_ref,
+                        "providerId": "computer",
+                        "profileRef": computer_profile.profile_ref,
+                        "tools": connector_binding_tools("computer"),
+                    }
+                )
+        if skipped:
+            print(
+                f"Skipped {skipped} provider connection(s) without a configured profile or target.",
+                file=sys.stderr,
+            )
+        payload = json.dumps(
+            {"schemaVersion": 1, "bindings": bindings},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     finally:
-        store.close()
-    bindings: list[dict[str, object]] = []
-    skipped = 0
-    for connection in connections:
-        provider_id = "huggingface" if connection.provider == "hf" else connection.provider
-        tools = connector_binding_tools(provider_id)
-        if not tools:
-            continue
-        profile_ref = (
-            connection.account_link_ref
-            if connection.provider in {"github", "hf"}
-            else connection.binding_ref
-        )
-        if not profile_ref or (connection.provider != "github" and not connection.target_ref):
-            skipped += 1
-            continue
-        bindings.append(
-            {
-                "bindingId": f"exchange-{provider_id}-{connection.id}",
-                "connectionRef": str(connection.id),
-                "providerId": provider_id,
-                "profileRef": profile_ref,
-                "tools": tools,
-            }
-        )
-    if skipped:
-        print(
-            f"Skipped {skipped} provider connection(s) without a configured profile or target.",
-            file=sys.stderr,
-        )
-    payload = json.dumps(
-        {"schemaVersion": 1, "bindings": bindings},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+        services.close()
     print(payload)
     return 0
 
@@ -496,6 +514,7 @@ def _integration_connector_tool_catalog(arguments: argparse.Namespace) -> int:
     from cyrene_exchange_product.integrations.clients import ProviderToolDefinition
     from cyrene_exchange_product.integrations.connector_operations import (
         connector_binding_tools,
+        validate_computer_tool_schema,
     )
 
     database_path = Path(arguments.integration_database).expanduser().resolve()
@@ -582,6 +601,54 @@ def _integration_connector_tool_catalog(arguments: argparse.Namespace) -> int:
                     "connectionRef": str(connection.id),
                     "profileRef": profile_ref,
                     "tools": tools,
+                }
+            )
+
+        computer_profile = getattr(services, "computer_runner_profile", None)
+        if (
+            computer_profile is not None
+            and computer_profile.expected_issuer == arguments.issuer
+            and computer_profile.organization_id == arguments.organization_id
+            and computer_profile.workspace_id == arguments.workspace_id
+        ):
+            computer_client = getattr(services, "computer_runner_client", None)
+            if computer_client is None:
+                raise SystemExit("configured computer runner tool catalog is unavailable")
+            descriptors = computer_client.list_tool_catalog()
+            by_id = {descriptor.tool_id: descriptor for descriptor in descriptors}
+            operation_map = connector_binding_tools("computer")
+            expected = {str(item["toolId"]): item for item in operation_map}
+            if len(expected) != len(operation_map) or set(expected) - set(by_id):
+                raise SystemExit("computer runner catalog is missing a required fixed operation")
+            computer_tools: list[dict[str, object]] = []
+            for tool_id in sorted(expected):
+                definition = by_id[tool_id]
+                mapping = expected[tool_id]
+                validate_computer_tool_schema(
+                    computer_profile,
+                    tool_id=tool_id,
+                    input_schema=definition.input_schema,
+                )
+                mutating = mapping.get("mutating")
+                if not isinstance(mutating, bool):
+                    raise SystemExit("computer runner operation map has invalid mutability")
+                computer_tools.append(
+                    {
+                        "id": definition.tool_id,
+                        "name": definition.name,
+                        "description": definition.description,
+                        "readOnly": not mutating,
+                        "inputSchema": definition.input_schema,
+                    }
+                )
+            items.append(
+                {
+                    "bindingId": f"exchange-computer-{computer_profile.connection_ref}",
+                    "capabilityId": "tool.provider.v1",
+                    "providerId": "computer",
+                    "connectionRef": computer_profile.connection_ref,
+                    "profileRef": computer_profile.profile_ref,
+                    "tools": computer_tools,
                 }
             )
 
@@ -1000,11 +1067,15 @@ def parser() -> argparse.ArgumentParser:
         )
     binding_export = integration_commands.add_parser(
         "connector-bindings",
-        help="Export a Navigator launcher binding map for one exact actor and workspace",
+        help=(
+            "Export a Navigator launcher binding map for one actor and optional "
+            "organization/workspace"
+        ),
     )
     binding_export.add_argument("--integration-database", type=Path, required=True)
     binding_export.add_argument("--issuer", required=True)
     binding_export.add_argument("--subject", required=True)
+    binding_export.add_argument("--organization-id")
     binding_export.add_argument("--workspace-id", required=True)
     catalog_export = integration_commands.add_parser(
         "connector-tool-catalog",

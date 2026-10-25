@@ -19,7 +19,7 @@ evidence. It never stores provider credentials or invokes a model or agent.
 | `authorization_cloud.py` | Fresh-authority-gated provider monitoring, cloud refresh jobs, and email outbox worker. |
 | `authorization_cloud_profiles.py` | Closed host profile parsing, actor pins, and binding/resource allowlists. |
 | `authorization_cloud_provider.py` | Signed DirectPlugin calls and per-call Platform authority revalidation. |
-| `connector_profiles.py` | Closed Navigator HMAC and Teams egress host bindings, including Bot Framework route validation. |
+| `connector_profiles.py` | Closed Navigator HMAC, Teams egress, and isolated computer runner host bindings. |
 | `connector_security.py` | Raw-body Navigator HMAC, pinned Platform grant verification, and RFC 8785 connector digests. |
 | `connector_operations.py` | Closed GitHub (including proactive task/CI operations), Hugging Face, cloud, and Teams operation/resource maps and safe provider-result projection. |
 | `api.py` | Fixed HTTP routes for account profiles, connector authorization/invocation, Teams egress, connections, and webhooks. |
@@ -300,6 +300,49 @@ they are never retried automatically. See the
 [`connector-operations.md`](../../../../contracts/product/v1/connector-operations.md)
 contract for the target map.
 
+## Host computer runner
+
+The optional `connectorHost.computerRunner` section binds the fixed
+`computer-runtime` provider binding to one logical runner workspace and exact
+organization/workspace/issuer. It is a host-owned runtime profile; it does not
+create an OAuth integration connection or Account Center credential. When the
+profile is absent, the computer operation map and catalog entry are omitted.
+The profile uses the configured DirectPlugin mTLS channel, passes only the
+provider's typed arguments, and caps file writes at 1 MiB, each file read at
+64 KiB, and each command output stream at 64 KiB. The physical isolation root
+remains owned by the runner deployment.
+
+The host profile contains only a logical UUID, the admitted caller scope, and
+the fixed DirectPlugin reference. The TLS references resolve through the
+existing `hostSecretRefs` map; do not put key material or filesystem paths in
+this Exchange profile. Example shape:
+
+```json
+{
+  "computerRunner": {
+    "profileRef": "computer-workspace-main",
+    "connectionRef": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "organizationId": "organization-id",
+    "workspaceId": "workspace-id",
+    "expectedIssuer": "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0",
+    "directPlugin": {
+      "bindingId": "computer-runtime",
+      "connectionRef": "grpcs://computer-runner.internal:443",
+      "transport": "mtls",
+      "mtls": {
+        "rootCertificateRef": "computer/root-ca",
+        "clientCertificateRef": "exchange/computer-client-cert",
+        "clientKeyRef": "exchange/computer-client-key"
+      }
+    },
+    "maxCommandTimeoutMs": 600000,
+    "maxFileBytes": 1048576,
+    "maxReadBytes": 65536,
+    "maxDirectoryDepth": 32
+  }
+}
+```
+
 ## Private Navigator tool catalog snapshot
 
 Before Navigator starts, export tool schemas from the configured provider
@@ -442,6 +485,19 @@ branch、file 或 run 定位符；完整参数 digest 还绑定查询文本、�
 GitHub App 调用仍要求新的 Directory grant 与 Account Center 一次性 lease。写入结果有歧义时
 保持阻塞，等待回读，不会自动重试。目标映射见
 [`connector-operations.md`](../../../../contracts/product/v1/connector-operations.md)。
+
+## Host computer runner
+
+可选 `connectorHost.computerRunner` section 将固定的 `computer-runtime` provider binding
+绑定到一个逻辑 runner workspace 和精确的组织/workspace/issuer。它是 Host 管理的运行时
+profile，不创建 OAuth 集成 connection 或 Account Center 凭据。未配置 profile 时，computer
+操作 map 与工具目录项都会关闭。profile 使用已配置的 DirectPlugin mTLS 通道，只传递 Provider
+声明的类型化参数；文件写入上限 1 MiB、每次文件读取 64 KiB、command 的 stdout/stderr 各
+64 KiB。物理隔离根目录由 runner 部署管理。
+
+Host profile 只保存逻辑 UUID、允许的调用者 scope 和固定 DirectPlugin 引用。TLS 引用通过
+已有 `hostSecretRefs` 映射解析；Exchange profile 不包含密钥内容或文件系统路径。字段形状
+见上方 JSON。
 
 ## Navigator 私有工具目录快照
 

@@ -10,6 +10,7 @@ import json
 import ssl
 import threading
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,7 @@ from cyrene_exchange_product.integrations.connector_operations import (
     _resource_projection,
     _resource_ref,
 )
+from cyrene_exchange_product.integrations.connector_profiles import parse_connector_host_settings
 from cyrene_exchange_product.integrations.connector_security import (
     ConnectorGrantClaims,
     NavigatorHmacAuthenticator,
@@ -1517,3 +1519,248 @@ def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_
         server.should_exit = True
         server_thread.join(timeout=10)
         services.close()
+
+
+def test_host_computer_write_uses_directory_grant_and_keeps_unknown_result_blocked(
+    tmp_path: Path,
+) -> None:
+    """A host runner has no OAuth connection, yet keeps grant and replay protections."""
+
+    issuer = "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0"
+    subject = "11111111-1111-4111-8111-111111111111"
+    settings = parse_connector_host_settings(
+        {
+            "computerRunner": {
+                "profileRef": "computer-owner-workspace",
+                "connectionRef": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "organizationId": "org-computer",
+                "workspaceId": "workspace-computer",
+                "expectedIssuer": issuer,
+                "directPlugin": {
+                    "bindingId": "computer-runtime",
+                    "connectionRef": "grpcs://computer-runner.test:443",
+                    "transport": "mtls",
+                    "mtls": {
+                        "rootCertificateRef": "test/root-ca",
+                        "clientCertificateRef": "test/client-cert",
+                        "clientKeyRef": "test/client-key",
+                    },
+                },
+            }
+        }
+    )
+    profile = settings.computer_runner
+    assert profile is not None
+    principal = IntegrationPrincipal(
+        issuer=issuer,
+        subject=subject,
+        organization_id=profile.organization_id,
+        workspace_id=profile.workspace_id,
+        allowed_operation_ids=frozenset({"computer.file.write"}),
+    )
+    database = tmp_path / "computer-runner.sqlite3"
+    store = IntegrationStore(database)
+    key_file = tmp_path / "navigator-exchange-hmac.key"
+    key = b"n" * 32
+    key_file.write_bytes(key)
+    key_file.chmod(0o600)
+
+    class _Authority:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def authorize_connector_operation(self, **kwargs: Any) -> bytes:
+            self.calls.append(kwargs)
+            return b"synthetic-computer-directory-grant"
+
+    class _GrantVerifier:
+        def __init__(self) -> None:
+            self.claims: ConnectorGrantClaims | None = None
+            self.consumed = False
+
+        def validate_authority_response(
+            self,
+            _grant: bytes,
+            *,
+            expected: dict[str, Any],
+        ) -> ConnectorGrantClaims:
+            self.claims = ConnectorGrantClaims(
+                request_id=str(expected["request_id"]),
+                audience="exchange",
+                organization_id=str(expected["organization_id"]),
+                workspace_id=str(expected["workspace_id"]),
+                principal_issuer=str(expected["principal_issuer"]),
+                principal_subject=str(expected["principal_subject"]),
+                connection_ref=str(expected["connection_ref"]),
+                provider_id=str(expected["provider_id"]),
+                profile_ref=str(expected["profile_ref"]),
+                operation_id=str(expected["operation_id"]),
+                resource_ref=str(expected["resource_ref"]),
+                arguments_digest_sha256=expected["arguments_digest_sha256"],
+                issued_at_epoch=time.time(),
+                expires_at_epoch=time.time() + 15,
+                grant_ref="sha256:" + "b" * 64,
+            )
+            return self.claims
+
+        def inspect(
+            self,
+            _grant: bytes,
+            *,
+            expected: dict[str, Any] | None = None,
+        ) -> ConnectorGrantClaims:
+            assert self.claims is not None
+            if expected is not None:
+                assert self.claims.request_id == expected["request_id"]
+                assert self.claims.connection_ref == expected["connection_ref"]
+                assert self.claims.provider_id == expected["provider_id"]
+                assert self.claims.operation_id == expected["operation_id"]
+                assert self.claims.resource_ref == expected["resource_ref"]
+                assert self.claims.arguments_digest_sha256 == expected["arguments_digest_sha256"]
+            return self.claims
+
+        def consume(
+            self,
+            grant: bytes,
+            *,
+            expected: dict[str, Any] | None = None,
+        ) -> ConnectorGrantClaims:
+            if self.consumed:
+                raise AssertionError("one-use grant was consumed twice")
+            self.consumed = True
+            return self.inspect(grant, expected=expected)
+
+    class _Computer:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def call_provider_tool(
+            self, *, tool_id: str, payload: Mapping[str, object]
+        ) -> dict[str, Any]:
+            self.calls.append({"tool_id": tool_id, "payload": dict(payload)})
+            raise ExchangeProductError(
+                code="EXCHANGE_COMPUTER_PROVIDER_UNAVAILABLE",
+                title="Computer runner unavailable",
+                detail="Controlled transport loss after dispatch.",
+                status=503,
+                retryable=True,
+            )
+
+    authority = _Authority()
+    grant_verifier = _GrantVerifier()
+    computer = _Computer()
+    dispatcher = ConnectorOperationDispatcher(
+        store=store,
+        accounts=SimpleNamespace(),
+        github=SimpleNamespace(),
+        authorization_cloud=None,
+        registry=None,
+        computer=computer,
+        computer_runner_profile=profile,
+    )
+    services = IntegrationServices(
+        store=store,
+        authorizer=None,
+        accounts=SimpleNamespace(),  # type: ignore[arg-type]
+        github=SimpleNamespace(),  # type: ignore[arg-type]
+        webhook_verifier=SimpleNamespace(),  # type: ignore[arg-type]
+        delegation_authorizer=None,
+        callback_principal=principal,
+        navigator_hmac_authenticator=NavigatorHmacAuthenticator(
+            NavigatorHmacSettings(key_id="navigator-computer-v1", key_file=key_file),
+            replay_guard=store,
+        ),
+        connector_grant_authority=authority,
+        connector_grant_verifier=grant_verifier,
+        connector_operation_dispatcher=dispatcher,
+        computer_runner_client=computer,
+        computer_runner_profile=profile,
+    )
+    app = create_app(database_path=tmp_path / "computer-gateway.sqlite3", integrations=services)
+    arguments: dict[str, Any] = {
+        "path": "src/assistant.txt",
+        "content_base64": "YQ==",
+        "overwrite": True,
+    }
+    request_id = "computer-file-write-unknown"
+    target = {
+        "workspace_ref": profile.connection_ref,
+        "path": "src/assistant.txt",
+    }
+    resource_ref = _resource_ref(
+        provider_id="computer",
+        profile_ref=profile.profile_ref,
+        operation_id="computer.file.write",
+        target=target,
+    )
+
+    def navigator_headers(path: str, body: bytes) -> dict[str, str]:
+        timestamp = str(int(time.time()))
+        message = (
+            b"POST\n" + path.encode("utf-8") + b"\n" + timestamp.encode("ascii") + b"\n" + body
+        )
+        return {
+            "content-type": "application/json",
+            "x-cyrene-navigator-key-id": "navigator-computer-v1",
+            "x-cyrene-navigator-timestamp": timestamp,
+            "x-cyrene-navigator-signature": hmac.new(key, message, hashlib.sha256).hexdigest(),
+        }
+
+    mint_path = "/internal/v1/connector-operation-grants"
+    grant_request = {
+        "request_id": request_id,
+        "workspace_id": profile.workspace_id,
+        "principal_issuer": issuer,
+        "principal_subject": subject,
+        "connection_ref": profile.connection_ref,
+        "provider_id": "computer",
+        "profile_ref": profile.profile_ref,
+        "operation_id": "computer.file.write",
+        "resource_ref": resource_ref,
+        "arguments": arguments,
+        "arguments_digest_sha256": digest_arguments(arguments),
+    }
+    raw_grant_request = json.dumps(
+        grant_request,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    invoke_path = f"/internal/v1/connector-operations/{profile.connection_ref}"
+    invoke_request = {
+        "request_id": request_id,
+        "provider_id": "computer",
+        "profile_ref": profile.profile_ref,
+        "operation_id": "computer.file.write",
+        "resource_ref": resource_ref,
+        "arguments": arguments,
+    }
+
+    with TestClient(app) as client:
+        minted = client.post(
+            mint_path,
+            content=raw_grant_request,
+            headers=navigator_headers(mint_path, raw_grant_request),
+        )
+        assert minted.status_code == 200, minted.text
+        grant_bin = minted.json()["connectorGrantBin"]
+        headers = {"x-cyrene-connector-grant-bin": grant_bin}
+        first = client.post(invoke_path, json=invoke_request, headers=headers)
+        assert first.status_code == 200, first.text
+        assert first.json()["outcome"] == "uncertain"
+        replay = client.post(invoke_path, json=invoke_request, headers=headers)
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["outcome"] == "uncertain"
+        assert len(authority.calls) == 1
+        assert authority.calls[0]["provider_id"] == "computer"
+        assert authority.calls[0]["operation_id"] == "computer.file.write"
+        assert authority.calls[0]["connection_ref"] == profile.connection_ref
+        assert len(computer.calls) == 1
+        assert computer.calls[0] == {
+            "tool_id": "computer.file.write",
+            "payload": arguments,
+        }
+        row = store._connection.execute(
+            "SELECT state FROM connector_invocations WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        assert row is not None and row["state"] == "UNKNOWN_RESULT"

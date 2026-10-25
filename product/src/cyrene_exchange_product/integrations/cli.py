@@ -61,6 +61,7 @@ def build_production_services(
     )
     from cyrene_exchange_product.integrations.clients import (
         AccountCenterClient,
+        ComputerRunnerClient,
         DirectPluginHealthClient,
         GitHubIssuesClient,
         GitHubWebhookClient,
@@ -531,6 +532,24 @@ def build_production_services(
         teams_runtime = direct_client(teams_endpoint)
         teams_message_client = TeamsMessageClient(teams_runtime)
 
+    computer_runner_client = None
+    computer_runtime = None
+    computer_runner_profile = connector_settings.computer_runner
+    if computer_runner_profile is not None:
+        computer_endpoint: dict[str, Any] = {
+            "bindingId": computer_runner_profile.endpoint.binding_id,
+            "connectionRef": computer_runner_profile.endpoint.connection_ref,
+            "transport": computer_runner_profile.endpoint.transport,
+        }
+        if computer_runner_profile.endpoint.mtls is not None:
+            computer_endpoint["mtls"] = dict(computer_runner_profile.endpoint.mtls)
+        computer_runtime = direct_client(computer_endpoint)
+        computer_runner_client = ComputerRunnerClient(
+            computer_runtime,
+            binding_id=computer_runner_profile.endpoint.binding_id,
+            deadline_seconds=computer_runner_profile.max_command_timeout_ms / 1000 + 5,
+        )
+
     authorization_clients: dict[str, Any] = {}
     email_notification_client = None
     authorization_registry = None
@@ -633,6 +652,8 @@ def build_production_services(
         github=github,
         authorization_cloud=authorization_cloud_provider,
         registry=authorization_registry,
+        computer=computer_runner_client,
+        computer_runner_profile=computer_runner_profile,
     )
     dispatcher = None
     runner = None
@@ -683,12 +704,15 @@ def build_production_services(
         connector_operation_dispatcher=connector_operation_dispatcher,
         teams_message_client=teams_message_client,
         teams_message_profile=teams_message_profile,
+        computer_runner_client=computer_runner_client,
+        computer_runner_profile=computer_runner_profile,
         authorization_profile_registry=authorization_registry,
         transport_clients=(
             account_runtime,
             github_runtime,
             *((wecom_runtime,) if wecom_runtime is not None else ()),
             *((teams_runtime,) if teams_runtime is not None else ()),
+            *((computer_runtime,) if computer_runtime is not None else ()),
             github_health,
             *authorization_clients.values(),
             *((email_notification_client,) if email_notification_client is not None else ()),
@@ -1084,6 +1108,12 @@ def validate_host_configuration(
             "connectorHost.teamsMessages",
             check_path,
         )
+    if connector_settings.computer_runner is not None:
+        _validate_direct_endpoint(
+            endpoint_mapping(connector_settings.computer_runner.endpoint),
+            "connectorHost.computerRunner",
+            check_path,
+        )
 
     # Validate direct Plugin endpoint profiles without dialing the runtime.
     endpoints = [("accountCenter", account), ("githubIssues", github)]
@@ -1149,6 +1179,7 @@ def validate_host_configuration(
         ),
         "navigatorConnectorConfigured": connector_settings.navigator is not None,
         "teamsMessagesConfigured": connector_settings.teams_messages is not None,
+        "computerRunnerConfigured": connector_settings.computer_runner is not None,
     }
 
 
