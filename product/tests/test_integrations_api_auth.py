@@ -64,11 +64,15 @@ from cyrene_exchange_product.integrations.connector_security import (
     navigator_hmac_body_limit,
 )
 from cyrene_exchange_product.integrations.models import (
+    AuthorizationCapabilityRecord,
+    AuthorizationHealthRecord,
+    AuthorizationState,
     CreateActorBinding,
     CreateIntegrationConnection,
     CreateSyncBinding,
     IntegrationConnection,
     IntegrationPrincipal,
+    LoginState,
     ResourceSnapshot,
     SnapshotFreshness,
 )
@@ -1841,3 +1845,179 @@ def test_host_computer_write_uses_directory_grant_and_keeps_unknown_result_block
             (request_id,),
         ).fetchone()
         assert row is not None and row["state"] == "UNKNOWN_RESULT"
+
+
+def test_navigator_health_snapshot_is_owner_pinned_and_omits_authorization_refs(
+    tmp_path: Path,
+) -> None:
+    key = b"h" * 32
+    key_file = tmp_path / "navigator-health.key"
+    key_file.write_bytes(key)
+    key_file.chmod(0o600)
+    owner = IntegrationPrincipal(
+        issuer="https://identity.example.test",
+        subject="health-owner",
+        organization_id="org-health",
+        workspace_id="workspace-health",
+        allowed_operation_ids=frozenset({"integrationCreateConnection"}),
+    )
+    intruder = IntegrationPrincipal(
+        issuer=owner.issuer,
+        subject="health-intruder",
+        organization_id=owner.organization_id,
+        workspace_id=owner.workspace_id,
+        allowed_operation_ids=frozenset({"integrationCreateConnection"}),
+    )
+    store = IntegrationStore(tmp_path / "health-snapshot.sqlite3")
+    connection = store.create_connection(
+        owner,
+        CreateIntegrationConnection(
+            provider="azure",
+            binding_ref="azure-health",
+            target_ref="vm-health",
+            display_name="Managed VM",
+        ),
+        idempotency_key="health-owner-connection",
+    )
+    now = datetime.now(UTC)
+    claim = store.claim_authorization_checks("health-monitor", now=now)[0]
+    expires_at = now + timedelta(days=3)
+    store.complete_authorization_check(
+        claim,
+        AuthorizationHealthRecord(
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            actor_issuer=connection.actor_issuer,
+            actor_subject=connection.actor_subject,
+            connection_id=connection.id,
+            authorization_ref="opaque-useful-for-reauth",
+            login_state=LoginState.PRESENT,
+            authorization_state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+            checked_at=now,
+            expires_at=expires_at,
+            generation=9,
+            capabilities=[
+                AuthorizationCapabilityRecord(
+                    capability_id="cloud.vm.read",
+                    state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+                    last_verified_at=now,
+                    expires_at=expires_at,
+                    reason_code="auth_expired",
+                )
+            ],
+            reason_code="auth_expired",
+        ),
+        [],
+        now=now,
+    )
+    intruder_connection = store.create_connection(
+        intruder,
+        CreateIntegrationConnection(
+            provider="azure",
+            binding_ref="azure-health",
+            target_ref="vm-health",
+            display_name="Other owner's VM",
+        ),
+        idempotency_key="health-intruder-connection",
+    )
+
+    class Registry:
+        def context_for_connection(self, selected: IntegrationConnection):
+            if selected.actor_subject != owner.subject:
+                raise PermissionError("owner is not host-pinned")
+            return (
+                SimpleNamespace(
+                    issuer=selected.actor_issuer,
+                    subject=selected.actor_subject,
+                    organization_id=selected.organization_id,
+                    workspace_id=selected.workspace_id,
+                ),
+                SimpleNamespace(),
+            )
+
+        def profile_for_connection(
+            self,
+            principal: IntegrationPrincipal,
+            selected: IntegrationConnection,
+            *,
+            operation_id: str,
+        ):
+            if (
+                operation_id != "integrationGetAuthorizationHealth"
+                or principal.subject != owner.subject
+                or selected.binding_ref != "azure-health"
+            ):
+                raise PermissionError("connection is outside configured health profile")
+            return SimpleNamespace(), "vm-health"
+
+    authenticator = NavigatorHmacAuthenticator(
+        NavigatorHmacSettings(key_id="navigator-health-v1", key_file=key_file),
+        replay_guard=store,
+    )
+    services = IntegrationServices(
+        store=store,
+        authorizer=None,
+        accounts=_Accounts(),  # type: ignore[arg-type]
+        github=_GitHub(),  # type: ignore[arg-type]
+        webhook_verifier=_WebhookVerifier(),  # type: ignore[arg-type]
+        delegation_authorizer=None,
+        callback_principal=owner,
+        navigator_hmac_authenticator=authenticator,
+        authorization_profile_registry=Registry(),
+    )
+    app = create_app(
+        database_path=tmp_path / "health-snapshot-gateway.sqlite3",
+        integrations=services,
+    )
+
+    def signed_request(request_id: str, connection_ids: list[str]) -> tuple[bytes, dict[str, str]]:
+        body = json.dumps(
+            {
+                "requestId": request_id,
+                "organizationId": owner.organization_id,
+                "workspaceId": owner.workspace_id,
+                "connectionIds": connection_ids,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        timestamp = str(int(time.time()))
+        message = (
+            b"POST\n/internal/v1/authorization-health/snapshots\n"
+            + timestamp.encode("ascii")
+            + b"\n"
+            + body
+        )
+        headers = {
+            "content-type": "application/json",
+            "x-cyrene-navigator-key-id": "navigator-health-v1",
+            "x-cyrene-navigator-timestamp": timestamp,
+            "x-cyrene-navigator-signature": hmac.new(key, message, hashlib.sha256).hexdigest(),
+        }
+        return body, headers
+
+    path = "/internal/v1/authorization-health/snapshots"
+    body, headers = signed_request("snapshot-owner-1", [str(connection.id)])
+    with TestClient(app) as client:
+        response = client.post(path, content=body, headers=headers)
+        denied_body, denied_headers = signed_request(
+            "snapshot-owner-2", [str(intruder_connection.id)]
+        )
+        denied = client.post(path, content=denied_body, headers=denied_headers)
+
+    assert response.status_code == 200, response.text
+    snapshot = response.json()
+    assert set(snapshot) == {"connections"}
+    assert len(snapshot["connections"]) == 1
+    item = snapshot["connections"][0]
+    assert item["connectionId"] == str(connection.id)
+    assert item["provider"] == "azure"
+    assert item["loginState"] == "PRESENT"
+    assert item["authorizationState"] == "REAUTHORIZATION_REQUIRED"
+    assert item["generation"] == 9
+    assert item["reasonCode"] == "auth_expired"
+    assert item["capabilities"][0]["capabilityId"] == "cloud.vm.read"
+    assert "authorizationRef" not in item
+    assert "principalSubject" not in item
+    assert denied.status_code == 403
+    assert "snapshot_connection_scope_mismatch" in denied.text
+    store.close()

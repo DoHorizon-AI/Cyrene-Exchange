@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
 from functools import partial
@@ -74,6 +75,15 @@ from cyrene_exchange_product.integrations.store import (
 )
 
 _MAX_NAVIGATOR_REQUEST_BYTES = 128 * 1024
+_SAFE_HEALTH_REASON_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$")
+
+
+def _safe_health_reason_code(value: object) -> str | None:
+    """Expose only bounded code-shaped health reasons, never provider prose."""
+
+    if isinstance(value, str) and _SAFE_HEALTH_REASON_CODE.fullmatch(value):
+        return value
+    return None
 
 
 async def _invoke_connector_dispatcher(
@@ -393,6 +403,34 @@ class AuthorizationHealthResponse(_HttpResponseModel):
     reason_code: str | None = Field(default=None, alias="reasonCode")
 
 
+class AuthorizationHealthSnapshotConnectionResponse(_HttpResponseModel):
+    """Host-safe snapshot without owner identity or a renewable authorization ref."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    connection_id: UUID = Field(alias="connectionId")
+    provider: ProviderId
+    login_state: Literal["PRESENT", "MISSING", "UNKNOWN", "UNAVAILABLE"] = Field(alias="loginState")
+    authorization_state: Literal[
+        "VALID", "REAUTHORIZATION_REQUIRED", "PERMISSION_DENIED", "UNKNOWN", "UNAVAILABLE"
+    ] = Field(alias="authorizationState")
+    checked_at: datetime | None = Field(default=None, alias="checkedAt")
+    expires_at: datetime | None = Field(default=None, alias="expiresAt")
+    generation: int = Field(ge=0)
+    capabilities: list[AuthorizationCapabilityResponse] = Field(max_length=100)
+    reason_code: str | None = Field(default=None, alias="reasonCode")
+
+
+class AuthorizationHealthSnapshotResponse(_HttpResponseModel):
+    """Bounded page of snapshots for connections pinned by the host."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    connections: list[AuthorizationHealthSnapshotConnectionResponse] = Field(
+        min_length=1, max_length=100
+    )
+
+
 class RenewalSessionResponse(_HttpResponseModel):
     """Pollable Product session; provider credentials and internal refs are omitted."""
 
@@ -499,6 +537,21 @@ class ConnectorOperationGrantBody(IntegrationRequestBody):
     resource_ref: str = Field(min_length=1, max_length=1000)
     arguments: dict[str, Any]
     arguments_digest_sha256: str = Field(pattern="^[0-9a-f]{64}$")
+
+
+class AuthorizationHealthSnapshotBody(IntegrationRequestBody):
+    """Navigator HMAC selector for one bounded set of host-pinned connections."""
+
+    request_id: str = Field(min_length=1, max_length=200)
+    organization_id: str = Field(min_length=1, max_length=200)
+    workspace_id: str = Field(min_length=1, max_length=200)
+    connection_ids: list[UUID] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_connection_ids(self) -> AuthorizationHealthSnapshotBody:
+        if len(self.connection_ids) != len(set(self.connection_ids)):
+            raise ValueError("connectionIds must be unique")
+        return self
 
 
 class ConnectorOperationBody(IntegrationRequestBody):
@@ -2879,6 +2932,123 @@ def create_router(services: IntegrationServices) -> APIRouter:
             ],
             "reasonCode": health.reason_code,
         }
+
+    @router.post(
+        "/internal/v1/authorization-health/snapshots",
+        operation_id="internalReadAuthorizationHealthSnapshots",
+        response_model=AuthorizationHealthSnapshotResponse,
+    )
+    async def read_authorization_health_snapshots(request: Request) -> dict[str, Any]:
+        """Project only pinned-owner health metadata to the signed Navigator workload."""
+
+        body = await signed_navigator_body(request, AuthorizationHealthSnapshotBody)
+        registry = services.authorization_profile_registry
+        if registry is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                title="Authorization snapshot is not configured",
+                detail="Exchange has no host-owned authorization profile registry.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "authorization_profile_registry_unavailable"},
+            )
+
+        snapshots: list[dict[str, Any]] = []
+        for connection_id in body.connection_ids:
+            connection = services.store.current_connection_for_provider_call(connection_id)
+            if (
+                connection is None
+                or connection.organization_id != body.organization_id
+                or connection.workspace_id != body.workspace_id
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_RESOURCE_NOT_FOUND",
+                    title="Authorization connection not found",
+                    detail="The requested configured connection is unavailable in this workspace.",
+                    status=404,
+                )
+            try:
+                # The owner comes from the persisted row and is then checked against
+                # the fixed host profile. No principal or destination is accepted in
+                # the Navigator request body.
+                context, _profile = registry.context_for_connection(connection)
+                owner = IntegrationPrincipal(
+                    issuer=context.issuer,
+                    subject=context.subject,
+                    organization_id=context.organization_id,
+                    workspace_id=context.workspace_id,
+                    allowed_operation_ids=frozenset({"integrationGetAuthorizationHealth"}),
+                )
+                registry.profile_for_connection(
+                    owner,
+                    connection,
+                    operation_id="integrationGetAuthorizationHealth",
+                )
+                services.store.get_connection(
+                    owner,
+                    connection_id,
+                    authorization_operation_id="integrationGetAuthorizationHealth",
+                )
+                health = services.store.latest_authorization_health(
+                    owner,
+                    connection_id,
+                    authorization_operation_id="integrationGetAuthorizationHealth",
+                )
+            except PermissionError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Authorization snapshot denied",
+                    detail="The connection owner is outside its fixed host profile.",
+                    status=403,
+                    context={"reasonCode": "snapshot_connection_scope_mismatch"},
+                ) from exc
+            except IntegrationNotFound as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_RESOURCE_NOT_FOUND",
+                    title="Authorization connection not found",
+                    detail="The requested configured connection is unavailable in this workspace.",
+                    status=404,
+                ) from exc
+
+            if health is None:
+                snapshots.append(
+                    {
+                        "connectionId": connection.id,
+                        "provider": connection.provider,
+                        "loginState": LoginState.UNKNOWN.value,
+                        "authorizationState": AuthorizationState.UNKNOWN.value,
+                        "checkedAt": None,
+                        "expiresAt": None,
+                        "generation": 0,
+                        "capabilities": [],
+                        "reasonCode": "not_observed",
+                    }
+                )
+                continue
+
+            snapshots.append(
+                {
+                    "connectionId": connection.id,
+                    "provider": connection.provider,
+                    "loginState": health.login_state.value,
+                    "authorizationState": health.authorization_state.value,
+                    "checkedAt": health.checked_at,
+                    "expiresAt": health.expires_at,
+                    "generation": health.generation,
+                    "capabilities": [
+                        {
+                            "capabilityId": capability.capability_id,
+                            "state": capability.state.value,
+                            "lastVerifiedAt": capability.last_verified_at,
+                            "expiresAt": capability.expires_at,
+                            "reasonCode": _safe_health_reason_code(capability.reason_code),
+                        }
+                        for capability in health.capabilities
+                    ],
+                    "reasonCode": _safe_health_reason_code(health.reason_code),
+                }
+            )
+        return {"connections": snapshots}
 
     @router.post(
         "/api/v1/accounts/authorizations/{authorization_id}/renewal-sessions",

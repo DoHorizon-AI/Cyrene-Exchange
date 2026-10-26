@@ -635,6 +635,7 @@ def build_production_services(
             registry=authorization_registry,
             provider_clients=authorization_clients,
             email_client=email_notification_client,
+            account_center=accounts,
             current_context_resolver=current_context_resolver,
             context_key=hmac_key,
         )
