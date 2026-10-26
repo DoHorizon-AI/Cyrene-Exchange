@@ -822,23 +822,12 @@ def _verify_profile_readback(
     actual_auth_mode = profile.get("auth_mode")
     if (
         allowed_auth_modes is None
-        or (
-            actual_auth_mode is not None
-            and (
-                not isinstance(actual_auth_mode, str) or actual_auth_mode not in allowed_auth_modes
-            )
-        )
-        or (
-            expected_auth_mode is not None
-            and actual_auth_mode != expected_auth_mode
-            and not (
-                expected_auth_mode in {"github_app", "fine_grained_token"}
-                and actual_auth_mode is None
-            )
-        )
+        or not isinstance(actual_auth_mode, str)
+        or actual_auth_mode not in allowed_auth_modes
+        or (expected_auth_mode is not None and actual_auth_mode != expected_auth_mode)
     ):
         raise _bootstrap_error(f"{provider}_profile_auth_mode_mismatch")
-    access_mode = profile.get("access_mode", "actor_owned")
+    access_mode = profile.get("access_mode")
     if not isinstance(access_mode, str) or access_mode not in {
         "actor_owned",
         "workspace_operator",

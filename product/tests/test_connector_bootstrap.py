@@ -486,6 +486,57 @@ def test_private_bootstrap_rejects_existing_profile_scope_drift_before_writes(
         store.close()
 
 
+@pytest.mark.parametrize("missing_field", ["auth_mode", "access_mode"])
+def test_private_bootstrap_rejects_incomplete_existing_github_metadata_before_writes(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    specification_path = tmp_path / f"bootstrap-github-missing-{missing_field}.json"
+    specification_path.write_text(json.dumps(_private_specification()), encoding="utf-8")
+    specification_path.chmod(0o600)
+    services, store, _authority, _verifier, accounts = _services(tmp_path)
+    try:
+        plan = provision_connector_profiles(services, specification_path, plan_only=True)
+        profile_ref = plan["profiles"]["github"]["profileRef"]
+        profile = {
+            "profile_ref": profile_ref,
+            "provider": "github",
+            "identity_ref": "12345678",
+            "target_scope": {
+                "repositories": [
+                    {
+                        "repository_id": "123",
+                        "owner": "example-org",
+                        "name": "private-repo",
+                    }
+                ]
+            },
+            "auth_mode": "github_app",
+            "auth_status": "healthy",
+            "access_mode": "workspace_operator",
+            "external_subject": "example-org",
+        }
+        profile.pop(missing_field)
+        accounts.links[profile_ref] = profile
+
+        with pytest.raises(ExchangeProductError):
+            provision_connector_profiles(services, specification_path)
+
+        assert accounts.github_link_calls == 0
+        assert accounts.hf_link_calls == 0
+        assert (
+            store.connector_bindings_for_actor(
+                issuer=ISSUER,
+                subject=SUBJECT,
+                organization_id="org-test",
+                workspace_id="workspace-test",
+            )
+            == []
+        )
+    finally:
+        store.close()
+
+
 def test_plan_only_verifies_role_without_linking_profiles_or_saving_connections(
     tmp_path: Path,
 ) -> None:
@@ -821,6 +872,7 @@ def test_profile_readback_requires_configured_access_mode() -> None:
             {
                 "profile_ref": "gh-profile",
                 "provider": "github",
+                "auth_mode": "github_app",
                 "auth_status": "healthy",
                 "access_mode": "workspace_operator",
             }
