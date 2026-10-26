@@ -74,6 +74,8 @@ class _AccountCenter:
         self.hf_credential_ref: str | None = None
         self.access_mode = access_mode
         self.host_profile_registrations: list[dict[str, Any]] = []
+        self.github_link_calls = 0
+        self.hf_link_calls = 0
 
     def link_github_app_installation(
         self,
@@ -83,15 +85,21 @@ class _AccountCenter:
         installation_id: str,
         repositories: list[dict[str, str]],
         idempotency_key: str,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         assert installation_id == "12345678"
         assert idempotency_key == "phase1-github-installation"
+        self.github_link_calls += 1
         self.github_repositories = repositories
         self.links[profile_ref] = {
             "profile_ref": profile_ref,
             "provider": "github",
+            "identity_ref": installation_id,
+            "target_scope": {"repositories": repositories},
+            "auth_mode": "github_app",
             "auth_status": "healthy",
             "access_mode": self.access_mode,
+            "external_subject": "example-org",
+            "credential_revision": 0,
         }
         return self.links[profile_ref]
 
@@ -104,19 +112,23 @@ class _AccountCenter:
         scopes: dict[str, Any],
         idempotency_key: str,
         auth_mode: str | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         assert credential_secret_ref == "huggingface/connector-token"
         assert idempotency_key == "phase1-huggingface-primary"
         assert scopes["repositories"][0]["repo_id"] == "example-org/private-model"
+        self.hf_link_calls += 1
         self.hf_credential_ref = credential_secret_ref
         self.links[profile_ref] = {
             "profile_ref": profile_ref,
             "provider": "huggingface",
+            "identity_ref": "hf-owner",
+            "target_scope": scopes,
+            "auth_mode": auth_mode or "fine_grained_token",
             "auth_status": "healthy",
             "access_mode": self.access_mode,
+            "external_subject": "hf-owner",
+            "credential_revision": 0,
         }
-        if auth_mode is not None:
-            self.links[profile_ref]["auth_mode"] = auth_mode
         return self.links[profile_ref]
 
     def list_provider_profiles(self, _principal: IntegrationPrincipal) -> dict[str, Any]:
@@ -334,10 +346,142 @@ def test_private_bootstrap_verifies_directory_role_and_is_idempotent(tmp_path: P
                 organization_id="org-test",
             )
         assert accounts.hf_credential_ref == "huggingface/connector-token"
+        assert accounts.github_link_calls == 1
+        assert accounts.hf_link_calls == 1
         encoded_result = json.dumps(first).lower()
         assert "credentialsecretref" not in encoded_result
         assert "access_token" not in encoded_result
         assert first["huggingface"]["authMode"] == "fine_grained_token"
+    finally:
+        store.close()
+
+
+def test_private_bootstrap_reuses_exact_existing_account_center_profiles(
+    tmp_path: Path,
+) -> None:
+    specification_path = tmp_path / "bootstrap-existing-profiles.json"
+    specification_path.write_text(json.dumps(_private_specification()), encoding="utf-8")
+    specification_path.chmod(0o600)
+    services, store, _authority, _verifier, accounts = _services(tmp_path)
+    try:
+        plan = provision_connector_profiles(services, specification_path, plan_only=True)
+        github_profile_ref = plan["profiles"]["github"]["profileRef"]
+        hf_profile_ref = plan["profiles"]["huggingface"]["profileRef"]
+        github_scope = [{"repository_id": "123", "owner": "example-org", "name": "private-repo"}]
+        hf_scope = services.authorization_profile_registry.settings.profiles[
+            "hf-primary"
+        ].account_scopes
+        accounts.links[github_profile_ref] = {
+            "profile_ref": github_profile_ref,
+            "provider": "github",
+            "identity_ref": "12345678",
+            "target_scope": {"repositories": github_scope},
+            "auth_mode": "github_app",
+            "auth_status": "healthy",
+            "access_mode": "workspace_operator",
+            "external_subject": "example-org",
+            "credential_revision": 4,
+        }
+        accounts.links[hf_profile_ref] = {
+            "profile_ref": hf_profile_ref,
+            "provider": "huggingface",
+            "identity_ref": "hf-owner",
+            "target_scope": hf_scope,
+            "auth_mode": "fine_grained_token",
+            "auth_status": "healthy",
+            "access_mode": "workspace_operator",
+            "external_subject": "hf-owner",
+            "credential_revision": 7,
+        }
+
+        result = provision_connector_profiles(services, specification_path)
+
+        assert result["github"]["profileRef"] == github_profile_ref
+        assert result["huggingface"]["profileRef"] == hf_profile_ref
+        assert accounts.github_link_calls == 0
+        assert accounts.hf_link_calls == 0
+        assert accounts.hf_credential_ref is None
+        connections = store.connector_bindings_for_actor(
+            issuer=ISSUER,
+            subject=SUBJECT,
+            organization_id="org-test",
+            workspace_id="workspace-test",
+        )
+        assert len(connections) == 2
+        assert {connection.account_link_ref for connection in connections} == {
+            github_profile_ref,
+            hf_profile_ref,
+        }
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("provider", ["github", "huggingface"])
+def test_private_bootstrap_rejects_existing_profile_scope_drift_before_writes(
+    tmp_path: Path,
+    provider: str,
+) -> None:
+    specification_path = tmp_path / f"bootstrap-{provider}-scope-drift.json"
+    specification_path.write_text(json.dumps(_private_specification()), encoding="utf-8")
+    specification_path.chmod(0o600)
+    services, store, _authority, _verifier, accounts = _services(tmp_path)
+    try:
+        plan = provision_connector_profiles(services, specification_path, plan_only=True)
+        github_profile_ref = plan["profiles"]["github"]["profileRef"]
+        hf_profile_ref = plan["profiles"]["huggingface"]["profileRef"]
+        accounts.links[github_profile_ref] = {
+            "profile_ref": github_profile_ref,
+            "provider": "github",
+            "identity_ref": "12345678",
+            "target_scope": {
+                "repositories": [
+                    {
+                        "repository_id": "999",
+                        "owner": "example-org",
+                        "name": "private-repo",
+                    }
+                ]
+            },
+            "auth_mode": "github_app",
+            "auth_status": "healthy",
+            "access_mode": "workspace_operator",
+            "external_subject": "example-org",
+        }
+        accounts.links[hf_profile_ref] = {
+            "profile_ref": hf_profile_ref,
+            "provider": "huggingface",
+            "identity_ref": "hf-owner",
+            "target_scope": {
+                "repositories": [
+                    {
+                        "repo_type": "model",
+                        "repo_id": "different-org/different-model",
+                        "permissions": ["read", "write"],
+                    }
+                ]
+            },
+            "auth_mode": "fine_grained_token",
+            "auth_status": "healthy",
+            "access_mode": "workspace_operator",
+            "external_subject": "hf-owner",
+        }
+        accounts.links.pop(github_profile_ref if provider == "huggingface" else hf_profile_ref)
+
+        with pytest.raises(ExchangeProductError):
+            provision_connector_profiles(services, specification_path)
+
+        assert accounts.github_link_calls == 0
+        assert accounts.hf_link_calls == 0
+        assert accounts.host_profile_registrations == []
+        assert (
+            store.connector_bindings_for_actor(
+                issuer=ISSUER,
+                subject=SUBJECT,
+                organization_id="org-test",
+                workspace_id="workspace-test",
+            )
+            == []
+        )
     finally:
         store.close()
 
