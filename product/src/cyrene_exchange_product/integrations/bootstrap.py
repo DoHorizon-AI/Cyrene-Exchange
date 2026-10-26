@@ -233,6 +233,7 @@ def provision_connector_profiles(
                     "targetAlias": entry["target_alias"],
                     "providerTargetRef": entry["target"].target_ref,
                     "expectedAccessMode": entry["expected_access_mode"],
+                    "accountCenterProfileRef": entry["account_profile_ref"],
                     "status": "PLANNED",
                 }
                 for entry in cloud_entries
@@ -387,6 +388,8 @@ def _cloud_profile_entries(
             "workspace_operator",
         }:
             raise _bootstrap_error("cloud_bootstrap_access_mode_invalid")
+        if expected_access_mode != "workspace_operator":
+            raise _bootstrap_error("cloud_bootstrap_static_profile_required")
         if profile_alias in seen_aliases:
             raise _bootstrap_error("cloud_bootstrap_profile_duplicate")
         profile = profiles.get(profile_alias)
@@ -433,6 +436,14 @@ def _authorize_cloud_profile_targets(
 
     for entry in entries:
         profile = entry["profile"]
+        owner = (principal.issuer, principal.subject)
+        if (
+            profile.access_mode != "workspace_operator"
+            or profile.allowed_actors != frozenset({owner})
+            or profile.allowed_context_refs
+            or entry["target"].allowed_context_refs
+        ):
+            raise _bootstrap_error("cloud_host_profile_scope_mismatch")
         account_profile_ref = registry.account_center_profile_ref(principal, profile)
         request = CreateIntegrationConnection(
             provider=profile.provider,

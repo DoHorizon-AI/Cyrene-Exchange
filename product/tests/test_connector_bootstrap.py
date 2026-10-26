@@ -221,7 +221,7 @@ def _cloud_profile(
         workspace_id="workspace-test",
         expected_issuer=ISSUER,
         allowed_context_refs=frozenset(),
-        allowed_actors=frozenset(),
+        allowed_actors=frozenset({(ISSUER, SUBJECT)}),
         access_mode=access_mode,
     )
 
@@ -391,6 +391,10 @@ def test_plan_only_cloud_profiles_are_host_resolved_without_fake_connection_ids(
         assert all(
             "connectionRef" not in item and "profileRef" not in item for item in plan["cloud"]
         )
+        assert {item["provider"]: item["accountCenterProfileRef"] for item in plan["cloud"]} == {
+            "azure": "d8148b76-e918-539c-8f60-e8f4db60cf77",
+            "gcp": "a1205e3f-b58a-5bfd-919d-b26790f3a3c4",
+        }
         assert {item["targetAlias"] for item in plan["cloud"]} == {
             "azure-target",
             "gcp-target",
@@ -409,6 +413,94 @@ def test_plan_only_cloud_profiles_are_host_resolved_without_fake_connection_ids(
         )
     finally:
         store.close()
+
+
+def test_cloud_bootstrap_rejects_actor_owned_profiles_for_static_runner(tmp_path: Path) -> None:
+    specification = _private_specification()
+    specification["cloud"] = _cloud_specification()
+    specification["cloud"][0]["expectedAccessMode"] = "actor_owned"
+    specification_path = tmp_path / "bootstrap-cloud-actor-owned.json"
+    specification_path.write_text(json.dumps(specification), encoding="utf-8")
+    specification_path.chmod(0o600)
+    services, store, authority, _verifier, accounts = _services(
+        tmp_path, cloud_providers=("azure", "gcp")
+    )
+    try:
+        with pytest.raises(ExchangeProductError):
+            provision_connector_profiles(services, specification_path, plan_only=True)
+        assert authority.requests == []
+        assert accounts.links == {}
+        assert accounts.host_profile_registrations == []
+        assert (
+            store.connector_bindings_for_actor(
+                issuer=ISSUER,
+                subject=SUBJECT,
+                workspace_id="workspace-test",
+            )
+            == []
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("invalid_pin", ["additional_actor", "profile_context", "target_context"])
+def test_cloud_bootstrap_rejects_dynamic_or_multi_actor_profiles(
+    tmp_path: Path,
+    invalid_pin: str,
+) -> None:
+    specification = _private_specification()
+    specification["cloud"] = _cloud_specification()
+    specification_path = tmp_path / f"bootstrap-cloud-{invalid_pin}.json"
+    specification_path.write_text(json.dumps(specification), encoding="utf-8")
+    specification_path.chmod(0o600)
+    services, store, authority, _verifier, accounts = _services(
+        tmp_path, cloud_providers=("azure", "gcp")
+    )
+    profile = services.authorization_profile_registry.settings.profiles["azure-primary"]
+    if invalid_pin == "additional_actor":
+        profile.allowed_actors = frozenset({(ISSUER, SUBJECT), (ISSUER, "other-subject")})
+    elif invalid_pin == "profile_context":
+        profile.allowed_context_refs = frozenset({"external-context"})
+    else:
+        profile.targets["azure-target"].allowed_context_refs = frozenset({"external-context"})
+    try:
+        with pytest.raises(ExchangeProductError):
+            provision_connector_profiles(services, specification_path)
+        assert authority.requests
+        assert accounts.links == {}
+        assert accounts.host_profile_registrations == []
+        assert (
+            store.connector_bindings_for_actor(
+                issuer=ISSUER,
+                subject=SUBJECT,
+                workspace_id="workspace-test",
+            )
+            == []
+        )
+    finally:
+        store.close()
+
+
+def test_account_center_profile_ref_is_owner_scoped_for_static_and_actor_owned_profiles() -> None:
+    shared = _cloud_profile("azure", access_mode="workspace_operator")
+    actor_owned = _cloud_profile("azure", access_mode="actor_owned")
+    registry = AuthorizationCloudProfileRegistry(
+        SimpleNamespace(contexts={}, profiles={"shared": shared, "actor-owned": actor_owned})
+    )
+    principal = IntegrationPrincipal(
+        issuer=ISSUER,
+        subject=SUBJECT,
+        organization_id="org-test",
+        workspace_id="workspace-test",
+        allowed_operation_ids=frozenset({"navigator.connector.operator.v1"}),
+    )
+
+    assert registry.account_center_profile_ref(principal, shared) == (
+        "d8148b76-e918-539c-8f60-e8f4db60cf77"
+    )
+    assert registry.account_center_profile_ref(principal, actor_owned) == (
+        "f7d95688-2a49-5fac-9d21-1fa53ac6ddae"
+    )
 
 
 def test_cloud_bootstrap_registers_account_profiles_and_reads_back_real_connections(
