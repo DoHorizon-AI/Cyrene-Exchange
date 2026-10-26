@@ -641,10 +641,21 @@ def test_connector_tool_catalog_cli_omits_legacy_oauth_issue_connections(
     assert json.loads(capsys.readouterr().out) == {"items": [], "schemaVersion": 1}
 
 
+@pytest.mark.parametrize(
+    ("repo_type", "repo_id", "list_operation_id"),
+    [
+        ("model", "Qwen/Qwen2.5-0.5B-Instruct", "huggingface.models.list"),
+        ("dataset", "example-org/private-dataset", "huggingface.datasets.list"),
+        ("space", "example-org/private-space", "huggingface.spaces.list"),
+    ],
+)
 def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
     tmp_path: Path,
     monkeypatch: Any,
     capsys: pytest.CaptureFixture[str],
+    repo_type: str,
+    repo_id: str,
+    list_operation_id: str,
 ) -> None:
     database_path = tmp_path / "integrations.sqlite3"
     database_path.touch()
@@ -658,12 +669,23 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
         actor_subject="actor-1",
         account_link_ref=profile_ref,
         binding_ref="hf-primary",
-        target_ref="hf-qwen",
+        target_ref=f"hf-{repo_type}",
         access_mode="workspace_operator",
     )
-    target_ref = "Qwen/Qwen2.5-0.5B-Instruct"
+    target_ref = repo_id
+    list_operation_ids = {
+        "huggingface.models.list",
+        "huggingface.datasets.list",
+        "huggingface.spaces.list",
+    }
     read_only_map = [
-        item for item in connector_binding_tools("huggingface") if item["mutating"] is False
+        item
+        for item in connector_binding_tools("huggingface")
+        if item["mutating"] is False
+        and (
+            item["operationId"] not in list_operation_ids
+            or item["operationId"] == list_operation_id
+        )
     ]
     provider_catalog = _definitions_for_operation_map(read_only_map)
     account_profile = {
@@ -676,7 +698,7 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
         "target_scope": {
             "repositories": [
                 {
-                    "repo_type": "model",
+                    "repo_type": repo_type,
                     "repo_id": target_ref,
                     "permissions": ["read"],
                 }
@@ -712,14 +734,14 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
                         account_scopes={
                             "repositories": [
                                 {
-                                    "repo_type": "model",
+                                    "repo_type": repo_type,
                                     "repo_id": target_ref,
                                     "permissions": ["read"],
                                 }
                             ]
                         },
                         targets={
-                            "hf-qwen": SimpleNamespace(
+                            f"hf-{repo_type}": SimpleNamespace(
                                 target_ref=target_ref,
                                 display_name="Qwen target",
                             )
@@ -780,8 +802,11 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
     assert {tool["id"] for tool in catalog_item["tools"]} == {
         str(item["toolId"]) for item in read_only_map
     }
+    assert {tool["id"] for tool in catalog_item["tools"]}.isdisjoint(
+        list_operation_ids - {list_operation_id}
+    )
     assert output["connections"][0]["targetScope"] == {
-        "repoType": "model",
+        "repoType": repo_type,
         "repoId": target_ref,
         "permissions": ["read"],
     }

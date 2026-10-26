@@ -4190,6 +4190,60 @@ class IntegrationStore:
             )
             return updated
 
+    def fail_renewal_session_start(
+        self,
+        principal: IntegrationPrincipal,
+        authorization_ref: str,
+        session_ref: str,
+    ) -> RenewalSessionRecord:
+        """Persist a definite no-start response without enabling retry or polling."""
+
+        principal.require("accountBeginRenewalSession")
+        with self._transaction() as cursor:
+            row = cursor.execute(
+                """SELECT document FROM renewal_sessions WHERE organization_id=? AND workspace_id=?
+                   AND actor_issuer=? AND actor_subject=? AND authorization_ref=?
+                   AND session_ref=?""",
+                (*self._scope(principal), authorization_ref, session_ref),
+            ).fetchone()
+            if row is None:
+                raise IntegrationNotFound("renewal start intent not found")
+            session = RenewalSessionRecord.model_validate_json(str(row["document"]))
+            if session.provider_session_ref is not None:
+                return session
+            if session.state == RenewalState.FAILED:
+                return session
+            updated = session.model_copy(
+                update={
+                    "state": RenewalState.FAILED,
+                    "expires_at": None,
+                    "authorization_url": None,
+                    "user_code": None,
+                    "qr_attachment_ref": None,
+                    "reason_code": "provider_start_rejected",
+                }
+            )
+            document = updated.model_dump_json(by_alias=True)
+            cursor.execute(
+                """UPDATE renewal_sessions SET state=?,document=? WHERE organization_id=?
+                   AND workspace_id=? AND actor_issuer=? AND actor_subject=?
+                   AND authorization_ref=? AND session_ref=?""",
+                (
+                    RenewalState.FAILED.value,
+                    document,
+                    *self._scope(principal),
+                    authorization_ref,
+                    session_ref,
+                ),
+            )
+            cursor.execute(
+                """UPDATE idempotency_records SET document=? WHERE organization_id=?
+                   AND workspace_id=? AND actor_issuer=? AND actor_subject=?
+                   AND operation_id='accountBeginRenewalSession' AND resource_id=?""",
+                (document, *self._scope(principal), session_ref),
+            )
+            return updated
+
     def update_renewal_session_status(
         self,
         principal: IntegrationPrincipal,

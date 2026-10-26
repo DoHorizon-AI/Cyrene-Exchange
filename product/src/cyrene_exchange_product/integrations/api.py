@@ -3376,6 +3376,43 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         qr_attachment_ref=provider_session.qr_attachment_ref,
                         generation=provider_session.generation,
                     )
+                except PermissionError as exc:
+                    services.store.fail_renewal_session_start(
+                        actor,
+                        authorization_id,
+                        session.session_ref,
+                    )
+                    raise ExchangeProductError(
+                        code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                        title="Renewal authorization denied",
+                        detail="The provider rejected the exact renewal profile scope.",
+                        status=403,
+                        context={"reasonCode": "provider_start_rejected"},
+                    ) from exc
+                except ExchangeProductError as exc:
+                    if (
+                        exc.status < 500
+                        and not exc.retryable
+                        and exc.status
+                        not in {
+                            408,
+                            409,
+                            425,
+                            429,
+                        }
+                    ):
+                        services.store.fail_renewal_session_start(
+                            actor,
+                            authorization_id,
+                            session.session_ref,
+                        )
+                        raise
+                    services.store.mark_renewal_start_unknown(
+                        actor,
+                        authorization_id,
+                        session.session_ref,
+                        reason_code="provider_start_outcome_unknown",
+                    )
                 except Exception:
                     services.store.mark_renewal_start_unknown(
                         actor,

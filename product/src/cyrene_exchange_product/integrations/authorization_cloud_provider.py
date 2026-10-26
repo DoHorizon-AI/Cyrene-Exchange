@@ -99,7 +99,11 @@ class PlatformCurrentAuthorizationContextResolver:
                 operation_id=operation_id,
             )
             if used_static_owner:
-                provider_operation_id, arguments = _health_grant_scope(current, profile)
+                provider_operation_id, arguments = _health_grant_scope(
+                    current,
+                    profile,
+                    product_operation_id=operation_id,
+                )
                 if provider_operation_id is None or arguments is None:
                     return None
                 principal, _claims = self._mint_connector_grant(
@@ -134,6 +138,8 @@ class PlatformCurrentAuthorizationContextResolver:
         """
 
         try:
+            if operation_id != "integrationGetAuthorizationHealth":
+                return None, None
             current, profile, principal, _used_static_owner = self._resolve_connection_principal(
                 connection,
                 operation_id=operation_id,
@@ -403,9 +409,13 @@ class PlatformCurrentAuthorizationContextResolver:
 def _health_grant_scope(
     connection: IntegrationConnection,
     profile: AuthorizationProviderProfile,
+    *,
+    product_operation_id: str,
 ) -> tuple[str | None, dict[str, object] | None]:
     """Build one host-selected read target for a background health probe."""
 
+    if product_operation_id != "integrationGetAuthorizationHealth":
+        return None, None
     if connection.provider == "hf":
         target = profile.targets.get(connection.target_ref or "")
         repositories = (profile.account_scopes or {}).get("repositories")
@@ -1177,9 +1187,18 @@ class AuthorizationCloudDirectProvider:
         *,
         request_id: str,
     ) -> ProviderRenewalSession:
-        principal, profile, _ = self._verified_connection(
-            principal, connection, operation_id="accountBeginRenewalSession"
-        )
+        if connection.provider == "hf":
+            principal, profile, _ = self._verified_request_connection(
+                principal,
+                connection,
+                operation_id="accountBeginRenewalSession",
+            )
+        else:
+            principal, profile, _ = self._verified_connection(
+                principal,
+                connection,
+                operation_id="accountBeginRenewalSession",
+            )
         if not _OPAQUE_PROVIDER_REF.fullmatch(authorization_ref):
             raise PermissionError("renewal authorization is not selected by the verified binding")
         if profile.provider == "hf":
@@ -1224,11 +1243,18 @@ class AuthorizationCloudDirectProvider:
             authorization_ref,
             operation_id="accountGetRenewalSession",
         )
-        principal, profile, _ = self._verified_connection(
-            principal,
-            connection,
-            operation_id="accountGetRenewalSession",
-        )
+        if connection.provider == "hf":
+            principal, profile, _ = self._verified_request_connection(
+                principal,
+                connection,
+                operation_id="accountGetRenewalSession",
+            )
+        else:
+            principal, profile, _ = self._verified_connection(
+                principal,
+                connection,
+                operation_id="accountGetRenewalSession",
+            )
         if profile.provider == "hf":
             if (
                 profile.auth_mode != "device_oauth"
@@ -1269,11 +1295,18 @@ class AuthorizationCloudDirectProvider:
             authorization_ref,
             operation_id="accountGetRenewalSession",
         )
-        principal, profile, _ = self._verified_connection(
-            principal,
-            connection,
-            operation_id="accountGetRenewalSession",
-        )
+        if connection.provider == "hf":
+            principal, profile, _ = self._verified_request_connection(
+                principal,
+                connection,
+                operation_id="accountGetRenewalSession",
+            )
+        else:
+            principal, profile, _ = self._verified_connection(
+                principal,
+                connection,
+                operation_id="accountGetRenewalSession",
+            )
         if profile.provider == "hf":
             if (
                 profile.auth_mode != "device_oauth"
@@ -1398,6 +1431,26 @@ class AuthorizationCloudDirectProvider:
             operation_id=operation_id,
         )
         return fresh, profile, target_ref
+
+    def _verified_request_connection(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        *,
+        operation_id: str,
+    ) -> tuple[IntegrationPrincipal, AuthorizationProviderProfile, str | None]:
+        """Validate one current user request without requiring a stored bearer context."""
+
+        principal.require(operation_id)
+        current = self._store.current_connection_for_provider_call(connection.id)
+        if current is None or current != connection or not current.enabled:
+            raise PermissionError("connection changed before provider call")
+        profile, target_ref = self._registry.profile_for_connection(
+            principal,
+            current,
+            operation_id=operation_id,
+        )
+        return principal, profile, target_ref
 
     def _call_profile(
         self,

@@ -141,7 +141,7 @@ An abridged host-owned configuration shape is:
           "transport": "local"
         },
         "callerWorkload": "exchange.integrations",
-        "audience": "cloud-resources",
+        "audience": "cloud-management",
         "expectedIssuer": "https://identity.example.invalid",
         "contextKeyRef": "keys/azure",
         "organizationId": "org-a",
@@ -460,6 +460,9 @@ tool catalog; modern connector calls still require a verified App profile.
 
 The full legacy authorization/cloud example remains available at
 [`integration-configuration.authorization-cloud.json`](../../../examples/integration-configuration.authorization-cloud.json).
+Its Azure binding intentionally targets the older Cloud Resources provider and
+uses `audience: "cloud-resources"`; it cannot bind the native Cloud Management
+profile. Native Cloud Management profiles use `audience: "cloud-management"`.
 
 ## Directory 授权的 Connector 调用
 

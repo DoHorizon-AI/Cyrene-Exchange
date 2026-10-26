@@ -638,6 +638,7 @@ def _integration_connector_export_data(
             raise SystemExit("an enabled connector connection has no complete host profile scope")
 
         read_only_hf_target = False
+        selected_hf_repo_type: str | None = None
         connection_target_scope: dict[str, Any] | None = None
         account_profile: dict[str, Any] | None = None
         host_profile: Any = None
@@ -681,6 +682,7 @@ def _integration_connector_export_data(
                 if len(target_rows) != 1:
                     raise SystemExit("Hugging Face target does not match its issued profile scope")
                 target_row = target_rows[0]
+                selected_hf_repo_type = str(target_row["repoType"])
                 read_only_hf_target = "write" not in target_row["permissions"]
                 connection_target_scope = {
                     "repoType": target_row["repoType"],
@@ -732,8 +734,28 @@ def _integration_connector_export_data(
                 descriptors = {descriptor.tool_id: descriptor for descriptor in provider_catalog}
                 catalog_cache[cache_key] = descriptors
         descriptor_ids = set(descriptors)
-        if provider_id == "huggingface" and read_only_hf_target:
-            selected_ids = read_ids
+        if provider_id == "huggingface":
+            list_operations = {
+                "huggingface.models.list": "model",
+                "huggingface.datasets.list": "dataset",
+                "huggingface.spaces.list": "space",
+            }
+            selected_list_operation = next(
+                (
+                    operation_id
+                    for operation_id, repo_type in list_operations.items()
+                    if repo_type == selected_hf_repo_type
+                ),
+                None,
+            )
+            selected_ids = {
+                tool_id
+                for tool_id, mapping in expected.items()
+                if mapping["operationId"] not in list_operations
+                or mapping["operationId"] == selected_list_operation
+            }
+            if read_only_hf_target:
+                selected_ids &= read_ids
         elif include_live_catalog and provider_id in {"azure", "gcp", "runpod"}:
             available = descriptor_ids & expected_ids
             if available == expected_ids:

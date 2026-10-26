@@ -91,7 +91,7 @@ def _settings(*, include_wecom: bool = True, include_email: bool = True, include
                 "transport": "local",
             },
             "callerWorkload": "exchange.integrations",
-            "audience": "cloud-resources",
+            "audience": "cloud-management",
             "expectedIssuer": _ISSUER,
             "contextKeyRef": "keys/cloud-azure",
             "organizationId": _ORG,
@@ -209,7 +209,7 @@ def _hf_settings():
                         "connectionRef": "grpc://127.0.0.1:5510",
                         "transport": "local",
                     },
-                    "callerWorkload": "exchange.integrations",
+                    "callerWorkload": "exchange-service",
                     "audience": "huggingface-provider",
                     "expectedIssuer": _ISSUER,
                     "contextKeyRef": "keys/huggingface",
@@ -474,6 +474,28 @@ def test_contextless_cloud_health_requires_a_fresh_workspace_connector_grant(
         digest_arguments({"profile_ref": "azure-prod"})
     )
     assert verifier.consumed == 1
+    assert (
+        resolver.for_connection(
+            connection,
+            operation_id="integrationRefreshConnectionResources",
+        )
+        is None
+    )
+    assert len(authority.requests) == 1
+    direct = _DirectClient({"resources": []})
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={"azure-prod": direct},
+        email_client=None,
+        account_center=None,
+        current_context_resolver=resolver,
+        context_key=lambda _reference: _KEY,
+    )
+    refresh_principal = _principal(operations={"integrationRefreshConnectionResources"})
+    with pytest.raises(PermissionError, match="current Platform grant"):
+        provider.cloud_resources(refresh_principal, connection)
+    assert direct.requests == []
     store.close()
 
 
@@ -575,6 +597,102 @@ def test_contextless_hf_health_projects_exact_grant_into_account_center_lease(
     assert principal.allowed_operation_ids == frozenset(
         {"integrationGetAuthorizationHealth", "huggingface.repo.get"}
     )
+    denied_principal, denied_claims = resolver.for_connection_with_connector_grant(
+        connection,
+        operation_id="integrationRefreshConnectionResources",
+        provider_operation_id="cloud.provider.health.read",
+        arguments={"profile_ref": "hf-oauth"},
+    )
+    assert denied_principal is None and denied_claims is None
+    assert len(authority.requests) == 1
+    store.close()
+
+
+def test_hf_device_renewal_uses_the_fresh_actor_request_without_a_stored_bearer_context(
+    tmp_path: Path,
+) -> None:
+    settings = _hf_settings()
+    configured = settings.profiles["hf-oauth"]
+    profile = replace(
+        configured,
+        allowed_context_refs=frozenset(),
+        allowed_actors=frozenset({(_ISSUER, _SUBJECT)}),
+        access_mode="workspace_operator",
+        targets={
+            alias: replace(target, allowed_context_refs=frozenset())
+            for alias, target in configured.targets.items()
+        },
+    )
+    registry = AuthorizationCloudProfileRegistry(
+        replace(settings, contexts={}, profiles={"hf-oauth": profile})
+    )
+    principal = _principal(
+        operations={
+            "integrationCreateConnection",
+            "accountBeginRenewalSession",
+            "navigator.connector.operator.v1",
+        }
+    )
+    profile_ref = "00000000-0000-4000-8000-000000000401"
+    store = IntegrationStore(tmp_path / "hf-renewal-without-stored-context.sqlite3")
+    connection = store.create_connection(
+        principal,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-oauth",
+            target_ref="selected-model",
+            account_link_ref=profile_ref,
+            display_name="Selected HF model",
+        ),
+        idempotency_key="hf-static-owner-renewal",
+        access_mode="workspace_operator",
+    )
+
+    class _Accounts:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def begin_huggingface_renewal(
+            self,
+            selected: IntegrationPrincipal,
+            *,
+            profile_ref: str,
+            session_ref: str,
+        ) -> dict[str, Any]:
+            self.calls.append((selected.subject, profile_ref))
+            return {
+                "profile_ref": profile_ref,
+                "session_ref": session_ref,
+                "state": "waiting_user",
+                "verification_uri": "https://hf.co/oauth/device",
+                "user_code": "ABCD-EFGH",
+                "generation": 5,
+            }
+
+    accounts = _Accounts()
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={},
+        email_client=None,
+        account_center=accounts,
+        current_context_resolver=None,
+        context_key=lambda _reference: _KEY,
+    )
+
+    session = provider.start_renewal(
+        principal,
+        connection,
+        profile_ref,
+        request_id="renewal-session-owner-1",
+    )
+
+    assert session.authorization_ref == profile_ref
+    assert session.session_ref == "renewal-session-owner-1"
+    assert session.state.value == "WAITING_USER"
+    assert session.authorization_url == "https://hf.co/oauth/device"
+    assert session.user_code == "ABCD-EFGH"
+    assert accounts.calls == [(_SUBJECT, profile_ref)]
     store.close()
 
 
@@ -706,8 +824,8 @@ def test_hf_health_uses_account_center_lease_and_suppresses_oauth_access_ttl(
         method="call_tool",
         payload=signed_payload,
         context=envelope["trusted_context"],
-        keys={"exchange.integrations": _KEY},
-        expected_caller_id="exchange.integrations",
+        keys={"exchange-service": _KEY},
+        expected_caller_id="exchange-service",
     )
     store.close()
 
@@ -1093,10 +1211,12 @@ def test_cloud_management_health_maps_auth_permission_and_transport_states(
     store.close()
 
 
-def test_cloud_query_uses_host_target_alias_and_projects_provider_observation(
+def test_legacy_cloud_resources_query_uses_host_target_alias_and_projects_observation(
     tmp_path: Path,
 ) -> None:
     settings = _settings(include_wecom=False, include_email=False)
+    legacy_profile = replace(settings.profiles["azure-prod"], audience="cloud-resources")
+    settings = replace(settings, profiles={"azure-prod": legacy_profile})
     registry = AuthorizationCloudProfileRegistry(settings)
     principal = _principal()
     store = IntegrationStore(tmp_path / "integrations.sqlite3")

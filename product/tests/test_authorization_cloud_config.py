@@ -145,7 +145,7 @@ def _config(tmp_path: Path) -> tuple[dict[str, Any], dict[str, str]]:
                         "transport": "local",
                     },
                     "callerWorkload": "exchange.integrations",
-                    "audience": "cloud-resources",
+                    "audience": "cloud-management",
                     "expectedIssuer": "https://identity.example.test",
                     "contextKeyRef": "keys/azure",
                     "organizationId": "org-a",
@@ -419,6 +419,19 @@ def test_hf_target_ref_is_repo_identity_but_connection_ref_remains_an_alias() ->
             target_alias="hf-primary-target",
         )
         == first_profile_ref
+    )
+    another_target = replace(target, target_ref="example-org/another-model")
+    other_profile = replace(
+        profile,
+        targets={**profile.targets, "hf-secondary-target": another_target},
+    )
+    assert (
+        registry.account_center_profile_ref(
+            principal,
+            other_profile,
+            target_alias="hf-secondary-target",
+        )
+        != first_profile_ref
     )
 
 

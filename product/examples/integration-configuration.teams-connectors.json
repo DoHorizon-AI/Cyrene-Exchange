@@ -91,7 +91,7 @@
             "clientKeyRef": "tls/exchange-plugin-client-key"
           }
         },
-        "callerWorkload": "exchange.integrations",
+        "callerWorkload": "exchange-service",
         "audience": "huggingface-provider",
         "expectedIssuer": "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0",
         "contextKeyRef": "keys/hf",
