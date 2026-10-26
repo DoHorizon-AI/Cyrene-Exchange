@@ -941,7 +941,7 @@ def _attach_authorization_cloud_runner(
         begin_drain = getattr(runner, "begin_drain", None)
         try:
             if callable(begin_drain):
-                begin_drain()
+                begin_drain(timeout_seconds=max(0.0, shutdown_deadline - monotonic()))
         finally:
             stop_event.set()
         worker.join(timeout=max(0.0, shutdown_deadline - monotonic()))

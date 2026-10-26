@@ -216,14 +216,24 @@ class AuthorizationCloudRunner:
 
         return self._monitor_interval_seconds
 
-    def begin_drain(self) -> None:
-        """Fence new durable claims before the host begins waiting for this worker."""
+    def begin_drain(self, *, timeout_seconds: float = 0.0) -> bool:
+        """Fence claims, then briefly synchronize with any gate already entered.
 
-        with self._claim_gate:
-            self._draining.set()
+        The bounded gate wait covers only local claim/start admission and never a
+        provider network call. A false result means the host must retain its
+        shutdown failure behavior instead of closing services under this worker.
+        """
+
+        if timeout_seconds < 0:
+            raise ValueError("authorization/cloud drain timeout is invalid")
+        self._draining.set()
+        if not self._claim_gate.acquire(timeout=timeout_seconds):
+            return False
+        self._claim_gate.release()
+        return True
 
     def _allow_provider_io(self, stop_event: Event | None) -> bool:
-        """Linearize entry to one provider call against the host drain barrier."""
+        """Admit one active-call intent against drain without locking across I/O."""
 
         with self._claim_gate:
             return not self._draining.is_set() and not _stop_requested(stop_event)
@@ -298,6 +308,13 @@ class AuthorizationCloudRunner:
                 )
                 break
             previous = self._store.latest_authorization_health_for_monitor(claim)
+            if self._drain_requested(stop_event):
+                self._store.release_authorization_check(
+                    claim,
+                    now=now,
+                    retry_delay_seconds=1,
+                )
+                break
             principal = self._current_connection_principal(claim.connection, _MONITOR_OPERATION)
             if self._drain_requested(stop_event):
                 self._store.release_authorization_check(
@@ -381,6 +398,13 @@ class AuthorizationCloudRunner:
             )
             return 0, 0, 0
         connection = self._store.connection_for_cloud_refresh(claim)
+        if self._drain_requested(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
+            return 0, 0, 0
         principal = self._current_connection_principal(connection, _REFRESH_OPERATION)
         if self._drain_requested(stop_event):
             self._store.release_cloud_refresh_claim(

@@ -311,7 +311,11 @@ def test_runner_drain_barrier_prevents_new_claims_before_stop_event_is_set(
         worker_id="auth-cloud-worker",
     )
 
-    runner.begin_drain()
+    runner._claim_gate.acquire()
+    try:
+        assert runner.begin_drain(timeout_seconds=0.01) is False
+    finally:
+        runner._claim_gate.release()
     result = runner.run_once()
 
     assert result.authorization_checks == 0

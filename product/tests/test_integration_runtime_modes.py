@@ -148,7 +148,8 @@ def test_integration_app_starts_and_drains_the_existing_authorization_runner(
     class _Runner:
         monitor_interval_seconds = 900
 
-        def begin_drain(self) -> None:
+        def begin_drain(self, *, timeout_seconds: float) -> None:
+            assert timeout_seconds >= 0
             drain_started.set()
 
         def run_forever(self, stop_event: Event) -> None:
