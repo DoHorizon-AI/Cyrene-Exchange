@@ -15,7 +15,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from threading import Event
+from threading import Event, Lock
 from typing import Protocol
 
 from cyrene_exchange_product.integrations.models import (
@@ -207,6 +207,8 @@ class AuthorizationCloudRunner:
         self._email_recipient_resolver = email_recipient_resolver
         self._monitor_interval_seconds = monitor_interval_seconds
         self._idle_delay_seconds = idle_delay_seconds
+        self._claim_gate = Lock()
+        self._draining = Event()
 
     @property
     def monitor_interval_seconds(self) -> int:
@@ -214,13 +216,36 @@ class AuthorizationCloudRunner:
 
         return self._monitor_interval_seconds
 
-    def run_once(self, *, now: datetime | None = None) -> AuthorizationCloudRunResult:
+    def begin_drain(self) -> None:
+        """Fence new durable claims before the host begins waiting for this worker."""
+
+        self._draining.set()
+
+    def _drain_requested(self, stop_event: Event | None) -> bool:
+        return self._draining.is_set() or _stop_requested(stop_event)
+
+    def run_once(
+        self,
+        *,
+        now: datetime | None = None,
+        stop_event: Event | None = None,
+    ) -> AuthorizationCloudRunResult:
         """Process due monitor checks, one refresh job, and one email job."""
 
         moment = now or utc_now()
-        checks = self._run_authorization_checks(moment)
-        refresh, refresh_deferred, refresh_unknown = self._run_cloud_refresh(moment)
-        email, email_deferred, email_unknown = self._run_email_notification(moment)
+        checks = self._run_authorization_checks(moment, stop_event=stop_event)
+        refresh = email = refresh_deferred = email_deferred = 0
+        refresh_unknown = email_unknown = 0
+        if not self._drain_requested(stop_event):
+            refresh, refresh_deferred, refresh_unknown = self._run_cloud_refresh(
+                moment,
+                stop_event=stop_event,
+            )
+        if not self._drain_requested(stop_event):
+            email, email_deferred, email_unknown = self._run_email_notification(
+                moment,
+                stop_event=stop_event,
+            )
         return AuthorizationCloudRunResult(
             authorization_checks=checks,
             cloud_refreshes=refresh,
@@ -232,8 +257,8 @@ class AuthorizationCloudRunner:
     def run_forever(self, stop_event: Event) -> None:
         """Poll durable jobs until the host signals shutdown."""
 
-        while not stop_event.is_set():
-            result = self.run_once()
+        while not self._drain_requested(stop_event):
+            result = self.run_once(stop_event=stop_event)
             if (
                 result.authorization_checks == 0
                 and result.cloud_refreshes == 0
@@ -241,12 +266,39 @@ class AuthorizationCloudRunner:
             ):
                 stop_event.wait(self._idle_delay_seconds)
 
-    def _run_authorization_checks(self, now: datetime) -> int:
-        claims = self._store.claim_authorization_checks(self._worker_id, now=now)
+    def _run_authorization_checks(self, now: datetime, *, stop_event: Event | None) -> int:
+        if self._drain_requested(stop_event):
+            return 0
+        # Claim one row at a time so shutdown never leaves a batch of unstarted
+        # monitors fenced to a worker that is already draining.
+        with self._claim_gate:
+            claims = (
+                []
+                if self._draining.is_set() or _stop_requested(stop_event)
+                else self._store.claim_authorization_checks(
+                    self._worker_id,
+                    now=now,
+                    limit=1,
+                )
+            )
         completed = 0
         for claim in claims:
+            if self._drain_requested(stop_event):
+                self._store.release_authorization_check(
+                    claim,
+                    now=now,
+                    retry_delay_seconds=1,
+                )
+                break
             previous = self._store.latest_authorization_health_for_monitor(claim)
             principal = self._current_connection_principal(claim.connection, _MONITOR_OPERATION)
+            if self._drain_requested(stop_event):
+                self._store.release_authorization_check(
+                    claim,
+                    now=now,
+                    retry_delay_seconds=1,
+                )
+                break
             if principal is None:
                 observation = _unavailable_health(
                     claim.connection,
@@ -291,12 +343,38 @@ class AuthorizationCloudRunner:
             completed += 1
         return completed
 
-    def _run_cloud_refresh(self, now: datetime) -> tuple[int, int, int]:
-        claim = self._store.claim_cloud_refresh(self._worker_id, now=now)
+    def _run_cloud_refresh(
+        self,
+        now: datetime,
+        *,
+        stop_event: Event | None,
+    ) -> tuple[int, int, int]:
+        if self._drain_requested(stop_event):
+            return 0, 0, 0
+        with self._claim_gate:
+            claim = (
+                None
+                if self._draining.is_set() or _stop_requested(stop_event)
+                else self._store.claim_cloud_refresh(self._worker_id, now=now)
+            )
         if claim is None:
+            return 0, 0, 0
+        if self._drain_requested(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
             return 0, 0, 0
         connection = self._store.connection_for_cloud_refresh(claim)
         principal = self._current_connection_principal(connection, _REFRESH_OPERATION)
+        if self._drain_requested(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
+            return 0, 0, 0
         if principal is None:
             self._store.complete_cloud_refresh(
                 claim,
@@ -350,11 +428,31 @@ class AuthorizationCloudRunner:
         )
         return 1, 0, 0
 
-    def _run_email_notification(self, now: datetime) -> tuple[int, int, int]:
+    def _run_email_notification(
+        self,
+        now: datetime,
+        *,
+        stop_event: Event | None,
+    ) -> tuple[int, int, int]:
         if self._email is None:
             return 0, 0, 0
-        claim = self._store.claim_email_notification(self._worker_id, now=now)
+        if self._drain_requested(stop_event):
+            return 0, 0, 0
+        with self._claim_gate:
+            claim = (
+                None
+                if self._draining.is_set() or _stop_requested(stop_event)
+                else self._store.claim_email_notification(self._worker_id, now=now)
+            )
         if claim is None:
+            return 0, 0, 0
+        if self._drain_requested(stop_event):
+            self._store.release_email_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+                failure_reason_code="shutdown_before_send",
+            )
             return 0, 0, 0
         try:
             principal = self._contexts.for_claimed_notification(
@@ -364,6 +462,14 @@ class AuthorizationCloudRunner:
             )
         except Exception:
             principal = None
+        if self._drain_requested(stop_event):
+            self._store.release_email_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+                failure_reason_code="shutdown_before_send",
+            )
+            return 0, 0, 0
         if principal is None or not _principal_matches_notification(principal, claim.job):
             self._store.release_email_claim(
                 claim,
@@ -378,6 +484,15 @@ class AuthorizationCloudRunner:
                 now=now,
             )
         except Exception:
+            return 0, 0, 0
+        if self._drain_requested(stop_event):
+            self._store.release_email_send_before_provider(
+                claim.job.id,
+                claim_fence=claim.claim_fence,
+                now=now,
+                failure_reason_code="shutdown_before_send",
+                retry_delay_seconds=1,
+            )
             return 0, 0, 0
         try:
             evidence = self._email.send_notification(principal, claim.job)
@@ -457,6 +572,12 @@ class AuthorizationCloudRunner:
         if not _principal_matches_connection(principal, connection, operation_id):
             return None
         return principal
+
+
+def _stop_requested(stop_event: Event | None) -> bool:
+    """Return whether the host has begun draining this worker."""
+
+    return stop_event is not None and stop_event.is_set()
 
 
 def _principal_matches_connection(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 from typing import Any
 
@@ -142,10 +142,14 @@ def test_integration_app_starts_and_drains_the_existing_authorization_runner(
 ) -> None:
     started = Event()
     stopped = Event()
+    drain_started = Event()
     close_state: dict[str, bool] = {}
 
     class _Runner:
         monitor_interval_seconds = 900
+
+        def begin_drain(self) -> None:
+            drain_started.set()
 
         def run_forever(self, stop_event: Event) -> None:
             started.set()
@@ -187,7 +191,80 @@ def test_integration_app_starts_and_drains_the_existing_authorization_runner(
         }
 
     assert stopped.is_set()
+    assert drain_started.is_set()
     assert close_state["worker_stopped_before_close"] is True
+
+
+def test_integration_app_does_not_close_services_when_runner_exceeds_drain_deadline(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    started = Event()
+    finish_inflight_work = Event()
+    operation_returned = Event()
+    close_state: dict[str, bool] = {}
+    workers: list[Thread] = []
+
+    class _TrackedThread(Thread):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            workers.append(self)
+
+    monkeypatch.setattr(
+        product_server,
+        "_AUTHORIZATION_CLOUD_RUNNER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(product_server, "Thread", _TrackedThread)
+
+    class _Runner:
+        monitor_interval_seconds = 900
+
+        def run_forever(self, stop_event: Event) -> None:
+            started.set()
+            finish_inflight_work.wait(timeout=5)
+            operation_returned.set()
+
+    def close_services() -> None:
+        close_state["closed"] = True
+
+    services = SimpleNamespace(
+        store=object(),
+        authorization_cloud_runner=_Runner(),
+        close=close_services,
+    )
+    monkeypatch.setattr(
+        product_server,
+        "create_app",
+        lambda **_kwargs: _app_with_shutdown_callback(close_services),
+    )
+    app = product_server.build_integration_app(
+        database_path=tmp_path / "unused.sqlite3",
+        integrations=services,
+        enable_authorization_cloud_runner=True,
+    )
+
+    try:
+        with (
+            pytest.raises(RuntimeError, match="did not drain before shutdown"),
+            TestClient(app) as client,
+        ):
+            assert started.wait(timeout=2)
+            assert client.get("/healthz").status_code == 200
+        assert app.state.authorization_cloud_runner_state == "shutdown_timeout"
+        assert close_state == {}
+    finally:
+        finish_inflight_work.set()
+    assert operation_returned.wait(timeout=2)
+    assert len(workers) == 1
+    workers[0].join(timeout=2)
+    assert not workers[0].is_alive()
+
+
+def _app_with_shutdown_callback(close_services: Any) -> FastAPI:
+    app = FastAPI()
+    app.router.on_shutdown.append(close_services)
+    return app
 
 
 @pytest.mark.parametrize(

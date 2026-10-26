@@ -936,10 +936,17 @@ def _attach_authorization_cloud_runner(
             set_state("stopped")
             return
         set_state("stopping")
-        stop_event.set()
+        begin_drain = getattr(runner, "begin_drain", None)
+        try:
+            if callable(begin_drain):
+                begin_drain()
+        finally:
+            stop_event.set()
         worker.join(timeout=_AUTHORIZATION_CLOUD_RUNNER_SHUTDOWN_TIMEOUT_SECONDS)
         if worker.is_alive():
             set_state("shutdown_timeout")
+            # Keep IntegrationServices open: the in-flight provider call may
+            # still return and commit its fenced outcome before the worker exits.
             raise RuntimeError("authorization/cloud runner did not drain before shutdown")
         if app.state.authorization_cloud_runner_state != "failed":
             set_state("stopped")
