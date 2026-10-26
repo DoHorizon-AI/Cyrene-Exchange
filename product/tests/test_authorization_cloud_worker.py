@@ -322,6 +322,85 @@ def test_runner_drain_barrier_prevents_new_claims_before_stop_event_is_set(
     store.close()
 
 
+def test_runner_releases_cloud_claim_if_drain_starts_during_health_lookup(
+    tmp_path: Path,
+) -> None:
+    principal = _principal()
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _cloud_connection(store, principal)
+    now = datetime.now(UTC)
+    monitor_claims = store.claim_authorization_checks("auth-cloud-worker", now=now)
+    assert len(monitor_claims) == 1
+    store.complete_authorization_check(
+        monitor_claims[0],
+        AuthorizationHealthRecord(
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            actor_issuer=connection.actor_issuer,
+            actor_subject=connection.actor_subject,
+            connection_id=connection.id,
+            authorization_ref="native-auth-ref-1",
+            login_state=LoginState.PRESENT,
+            authorization_state=AuthorizationState.VALID,
+            checked_at=now,
+            expires_at=now + timedelta(days=2),
+            generation=4,
+        ),
+        [],
+        now=now,
+        interval_seconds=900,
+    )
+    refresh = store.enqueue_cloud_refresh(
+        principal,
+        connection.id,
+        idempotency_key="drain-during-cloud-health-lookup",
+        now=now,
+    )
+    provider = _Provider()
+    runner = AuthorizationCloudRunner(
+        store=store,
+        contexts=_Contexts(principal),
+        provider=provider,
+        email=None,
+        worker_id="auth-cloud-worker",
+    )
+    original_latest_health = store.latest_authorization_health_for_connection
+    health_lookup_started = Event()
+    finish_health_lookup = Event()
+
+    def blocked_latest_health(current_connection):
+        health_lookup_started.set()
+        if not finish_health_lookup.wait(timeout=5):
+            raise TimeoutError("test health lookup was not released")
+        return original_latest_health(current_connection)
+
+    store.latest_authorization_health_for_connection = blocked_latest_health
+    stop_event = Event()
+    worker = Thread(target=runner.run_forever, args=(stop_event,), daemon=True)
+    worker.start()
+    try:
+        assert health_lookup_started.wait(timeout=2)
+        runner.begin_drain()
+        stop_event.set()
+    finally:
+        finish_health_lookup.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert provider.cloud_calls == 0
+    assert (
+        store.get_cloud_refresh_operation(principal, refresh.id).state == CloudRefreshState.QUEUED
+    )
+    row = store._connection.execute(
+        "SELECT claim_owner,lease_expires_at FROM cloud_refresh_outbox WHERE operation_id=?",
+        (str(refresh.id),),
+    ).fetchone()
+    assert row is not None and row["claim_owner"] is None and row["lease_expires_at"] is None
+    assert runner.run_once().cloud_refreshes == 0
+    assert provider.cloud_calls == 0
+    store.close()
+
+
 def test_expiry_alerts_have_distinct_24h_and_1h_stages_and_six_hour_reminders(
     tmp_path: Path,
 ) -> None:

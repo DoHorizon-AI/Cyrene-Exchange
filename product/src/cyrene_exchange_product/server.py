@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, Thread
+from time import monotonic
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -936,13 +937,14 @@ def _attach_authorization_cloud_runner(
             set_state("stopped")
             return
         set_state("stopping")
+        shutdown_deadline = monotonic() + _AUTHORIZATION_CLOUD_RUNNER_SHUTDOWN_TIMEOUT_SECONDS
         begin_drain = getattr(runner, "begin_drain", None)
         try:
             if callable(begin_drain):
                 begin_drain()
         finally:
             stop_event.set()
-        worker.join(timeout=_AUTHORIZATION_CLOUD_RUNNER_SHUTDOWN_TIMEOUT_SECONDS)
+        worker.join(timeout=max(0.0, shutdown_deadline - monotonic()))
         if worker.is_alive():
             set_state("shutdown_timeout")
             # Keep IntegrationServices open: the in-flight provider call may

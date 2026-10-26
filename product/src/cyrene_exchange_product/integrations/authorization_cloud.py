@@ -219,7 +219,14 @@ class AuthorizationCloudRunner:
     def begin_drain(self) -> None:
         """Fence new durable claims before the host begins waiting for this worker."""
 
-        self._draining.set()
+        with self._claim_gate:
+            self._draining.set()
+
+    def _allow_provider_io(self, stop_event: Event | None) -> bool:
+        """Linearize entry to one provider call against the host drain barrier."""
+
+        with self._claim_gate:
+            return not self._draining.is_set() and not _stop_requested(stop_event)
 
     def _drain_requested(self, stop_event: Event | None) -> bool:
         return self._draining.is_set() or _stop_requested(stop_event)
@@ -307,6 +314,13 @@ class AuthorizationCloudRunner:
                     reason_code="current_authority_unavailable",
                 )
             else:
+                if not self._allow_provider_io(stop_event):
+                    self._store.release_authorization_check(
+                        claim,
+                        now=now,
+                        retry_delay_seconds=1,
+                    )
+                    break
                 try:
                     observation = self._provider.authorization_health(principal, claim.connection)
                     _check_observation_scope(claim, principal, observation, _MONITOR_OPERATION)
@@ -385,6 +399,13 @@ class AuthorizationCloudRunner:
             )
             return 1, 0, 0
         latest_health = self._store.latest_authorization_health_for_connection(connection)
+        if self._drain_requested(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
+            return 0, 0, 0
         if (
             latest_health is not None
             and latest_health.authorization_state == AuthorizationState.REAUTHORIZATION_REQUIRED
@@ -397,6 +418,13 @@ class AuthorizationCloudRunner:
                 result={"reasonCode": "connection_reauthorization_required"},
             )
             return 1, 0, 0
+        if not self._allow_provider_io(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
+            return 0, 0, 0
         try:
             observations = self._provider.cloud_resources(principal, connection)
             if any(item.connection_id != connection.id for item in observations):
@@ -485,7 +513,7 @@ class AuthorizationCloudRunner:
             )
         except Exception:
             return 0, 0, 0
-        if self._drain_requested(stop_event):
+        if not self._allow_provider_io(stop_event):
             self._store.release_email_send_before_provider(
                 claim.job.id,
                 claim_fence=claim.claim_fence,
