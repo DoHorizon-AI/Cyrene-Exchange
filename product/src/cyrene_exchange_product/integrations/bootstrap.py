@@ -444,7 +444,11 @@ def _authorize_cloud_profile_targets(
             or entry["target"].allowed_context_refs
         ):
             raise _bootstrap_error("cloud_host_profile_scope_mismatch")
-        account_profile_ref = registry.account_center_profile_ref(principal, profile)
+        account_profile_ref = registry.account_center_profile_ref(
+            principal,
+            profile,
+            target_alias=entry["target_alias"],
+        )
         request = CreateIntegrationConnection(
             provider=profile.provider,
             binding_ref=entry["profile_alias"],

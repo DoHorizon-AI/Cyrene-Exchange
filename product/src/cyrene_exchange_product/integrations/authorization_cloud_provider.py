@@ -38,7 +38,15 @@ from cyrene_exchange_product.integrations.clients import (
     _raise_provider_error,
     list_provider_tool_catalog,
 )
-from cyrene_exchange_product.integrations.connector_security import digest_arguments
+from cyrene_exchange_product.integrations.connector_operations import (
+    _account_center_grant_proof,
+    _resource_projection,
+    _resource_ref,
+)
+from cyrene_exchange_product.integrations.connector_security import (
+    ConnectorGrantClaims,
+    digest_arguments,
+)
 from cyrene_exchange_product.integrations.models import (
     AuthorizationCapabilityRecord,
     AuthorizationHealthRecord,
@@ -58,7 +66,7 @@ from cyrene_exchange_product.integrations.store import IntegrationStore
 
 
 class PlatformCurrentAuthorizationContextResolver:
-    """Reverify a host-owned live bearer and current catalog grant on every worker call."""
+    """Reverify bearer or one-use Directory proof before every worker call."""
 
     def __init__(
         self,
@@ -67,11 +75,15 @@ class PlatformCurrentAuthorizationContextResolver:
         identity_verifier: Any,
         registry: AuthorizationCloudProfileRegistry,
         bearer_token: Callable[[str], str | None],
+        connector_grant_authority: Any = None,
+        connector_grant_verifier: Any = None,
     ) -> None:
         self._store = store
         self._identity_verifier = identity_verifier
         self._registry = registry
         self._bearer_token = bearer_token
+        self._connector_grant_authority = connector_grant_authority
+        self._connector_grant_verifier = connector_grant_verifier
 
     def for_connection(
         self,
@@ -82,16 +94,22 @@ class PlatformCurrentAuthorizationContextResolver:
         """Reload the connection and reverify its owner before each provider call."""
 
         try:
-            current = self._store.current_connection_for_provider_call(connection.id)
-            if current is None or current != connection:
-                return None
-            context, _profile = self._registry.context_for_connection(current)
-            principal = self._verified_principal(context, operation_id=operation_id)
-            self._registry.profile_for_connection(
-                principal,
-                current,
+            current, profile, principal, used_static_owner = self._resolve_connection_principal(
+                connection,
                 operation_id=operation_id,
             )
+            if used_static_owner:
+                provider_operation_id, arguments = _health_grant_scope(current, profile)
+                if provider_operation_id is None or arguments is None:
+                    return None
+                principal, _claims = self._mint_connector_grant(
+                    current,
+                    profile,
+                    principal,
+                    operation_id=provider_operation_id,
+                    arguments=arguments,
+                    product_operation_id=operation_id,
+                )
             return principal
         except Exception as exc:
             _LOGGER.info(
@@ -99,6 +117,166 @@ class PlatformCurrentAuthorizationContextResolver:
                 type(exc).__name__,
             )
             return None
+
+    def for_connection_with_connector_grant(
+        self,
+        connection: IntegrationConnection,
+        *,
+        operation_id: str,
+        provider_operation_id: str,
+        arguments: Mapping[str, object],
+    ) -> tuple[IntegrationPrincipal | None, ConnectorGrantClaims | None]:
+        """Return a fresh principal plus one verified shared-profile proof.
+
+        Account Center consumes the projected claims when minting a shared HF lease.
+        The signed grant itself is verified and consumed by Exchange first.
+        中文：HF 共享租约同时交由 Account Center 按原 claims 消费。
+        """
+
+        try:
+            current, profile, principal, _used_static_owner = self._resolve_connection_principal(
+                connection,
+                operation_id=operation_id,
+            )
+            if current.access_mode != "workspace_operator":
+                return principal, None
+            if provider_operation_id not in {
+                "cloud.provider.health.read",
+                "huggingface.repo.get",
+            }:
+                return None, None
+            return self._mint_connector_grant(
+                current,
+                profile,
+                principal,
+                operation_id=provider_operation_id,
+                arguments=arguments,
+                product_operation_id=operation_id,
+            )
+        except Exception as exc:
+            _LOGGER.info(
+                "Current connector grant is unavailable for an integration connection (%s)",
+                type(exc).__name__,
+            )
+            return None, None
+
+    def _resolve_connection_principal(
+        self,
+        connection: IntegrationConnection,
+        *,
+        operation_id: str,
+    ) -> tuple[IntegrationConnection, AuthorizationProviderProfile, IntegrationPrincipal, bool]:
+        """Resolve a live bearer principal or a static owner awaiting Authority proof."""
+
+        current = self._store.current_connection_for_provider_call(connection.id)
+        if current is None or current != connection:
+            raise PermissionError("connection changed before current authorization")
+        try:
+            context, _profile = self._registry.context_for_connection(current)
+            principal = self._verified_principal(context, operation_id=operation_id)
+            profile, _target = self._registry.profile_for_connection(
+                principal,
+                current,
+                operation_id=operation_id,
+            )
+            return current, profile, principal, False
+        except PermissionError:
+            profile, _target = self._registry.profile_for_static_workspace_operator_connection(
+                current
+            )
+            principal = IntegrationPrincipal(
+                issuer=current.actor_issuer,
+                subject=current.actor_subject,
+                organization_id=current.organization_id,
+                workspace_id=current.workspace_id,
+                allowed_operation_ids=frozenset({operation_id}),
+            )
+            self._registry.profile_for_connection(
+                principal,
+                current,
+                operation_id=operation_id,
+            )
+            return current, profile, principal, True
+
+    def _mint_connector_grant(
+        self,
+        connection: IntegrationConnection,
+        profile: AuthorizationProviderProfile,
+        principal: IntegrationPrincipal,
+        *,
+        operation_id: str,
+        arguments: Mapping[str, object],
+        product_operation_id: str,
+    ) -> tuple[IntegrationPrincipal, ConnectorGrantClaims]:
+        """Mint, validate, and consume one exact live Directory connector proof."""
+
+        authority = self._connector_grant_authority
+        verifier = self._connector_grant_verifier
+        if authority is None or verifier is None or not verifier.configured:
+            raise PermissionError("Platform connector-grant authority is unavailable")
+        if profile.provider != connection.provider:
+            raise PermissionError("provider profile does not match the persisted connection")
+        provider_id = "huggingface" if connection.provider == "hf" else connection.provider
+        profile_ref = (
+            connection.account_link_ref if connection.provider == "hf" else connection.binding_ref
+        )
+        if not profile_ref:
+            raise PermissionError("provider profile reference is unavailable")
+        payload = dict(arguments)
+        arguments_digest = digest_arguments(payload)
+        target = _resource_projection(
+            provider_id=provider_id,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            arguments=payload,
+        )
+        resource_ref = _resource_ref(
+            provider_id=provider_id,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            target=target,
+        )
+        request_id = str(uuid4())
+        expected = {
+            "request_id": request_id,
+            "organization_id": connection.organization_id,
+            "workspace_id": connection.workspace_id,
+            "principal_issuer": connection.actor_issuer,
+            "principal_subject": connection.actor_subject,
+            "connection_ref": str(connection.id),
+            "provider_id": provider_id,
+            "profile_ref": profile_ref,
+            "operation_id": operation_id,
+            "resource_ref": resource_ref,
+            "arguments_digest_sha256": bytes.fromhex(arguments_digest),
+        }
+        grant_bytes = authority.authorize_connector_operation(
+            workspace_id=connection.workspace_id,
+            principal_issuer=connection.actor_issuer,
+            principal_subject=connection.actor_subject,
+            connection_ref=str(connection.id),
+            provider_id=provider_id,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            resource_ref=resource_ref,
+            arguments_digest_sha256=bytes.fromhex(arguments_digest),
+            request_id=request_id,
+        )
+        verifier.validate_authority_response(grant_bytes, expected=expected)
+        claims = verifier.consume(grant_bytes, expected=expected)
+        verified_principal = IntegrationPrincipal(
+            issuer=claims.principal_issuer,
+            subject=claims.principal_subject,
+            organization_id=claims.organization_id,
+            workspace_id=claims.workspace_id,
+            allowed_operation_ids=frozenset({product_operation_id, operation_id}),
+        )
+        self._registry.profile_for_connection(
+            verified_principal,
+            connection,
+            operation_id=product_operation_id,
+        )
+        return verified_principal, claims
 
     def for_claimed_notification(
         self,
@@ -222,6 +400,37 @@ class PlatformCurrentAuthorizationContextResolver:
         return principal
 
 
+def _health_grant_scope(
+    connection: IntegrationConnection,
+    profile: AuthorizationProviderProfile,
+) -> tuple[str | None, dict[str, object] | None]:
+    """Build one host-selected read target for a background health probe."""
+
+    if connection.provider == "hf":
+        target = profile.targets.get(connection.target_ref or "")
+        repositories = (profile.account_scopes or {}).get("repositories")
+        if target is None or not isinstance(repositories, list):
+            return None, None
+        selected = [
+            item
+            for item in repositories
+            if isinstance(item, Mapping)
+            and item.get("repo_id") == target.target_ref
+            and "read" in item.get("permissions", [])
+        ]
+        if len(selected) != 1:
+            return None, None
+        row = selected[0]
+        repo_type = row.get("repo_type")
+        repo_id = row.get("repo_id")
+        if repo_type not in {"model", "dataset", "space"} or not isinstance(repo_id, str):
+            return None, None
+        return "huggingface.repo.get", {"repo_type": repo_type, "repo_id": repo_id}
+    if connection.provider in {"azure", "gcp", "runpod"}:
+        return "cloud.provider.health.read", {"profile_ref": profile.profile_ref}
+    return None, None
+
+
 _OFFICIAL_WECOM_QR_URL = re.compile(
     r"^https://work\.weixin\.qq\.com/ai/qc/gen\?source=wecom_cli_external&scode=[A-Za-z0-9_-]{8,256}$"
 )
@@ -290,7 +499,7 @@ def _provider_timestamp(value: object) -> datetime | None:
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            return None
+            return None  # diagnostic-allow: malformed optional expiry has no safe deadline.
     else:
         return None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
@@ -352,6 +561,7 @@ class AuthorizationCloudDirectProvider:
                 principal,
                 connection,
                 profile,
+                target_ref=target_ref,
             )
         if profile.provider in {"azure", "gcp", "runpod"}:
             return self._cloud_management_authorization_health(
@@ -529,8 +739,10 @@ class AuthorizationCloudDirectProvider:
         principal: IntegrationPrincipal,
         connection: IntegrationConnection,
         profile: AuthorizationProviderProfile,
+        *,
+        target_ref: str | None,
     ) -> AuthorizationHealthRecord:
-        """Probe a scoped HF repository through Account Center's renewable lease."""
+        """Probe only this connection's HF repository through an Account Center lease."""
 
         checked_at = datetime.now(UTC)
         profile_ref = connection.account_link_ref
@@ -625,48 +837,74 @@ class AuthorizationCloudDirectProvider:
             )
 
         repositories = account_scope.get("repositories")
-        read_scope = (
-            next(
-                (
-                    item
-                    for item in repositories
-                    if isinstance(item, Mapping)
-                    and item.get("repo_type") in {"model", "dataset", "space"}
-                    and isinstance(item.get("repo_id"), str)
-                    and "read" in item.get("permissions", [])
-                ),
-                None,
-            )
-            if isinstance(repositories, list)
-            else None
+        selected_scope = (
+            [
+                item
+                for item in repositories
+                if isinstance(item, Mapping) and item.get("repo_id") == target_ref
+            ]
+            if isinstance(repositories, list) and isinstance(target_ref, str)
+            else []
         )
-        if read_scope is None:
+        read_scope = selected_scope[0] if len(selected_scope) == 1 else None
+        if (
+            read_scope is None
+            or read_scope.get("repo_type") not in {"model", "dataset", "space"}
+            or not isinstance(read_scope.get("repo_id"), str)
+            or "read" not in read_scope.get("permissions", [])
+        ):
             return _huggingface_health_record(
                 connection,
                 checked_at=checked_at,
                 login_state=LoginState.PRESENT,
                 authorization_state=AuthorizationState.PERMISSION_DENIED,
                 generation=generation,
-                reason_code="huggingface_read_scope_missing",
+                reason_code="huggingface_target_read_scope_missing",
                 capabilities=[
                     AuthorizationCapabilityRecord(
                         capability_id="huggingface.repository.read",
                         state=AuthorizationState.PERMISSION_DENIED,
                         last_verified_at=checked_at,
-                        reason_code="huggingface_read_scope_missing",
+                        reason_code="huggingface_target_read_scope_missing",
                     )
                 ],
             )
 
+        target = {
+            "repo_type": read_scope["repo_type"],
+            "repo_id": read_scope["repo_id"],
+        }
+        arguments_sha256 = digest_arguments(target)
         operation_id = "huggingface.repo.get"
-        lease_principal = (
-            self._current_context_resolver.for_connection(
-                connection,
-                operation_id=operation_id,
+        connector_grant: Mapping[str, object] | None = None
+        if self._current_context_resolver is None:
+            lease_principal = None
+        elif connection.access_mode == "workspace_operator":
+            for_grant = getattr(
+                self._current_context_resolver,
+                "for_connection_with_connector_grant",
+                None,
             )
-            if self._current_context_resolver is not None
-            else None
-        )
+            lease_principal, claims = (
+                for_grant(
+                    connection,
+                    operation_id="integrationGetAuthorizationHealth",
+                    provider_operation_id=operation_id,
+                    arguments=target,
+                )
+                if callable(for_grant)
+                else (None, None)
+            )
+            if claims is not None:
+                connector_grant = _account_center_grant_proof(
+                    claims,
+                    arguments_sha256=arguments_sha256,
+                )
+        else:
+            lease_principal = self._current_context_resolver.for_connection(
+                connection,
+                operation_id="integrationGetAuthorizationHealth",
+            )
         if lease_principal is None:
             return _huggingface_health_record(
                 connection,
@@ -677,18 +915,18 @@ class AuthorizationCloudDirectProvider:
                 reason_code="current_authority_unavailable",
             )
 
-        target = {
-            "repo_type": read_scope["repo_type"],
-            "repo_id": read_scope["repo_id"],
-        }
-        arguments_sha256 = digest_arguments(target)
         try:
+            lease_arguments: dict[str, object] = {
+                "profile_ref": profile_ref,
+                "operation_id": operation_id,
+                "target": target,
+                "arguments_sha256": arguments_sha256,
+            }
+            if connector_grant is not None:
+                lease_arguments["connector_grant"] = connector_grant
             lease = self._account_center.create_provider_credential_lease(
                 lease_principal,
-                profile_ref=profile_ref,
-                operation_id=operation_id,
-                target=target,
-                arguments_sha256=arguments_sha256,
+                **lease_arguments,
             )
             lease_ref = lease.get("lease_ref") if isinstance(lease, Mapping) else None
             if (
@@ -992,7 +1230,11 @@ class AuthorizationCloudDirectProvider:
             operation_id="accountGetRenewalSession",
         )
         if profile.provider == "hf":
-            if self._account_center is None or connection.account_link_ref != authorization_ref:
+            if (
+                profile.auth_mode != "device_oauth"
+                or self._account_center is None
+                or connection.account_link_ref != authorization_ref
+            ):
                 raise PermissionError("HF renewal profile is not available in Account Center")
             result = self._account_center.poll_huggingface_renewal(
                 principal,
@@ -1033,7 +1275,11 @@ class AuthorizationCloudDirectProvider:
             operation_id="accountGetRenewalSession",
         )
         if profile.provider == "hf":
-            if self._account_center is None or connection.account_link_ref != authorization_ref:
+            if (
+                profile.auth_mode != "device_oauth"
+                or self._account_center is None
+                or connection.account_link_ref != authorization_ref
+            ):
                 raise PermissionError("HF renewal profile is not available in Account Center")
             result = self._account_center.poll_huggingface_renewal(
                 principal,
@@ -1583,7 +1829,6 @@ def _invoke_signed_huggingface_tool(
         "huggingface.repo.get": "huggingface.repo.get",
         "huggingface.file.download": "huggingface.file.download",
         "huggingface.file.upload": "huggingface.file.upload",
-        "hf_vendor_cli": "huggingface.vendor.cli.execute",
     }
     if (
         client is None

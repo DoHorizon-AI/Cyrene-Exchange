@@ -50,18 +50,31 @@ credential. User-facing connection creation checks the verified actor against th
 profile's `allowedContextRefs` or exact `allowedActors` and the target's optional
 narrower context allowlist.
 
+For Hugging Face, each connection target alias resolves to one exact Account Center
+repository ID. The host profile's `targets.<alias>.targetRef` must equal the same
+`owner/repository` value in `accountScopes.repositories`; the connection request
+still sends the configured alias, never a caller-chosen repository ID. For example,
+`hf-primary-target` can map to `Qwen/Qwen2.5-0.5B-Instruct`.
+
+Cloud Account Center profile UUIDs are derived from the verified issuer,
+organization, workspace, provider, host profile alias, and exact target alias plus
+provider target. `workspace_operator` profiles omit the user subject so the one
+pre-provisioned workspace profile stays stable; `actor_owned` profiles include it.
+This keeps separate resource targets from colliding in Account Center's one-target
+host identity scope.
+
 Each `currentAuthority.contexts[]` entry pins one expected issuer, subject,
-organization, and workspace and names a `bearerTokenEnvRef`. That reference must
-exist in `hostSecretRefs`; its mapped environment variable contains a currently
-issued first-party bearer. Exchange reads the value on every background provider
-call and calls Platform `VerifyIdentity` and the role-filtered catalog snapshot
-again. It does not cache or extend a session, infer a principal from a stored
-connection, or turn a missing bearer into a service identity. Operators must
-rotate the actual current bearer through the host secret store and restart or
-reload the service environment as required by the host. A missing, expired, or
-revoked bearer or an absent operation grant produces an unavailable authorization
-observation, a failed cloud refresh with a reason code, or a deferred email job;
-none is reported as healthy.
+organization, and workspace and names a `bearerTokenEnvRef`. Profiles using that
+context re-read the current bearer on every background provider call and ask
+Platform to verify the identity and operation again; Exchange never caches or
+extends a session. The cloud/HF service-monitor profile may omit `contexts` only
+when it is `workspace_operator`, its `allowedActors` contains exactly the stored
+owner, and the profile and targets have no context allowlists. That path uses the
+existing Exchange connector-workload mTLS client to request, verify, and consume a
+fresh exact-operation Directory grant for every health probe. It does not
+synthesize a service actor or persist an owner bearer. Missing or revoked role
+proof produces an unavailable observation, while provider network failures remain
+unknown rather than becoming reauthorization failures.
 
 The email sender is disabled unless `emailNotifications.enabled` is explicitly
 `true`. Its profile fixes a DirectPlugin endpoint, HMAC context key reference,
@@ -214,8 +227,8 @@ persisted and returned as `uncertain` without creating a resend.
 
 Directory-authorized provider operations are available only to actors granted
 `navigator.connector.operator.v1`. Typed provider API tools bind their fixed
-resource scope; native GitHub, Hugging Face, Azure, GCP, and RunPod CLI calls bind
-the host-owned profile and exact `argv` array, suppress all
+resource scope; GitHub, Azure, GCP, and RunPod CLI calls bind the host-owned
+profile and exact `argv` array, suppress all
 stdout/stderr, and block credential-export arguments. CLI command completion is
 not treated as remote resource success: an unverified remote state remains
 `uncertain` until a typed status read confirms it.
@@ -262,7 +275,31 @@ to a 0600 private file and fill the expected `actor` issuer/subject/organization
 workspace and GitHub installation/repository data. Add the optional HF block when
 its host OAuth profile is ready; it contains only HF profile/target aliases and a
 stable `credentialSecretRef` (`huggingface/connector-token` in the example), never
-OAuth tokens. Keep idempotency keys stable across retries. Then run:
+OAuth tokens. An optional `cloud` array selects the exact host-owned cloud rows:
+
+```json
+{
+  "cloud": [
+    {
+      "profileAlias": "azure-primary",
+      "targetAlias": "vm-prod",
+      "expectedAccessMode": "workspace_operator"
+    },
+    {
+      "profileAlias": "gcp-primary",
+      "targetAlias": "instance-prod",
+      "expectedAccessMode": "workspace_operator"
+    }
+  ]
+}
+```
+
+The selected cloud profiles must be the host-pinned Azure and GCP profiles (and
+the host-pinned RunPod profile when it is configured), configured for one verified
+owner with no context allowlists. Plan-only prints
+each deterministic `accountCenterProfileRef` for the operator's Account Center
+`workspace_operator_profile_refs` setting without registering profiles or writing
+connections. Keep idempotency keys stable across retries. Then run:
 
 ```bash
 cyrene-exchange integrations bootstrap-connectors \
@@ -272,9 +309,9 @@ cyrene-exchange integrations bootstrap-connectors \
 ```
 
 The plan-only command verifies one fresh signed `github.repository.list` grant
-and prints stable profile references and connection UUIDs; it does not link an
-account or write a connection. For each profile intended to be shared, add its
-planned profile reference to the private Account Center
+and prints stable GitHub/HF profile references and connection UUIDs plus the
+cloud `accountCenterProfileRef` values; it does not link an account or write a
+connection. Add each planned reference intended to be shared to the private Account Center
 `workspace_operator_profile_refs` setting, then run the same command without
 `--plan-only`. Exchange requires Account Center's profile readback to confirm
 the configured access mode before saving the connection. `actor_owned` is the
@@ -405,8 +442,11 @@ metadata contains only issued profile references, provider, access/auth mode,
 status, credential revision when available, and allowlisted target scope. The
 connection rows contain issued connection/profile references and target scope.
 The export omits credentials, secret references, OAuth/device codes, and
-authorization references. HF write tools are excluded only when the connected
-repository's Account Center grant is read-only. A cloud catalog may be complete
+authorization references. The complete Account Center HF repository scope must
+match the host-declared scope before readiness can be emitted. HF write tools are
+excluded when the selected repository's grant is read-only; repository operations
+must also match the connection's exact repository ID and read/write permission.
+The unscoped HF vendor CLI is not exposed. A cloud catalog may be complete
 or exactly its canonical read-only operation set; every required read operation
 must be present. Missing or partial read catalogs abort the export. This is a
 host activation readback, not a provider health check or proof of external
@@ -463,7 +503,7 @@ Teams provider，使回复留在原区域。Bot secret 只由 Teams provider 读
 `Retry-After`；发送结果未知时 Exchange 持久化并返回 `uncertain`，不创建重发。
 
 只有获得 `navigator.connector.operator.v1` 的主体才能使用 Directory 授权的连接器操作。类型化
-Provider API 工具绑定固定资源范围；GitHub、Hugging Face、Azure、GCP 和 RunPod 的原生 CLI
+Provider API 工具绑定固定资源范围；GitHub、Azure、GCP 和 RunPod 的原生 CLI
 调用绑定宿主管理的 profile 和完整 `argv` 数组，始终隐藏
 stdout/stderr 并阻止凭据导出参数。CLI 命令结束不代表云端资源已成功；只有状态回读确认后，
 才能报告远端终态。

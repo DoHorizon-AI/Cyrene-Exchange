@@ -392,8 +392,8 @@ def test_plan_only_cloud_profiles_are_host_resolved_without_fake_connection_ids(
             "connectionRef" not in item and "profileRef" not in item for item in plan["cloud"]
         )
         assert {item["provider"]: item["accountCenterProfileRef"] for item in plan["cloud"]} == {
-            "azure": "d8148b76-e918-539c-8f60-e8f4db60cf77",
-            "gcp": "a1205e3f-b58a-5bfd-919d-b26790f3a3c4",
+            "azure": "ae90a7c4-a46f-5ba2-be13-1571a5f019a8",
+            "gcp": "f0da8a27-c265-5ee5-b14f-756bad1444f4",
         }
         assert {item["targetAlias"] for item in plan["cloud"]} == {
             "azure-target",
@@ -495,11 +495,21 @@ def test_account_center_profile_ref_is_owner_scoped_for_static_and_actor_owned_p
         allowed_operation_ids=frozenset({"navigator.connector.operator.v1"}),
     )
 
-    assert registry.account_center_profile_ref(principal, shared) == (
-        "d8148b76-e918-539c-8f60-e8f4db60cf77"
+    assert (
+        registry.account_center_profile_ref(
+            principal,
+            shared,
+            target_alias="azure-target",
+        )
+        == "ae90a7c4-a46f-5ba2-be13-1571a5f019a8"
     )
-    assert registry.account_center_profile_ref(principal, actor_owned) == (
-        "f7d95688-2a49-5fac-9d21-1fa53ac6ddae"
+    assert (
+        registry.account_center_profile_ref(
+            principal,
+            actor_owned,
+            target_alias="azure-target",
+        )
+        == "70e53f8c-983e-5f97-b2ff-607356be3594"
     )
 
 
@@ -606,7 +616,9 @@ def test_cloud_bootstrap_rejects_account_center_scope_mismatch_before_linking_ot
     )
     profile = services.authorization_profile_registry.settings.profiles["azure-primary"]
     profile_ref = services.authorization_profile_registry.account_center_profile_ref(
-        principal, profile
+        principal,
+        profile,
+        target_alias="azure-target",
     )
     accounts.links[profile_ref] = {
         "profile_ref": profile_ref,

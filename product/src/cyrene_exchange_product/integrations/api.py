@@ -116,6 +116,146 @@ def _connection_for_renewal(
     return selected[0]
 
 
+def _require_supported_renewal_profile(
+    services: Any,
+    principal: IntegrationPrincipal,
+    connection: Any,
+    *,
+    operation_id: str,
+) -> None:
+    """Reject HF renewal before persisting intent unless the host profile is device OAuth."""
+
+    if connection.provider != "hf":
+        return
+    registry = services.authorization_profile_registry
+    if registry is None:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_RENEWAL_UNAVAILABLE",
+            title="Hugging Face renewal is unavailable",
+            detail="The fixed Hugging Face authorization profile is not configured.",
+            status=503,
+            context={"reasonCode": "huggingface_host_profile_unavailable"},
+        )
+    try:
+        profile, _target_ref = registry.profile_for_connection(
+            principal,
+            connection,
+            operation_id=operation_id,
+        )
+    except PermissionError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+            title="Hugging Face profile is unavailable",
+            detail="The selected Hugging Face profile is outside this verified actor scope.",
+            status=403,
+            context={"reasonCode": "huggingface_profile_scope_mismatch"},
+        ) from exc
+    if profile.provider != "hf" or profile.auth_mode != "device_oauth":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_RENEWAL_UNSUPPORTED",
+            title="Hugging Face renewal is unsupported",
+            detail="Only a linked Hugging Face device OAuth profile can start device renewal.",
+            status=409,
+            context={"reasonCode": "huggingface_device_oauth_required"},
+        )
+
+
+def _ensure_cloud_identity_profile(
+    services: Any,
+    principal: IntegrationPrincipal,
+    *,
+    connection: Any,
+    profile: Any,
+    target_alias: str,
+) -> None:
+    """Idempotently register/read back one host-owned non-secret cloud profile."""
+
+    target = profile.targets.get(target_alias)
+    if target is None:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+            title="Cloud profile is not configured",
+            detail="The selected cloud target is not in trusted host settings.",
+            status=403,
+        )
+    profile_ref = connection.account_link_ref
+    if not isinstance(profile_ref, str) or not profile_ref:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center profile reference is unavailable",
+            detail="The fixed cloud identity profile reference is invalid.",
+            status=502,
+        )
+    expected = {
+        "profile_ref": profile_ref,
+        "provider": connection.provider,
+        "identity_ref": profile.identity_ref or profile.profile_ref,
+        "target_scope": {
+            "target_ref": target_alias,
+            "provider_target_ref": target.target_ref,
+        },
+        "access_mode": connection.access_mode,
+    }
+
+    def readback() -> Mapping[str, Any] | None:
+        response = services.accounts.list_provider_profiles(principal)
+        rows = response.get("profiles") if isinstance(response, Mapping) else None
+        if not isinstance(rows, list):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned malformed cloud profile metadata.",
+                status=502,
+            )
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, Mapping) and row.get("profile_ref") == profile_ref
+        ]
+        if len(matches) > 1:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned duplicate cloud profile metadata.",
+                status=502,
+            )
+        if not matches:
+            return None
+        row = matches[0]
+        if (
+            any(row.get(key) != value for key, value in expected.items())
+            or row.get("auth_mode") != "host_identity"
+            or row.get("auth_status") not in {"unknown", "configured", "healthy"}
+            or row.get("external_subject") is not None
+            or row.get("expires_at") is not None
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned a mismatched cloud identity profile.",
+                status=502,
+                context={"reasonCode": "cloud_identity_profile_scope_mismatch"},
+            )
+        return row
+
+    if readback() is None:
+        services.accounts.register_host_identity_profile(
+            principal,
+            profile_ref=profile_ref,
+            provider=connection.provider,
+            identity_ref=str(expected["identity_ref"]),
+            target_scope=expected["target_scope"],
+            idempotency_key=f"connection-profile:{connection.id}",
+        )
+        if readback() is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center profile readback is unavailable",
+                detail="Account Center did not persist the host cloud identity profile.",
+                status=502,
+            )
+
+
 async def _invoke_connector_dispatcher(
     dispatcher: Any,
     prepared: Any,
@@ -2018,6 +2158,41 @@ def create_router(services: IntegrationServices) -> APIRouter:
             repository_id=body.repository_id,
             repository_name=body.repository_name,
         )
+        cloud_profile = None
+        if create_request.provider in {"azure", "gcp", "runpod"}:
+            registry = services.authorization_profile_registry
+            cloud_profile = (
+                registry.settings.profiles.get(create_request.binding_ref or "")
+                if registry is not None
+                else None
+            )
+            if (
+                cloud_profile is None
+                or cloud_profile.provider != create_request.provider
+                or create_request.target_ref not in cloud_profile.targets
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Cloud profile is not configured",
+                    detail="The selected cloud profile or target is not in trusted host settings.",
+                    status=403,
+                )
+            account_profile_ref = registry.account_center_profile_ref(
+                actor,
+                cloud_profile,
+                target_alias=str(create_request.target_ref),
+            )
+            if create_request.account_link_ref not in {None, account_profile_ref}:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Cloud profile reference is invalid",
+                    detail="The Account Center profile reference is fixed by host configuration.",
+                    status=403,
+                    context={"reasonCode": "cloud_account_profile_ref_mismatch"},
+                )
+            create_request = create_request.model_copy(
+                update={"account_link_ref": account_profile_ref}
+            )
         create_request = create_request.model_copy(
             update={"display_name": services.display_name_for_connection(actor, create_request)}
         )
@@ -2037,50 +2212,14 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 create_request,
                 idempotency_key=idempotency_key,
             )
-        if connection.provider in {"azure", "gcp", "runpod"}:
-            registry = services.authorization_profile_registry
-            host_profile = (
-                registry.settings.profiles.get(connection.binding_ref or "")
-                if registry is not None
-                else None
-            )
-            target = (
-                host_profile.targets.get(connection.target_ref or "")
-                if host_profile is not None
-                else None
-            )
-            if (
-                host_profile is None
-                or host_profile.provider != connection.provider
-                or target is None
-            ):
-                raise ExchangeProductError(
-                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
-                    title="Cloud profile is not configured",
-                    detail="The selected cloud profile or target is not in trusted host settings.",
-                    status=403,
-                )
-            registered = services.accounts.register_host_identity_profile(
+        if cloud_profile is not None:
+            _ensure_cloud_identity_profile(
+                services,
                 actor,
-                profile_ref=host_profile.profile_ref,
-                provider=connection.provider,
-                identity_ref=host_profile.identity_ref or host_profile.profile_ref,
-                target_scope={
-                    "target_ref": connection.target_ref,
-                    "provider_target_ref": target.target_ref,
-                },
-                idempotency_key=f"connection-profile:{connection.id}",
+                connection=connection,
+                profile=cloud_profile,
+                target_alias=str(connection.target_ref),
             )
-            if (
-                registered.get("profile_ref") != host_profile.profile_ref
-                or registered.get("provider") != connection.provider
-            ):
-                raise ExchangeProductError(
-                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
-                    title="Account Center response invalid",
-                    detail="Account Center returned a mismatched host identity profile.",
-                    status=502,
-                )
         return _connection_response(connection)
 
     @router.get(
@@ -3047,15 +3186,19 @@ def create_router(services: IntegrationServices) -> APIRouter:
             try:
                 # The owner comes from the persisted row and is then checked against
                 # the fixed host profile. No principal or destination is accepted in
-                # the Navigator request body.
-                context, _profile = registry.context_for_connection(connection)
-                owner = IntegrationPrincipal(
-                    issuer=context.issuer,
-                    subject=context.subject,
-                    organization_id=context.organization_id,
-                    workspace_id=context.workspace_id,
-                    allowed_operation_ids=frozenset({"integrationGetAuthorizationHealth"}),
+                # the Navigator request body. Static cloud profiles use the same
+                # fresh connector-only Directory grant as Navigator operations.
+                resolver = services.current_context_resolver
+                owner = (
+                    resolver.for_connection(
+                        connection,
+                        operation_id="integrationGetAuthorizationHealth",
+                    )
+                    if resolver is not None
+                    else None
                 )
+                if owner is None:
+                    raise PermissionError("current Directory authorization is unavailable")
                 registry.profile_for_connection(
                     owner,
                     connection,
@@ -3170,6 +3313,12 @@ def create_router(services: IntegrationServices) -> APIRouter:
             authorization_id,
             operation_id="accountBeginRenewalSession",
         )
+        _require_supported_renewal_profile(
+            services,
+            actor,
+            connection,
+            operation_id="accountBeginRenewalSession",
+        )
         session, created = services.store.begin_renewal_session(
             actor,
             authorization_id,
@@ -3269,10 +3418,16 @@ def create_router(services: IntegrationServices) -> APIRouter:
             str(session_id),
             authorization_operation_id="accountGetRenewalSession",
         )
-        _connection_for_renewal(
+        connection = _connection_for_renewal(
             services.store,
             actor,
             session.authorization_ref,
+            operation_id="accountGetRenewalSession",
+        )
+        _require_supported_renewal_profile(
+            services,
+            actor,
+            connection,
             operation_id="accountGetRenewalSession",
         )
         authorization_id = session.authorization_ref

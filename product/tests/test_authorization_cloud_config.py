@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, ValidationError
 
 import cyrene_exchange_product.integrations.auth as auth_module
 import cyrene_exchange_product.integrations.cli as integration_cli
@@ -326,6 +327,12 @@ def test_documented_configuration_schema_accepts_default_and_enabled_email_examp
         "hostSecretRefs": teams_connectors["hostSecretRefs"],
     }
     Draft202012Validator(schema).validate(connector_fragment)
+    invalid_hf_target = json.loads(json.dumps(connector_fragment))
+    invalid_hf_target["authorizationCloud"]["profiles"]["hf-primary"]["targets"][
+        "hf-primary-target"
+    ]["targetRef"] = "account-scope"
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(invalid_hf_target)
 
     computer_fragment = {
         "hostSecretRefs": {
@@ -360,6 +367,59 @@ def test_documented_configuration_schema_accepts_default_and_enabled_email_examp
         },
     }
     Draft202012Validator(schema).validate(computer_fragment)
+
+
+def test_hf_target_ref_is_repo_identity_but_connection_ref_remains_an_alias() -> None:
+    """Bind one request alias to the exact Account Center repository ID."""
+
+    example = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "examples"
+            / "integration-configuration.teams-connectors.json"
+        ).read_text(encoding="utf-8")
+    )
+    settings = parse_authorization_cloud_settings(
+        example["authorizationCloud"],
+        email_value={"enabled": False},
+    )
+    registry = AuthorizationCloudProfileRegistry(settings)
+    profile = settings.profiles["hf-primary"]
+    target = profile.targets["hf-primary-target"]
+    assert target.target_ref == "example-org/example-private-model"
+
+    principal = IntegrationPrincipal(
+        issuer=profile.expected_issuer,
+        subject="owner-subject",
+        organization_id=profile.organization_id,
+        workspace_id=profile.workspace_id,
+        allowed_operation_ids=frozenset(
+            {"integrationCreateConnection", "navigator.connector.operator.v1"}
+        ),
+    )
+    request = CreateIntegrationConnection(
+        provider="hf",
+        binding_ref="hf-primary",
+        target_ref="hf-primary-target",
+        account_link_ref="00000000-0000-4000-8000-000000000401",
+    )
+    assert (
+        registry.display_name_for_connection(principal, request) == "Hugging Face primary account"
+    )
+    first_profile_ref = registry.account_center_profile_ref(
+        principal,
+        profile,
+        target_alias="hf-primary-target",
+    )
+    second_operator = replace(principal, subject="another-operator")
+    assert (
+        registry.account_center_profile_ref(
+            second_operator,
+            profile,
+            target_alias="hf-primary-target",
+        )
+        == first_profile_ref
+    )
 
 
 class _FakeAuthority:

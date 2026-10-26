@@ -623,12 +623,16 @@ def build_production_services(
             token = source.get(env_ref, "") if env_ref is not None else ""
             return token if token.strip() else None
 
-        if identity_verifier is not None and authorization_settings.contexts:
+        if (identity_verifier is not None and authorization_settings.contexts) or (
+            connector_authority is not None and connector_grant_verifier.configured
+        ):
             current_context_resolver = PlatformCurrentAuthorizationContextResolver(
                 store=integration_store,
                 identity_verifier=identity_verifier,
                 registry=authorization_registry,
                 bearer_token=current_bearer,
+                connector_grant_authority=connector_authority,
+                connector_grant_verifier=connector_grant_verifier,
             )
         authorization_cloud_provider = AuthorizationCloudDirectProvider(
             store=integration_store,

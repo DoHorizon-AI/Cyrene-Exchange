@@ -709,6 +709,15 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
                     "hf-primary": SimpleNamespace(
                         profile_ref="hf-primary",
                         provider="hf",
+                        account_scopes={
+                            "repositories": [
+                                {
+                                    "repo_type": "model",
+                                    "repo_id": target_ref,
+                                    "permissions": ["read"],
+                                }
+                            ]
+                        },
                         targets={
                             "hf-qwen": SimpleNamespace(
                                 target_ref=target_ref,
@@ -839,6 +848,107 @@ def test_connector_readiness_fails_when_read_only_catalog_lacks_a_read_operation
     monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
 
     with pytest.raises(SystemExit, match="missing required Exchange read operations"):
+        exchange_cli.run(
+            [
+                "integrations",
+                "connector-readiness",
+                "--integration-database",
+                str(database_path),
+                "--issuer",
+                "https://issuer.example",
+                "--subject",
+                "actor-1",
+                "--organization-id",
+                "org-1",
+                "--workspace-id",
+                "workspace-1",
+            ]
+        )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_connector_readiness_fails_closed_on_hf_scope_drift(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "integrations.sqlite3"
+    database_path.touch()
+    profile_ref = "00000000-0000-4000-8000-000000000401"
+    target_ref = "Qwen/Qwen2.5-0.5B-Instruct"
+    connection = SimpleNamespace(
+        id=uuid4(),
+        provider="hf",
+        organization_id="org-1",
+        workspace_id="workspace-1",
+        actor_issuer="https://issuer.example",
+        actor_subject="actor-1",
+        account_link_ref=profile_ref,
+        binding_ref="hf-primary",
+        target_ref="hf-target",
+        access_mode="workspace_operator",
+    )
+    account_profile = {
+        "profile_ref": profile_ref,
+        "provider": "huggingface",
+        "auth_status": "healthy",
+        "auth_mode": "device_oauth",
+        "access_mode": "workspace_operator",
+        "target_scope": {
+            "repositories": [
+                {
+                    "repo_type": "model",
+                    "repo_id": target_ref,
+                    "permissions": ["read"],
+                }
+            ]
+        },
+    }
+
+    class _Store:
+        def connector_bindings_for_actor(self, **_kwargs: Any) -> list[Any]:
+            return [connection]
+
+    class _Services:
+        store = _Store()
+        accounts = SimpleNamespace(
+            list_provider_profiles=lambda _principal: {"profiles": [account_profile]}
+        )
+        authorization_cloud = SimpleNamespace(list_tool_catalog=lambda _binding: ())
+        authorization_profile_registry = SimpleNamespace(
+            settings=SimpleNamespace(
+                profiles={
+                    "hf-primary": SimpleNamespace(
+                        profile_ref="hf-primary",
+                        provider="hf",
+                        account_scopes={
+                            "repositories": [
+                                {
+                                    "repo_type": "model",
+                                    "repo_id": target_ref,
+                                    "permissions": ["read", "write"],
+                                }
+                            ]
+                        },
+                        targets={
+                            "hf-target": SimpleNamespace(
+                                target_ref=target_ref,
+                                display_name="Qwen target",
+                            )
+                        },
+                    )
+                }
+            )
+        )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
+    monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
+
+    with pytest.raises(SystemExit, match="Account Center scope does not match"):
         exchange_cli.run(
             [
                 "integrations",

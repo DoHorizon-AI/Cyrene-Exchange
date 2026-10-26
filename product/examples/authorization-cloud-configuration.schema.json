@@ -32,6 +32,10 @@
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
     },
+    "huggingFaceRepositoryRef": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$"
+    },
     "secretRef": { "type": "string", "minLength": 1, "maxLength": 1024 },
     "endpoint": {
       "oneOf": [
@@ -92,7 +96,12 @@
       "additionalProperties": false,
       "required": ["targetRef", "displayName"],
       "properties": {
-        "targetRef": { "$ref": "#/$defs/alias" },
+        "targetRef": {
+          "oneOf": [
+            { "$ref": "#/$defs/alias" },
+            { "$ref": "#/$defs/huggingFaceRepositoryRef" }
+          ]
+        },
         "displayName": { "type": "string", "minLength": 1 },
         "allowedContextRefs": {
           "type": "array",
@@ -214,7 +223,16 @@
         {
           "if": { "properties": { "provider": { "const": "hf" } } },
           "then": {
-            "required": ["credentialSecretRef", "accountScopes"]
+            "required": ["credentialSecretRef", "accountScopes"],
+            "properties": {
+              "targets": {
+                "additionalProperties": {
+                  "properties": {
+                    "targetRef": { "$ref": "#/$defs/huggingFaceRepositoryRef" }
+                  }
+                }
+              }
+            }
           },
           "else": {
             "not": {
@@ -222,6 +240,13 @@
                 { "required": ["credentialSecretRef"] },
                 { "required": ["accountScopes"] }
               ]
+            },
+            "properties": {
+              "targets": {
+                "additionalProperties": {
+                  "properties": { "targetRef": { "$ref": "#/$defs/alias" } }
+                }
+              }
             }
           }
         }

@@ -310,6 +310,107 @@ def test_connection_list_and_unobserved_health_are_minimal_and_unknown(tmp_path:
     store.close()
 
 
+def test_cloud_connection_uses_host_derived_account_profile_uuid_idempotently(
+    tmp_path: Path,
+) -> None:
+    actor = _principal("actor-cloud", {"integrationCreateConnection", "integrationListConnections"})
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    services = _services(store, actor)
+    profile_ref = "30000000-0000-4000-8000-000000000003"
+    target = SimpleNamespace(target_ref="subscription-vm-prod", display_name="Production VM")
+    profile = SimpleNamespace(
+        profile_ref="azure-primary",
+        provider="azure",
+        identity_ref="azure-managed-identity",
+        access_mode="actor_owned",
+        targets={"vm-prod": target},
+    )
+
+    class Registry:
+        settings = SimpleNamespace(profiles={"azure-primary": profile})
+
+        def account_center_profile_ref(
+            self,
+            _principal: IntegrationPrincipal,
+            _profile: Any,
+            *,
+            target_alias: str,
+        ) -> str:
+            assert target_alias == "vm-prod"
+            return profile_ref
+
+        def display_name_for_connection(
+            self,
+            principal: IntegrationPrincipal,
+            request: CreateIntegrationConnection,
+        ) -> str:
+            assert principal.subject == actor.subject
+            assert request.account_link_ref == profile_ref
+            assert request.target_ref == "vm-prod"
+            return target.display_name
+
+    class Accounts:
+        def __init__(self) -> None:
+            self.profiles: list[dict[str, Any]] = []
+            self.register_calls: list[dict[str, Any]] = []
+
+        def list_provider_profiles(self, _principal: IntegrationPrincipal) -> dict[str, Any]:
+            return {"profiles": self.profiles}
+
+        def register_host_identity_profile(
+            self,
+            _principal: IntegrationPrincipal,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            self.register_calls.append(kwargs)
+            row = {
+                "profile_ref": kwargs["profile_ref"],
+                "provider": kwargs["provider"],
+                "identity_ref": kwargs["identity_ref"],
+                "target_scope": kwargs["target_scope"],
+                "access_mode": "actor_owned",
+                "auth_mode": "host_identity",
+                "auth_status": "unknown",
+                "external_subject": None,
+                "expires_at": None,
+            }
+            self.profiles.append(row)
+            return row
+
+    services.authorization_profile_registry = Registry()
+    services.connection_profile_resolver = (
+        services.authorization_profile_registry.display_name_for_connection
+    )
+    services.accounts = Accounts()
+    app = create_app(database_path=tmp_path / "gateway.sqlite3", integrations=services)
+    path = f"/api/v1/integrations/connections?workspaceId={_WORKSPACE}"
+    body = {"provider": "azure", "bindingRef": "azure-primary", "targetRef": "vm-prod"}
+    headers = {
+        "Authorization": "Bearer actor-token",
+        "Idempotency-Key": "azure-connection-1",
+    }
+
+    with TestClient(app) as client:
+        first = client.post(path, json=body, headers=headers)
+        replay = client.post(path, json=body, headers=headers)
+        saved = store.list_connections(actor)
+
+    assert first.status_code == replay.status_code == 201
+    assert first.json()["id"] == replay.json()["id"]
+    assert len(services.accounts.register_calls) == 1
+    registered = services.accounts.register_calls[0]
+    assert registered["profile_ref"] == profile_ref
+    assert registered["identity_ref"] == "azure-managed-identity"
+    assert registered["target_scope"] == {
+        "target_ref": "vm-prod",
+        "provider_target_ref": "subscription-vm-prod",
+    }
+    assert len(saved) == 1
+    assert saved[0].account_link_ref == profile_ref
+    assert saved[0].binding_ref == "azure-primary"
+    assert saved[0].target_ref == "vm-prod"
+
+
 def test_health_resources_feed_and_operation_serialize_utc_z_timestamps(tmp_path: Path) -> None:
     operations = {
         "integrationCreateConnection",
@@ -622,9 +723,16 @@ def test_huggingface_renewal_returns_device_code_and_tracks_recovery(tmp_path: P
             )
 
     provider = _HuggingFaceRenewal()
+    services = _services(store, actor, authorization_cloud=provider)
+    services.authorization_profile_registry = SimpleNamespace(
+        profile_for_connection=lambda _principal, _connection, *, operation_id: (
+            SimpleNamespace(provider="hf", auth_mode="device_oauth"),
+            "org/private-model",
+        )
+    )
     app = create_app(
         database_path=tmp_path / "gateway.sqlite3",
-        integrations=_services(store, actor, authorization_cloud=provider),
+        integrations=services,
     )
     path = f"/api/v1/accounts/authorizations/{profile_ref}/renewal-sessions"
     with TestClient(app) as client:
@@ -653,6 +761,76 @@ def test_huggingface_renewal_returns_device_code_and_tracks_recovery(tmp_path: P
     assert provider.start_calls == [(profile_ref, session_ref)]
     assert provider.poll_calls == [(profile_ref, session_ref)]
     store.close()
+
+
+def test_fine_grained_hf_profile_rejects_device_renewal_before_persisting_session(
+    tmp_path: Path,
+) -> None:
+    profile_ref = "30000000-0000-4000-8000-000000000002"
+    actor = _principal(
+        "actor-hf",
+        {"integrationCreateConnection", "accountBeginRenewalSession"},
+    )
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = store.create_connection(
+        actor,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-primary",
+            target_ref="selected-model",
+            account_link_ref=profile_ref,
+            display_name="Selected Hugging Face profile",
+        ),
+        idempotency_key="hf-fine-grained-connection",
+    )
+    _record_health(
+        store,
+        connection,
+        state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+        auth_ref=profile_ref,
+    )
+
+    class _Provider:
+        def __init__(self) -> None:
+            self.start_calls: list[str] = []
+
+        def start_renewal(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.start_calls.append("called")
+            raise AssertionError("fine-grained profile must be rejected before provider I/O")
+
+    provider = _Provider()
+    services = _services(store, actor, authorization_cloud=provider)
+    services.authorization_profile_registry = SimpleNamespace(
+        profile_for_connection=lambda _principal, _connection, *, operation_id: (
+            SimpleNamespace(provider="hf", auth_mode="fine_grained_token"),
+            "org/private-model",
+        )
+    )
+    app = create_app(
+        database_path=tmp_path / "gateway.sqlite3",
+        integrations=services,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/accounts/authorizations/{profile_ref}/renewal-sessions"
+            f"?workspaceId={_WORKSPACE}",
+            headers={
+                "Authorization": "Bearer actor-token",
+                "Idempotency-Key": "hf-fine-grained-renewal",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "EXCHANGE_CONNECTOR_RENEWAL_UNSUPPORTED"
+    assert response.json()["context"]["reasonCode"] == "huggingface_device_oauth_required"
+    assert provider.start_calls == []
+    reopened = IntegrationStore(tmp_path / "integrations.sqlite3")
+    rows = reopened._connection.execute(
+        "SELECT COUNT(*) AS total FROM renewal_sessions WHERE authorization_ref=?",
+        (profile_ref,),
+    ).fetchone()
+    assert rows is not None and rows["total"] == 0
+    reopened.close()
 
 
 def test_ambiguous_renewal_start_replays_only_same_key_and_request_id(tmp_path: Path) -> None:

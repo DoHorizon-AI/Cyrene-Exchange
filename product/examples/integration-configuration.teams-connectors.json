@@ -100,7 +100,7 @@
         "accessMode": "workspace_operator",
         "targets": {
           "hf-primary-target": {
-            "targetRef": "account-scope",
+            "targetRef": "example-org/example-private-model",
             "displayName": "Hugging Face primary account"
           }
         },

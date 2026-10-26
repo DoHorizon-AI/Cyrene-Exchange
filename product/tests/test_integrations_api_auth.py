@@ -1733,7 +1733,7 @@ def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_
                 }
             ]
         },
-        targets={"hf-target": object()},
+        targets={"hf-target": SimpleNamespace(target_ref="example-org/private-model")},
     )
     dispatcher = ConnectorOperationDispatcher(
         store=store,
@@ -2215,19 +2215,6 @@ def test_navigator_health_snapshot_is_owner_pinned_and_omits_authorization_refs(
     )
 
     class Registry:
-        def context_for_connection(self, selected: IntegrationConnection):
-            if selected.actor_subject != owner.subject:
-                raise PermissionError("owner is not host-pinned")
-            return (
-                SimpleNamespace(
-                    issuer=selected.actor_issuer,
-                    subject=selected.actor_subject,
-                    organization_id=selected.organization_id,
-                    workspace_id=selected.workspace_id,
-                ),
-                SimpleNamespace(),
-            )
-
         def profile_for_connection(
             self,
             principal: IntegrationPrincipal,
@@ -2243,6 +2230,26 @@ def test_navigator_health_snapshot_is_owner_pinned_and_omits_authorization_refs(
                 raise PermissionError("connection is outside configured health profile")
             return SimpleNamespace(), "vm-health"
 
+    class CurrentContextResolver:
+        def for_connection(
+            self,
+            selected: IntegrationConnection,
+            *,
+            operation_id: str,
+        ) -> IntegrationPrincipal | None:
+            if (
+                selected.actor_subject != owner.subject
+                or operation_id != "integrationGetAuthorizationHealth"
+            ):
+                return None
+            return IntegrationPrincipal(
+                issuer=owner.issuer,
+                subject=owner.subject,
+                organization_id=owner.organization_id,
+                workspace_id=owner.workspace_id,
+                allowed_operation_ids=frozenset({"integrationGetAuthorizationHealth"}),
+            )
+
     authenticator = NavigatorHmacAuthenticator(
         NavigatorHmacSettings(key_id="navigator-health-v1", key_file=key_file),
         replay_guard=store,
@@ -2257,6 +2264,7 @@ def test_navigator_health_snapshot_is_owner_pinned_and_omits_authorization_refs(
         callback_principal=owner,
         navigator_hmac_authenticator=authenticator,
         authorization_profile_registry=Registry(),
+        current_context_resolver=CurrentContextResolver(),
     )
     app = create_app(
         database_path=tmp_path / "health-snapshot-gateway.sqlite3",

@@ -16,6 +16,7 @@ import os
 import signal
 import ssl
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import partial
@@ -442,6 +443,43 @@ def _integration_authorization_cloud(arguments: argparse.Namespace, *, once: boo
         services.close()
 
 
+def _hf_scope_signature(
+    value: object,
+    *,
+    camel_case: bool,
+) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+    """Normalize one host or Account Center Hugging Face scope for exact comparison."""
+
+    if not isinstance(value, list) or not value:
+        raise SystemExit("Hugging Face repository scope is missing or malformed")
+    repo_type_key = "repoType" if camel_case else "repo_type"
+    repo_id_key = "repoId" if camel_case else "repo_id"
+    signature: list[tuple[str, str, tuple[str, ...]]] = []
+    for row in value:
+        if not isinstance(row, Mapping):
+            raise SystemExit("Hugging Face repository scope row is malformed")
+        repo_type = row.get(repo_type_key)
+        repo_id = row.get(repo_id_key)
+        permissions = row.get("permissions")
+        if (
+            repo_type not in {"model", "dataset", "space"}
+            or not isinstance(repo_id, str)
+            or not repo_id
+            or not isinstance(permissions, list)
+            or not permissions
+            or any(
+                not isinstance(item, str) or item not in {"read", "write"} for item in permissions
+            )
+            or "read" not in permissions
+            or len(permissions) != len(set(permissions))
+        ):
+            raise SystemExit("Hugging Face repository scope row is invalid")
+        signature.append((str(repo_type), repo_id, tuple(sorted(permissions))))
+    if len(signature) != len(set(signature)):
+        raise SystemExit("Hugging Face repository scope contains duplicate targets")
+    return tuple(sorted(signature))
+
+
 def _integration_connector_export_data(
     services: Any,
     arguments: argparse.Namespace,
@@ -628,6 +666,17 @@ def _integration_connector_export_data(
                 if account_profile is None:
                     raise SystemExit("Hugging Face Account Center profile readback is unavailable")
                 repositories = account_profile["targetScope"]["repositories"]
+                configured_repositories = (host_profile.account_scopes or {}).get("repositories")
+                if not isinstance(configured_repositories, list):
+                    raise SystemExit("Hugging Face host profile has no declared repository scope")
+
+                if _hf_scope_signature(repositories, camel_case=True) != _hf_scope_signature(
+                    configured_repositories,
+                    camel_case=False,
+                ):
+                    raise SystemExit(
+                        "Hugging Face Account Center scope does not match the host profile"
+                    )
                 target_rows = [row for row in repositories if row["repoId"] == target.target_ref]
                 if len(target_rows) != 1:
                     raise SystemExit("Hugging Face target does not match its issued profile scope")

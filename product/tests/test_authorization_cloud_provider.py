@@ -11,6 +11,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -33,6 +34,8 @@ from cyrene_exchange_product.integrations.authorization_cloud_provider import (
     AuthorizationCloudDirectProvider,
     PlatformCurrentAuthorizationContextResolver,
 )
+from cyrene_exchange_product.integrations.connector_operations import _account_center_grant_proof
+from cyrene_exchange_product.integrations.connector_security import digest_arguments
 from cyrene_exchange_product.integrations.models import (
     AuthorizationHealthRecord,
     AuthorizationState,
@@ -226,7 +229,7 @@ def _hf_settings():
                     },
                     "targets": {
                         "selected-model": {
-                            "targetRef": "hf-model-selected",
+                            "targetRef": "org/private-model",
                             "displayName": "Selected model",
                         }
                     },
@@ -351,6 +354,20 @@ class _StaticContexts:
         assert connection.actor_subject == self.principal.subject
         return self.principal
 
+    def for_connection_with_connector_grant(
+        self,
+        connection,
+        *,
+        operation_id: str,
+        provider_operation_id: str,
+        arguments: dict[str, object],
+    ):
+        self.principal.require(operation_id)
+        assert connection.actor_subject == self.principal.subject
+        assert provider_operation_id == "huggingface.repo.get"
+        assert arguments == {"repo_type": "model", "repo_id": "org/private-model"}
+        return self.principal, None
+
     def for_claimed_notification(self, job, *, claim_fence: int, operation_id: str):
         self.principal.require(operation_id)
         assert job.actor_subject == self.principal.subject
@@ -364,12 +381,223 @@ class _StaticContexts:
         return self.principal
 
 
+def test_contextless_cloud_health_requires_a_fresh_workspace_connector_grant(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(include_wecom=False, include_email=False)
+    configured_profile = settings.profiles["azure-prod"]
+    profile = replace(
+        configured_profile,
+        allowed_context_refs=frozenset(),
+        allowed_actors=frozenset({(_ISSUER, _SUBJECT)}),
+        access_mode="workspace_operator",
+        targets={
+            alias: replace(target, allowed_context_refs=frozenset())
+            for alias, target in configured_profile.targets.items()
+        },
+    )
+    settings = replace(settings, contexts={}, profiles={"azure-prod": profile})
+    registry = AuthorizationCloudProfileRegistry(settings)
+    principal = _principal(
+        operations={
+            "integrationCreateConnection",
+            "integrationGetAuthorizationHealth",
+            "navigator.connector.operator.v1",
+        }
+    )
+    store = IntegrationStore(tmp_path / "cloud-contextless.sqlite3")
+    connection = store.create_connection(
+        principal,
+        CreateIntegrationConnection(
+            provider="azure",
+            binding_ref="azure-prod",
+            target_ref="vm-prod",
+            display_name="Production VM",
+        ),
+        idempotency_key="contextless-cloud-health",
+        access_mode="workspace_operator",
+    )
+
+    class _Authority:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def authorize_connector_operation(self, **kwargs: Any) -> bytes:
+            self.requests.append(kwargs)
+            return b"synthetic-signed-grant"
+
+    class _Verifier:
+        configured = True
+
+        def __init__(self) -> None:
+            self.expected: dict[str, Any] | None = None
+            self.consumed = 0
+
+        def validate_authority_response(self, _grant: bytes, *, expected: dict[str, Any]):
+            self.expected = expected
+
+        def consume(self, _grant: bytes, *, expected: dict[str, Any]):
+            assert self.expected == expected
+            self.consumed += 1
+            return SimpleNamespace(
+                principal_issuer=expected["principal_issuer"],
+                principal_subject=expected["principal_subject"],
+                organization_id=expected["organization_id"],
+                workspace_id=expected["workspace_id"],
+            )
+
+    authority = _Authority()
+    verifier = _Verifier()
+    resolver = PlatformCurrentAuthorizationContextResolver(
+        store=store,
+        identity_verifier=None,
+        registry=registry,
+        bearer_token=lambda _reference: pytest.fail("contextless profile must not read a bearer"),
+        connector_grant_authority=authority,
+        connector_grant_verifier=verifier,
+    )
+
+    fresh = resolver.for_connection(
+        connection,
+        operation_id="integrationGetAuthorizationHealth",
+    )
+
+    assert fresh is not None
+    assert fresh.issuer == _ISSUER
+    assert fresh.subject == _SUBJECT
+    assert fresh.organization_id == _ORG
+    assert fresh.workspace_id == _WORKSPACE
+    assert authority.requests[0]["provider_id"] == "azure"
+    assert authority.requests[0]["profile_ref"] == "azure-prod"
+    assert authority.requests[0]["operation_id"] == "cloud.provider.health.read"
+    assert authority.requests[0]["arguments_digest_sha256"] == bytes.fromhex(
+        digest_arguments({"profile_ref": "azure-prod"})
+    )
+    assert verifier.consumed == 1
+    store.close()
+
+
+def test_contextless_hf_health_projects_exact_grant_into_account_center_lease(
+    tmp_path: Path,
+) -> None:
+    settings = _hf_settings()
+    configured = settings.profiles["hf-oauth"]
+    profile = replace(
+        configured,
+        allowed_context_refs=frozenset(),
+        allowed_actors=frozenset({(_ISSUER, _SUBJECT)}),
+        access_mode="workspace_operator",
+        targets={
+            alias: replace(target, allowed_context_refs=frozenset())
+            for alias, target in configured.targets.items()
+        },
+    )
+    registry = AuthorizationCloudProfileRegistry(
+        replace(settings, contexts={}, profiles={"hf-oauth": profile})
+    )
+    store = IntegrationStore(tmp_path / "hf-contextless.sqlite3")
+    connection = store.create_connection(
+        _principal(),
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-oauth",
+            target_ref="selected-model",
+            account_link_ref="00000000-0000-4000-8000-000000000401",
+            display_name="Selected HF model",
+        ),
+        idempotency_key="hf-contextless-connection",
+        access_mode="workspace_operator",
+    )
+
+    class _Authority:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def authorize_connector_operation(self, **kwargs: Any) -> bytes:
+            self.requests.append(kwargs)
+            return b"synthetic-signed-grant"
+
+    class _Verifier:
+        configured = True
+
+        def validate_authority_response(self, _grant: bytes, *, expected: dict[str, Any]):
+            self.expected = expected
+
+        def consume(self, _grant: bytes, *, expected: dict[str, Any]):
+            assert self.expected == expected
+            return SimpleNamespace(
+                request_id=expected["request_id"],
+                audience="exchange",
+                organization_id=expected["organization_id"],
+                workspace_id=expected["workspace_id"],
+                principal_issuer=expected["principal_issuer"],
+                principal_subject=expected["principal_subject"],
+                connection_ref=expected["connection_ref"],
+                provider_id=expected["provider_id"],
+                profile_ref=expected["profile_ref"],
+                operation_id=expected["operation_id"],
+                resource_ref=expected["resource_ref"],
+                arguments_digest_sha256=expected["arguments_digest_sha256"],
+                issued_at_epoch=100.0,
+                expires_at_epoch=115.0,
+                grant_ref="sha256:" + "b" * 64,
+            )
+
+    authority = _Authority()
+    resolver = PlatformCurrentAuthorizationContextResolver(
+        store=store,
+        identity_verifier=None,
+        registry=registry,
+        bearer_token=lambda _reference: pytest.fail("contextless profile must not read a bearer"),
+        connector_grant_authority=authority,
+        connector_grant_verifier=_Verifier(),
+    )
+    target = {"repo_type": "model", "repo_id": "org/private-model"}
+    principal, claims = resolver.for_connection_with_connector_grant(
+        connection,
+        operation_id="integrationGetAuthorizationHealth",
+        provider_operation_id="huggingface.repo.get",
+        arguments=target,
+    )
+
+    assert principal is not None
+    assert claims is not None
+    proof = _account_center_grant_proof(
+        claims,
+        arguments_sha256=digest_arguments(target),
+    )
+    assert proof["profile_ref"] == connection.account_link_ref
+    assert proof["connection_ref"] == str(connection.id)
+    assert proof["provider_id"] == "huggingface"
+    assert proof["operation_id"] == "huggingface.repo.get"
+    assert proof["arguments_sha256"] == digest_arguments(target)
+    assert authority.requests[0]["resource_ref"].startswith("sha256:")
+    assert principal.allowed_operation_ids == frozenset(
+        {"integrationGetAuthorizationHealth", "huggingface.repo.get"}
+    )
+    store.close()
+
+
 class _HuggingFaceAccounts:
-    def __init__(self, profile_ref: str) -> None:
+    def __init__(
+        self,
+        profile_ref: str,
+        *,
+        repositories: list[dict[str, Any]] | None = None,
+        denied_repo_id: str | None = None,
+    ) -> None:
         self.profile_ref = profile_ref
         self.revision = 5
         self.list_calls = 0
         self.lease_calls: list[dict[str, Any]] = []
+        self.repositories = repositories or [
+            {
+                "repo_type": "model",
+                "repo_id": "org/private-model",
+                "permissions": ["read"],
+            }
+        ]
+        self.denied_repo_id = denied_repo_id
 
     def list_provider_profiles(self, principal: IntegrationPrincipal) -> dict[str, Any]:
         assert principal.subject == _SUBJECT
@@ -381,15 +609,7 @@ class _HuggingFaceAccounts:
                     "provider": "huggingface",
                     "auth_mode": "device_oauth",
                     "auth_status": "healthy",
-                    "target_scope": {
-                        "repositories": [
-                            {
-                                "repo_type": "model",
-                                "repo_id": "org/private-model",
-                                "permissions": ["read"],
-                            }
-                        ]
-                    },
+                    "target_scope": {"repositories": self.repositories},
                     "credential_revision": self.revision,
                     "expires_at": 1_800_000_000,
                 }
@@ -399,6 +619,16 @@ class _HuggingFaceAccounts:
     def create_provider_credential_lease(self, principal: IntegrationPrincipal, **kwargs):
         assert "huggingface.repo.get" in principal.allowed_operation_ids
         self.lease_calls.append(kwargs)
+        if (
+            self.denied_repo_id is not None
+            and kwargs["target"].get("repo_id") == self.denied_repo_id
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_AUTHORIZATION_DENIED",
+                title="The selected HF repository is not readable",
+                detail="Synthetic target-specific authorization denial.",
+                status=403,
+            )
         return {
             "lease_ref": "00000000-0000-4000-8000-000000000402",
             "profile_ref": kwargs["profile_ref"],
@@ -479,6 +709,74 @@ def test_hf_health_uses_account_center_lease_and_suppresses_oauth_access_ttl(
         keys={"exchange.integrations": _KEY},
         expected_caller_id="exchange.integrations",
     )
+    store.close()
+
+
+def test_hf_health_probes_only_the_connection_selected_repository(
+    tmp_path: Path,
+) -> None:
+    settings = _hf_settings()
+    profile = settings.profiles["hf-oauth"]
+    repositories = [
+        {
+            "repo_type": "model",
+            "repo_id": "org/other-model",
+            "permissions": ["read"],
+        },
+        {
+            "repo_type": "model",
+            "repo_id": "org/selected-model",
+            "permissions": ["read"],
+        },
+    ]
+    profile = replace(
+        profile,
+        account_scopes={"repositories": repositories},
+        targets={
+            "selected-model": replace(
+                profile.targets["selected-model"],
+                target_ref="org/selected-model",
+            )
+        },
+    )
+    settings = replace(settings, profiles={"hf-oauth": profile})
+    registry = AuthorizationCloudProfileRegistry(settings)
+    principal = _principal(
+        operations={
+            "integrationCreateConnection",
+            "integrationGetAuthorizationHealth",
+            "huggingface.repo.get",
+        }
+    )
+    store = IntegrationStore(tmp_path / "hf-selected-target.sqlite3")
+    account_profile_ref = "00000000-0000-4000-8000-000000000401"
+    connection = _hf_connection(store, principal, account_profile_ref)
+    accounts = _HuggingFaceAccounts(
+        account_profile_ref,
+        repositories=repositories,
+        denied_repo_id="org/selected-model",
+    )
+    direct = _DirectClient({"repo_id": "org/other-model"})
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={"hf-oauth": direct},
+        email_client=None,
+        account_center=accounts,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda _reference: _KEY,
+    )
+
+    observed = provider.authorization_health(principal, connection)
+
+    assert observed.authorization_state == AuthorizationState.PERMISSION_DENIED
+    assert observed.reason_code == "account_center_authorization_denied"
+    assert len(accounts.lease_calls) == 1
+    assert accounts.lease_calls[0]["target"] == {
+        "repo_type": "model",
+        "repo_id": "org/selected-model",
+    }
+    assert direct.requests == []
     store.close()
 
 

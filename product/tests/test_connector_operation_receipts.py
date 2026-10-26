@@ -868,10 +868,7 @@ def test_runpod_resource_bindings_use_the_navigator_cloud_target_projection() ->
 def test_github_and_huggingface_cli_bind_profile_scope_and_argv_only() -> None:
     """Vendor CLI calls bind a host profile separately from exact argv payloads."""
 
-    expected = {
-        "github": ("github.vendor.cli.execute", "github_vendor_cli"),
-        "huggingface": ("huggingface.vendor.cli.execute", "hf_vendor_cli"),
-    }
+    expected = {"github": ("github.vendor.cli.execute", "github_vendor_cli")}
     for provider_id, (operation_id, tool_id) in expected.items():
         tool = next(
             item
@@ -955,7 +952,10 @@ def test_vendor_cli_argument_schemas_exclude_model_profile_refs_and_block_export
             {"argv": ["gh", "auth", "login"]},
         )
 
-    hf_profile = SimpleNamespace(provider="hf", targets={"hf-target": object()})
+    hf_profile = SimpleNamespace(
+        provider="hf",
+        targets={"hf-target": SimpleNamespace(target_ref="example-org/private-model")},
+    )
     registry = SimpleNamespace(settings=SimpleNamespace(profiles={"hf-primary": hf_profile}))
     dispatcher = ConnectorOperationDispatcher(
         store=None,
@@ -974,16 +974,77 @@ def test_vendor_cli_argument_schemas_exclude_model_profile_refs_and_block_export
         binding_ref="hf-primary",
         target_ref="hf-target",
     )
-    dispatcher._validate_huggingface_target(
-        hf_connection,
-        "huggingface.vendor.cli.execute",
-        argv,
+    assert all(
+        item["operationId"] != "huggingface.vendor.cli.execute"
+        for item in connector_binding_tools("huggingface")
     )
+    with pytest.raises(PermissionError, match="cannot be constrained"):
+        dispatcher._validate_huggingface_target(
+            hf_connection,
+            "huggingface.vendor.cli.execute",
+            argv,
+        )
     with pytest.raises(ValueError, match="argument fields"):
         dispatcher._validate_huggingface_target(
             hf_connection,
             "huggingface.vendor.cli.execute",
             {**argv, "profile_ref": "model-selected-profile"},
+        )
+
+
+def test_hf_upload_requires_write_permission_on_the_selected_repository() -> None:
+    principal = actor()
+    target_ref = "example-org/selected-model"
+    hf_profile = SimpleNamespace(
+        provider="hf",
+        targets={"hf-target": SimpleNamespace(target_ref=target_ref)},
+        account_scopes={
+            "repositories": [
+                {
+                    "repo_type": "model",
+                    "repo_id": target_ref,
+                    "permissions": ["read"],
+                }
+            ]
+        },
+    )
+    dispatcher = ConnectorOperationDispatcher(
+        store=None,
+        accounts=None,
+        github=None,
+        authorization_cloud=None,
+        registry=SimpleNamespace(settings=SimpleNamespace(profiles={"hf-primary": hf_profile})),
+    )
+    connection = IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="hf",
+        account_link_ref="00000000-0000-4000-8000-000000000401",
+        binding_ref="hf-primary",
+        target_ref="hf-target",
+    )
+    upload = {
+        "repo_type": "model",
+        "repo_id": target_ref,
+        "path": "upload.bin",
+        "content_base64": "eA==",
+    }
+
+    with pytest.raises(PermissionError, match="permission scope"):
+        dispatcher._validate_huggingface_target(
+            connection,
+            "huggingface.file.upload",
+            upload,
+        )
+
+    hf_profile.account_scopes["repositories"][0]["permissions"] = ["read", "write"]
+    with pytest.raises(PermissionError, match="selected connection target"):
+        dispatcher._validate_huggingface_target(
+            connection,
+            "huggingface.file.upload",
+            {**upload, "repo_id": "example-org/other-model"},
         )
 
 
