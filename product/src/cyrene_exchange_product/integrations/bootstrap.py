@@ -25,6 +25,7 @@ from cyrene_exchange_product.integrations.models import (
 )
 
 _MAX_BOOTSTRAP_BYTES = 64 * 1024
+_CLOUD_BOOTSTRAP_PROVIDERS = frozenset({"azure", "gcp", "runpod"})
 
 
 def provision_connector_profiles(
@@ -33,7 +34,7 @@ def provision_connector_profiles(
     *,
     plan_only: bool = False,
 ) -> dict[str, Any]:
-    """Link GitHub/HF profiles and persist exact actor or shared connections."""
+    """Link verified connector profiles and persist scoped provider connections."""
 
     specification = _read_bootstrap_file(Path(bootstrap_file))
     authority = services.connector_grant_authority
@@ -92,6 +93,18 @@ def provision_connector_profiles(
             )
         ):
             raise _bootstrap_error("huggingface_host_profile_scope_mismatch")
+
+    cloud_entries = (
+        _cloud_profile_entries(
+            specification["cloud"],
+            registry=registry,
+            issuer=issuer,
+            organization_id=organization_id,
+            workspace_id=workspace_id,
+        )
+        if "cloud" in specification
+        else []
+    )
 
     github_spec = _object(
         specification["github"],
@@ -176,6 +189,7 @@ def provision_connector_profiles(
         services=services,
         specification=specification,
     )
+    _authorize_cloud_profile_targets(cloud_entries, principal, registry)
     if plan_only:
         plan: dict[str, Any] = {
             "schemaVersion": 1,
@@ -211,7 +225,23 @@ def provision_connector_profiles(
                 "targetAlias": hf_target_alias,
                 "expectedAccessMode": hf_expected_access_mode,
             }
+        if cloud_entries:
+            plan["cloud"] = [
+                {
+                    "provider": entry["profile"].provider,
+                    "profileAlias": entry["profile_alias"],
+                    "targetAlias": entry["target_alias"],
+                    "providerTargetRef": entry["target"].target_ref,
+                    "expectedAccessMode": entry["expected_access_mode"],
+                    "status": "PLANNED",
+                }
+                for entry in cloud_entries
+            ]
         return plan
+
+    existing_cloud_profiles = _read_cloud_profile_readbacks(
+        services.accounts, principal, cloud_entries
+    )
 
     github_profile = services.accounts.link_github_app_installation(
         principal,
@@ -315,6 +345,276 @@ def provision_connector_profiles(
             "accessMode": hf_access_mode,
             "authMode": hf_profile_config.auth_mode or "fine_grained_token",
         }
+    if cloud_entries:
+        result["cloud"] = _provision_cloud_connections(
+            services,
+            principal,
+            cloud_entries,
+            existing_cloud_profiles,
+        )
+    return result
+
+
+def _cloud_profile_entries(
+    value: object,
+    *,
+    registry: Any,
+    issuer: str,
+    organization_id: str,
+    workspace_id: str,
+) -> list[dict[str, Any]]:
+    """Resolve a closed cloud selection only through trusted host profile aliases."""
+
+    if registry is None:
+        raise _bootstrap_error("cloud_host_profile_not_configured")
+    if not isinstance(value, list) or len(value) not in {2, 3}:
+        raise _bootstrap_error("cloud_bootstrap_profile_set_invalid")
+    profiles = registry.settings.profiles
+    seen_aliases: set[str] = set()
+    seen_providers: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    for raw in value:
+        row = _object(
+            raw,
+            required={"profileAlias", "targetAlias", "expectedAccessMode"},
+            label="bootstrap cloud profile",
+        )
+        profile_alias = _text(row["profileAlias"], "cloud profileAlias")
+        target_alias = _text(row["targetAlias"], "cloud targetAlias")
+        expected_access_mode = row["expectedAccessMode"]
+        if not isinstance(expected_access_mode, str) or expected_access_mode not in {
+            "actor_owned",
+            "workspace_operator",
+        }:
+            raise _bootstrap_error("cloud_bootstrap_access_mode_invalid")
+        if profile_alias in seen_aliases:
+            raise _bootstrap_error("cloud_bootstrap_profile_duplicate")
+        profile = profiles.get(profile_alias)
+        if profile is None or profile.provider not in _CLOUD_BOOTSTRAP_PROVIDERS:
+            raise _bootstrap_error("cloud_host_profile_not_configured")
+        if profile.provider in seen_providers:
+            raise _bootstrap_error("cloud_bootstrap_provider_duplicate")
+        seen_aliases.add(profile_alias)
+        seen_providers.add(profile.provider)
+        target = profile.targets.get(target_alias)
+        if (
+            profile.profile_ref != profile_alias
+            or profile.organization_id != organization_id
+            or profile.workspace_id != workspace_id
+            or profile.expected_issuer != issuer
+            or profile.access_mode != expected_access_mode
+            or target is None
+        ):
+            raise _bootstrap_error("cloud_host_profile_scope_mismatch")
+        identity_ref = _text(profile.identity_ref or profile.profile_ref, "cloud identityRef")
+        if len(identity_ref) > 256:
+            raise _bootstrap_error("cloud_profile_identity_ref_invalid")
+        entries.append(
+            {
+                "profile_alias": profile_alias,
+                "target_alias": target_alias,
+                "expected_access_mode": expected_access_mode,
+                "profile": profile,
+                "target": target,
+                "identity_ref": identity_ref,
+            }
+        )
+    if seen_providers not in ({"azure", "gcp"}, {"azure", "gcp", "runpod"}):
+        raise _bootstrap_error("cloud_bootstrap_profile_set_invalid")
+    return entries
+
+
+def _authorize_cloud_profile_targets(
+    entries: list[dict[str, Any]],
+    principal: IntegrationPrincipal,
+    registry: Any,
+) -> None:
+    """Verify the signed Directory actor can use each exact host-owned target alias."""
+
+    for entry in entries:
+        profile = entry["profile"]
+        account_profile_ref = registry.account_center_profile_ref(principal, profile)
+        request = CreateIntegrationConnection(
+            provider=profile.provider,
+            binding_ref=entry["profile_alias"],
+            target_ref=entry["target_alias"],
+            account_link_ref=account_profile_ref,
+            display_name=entry["target"].display_name,
+        )
+        try:
+            display_name = registry.display_name_for_connection(principal, request)
+        except (PermissionError, ValueError) as exc:
+            raise _bootstrap_error("cloud_host_profile_scope_mismatch") from exc
+        if display_name != entry["target"].display_name:
+            raise _bootstrap_error("cloud_host_profile_target_mismatch")
+        entry["account_profile_ref"] = account_profile_ref
+        entry["connection_request"] = request
+
+
+def _read_cloud_profile_readbacks(
+    accounts: Any,
+    principal: IntegrationPrincipal,
+    entries: list[dict[str, Any]],
+) -> dict[str, dict[str, Any] | None]:
+    """Read Account Center profile metadata before mutating Exchange or AC state."""
+
+    if not entries:
+        return {}
+    response = accounts.list_provider_profiles(principal)
+    return {
+        entry["account_profile_ref"]: _cloud_profile_readback(
+            response,
+            profile_ref=entry["account_profile_ref"],
+            provider=entry["profile"].provider,
+            identity_ref=entry["identity_ref"],
+            target_scope=_cloud_account_target_scope(entry),
+            access_mode=entry["expected_access_mode"],
+            allow_absent=True,
+        )
+        for entry in entries
+    }
+
+
+def _cloud_account_target_scope(entry: Mapping[str, Any]) -> dict[str, str]:
+    """Build the exact Account Center cloud scope only from trusted host config."""
+
+    return {
+        "target_ref": str(entry["target_alias"]),
+        "provider_target_ref": str(entry["target"].target_ref),
+    }
+
+
+def _cloud_profile_readback(
+    response: object,
+    *,
+    profile_ref: str,
+    provider: str,
+    identity_ref: str,
+    target_scope: Mapping[str, str],
+    access_mode: str,
+    allow_absent: bool,
+    require_auth_mode: bool = True,
+) -> dict[str, str] | None:
+    """Validate non-secret host identity metadata returned by Account Center."""
+
+    profiles = response.get("profiles") if isinstance(response, Mapping) else None
+    if not isinstance(profiles, list):
+        raise _bootstrap_error("cloud_account_center_readback_invalid")
+    matches = [
+        row
+        for row in profiles
+        if isinstance(row, Mapping) and row.get("profile_ref") == profile_ref
+    ]
+    if not matches and allow_absent:
+        return None
+    if len(matches) != 1:
+        raise _bootstrap_error("cloud_account_center_profile_readback_mismatch")
+    row = matches[0]
+    auth_status = row.get("auth_status")
+    if (
+        row.get("provider") != provider
+        or row.get("identity_ref") != identity_ref
+        or row.get("target_scope") != dict(target_scope)
+        or row.get("access_mode") != access_mode
+        or auth_status not in {"unknown", "configured", "healthy"}
+        or (
+            row.get("auth_mode") != "host_identity"
+            if require_auth_mode
+            else row.get("auth_mode") not in {None, "host_identity"}
+        )
+        or row.get("external_subject") is not None
+        or row.get("expires_at") is not None
+    ):
+        raise _bootstrap_error("cloud_account_center_profile_readback_mismatch")
+    return {
+        "profileRef": profile_ref,
+        "provider": provider,
+        "identityRef": identity_ref,
+        "accessMode": access_mode,
+        "authStatus": str(auth_status),
+    }
+
+
+def _provision_cloud_connections(
+    services: Any,
+    principal: IntegrationPrincipal,
+    entries: list[dict[str, Any]],
+    existing_profiles: Mapping[str, dict[str, Any] | None],
+) -> list[dict[str, Any]]:
+    """Register exact host scopes, persist connections, then return Account Center readbacks."""
+
+    result: list[dict[str, Any]] = []
+    for entry in entries:
+        profile = entry["profile"]
+        profile_ref = entry["account_profile_ref"]
+        target_scope = _cloud_account_target_scope(entry)
+        request = entry["connection_request"]
+        connection = services.store.create_connection(
+            principal,
+            request,
+            idempotency_key=f"connector-bootstrap/cloud/{profile.provider}/{profile_ref}",
+            access_mode=entry["expected_access_mode"],
+        )
+        if (
+            connection.provider != profile.provider
+            or connection.account_link_ref != profile_ref
+            or connection.binding_ref != entry["profile_alias"]
+            or connection.target_ref != entry["target_alias"]
+            or connection.access_mode != entry["expected_access_mode"]
+        ):
+            raise _bootstrap_error("cloud_exchange_connection_readback_mismatch")
+        if existing_profiles[profile_ref] is None:
+            registered = services.accounts.register_host_identity_profile(
+                principal,
+                profile_ref=profile_ref,
+                provider=profile.provider,
+                identity_ref=entry["identity_ref"],
+                target_scope=target_scope,
+                idempotency_key=f"connection-profile:{connection.id}",
+            )
+            _cloud_profile_readback(
+                {"profiles": [registered]},
+                profile_ref=profile_ref,
+                provider=profile.provider,
+                identity_ref=entry["identity_ref"],
+                target_scope=target_scope,
+                access_mode=entry["expected_access_mode"],
+                allow_absent=False,
+                require_auth_mode=False,
+            )
+        current_profile = _cloud_profile_readback(
+            services.accounts.list_provider_profiles(principal),
+            profile_ref=profile_ref,
+            provider=profile.provider,
+            identity_ref=entry["identity_ref"],
+            target_scope=target_scope,
+            access_mode=entry["expected_access_mode"],
+            allow_absent=False,
+        )
+        if current_profile is None:
+            raise _bootstrap_error("cloud_account_center_profile_readback_mismatch")
+        persisted = services.store.connector_connection_for_actor(
+            connection.id,
+            issuer=principal.issuer,
+            subject=principal.subject,
+            workspace_id=principal.workspace_id,
+            organization_id=principal.organization_id,
+        )
+        if persisted != connection:
+            raise _bootstrap_error("cloud_exchange_connection_readback_mismatch")
+        result.append(
+            {
+                "provider": profile.provider,
+                "profileAlias": entry["profile_alias"],
+                "profileRef": current_profile["profileRef"],
+                "identityRef": current_profile["identityRef"],
+                "targetAlias": entry["target_alias"],
+                "providerTargetRef": entry["target"].target_ref,
+                "connectionRef": str(persisted.id),
+                "accessMode": current_profile["accessMode"],
+                "authStatus": current_profile["authStatus"],
+            }
+        )
     return result
 
 
@@ -336,7 +636,7 @@ def _read_bootstrap_file(path: Path) -> dict[str, Any]:
     return _object(
         value,
         required={"schemaVersion", "actor", "github"},
-        optional={"huggingface"},
+        optional={"huggingface", "cloud"},
         label="private connector bootstrap file",
         expected_version=1,
     )

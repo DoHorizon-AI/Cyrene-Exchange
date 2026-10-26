@@ -12,6 +12,9 @@ import pytest
 from cyrene_exchange_product.cli import parser
 from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations.api import IntegrationServices
+from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
+    AuthorizationCloudProfileRegistry,
+)
 from cyrene_exchange_product.integrations.bootstrap import (
     _verify_profile_readback,
     provision_connector_profiles,
@@ -66,10 +69,11 @@ class _Verifier:
 
 class _AccountCenter:
     def __init__(self, *, access_mode: str = "workspace_operator") -> None:
-        self.links: dict[str, dict[str, str]] = {}
+        self.links: dict[str, dict[str, Any]] = {}
         self.github_repositories: list[dict[str, str]] = []
         self.hf_credential_ref: str | None = None
         self.access_mode = access_mode
+        self.host_profile_registrations: list[dict[str, Any]] = []
 
     def link_github_app_installation(
         self,
@@ -118,6 +122,34 @@ class _AccountCenter:
     def list_provider_profiles(self, _principal: IntegrationPrincipal) -> dict[str, Any]:
         return {"profiles": list(self.links.values())}
 
+    def register_host_identity_profile(
+        self,
+        _principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        provider: str,
+        identity_ref: str,
+        target_scope: dict[str, str],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        row = {
+            "profile_ref": profile_ref,
+            "provider": provider,
+            "identity_ref": identity_ref,
+            "target_scope": target_scope,
+            "access_mode": self.access_mode,
+            "auth_status": "unknown",
+            "auth_mode": "host_identity",
+            "external_subject": None,
+            "expires_at": None,
+        }
+        existing = self.links.get(profile_ref)
+        if existing is not None and existing != row:
+            raise IntegrationConflict("host identity profile changed")
+        self.host_profile_registrations.append({**row, "idempotency_key": idempotency_key})
+        self.links[profile_ref] = row
+        return row
+
 
 def _private_specification() -> dict[str, Any]:
     return {
@@ -146,10 +178,59 @@ def _private_specification() -> dict[str, Any]:
     }
 
 
+def _cloud_specification(*, include_runpod: bool = False) -> list[dict[str, str]]:
+    """Select only Azure/GCP and optionally Runpod; provider IDs stay host-owned."""
+
+    providers = ["azure", "gcp", *(["runpod"] if include_runpod else [])]
+    return [
+        {
+            "profileAlias": f"{provider}-primary",
+            "targetAlias": f"{provider}-target",
+            "expectedAccessMode": "workspace_operator",
+        }
+        for provider in providers
+    ]
+
+
+def _cloud_profile(
+    provider: str,
+    *,
+    profile_alias: str | None = None,
+    target_alias: str | None = None,
+    target_ref: str | None = None,
+    access_mode: str = "workspace_operator",
+    identity_ref: str | None = None,
+) -> Any:
+    """Return a synthetic fixed cloud profile for host configuration tests."""
+
+    alias = profile_alias or f"{provider}-primary"
+    selector = target_alias or f"{provider}-target"
+    target = target_ref or f"{provider}-resource"
+    return SimpleNamespace(
+        profile_ref=alias,
+        provider=provider,
+        identity_ref=identity_ref or f"{provider}-identity-ref",
+        targets={
+            selector: SimpleNamespace(
+                target_ref=target,
+                display_name=f"{provider} target",
+                allowed_context_refs=frozenset(),
+            )
+        },
+        organization_id="org-test",
+        workspace_id="workspace-test",
+        expected_issuer=ISSUER,
+        allowed_context_refs=frozenset(),
+        allowed_actors=frozenset(),
+        access_mode=access_mode,
+    )
+
+
 def _services(
     tmp_path: Path,
     *,
     deny: bool = False,
+    cloud_providers: tuple[str, ...] = (),
 ) -> tuple[Any, IntegrationStore, _Authority, _Verifier, _AccountCenter]:
     store = IntegrationStore(tmp_path / "bootstrap.sqlite3")
     authority = _Authority()
@@ -175,13 +256,16 @@ def _services(
         auth_mode=None,
         access_mode="workspace_operator",
     )
+    profiles = {"hf-primary": hf_profile}
+    for provider in cloud_providers:
+        cloud_profile = _cloud_profile(provider)
+        profiles[cloud_profile.profile_ref] = cloud_profile
+    registry = AuthorizationCloudProfileRegistry(SimpleNamespace(contexts={}, profiles=profiles))
     services = SimpleNamespace(
         store=store,
         connector_grant_authority=authority,
         connector_grant_verifier=verifier,
-        authorization_profile_registry=SimpleNamespace(
-            settings=SimpleNamespace(profiles={"hf-primary": hf_profile})
-        ),
+        authorization_profile_registry=registry,
         accounts=accounts,
         teams_message_profile=SimpleNamespace(
             expected_issuer=ISSUER,
@@ -276,6 +360,185 @@ def test_plan_only_verifies_role_without_linking_profiles_or_saving_connections(
         assert verifier.consumed == 1
         assert len(authority.requests) == 1
         assert accounts.links == {}
+        assert (
+            store.connector_bindings_for_actor(
+                issuer=ISSUER,
+                subject=SUBJECT,
+                workspace_id="workspace-test",
+            )
+            == []
+        )
+    finally:
+        store.close()
+
+
+def test_plan_only_cloud_profiles_are_host_resolved_without_fake_connection_ids(
+    tmp_path: Path,
+) -> None:
+    specification = _private_specification()
+    specification["cloud"] = _cloud_specification()
+    specification_path = tmp_path / "bootstrap-cloud-plan.json"
+    specification_path.write_text(json.dumps(specification), encoding="utf-8")
+    specification_path.chmod(0o600)
+    services, store, authority, verifier, accounts = _services(
+        tmp_path, cloud_providers=("azure", "gcp", "runpod")
+    )
+    try:
+        plan = provision_connector_profiles(services, specification_path, plan_only=True)
+
+        assert [item["provider"] for item in plan["cloud"]] == ["azure", "gcp"]
+        assert {item["status"] for item in plan["cloud"]} == {"PLANNED"}
+        assert all(
+            "connectionRef" not in item and "profileRef" not in item for item in plan["cloud"]
+        )
+        assert {item["targetAlias"] for item in plan["cloud"]} == {
+            "azure-target",
+            "gcp-target",
+        }
+        assert accounts.host_profile_registrations == []
+        assert accounts.links == {}
+        assert verifier.consumed == 1
+        assert len(authority.requests) == 1
+        assert (
+            store.connector_bindings_for_actor(
+                issuer=ISSUER,
+                subject=SUBJECT,
+                workspace_id="workspace-test",
+            )
+            == []
+        )
+    finally:
+        store.close()
+
+
+def test_cloud_bootstrap_registers_account_profiles_and_reads_back_real_connections(
+    tmp_path: Path,
+) -> None:
+    specification = _private_specification()
+    specification["cloud"] = _cloud_specification(include_runpod=True)
+    specification_path = tmp_path / "bootstrap-cloud.json"
+    specification_path.write_text(json.dumps(specification), encoding="utf-8")
+    specification_path.chmod(0o600)
+    services, store, authority, verifier, accounts = _services(
+        tmp_path, cloud_providers=("azure", "gcp", "runpod")
+    )
+    try:
+        first = provision_connector_profiles(services, specification_path)
+        second = provision_connector_profiles(services, specification_path)
+
+        assert first == second
+        assert [row["provider"] for row in first["cloud"]] == ["azure", "gcp", "runpod"]
+        assert {row["authStatus"] for row in first["cloud"]} == {"unknown"}
+        assert {row["accessMode"] for row in first["cloud"]} == {"workspace_operator"}
+        assert len(accounts.host_profile_registrations) == 3
+        assert {row["idempotency_key"] for row in accounts.host_profile_registrations} == {
+            f"connection-profile:{row['connectionRef']}" for row in first["cloud"]
+        }
+        account_profiles = {row["profile_ref"]: row for row in accounts.links.values()}
+        for result in first["cloud"]:
+            connection = store.connector_connection_for_actor(
+                result["connectionRef"],
+                issuer=ISSUER,
+                subject=SUBJECT,
+                workspace_id="workspace-test",
+                organization_id="org-test",
+            )
+            account_profile = account_profiles[result["profileRef"]]
+            assert connection.provider == result["provider"]
+            assert connection.account_link_ref == result["profileRef"]
+            assert connection.binding_ref == result["profileAlias"]
+            assert connection.target_ref == result["targetAlias"]
+            assert account_profile["identity_ref"] == result["identityRef"]
+            assert account_profile["target_scope"] == {
+                "target_ref": result["targetAlias"],
+                "provider_target_ref": result["providerTargetRef"],
+            }
+        encoded_result = json.dumps(first).lower()
+        assert "credential_secret_ref" not in encoded_result
+        assert "authorization_ref" not in encoded_result
+        assert "access_token" not in encoded_result
+        assert verifier.consumed == 2
+        assert len(authority.requests) == 2
+    finally:
+        store.close()
+
+
+def test_cloud_bootstrap_rejects_incomplete_provider_set_before_any_side_effect(
+    tmp_path: Path,
+) -> None:
+    specification = _private_specification()
+    specification["cloud"] = [_cloud_specification()[0]]
+    specification_path = tmp_path / "bootstrap-cloud-incomplete.json"
+    specification_path.write_text(json.dumps(specification), encoding="utf-8")
+    specification_path.chmod(0o600)
+    services, store, authority, _verifier, accounts = _services(
+        tmp_path, cloud_providers=("azure", "gcp")
+    )
+    try:
+        with pytest.raises(ExchangeProductError):
+            provision_connector_profiles(services, specification_path)
+        assert accounts.links == {}
+        assert accounts.host_profile_registrations == []
+        assert len(authority.requests) == 0
+        assert (
+            store.connector_bindings_for_actor(
+                issuer=ISSUER,
+                subject=SUBJECT,
+                workspace_id="workspace-test",
+            )
+            == []
+        )
+    finally:
+        store.close()
+
+
+def test_cloud_bootstrap_rejects_account_center_scope_mismatch_before_linking_other_profiles(
+    tmp_path: Path,
+) -> None:
+    specification = _private_specification()
+    specification["cloud"] = _cloud_specification()
+    specification_path = tmp_path / "bootstrap-cloud-scope-mismatch.json"
+    specification_path.write_text(json.dumps(specification), encoding="utf-8")
+    specification_path.chmod(0o600)
+    services, store, authority, _verifier, accounts = _services(
+        tmp_path, cloud_providers=("azure", "gcp")
+    )
+    principal = IntegrationPrincipal(
+        issuer=ISSUER,
+        subject=SUBJECT,
+        organization_id="org-test",
+        workspace_id="workspace-test",
+        allowed_operation_ids=frozenset(
+            {"navigator.connector.operator.v1", "integrationCreateConnection"}
+        ),
+    )
+    profile = services.authorization_profile_registry.settings.profiles["azure-primary"]
+    profile_ref = services.authorization_profile_registry.account_center_profile_ref(
+        principal, profile
+    )
+    accounts.links[profile_ref] = {
+        "profile_ref": profile_ref,
+        "provider": "azure",
+        "identity_ref": profile.identity_ref,
+        "target_scope": {
+            "target_ref": "azure-target",
+            "provider_target_ref": "another-subscription",
+        },
+        "access_mode": "workspace_operator",
+        "auth_status": "unknown",
+        "auth_mode": "host_identity",
+        "external_subject": None,
+        "expires_at": None,
+    }
+    try:
+        with pytest.raises(ExchangeProductError):
+            provision_connector_profiles(services, specification_path)
+        assert accounts.links[profile_ref]["target_scope"]["provider_target_ref"] == (
+            "another-subscription"
+        )
+        assert accounts.host_profile_registrations == []
+        assert len(accounts.links) == 1
+        assert authority.requests
         assert (
             store.connector_bindings_for_actor(
                 issuer=ISSUER,
