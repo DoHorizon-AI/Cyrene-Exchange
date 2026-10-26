@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
 from functools import partial
@@ -55,6 +56,7 @@ from cyrene_exchange_product.integrations.models import (
     CreateSyncBinding,
     EnqueueIssueAction,
     IntegrationAuthorizationError,
+    IntegrationConflict,
     IntegrationNotFound,
     IntegrationNotification,
     IntegrationPrincipal,
@@ -74,6 +76,184 @@ from cyrene_exchange_product.integrations.store import (
 )
 
 _MAX_NAVIGATOR_REQUEST_BYTES = 128 * 1024
+_SAFE_HEALTH_REASON_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$")
+
+
+def _safe_health_reason_code(value: object) -> str | None:
+    """Expose only bounded code-shaped health reasons, never provider prose."""
+
+    if isinstance(value, str) and _SAFE_HEALTH_REASON_CODE.fullmatch(value):
+        return value
+    return None
+
+
+def _connection_for_renewal(
+    store: IntegrationStore,
+    principal: IntegrationPrincipal,
+    authorization_ref: str,
+    *,
+    operation_id: str,
+) -> Any:
+    """Resolve one actor-owned WeCom or HF connection for its stored auth ref."""
+
+    selected = []
+    for provider in ("wecom", "hf"):
+        try:
+            selected.append(
+                store.connection_for_authorization(
+                    principal,
+                    authorization_ref,
+                    provider=provider,
+                    authorization_operation_id=operation_id,
+                )
+            )
+        except IntegrationNotFound:
+            continue
+    if not selected:
+        raise IntegrationNotFound("authorization is not attached to this actor's connection")
+    if len(selected) != 1:
+        raise IntegrationConflict("authorization reference matches multiple provider bindings")
+    return selected[0]
+
+
+def _require_supported_renewal_profile(
+    services: Any,
+    principal: IntegrationPrincipal,
+    connection: Any,
+    *,
+    operation_id: str,
+) -> None:
+    """Reject HF renewal before persisting intent unless the host profile is device OAuth."""
+
+    if connection.provider != "hf":
+        return
+    registry = services.authorization_profile_registry
+    if registry is None:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_RENEWAL_UNAVAILABLE",
+            title="Hugging Face renewal is unavailable",
+            detail="The fixed Hugging Face authorization profile is not configured.",
+            status=503,
+            context={"reasonCode": "huggingface_host_profile_unavailable"},
+        )
+    try:
+        profile, _target_ref = registry.profile_for_connection(
+            principal,
+            connection,
+            operation_id=operation_id,
+        )
+    except PermissionError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+            title="Hugging Face profile is unavailable",
+            detail="The selected Hugging Face profile is outside this verified actor scope.",
+            status=403,
+            context={"reasonCode": "huggingface_profile_scope_mismatch"},
+        ) from exc
+    if profile.provider != "hf" or profile.auth_mode != "device_oauth":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_RENEWAL_UNSUPPORTED",
+            title="Hugging Face renewal is unsupported",
+            detail="Only a linked Hugging Face device OAuth profile can start device renewal.",
+            status=409,
+            context={"reasonCode": "huggingface_device_oauth_required"},
+        )
+
+
+def _ensure_cloud_identity_profile(
+    services: Any,
+    principal: IntegrationPrincipal,
+    *,
+    connection: Any,
+    profile: Any,
+    target_alias: str,
+) -> None:
+    """Idempotently register/read back one host-owned non-secret cloud profile."""
+
+    target = profile.targets.get(target_alias)
+    if target is None:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+            title="Cloud profile is not configured",
+            detail="The selected cloud target is not in trusted host settings.",
+            status=403,
+        )
+    profile_ref = connection.account_link_ref
+    if not isinstance(profile_ref, str) or not profile_ref:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center profile reference is unavailable",
+            detail="The fixed cloud identity profile reference is invalid.",
+            status=502,
+        )
+    expected = {
+        "profile_ref": profile_ref,
+        "provider": connection.provider,
+        "identity_ref": profile.identity_ref or profile.profile_ref,
+        "target_scope": {
+            "target_ref": target_alias,
+            "provider_target_ref": target.target_ref,
+        },
+        "access_mode": connection.access_mode,
+    }
+
+    def readback() -> Mapping[str, Any] | None:
+        response = services.accounts.list_provider_profiles(principal)
+        rows = response.get("profiles") if isinstance(response, Mapping) else None
+        if not isinstance(rows, list):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned malformed cloud profile metadata.",
+                status=502,
+            )
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, Mapping) and row.get("profile_ref") == profile_ref
+        ]
+        if len(matches) > 1:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned duplicate cloud profile metadata.",
+                status=502,
+            )
+        if not matches:
+            return None
+        row = matches[0]
+        if (
+            any(row.get(key) != value for key, value in expected.items())
+            or row.get("auth_mode") != "host_identity"
+            or row.get("auth_status") not in {"unknown", "configured", "healthy"}
+            or row.get("external_subject") is not None
+            or row.get("expires_at") is not None
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned a mismatched cloud identity profile.",
+                status=502,
+                context={"reasonCode": "cloud_identity_profile_scope_mismatch"},
+            )
+        return row
+
+    if readback() is None:
+        services.accounts.register_host_identity_profile(
+            principal,
+            profile_ref=profile_ref,
+            provider=connection.provider,
+            identity_ref=str(expected["identity_ref"]),
+            target_scope=expected["target_scope"],
+            idempotency_key=f"connection-profile:{connection.id}",
+        )
+        if readback() is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center profile readback is unavailable",
+                detail="Account Center did not persist the host cloud identity profile.",
+                status=502,
+            )
 
 
 async def _invoke_connector_dispatcher(
@@ -393,6 +573,34 @@ class AuthorizationHealthResponse(_HttpResponseModel):
     reason_code: str | None = Field(default=None, alias="reasonCode")
 
 
+class AuthorizationHealthSnapshotConnectionResponse(_HttpResponseModel):
+    """Host-safe snapshot without owner identity or a renewable authorization ref."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    connection_id: UUID = Field(alias="connectionId")
+    provider: ProviderId
+    login_state: Literal["PRESENT", "MISSING", "UNKNOWN", "UNAVAILABLE"] = Field(alias="loginState")
+    authorization_state: Literal[
+        "VALID", "REAUTHORIZATION_REQUIRED", "PERMISSION_DENIED", "UNKNOWN", "UNAVAILABLE"
+    ] = Field(alias="authorizationState")
+    checked_at: datetime | None = Field(default=None, alias="checkedAt")
+    expires_at: datetime | None = Field(default=None, alias="expiresAt")
+    generation: int = Field(ge=0)
+    capabilities: list[AuthorizationCapabilityResponse] = Field(max_length=100)
+    reason_code: str | None = Field(default=None, alias="reasonCode")
+
+
+class AuthorizationHealthSnapshotResponse(_HttpResponseModel):
+    """Bounded page of snapshots for connections pinned by the host."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    connections: list[AuthorizationHealthSnapshotConnectionResponse] = Field(
+        min_length=1, max_length=100
+    )
+
+
 class RenewalSessionResponse(_HttpResponseModel):
     """Pollable Product session; provider credentials and internal refs are omitted."""
 
@@ -404,6 +612,13 @@ class RenewalSessionResponse(_HttpResponseModel):
     created_at: datetime = Field(alias="createdAt")
     expires_at: datetime | None = Field(default=None, alias="expiresAt")
     authorization_url: str | None = Field(default=None, alias="authorizationUrl")
+    user_code: str | None = Field(
+        default=None,
+        alias="userCode",
+        min_length=4,
+        max_length=32,
+        pattern=r"^[A-Z0-9]{4}-[A-Z0-9]{4}$",
+    )
     qr_attachment_ref: str | None = Field(default=None, alias="qrAttachmentRef")
     generation: int = Field(ge=0)
     reason_code: str | None = Field(default=None, alias="reasonCode")
@@ -499,6 +714,21 @@ class ConnectorOperationGrantBody(IntegrationRequestBody):
     resource_ref: str = Field(min_length=1, max_length=1000)
     arguments: dict[str, Any]
     arguments_digest_sha256: str = Field(pattern="^[0-9a-f]{64}$")
+
+
+class AuthorizationHealthSnapshotBody(IntegrationRequestBody):
+    """Navigator HMAC selector for one bounded set of host-pinned connections."""
+
+    request_id: str = Field(min_length=1, max_length=200)
+    organization_id: str = Field(min_length=1, max_length=200)
+    workspace_id: str = Field(min_length=1, max_length=200)
+    connection_ids: list[UUID] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_connection_ids(self) -> AuthorizationHealthSnapshotBody:
+        if len(self.connection_ids) != len(set(self.connection_ids)):
+            raise ValueError("connectionIds must be unique")
+        return self
 
 
 class ConnectorOperationBody(IntegrationRequestBody):
@@ -1278,6 +1508,7 @@ def _renewal_response(session: RenewalSessionRecord) -> dict[str, Any]:
         "createdAt": _http_timestamp_value(session.created_at),
         "expiresAt": _http_timestamp_value(session.expires_at),
         "authorizationUrl": session.authorization_url,
+        "userCode": session.user_code,
         "qrAttachmentRef": session.qr_attachment_ref,
         "generation": session.generation,
         "reasonCode": session.reason_code,
@@ -1927,6 +2158,41 @@ def create_router(services: IntegrationServices) -> APIRouter:
             repository_id=body.repository_id,
             repository_name=body.repository_name,
         )
+        cloud_profile = None
+        if create_request.provider in {"azure", "gcp", "runpod"}:
+            registry = services.authorization_profile_registry
+            cloud_profile = (
+                registry.settings.profiles.get(create_request.binding_ref or "")
+                if registry is not None
+                else None
+            )
+            if (
+                cloud_profile is None
+                or cloud_profile.provider != create_request.provider
+                or create_request.target_ref not in cloud_profile.targets
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Cloud profile is not configured",
+                    detail="The selected cloud profile or target is not in trusted host settings.",
+                    status=403,
+                )
+            account_profile_ref = registry.account_center_profile_ref(
+                actor,
+                cloud_profile,
+                target_alias=str(create_request.target_ref),
+            )
+            if create_request.account_link_ref not in {None, account_profile_ref}:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Cloud profile reference is invalid",
+                    detail="The Account Center profile reference is fixed by host configuration.",
+                    status=403,
+                    context={"reasonCode": "cloud_account_profile_ref_mismatch"},
+                )
+            create_request = create_request.model_copy(
+                update={"account_link_ref": account_profile_ref}
+            )
         create_request = create_request.model_copy(
             update={"display_name": services.display_name_for_connection(actor, create_request)}
         )
@@ -1946,50 +2212,14 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 create_request,
                 idempotency_key=idempotency_key,
             )
-        if connection.provider in {"azure", "gcp", "runpod"}:
-            registry = services.authorization_profile_registry
-            host_profile = (
-                registry.settings.profiles.get(connection.binding_ref or "")
-                if registry is not None
-                else None
-            )
-            target = (
-                host_profile.targets.get(connection.target_ref or "")
-                if host_profile is not None
-                else None
-            )
-            if (
-                host_profile is None
-                or host_profile.provider != connection.provider
-                or target is None
-            ):
-                raise ExchangeProductError(
-                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
-                    title="Cloud profile is not configured",
-                    detail="The selected cloud profile or target is not in trusted host settings.",
-                    status=403,
-                )
-            registered = services.accounts.register_host_identity_profile(
+        if cloud_profile is not None:
+            _ensure_cloud_identity_profile(
+                services,
                 actor,
-                profile_ref=host_profile.profile_ref,
-                provider=connection.provider,
-                identity_ref=host_profile.identity_ref or host_profile.profile_ref,
-                target_scope={
-                    "target_ref": connection.target_ref,
-                    "provider_target_ref": target.target_ref,
-                },
-                idempotency_key=f"connection-profile:{connection.id}",
+                connection=connection,
+                profile=cloud_profile,
+                target_alias=str(connection.target_ref),
             )
-            if (
-                registered.get("profile_ref") != host_profile.profile_ref
-                or registered.get("provider") != connection.provider
-            ):
-                raise ExchangeProductError(
-                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
-                    title="Account Center response invalid",
-                    detail="Account Center returned a mismatched host identity profile.",
-                    status=502,
-                )
         return _connection_response(connection)
 
     @router.get(
@@ -2028,10 +2258,13 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 context={"reasonCode": "connector_authority_not_configured"},
             )
         try:
-            if body.connection_ref == getattr(
-                services.teams_message_profile, "connection_ref", None
-            ):
-                profile = services.teams_message_profile
+            teams_root_profile = services.teams_message_profile
+            if body.connection_ref == getattr(teams_root_profile, "connection_ref", None):
+                profile = (
+                    teams_root_profile.profile_for_ref(body.profile_ref)
+                    if teams_root_profile is not None
+                    else None
+                )
                 if profile is None:
                     raise PermissionError("Teams message profile is not configured")
                 principal_value = IntegrationPrincipal(
@@ -2541,11 +2774,65 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 detail="The egress request must use the configured msteams provider.",
                 status=403,
             )
+        encoded = request.headers.get("x-cyrene-connector-grant-bin", "")
+        try:
+            grant_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The connector grant header is malformed.",
+                status=403,
+            ) from exc
+        try:
+            provisional = verifier.inspect(grant_bytes)
+        except PermissionError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The signed Teams actor grant is invalid.",
+                status=403,
+            ) from exc
+        teams_root_profile = services.teams_message_profile
+        profile = (
+            teams_root_profile.profile_for_ref(provisional.profile_ref)
+            if teams_root_profile is not None
+            else None
+        )
+        if profile is None or profile.connection_ref != provisional.connection_ref:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The signed grant does not select a configured Teams profile.",
+                status=403,
+                context={"reasonCode": "teams_profile_mismatch"},
+            )
+        if provisional.principal_issuer != profile.expected_issuer:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The signed Teams actor issuer does not match the configured tenant.",
+                status=403,
+            )
+        if (
+            profile.fixed_owner_subject is not None
+            and provisional.principal_subject != profile.fixed_owner_subject
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The signed Teams actor does not match the fixed notification owner.",
+                status=403,
+                context={"reasonCode": "teams_notification_owner_mismatch"},
+            )
         try:
             profile.authorize_conversation(
                 tenant_id=body.conversation.tenant_id,
                 team_id=body.conversation.team_id,
                 channel_id=body.conversation.channel_id,
+                conversation_id=body.conversation.conversation_id,
+                root_thread_id=body.conversation.root_thread_id,
+                service_url=body.conversation.service_url,
             )
             validate_teams_service_url(
                 body.conversation.service_url,
@@ -2586,24 +2873,6 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 status=400,
             )
         resource_ref = _teams_resource_ref(conversation)
-        encoded = request.headers.get("x-cyrene-connector-grant-bin", "")
-        try:
-            grant_bytes = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error) as exc:
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
-                title="Teams connector authorization denied",
-                detail="The connector grant header is malformed.",
-                status=403,
-            ) from exc
-        provisional = verifier.inspect(grant_bytes)
-        if provisional.principal_issuer != profile.expected_issuer:
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
-                title="Teams connector authorization denied",
-                detail="The signed Teams actor issuer does not match the configured tenant.",
-                status=403,
-            )
         expected = {
             "request_id": body.request_id,
             "organization_id": profile.organization_id,
@@ -2881,6 +3150,127 @@ def create_router(services: IntegrationServices) -> APIRouter:
         }
 
     @router.post(
+        "/internal/v1/authorization-health/snapshots",
+        operation_id="internalReadAuthorizationHealthSnapshots",
+        response_model=AuthorizationHealthSnapshotResponse,
+    )
+    async def read_authorization_health_snapshots(request: Request) -> dict[str, Any]:
+        """Project only pinned-owner health metadata to the signed Navigator workload."""
+
+        body = await signed_navigator_body(request, AuthorizationHealthSnapshotBody)
+        registry = services.authorization_profile_registry
+        if registry is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                title="Authorization snapshot is not configured",
+                detail="Exchange has no host-owned authorization profile registry.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "authorization_profile_registry_unavailable"},
+            )
+
+        snapshots: list[dict[str, Any]] = []
+        for connection_id in body.connection_ids:
+            connection = services.store.current_connection_for_provider_call(connection_id)
+            if (
+                connection is None
+                or connection.organization_id != body.organization_id
+                or connection.workspace_id != body.workspace_id
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_RESOURCE_NOT_FOUND",
+                    title="Authorization connection not found",
+                    detail="The requested configured connection is unavailable in this workspace.",
+                    status=404,
+                )
+            try:
+                # The owner comes from the persisted row and is then checked against
+                # the fixed host profile. No principal or destination is accepted in
+                # the Navigator request body. Static cloud profiles use the same
+                # fresh connector-only Directory grant as Navigator operations.
+                resolver = services.current_context_resolver
+                owner = (
+                    resolver.for_connection(
+                        connection,
+                        operation_id="integrationGetAuthorizationHealth",
+                    )
+                    if resolver is not None
+                    else None
+                )
+                if owner is None:
+                    raise PermissionError("current Directory authorization is unavailable")
+                registry.profile_for_connection(
+                    owner,
+                    connection,
+                    operation_id="integrationGetAuthorizationHealth",
+                )
+                services.store.get_connection(
+                    owner,
+                    connection_id,
+                    authorization_operation_id="integrationGetAuthorizationHealth",
+                )
+                health = services.store.latest_authorization_health(
+                    owner,
+                    connection_id,
+                    authorization_operation_id="integrationGetAuthorizationHealth",
+                )
+            except PermissionError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Authorization snapshot denied",
+                    detail="The connection owner is outside its fixed host profile.",
+                    status=403,
+                    context={"reasonCode": "snapshot_connection_scope_mismatch"},
+                ) from exc
+            except IntegrationNotFound as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_RESOURCE_NOT_FOUND",
+                    title="Authorization connection not found",
+                    detail="The requested configured connection is unavailable in this workspace.",
+                    status=404,
+                ) from exc
+
+            if health is None:
+                snapshots.append(
+                    {
+                        "connectionId": connection.id,
+                        "provider": connection.provider,
+                        "loginState": LoginState.UNKNOWN.value,
+                        "authorizationState": AuthorizationState.UNKNOWN.value,
+                        "checkedAt": None,
+                        "expiresAt": None,
+                        "generation": 0,
+                        "capabilities": [],
+                        "reasonCode": "not_observed",
+                    }
+                )
+                continue
+
+            snapshots.append(
+                {
+                    "connectionId": connection.id,
+                    "provider": connection.provider,
+                    "loginState": health.login_state.value,
+                    "authorizationState": health.authorization_state.value,
+                    "checkedAt": health.checked_at,
+                    "expiresAt": health.expires_at,
+                    "generation": health.generation,
+                    "capabilities": [
+                        {
+                            "capabilityId": capability.capability_id,
+                            "state": capability.state.value,
+                            "lastVerifiedAt": capability.last_verified_at,
+                            "expiresAt": capability.expires_at,
+                            "reasonCode": _safe_health_reason_code(capability.reason_code),
+                        }
+                        for capability in health.capabilities
+                    ],
+                    "reasonCode": _safe_health_reason_code(health.reason_code),
+                }
+            )
+        return {"connections": snapshots}
+
+    @router.post(
         "/api/v1/accounts/authorizations/{authorization_id}/renewal-sessions",
         status_code=202,
         operation_id="accountBeginRenewalSession",
@@ -2917,11 +3307,17 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 detail="Select a server-owned opaque provider authorization reference.",
                 status=422,
             )
-        connection = services.store.connection_for_authorization(
+        connection = _connection_for_renewal(
+            services.store,
             actor,
             authorization_id,
-            provider="wecom",
-            authorization_operation_id="accountBeginRenewalSession",
+            operation_id="accountBeginRenewalSession",
+        )
+        _require_supported_renewal_profile(
+            services,
+            actor,
+            connection,
+            operation_id="accountBeginRenewalSession",
         )
         session, created = services.store.begin_renewal_session(
             actor,
@@ -2976,8 +3372,46 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         state=RenewalState(provider_session.state),
                         expires_at=provider_session.expires_at,
                         authorization_url=provider_session.authorization_url,
+                        user_code=getattr(provider_session, "user_code", None),
                         qr_attachment_ref=provider_session.qr_attachment_ref,
                         generation=provider_session.generation,
+                    )
+                except PermissionError as exc:
+                    services.store.fail_renewal_session_start(
+                        actor,
+                        authorization_id,
+                        session.session_ref,
+                    )
+                    raise ExchangeProductError(
+                        code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                        title="Renewal authorization denied",
+                        detail="The provider rejected the exact renewal profile scope.",
+                        status=403,
+                        context={"reasonCode": "provider_start_rejected"},
+                    ) from exc
+                except ExchangeProductError as exc:
+                    if (
+                        exc.status < 500
+                        and not exc.retryable
+                        and exc.status
+                        not in {
+                            408,
+                            409,
+                            425,
+                            429,
+                        }
+                    ):
+                        services.store.fail_renewal_session_start(
+                            actor,
+                            authorization_id,
+                            session.session_ref,
+                        )
+                        raise
+                    services.store.mark_renewal_start_unknown(
+                        actor,
+                        authorization_id,
+                        session.session_ref,
+                        reason_code="provider_start_outcome_unknown",
                     )
                 except Exception:
                     services.store.mark_renewal_start_unknown(
@@ -3021,11 +3455,17 @@ def create_router(services: IntegrationServices) -> APIRouter:
             str(session_id),
             authorization_operation_id="accountGetRenewalSession",
         )
-        services.store.connection_for_authorization(
+        connection = _connection_for_renewal(
+            services.store,
             actor,
             session.authorization_ref,
-            provider="wecom",
-            authorization_operation_id="accountGetRenewalSession",
+            operation_id="accountGetRenewalSession",
+        )
+        _require_supported_renewal_profile(
+            services,
+            actor,
+            connection,
+            operation_id="accountGetRenewalSession",
         )
         authorization_id = session.authorization_ref
         has_provider_session = session.provider_session_ref is not None
@@ -3072,6 +3512,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     state=RenewalState(provider_session.state),
                     expires_at=provider_session.expires_at,
                     authorization_url=provider_session.authorization_url,
+                    user_code=getattr(provider_session, "user_code", None),
                     qr_attachment_ref=provider_session.qr_attachment_ref,
                     generation=provider_session.generation,
                     provider_session_ref=provider_session.session_ref,
@@ -3092,6 +3533,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         state=session.state,
                         expires_at=session.expires_at,
                         authorization_url=session.authorization_url,
+                        user_code=session.user_code,
                         qr_attachment_ref=session.qr_attachment_ref,
                         generation=session.generation,
                         reason_code="provider_status_unavailable",

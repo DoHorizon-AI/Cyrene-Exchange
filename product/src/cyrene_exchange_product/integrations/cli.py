@@ -623,18 +623,23 @@ def build_production_services(
             token = source.get(env_ref, "") if env_ref is not None else ""
             return token if token.strip() else None
 
-        if identity_verifier is not None and authorization_settings.contexts:
+        if (identity_verifier is not None and authorization_settings.contexts) or (
+            connector_authority is not None and connector_grant_verifier.configured
+        ):
             current_context_resolver = PlatformCurrentAuthorizationContextResolver(
                 store=integration_store,
                 identity_verifier=identity_verifier,
                 registry=authorization_registry,
                 bearer_token=current_bearer,
+                connector_grant_authority=connector_authority,
+                connector_grant_verifier=connector_grant_verifier,
             )
         authorization_cloud_provider = AuthorizationCloudDirectProvider(
             store=integration_store,
             registry=authorization_registry,
             provider_clients=authorization_clients,
             email_client=email_notification_client,
+            account_center=accounts,
             current_context_resolver=current_context_resolver,
             context_key=hmac_key,
         )
@@ -1220,6 +1225,10 @@ def validate_host_configuration(
         ),
         "navigatorConnectorConfigured": connector_settings.navigator is not None,
         "teamsMessagesConfigured": connector_settings.teams_messages is not None,
+        "teamsSystemNotificationConfigured": bool(
+            connector_settings.teams_messages is not None
+            and connector_settings.teams_messages.system_notification_profile is not None
+        ),
         "computerRunnerConfigured": connector_settings.computer_runner is not None,
     }
 

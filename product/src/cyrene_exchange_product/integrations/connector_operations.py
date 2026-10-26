@@ -68,7 +68,6 @@ _TOOL_IDS_BY_PROVIDER: Mapping[str, Mapping[str, str]] = {
         "huggingface.repo.get": "huggingface.repo.get",
         "huggingface.file.download": "huggingface.file.download",
         "huggingface.file.upload": "huggingface.file.upload",
-        "huggingface.vendor.cli.execute": "hf_vendor_cli",
     },
     "azure": {
         "cloud.provider.health.read": "cloud_provider_health",
@@ -136,7 +135,6 @@ _MUTATING_OPERATIONS = frozenset(
         "computer.file.write",
         "github.vendor.cli.execute",
         "huggingface.file.upload",
-        "huggingface.vendor.cli.execute",
         "cloud.resource.create",
         "cloud.resource.deploy",
         "cloud.resource.start",
@@ -390,6 +388,7 @@ class ConnectorOperationDispatcher:
             or principal.workspace_id != profile.workspace_id
         ):
             raise PermissionError("Teams actor or profile does not match the fixed host binding")
+        profile.authorize_principal(principal)
         principal.require(operation_id)
         selected = dict(arguments)
         _exact_fields(selected, required={"conversation", "text"})
@@ -412,6 +411,9 @@ class ConnectorOperationDispatcher:
                 tenant_id=_text(conversation["tenantId"], "tenantId"),
                 team_id=_text(conversation["teamId"], "teamId"),
                 channel_id=_text(conversation["channelId"], "channelId"),
+                conversation_id=_text(conversation["conversationId"], "conversationId"),
+                root_thread_id=_text(conversation["rootThreadId"], "rootThreadId"),
+                service_url=_text(conversation["serviceUrl"], "serviceUrl"),
             )
         except (ValueError, PermissionError) as exc:
             raise PermissionError("Teams conversation is outside the configured allowlist") from exc
@@ -653,7 +655,9 @@ class ConnectorOperationDispatcher:
         if operation_id == "huggingface.vendor.cli.execute":
             _exact_fields(arguments, required={"argv"})
             _reject_credential_export(arguments)
-            return
+            raise PermissionError(
+                "HF vendor CLI cannot be constrained to the selected repository scope"
+            )
         if operation_id in {
             "huggingface.models.list",
             "huggingface.datasets.list",
@@ -703,20 +707,28 @@ class ConnectorOperationDispatcher:
         repo_id = arguments.get("repo_id")
         scope = profile.account_scopes or {}
         repositories = scope.get("repositories")
-        if (
-            not isinstance(repo_type, str)
-            or not isinstance(repo_id, str)
-            or not isinstance(repositories, list)
-            or not any(
-                isinstance(item, Mapping)
+        matching = (
+            [
+                item
+                for item in repositories
+                if isinstance(item, Mapping)
                 and item.get("repo_type") == repo_type
                 and item.get("repo_id") == repo_id
-                for item in repositories
+                and item.get("repo_id") == alias.target_ref
+            ]
+            if isinstance(repo_type, str)
+            and isinstance(repo_id, str)
+            and isinstance(repositories, list)
+            else []
+        )
+        if len(matching) != 1:
+            raise PermissionError(
+                "HF repository does not match the selected connection target and host scope"
             )
-        ):
-            raise PermissionError("HF repository is outside the host-configured profile scope")
-        # The Account Center profile scope is authoritative for multi-repository HF
-        # profiles. The connection target is a host alias, not a repository name.
+        permissions = matching[0].get("permissions")
+        required_permission = "write" if operation_id == "huggingface.file.upload" else "read"
+        if not isinstance(permissions, list) or required_permission not in permissions:
+            raise PermissionError("HF operation exceeds the selected repository permission scope")
 
     def _validate_cloud_target(
         self,

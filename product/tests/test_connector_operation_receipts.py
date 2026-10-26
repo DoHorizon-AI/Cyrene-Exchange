@@ -30,6 +30,7 @@ from cyrene_exchange_product.integrations.connector_operations import (
 )
 from cyrene_exchange_product.integrations.connector_profiles import (
     ComputerRunnerProfile,
+    ConnectorHostConfigurationError,
     parse_connector_host_settings,
     validate_teams_service_url,
 )
@@ -867,10 +868,7 @@ def test_runpod_resource_bindings_use_the_navigator_cloud_target_projection() ->
 def test_github_and_huggingface_cli_bind_profile_scope_and_argv_only() -> None:
     """Vendor CLI calls bind a host profile separately from exact argv payloads."""
 
-    expected = {
-        "github": ("github.vendor.cli.execute", "github_vendor_cli"),
-        "huggingface": ("huggingface.vendor.cli.execute", "hf_vendor_cli"),
-    }
+    expected = {"github": ("github.vendor.cli.execute", "github_vendor_cli")}
     for provider_id, (operation_id, tool_id) in expected.items():
         tool = next(
             item
@@ -954,7 +952,10 @@ def test_vendor_cli_argument_schemas_exclude_model_profile_refs_and_block_export
             {"argv": ["gh", "auth", "login"]},
         )
 
-    hf_profile = SimpleNamespace(provider="hf", targets={"hf-target": object()})
+    hf_profile = SimpleNamespace(
+        provider="hf",
+        targets={"hf-target": SimpleNamespace(target_ref="example-org/private-model")},
+    )
     registry = SimpleNamespace(settings=SimpleNamespace(profiles={"hf-primary": hf_profile}))
     dispatcher = ConnectorOperationDispatcher(
         store=None,
@@ -973,16 +974,77 @@ def test_vendor_cli_argument_schemas_exclude_model_profile_refs_and_block_export
         binding_ref="hf-primary",
         target_ref="hf-target",
     )
-    dispatcher._validate_huggingface_target(
-        hf_connection,
-        "huggingface.vendor.cli.execute",
-        argv,
+    assert all(
+        item["operationId"] != "huggingface.vendor.cli.execute"
+        for item in connector_binding_tools("huggingface")
     )
+    with pytest.raises(PermissionError, match="cannot be constrained"):
+        dispatcher._validate_huggingface_target(
+            hf_connection,
+            "huggingface.vendor.cli.execute",
+            argv,
+        )
     with pytest.raises(ValueError, match="argument fields"):
         dispatcher._validate_huggingface_target(
             hf_connection,
             "huggingface.vendor.cli.execute",
             {**argv, "profile_ref": "model-selected-profile"},
+        )
+
+
+def test_hf_upload_requires_write_permission_on_the_selected_repository() -> None:
+    principal = actor()
+    target_ref = "example-org/selected-model"
+    hf_profile = SimpleNamespace(
+        provider="hf",
+        targets={"hf-target": SimpleNamespace(target_ref=target_ref)},
+        account_scopes={
+            "repositories": [
+                {
+                    "repo_type": "model",
+                    "repo_id": target_ref,
+                    "permissions": ["read"],
+                }
+            ]
+        },
+    )
+    dispatcher = ConnectorOperationDispatcher(
+        store=None,
+        accounts=None,
+        github=None,
+        authorization_cloud=None,
+        registry=SimpleNamespace(settings=SimpleNamespace(profiles={"hf-primary": hf_profile})),
+    )
+    connection = IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="hf",
+        account_link_ref="00000000-0000-4000-8000-000000000401",
+        binding_ref="hf-primary",
+        target_ref="hf-target",
+    )
+    upload = {
+        "repo_type": "model",
+        "repo_id": target_ref,
+        "path": "upload.bin",
+        "content_base64": "eA==",
+    }
+
+    with pytest.raises(PermissionError, match="permission scope"):
+        dispatcher._validate_huggingface_target(
+            connection,
+            "huggingface.file.upload",
+            upload,
+        )
+
+    hf_profile.account_scopes["repositories"][0]["permissions"] = ["read", "write"]
+    with pytest.raises(PermissionError, match="selected connection target"):
+        dispatcher._validate_huggingface_target(
+            connection,
+            "huggingface.file.upload",
+            {**upload, "repo_id": "example-org/other-model"},
         )
 
 
@@ -1365,6 +1427,234 @@ def test_teams_service_url_allows_only_verified_official_routes() -> None:
     ):
         with pytest.raises(ValueError):
             validate_teams_service_url(url, tenant_id=tenant_id)
+
+
+def test_system_notification_profile_inherits_transport_and_pins_owner_and_thread() -> None:
+    """A notification child profile reuses Teams transport but fixes the full destination."""
+
+    tenant_id = "00000000-0000-4000-8000-000000000001"
+    settings = parse_connector_host_settings(
+        {
+            "teamsMessages": {
+                "profileRef": "teams-chat-host",
+                "connectionRef": "teams-connection",
+                "organizationId": "org-1",
+                "workspaceId": "workspace-1",
+                "tenantId": tenant_id,
+                "allowedTeamIds": ["team-1"],
+                "allowedChannelIds": ["channel-1"],
+                "botAppId": "bot-app",
+                "directPlugin": {
+                    "bindingId": "teams-ingress",
+                    "connectionRef": "grpcs://teams-ingress:50051",
+                    "transport": "local",
+                },
+                "expectedIssuer": (f"https://login.microsoftonline.com/{tenant_id}/v2.0"),
+                "systemNotification": {
+                    "profileRef": "teams-system-notifications-v1",
+                    "ownerSubject": "owner-object-id",
+                    "fixedRoute": {
+                        "tenantId": tenant_id,
+                        "teamId": "team-1",
+                        "channelId": "channel-1",
+                        "conversationId": "19:conversation-id@thread.tacv2",
+                        "rootThreadId": "1740000000000",
+                        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+                    },
+                },
+            }
+        }
+    )
+
+    parent = settings.teams_messages
+    assert parent is not None
+    notification = parent.profile_for_ref("teams-system-notifications-v1")
+    assert notification is not None
+    assert notification.profile_ref == "teams-system-notifications-v1"
+    assert notification.connection_ref == parent.connection_ref
+    assert notification.endpoint == parent.endpoint
+    assert notification.bot_app_id == parent.bot_app_id
+    assert notification.expected_issuer == parent.expected_issuer
+    assert parent.profile_for_ref("unconfigured-host-alias") is None
+    parent.authorize_conversation(
+        tenant_id=tenant_id,
+        team_id="team-1",
+        channel_id="channel-1",
+        conversation_id="another-valid-chat-thread",
+        root_thread_id="1740000000001",
+        service_url="https://smba.trafficmanager.net/amer/",
+    )
+    notification.authorize_principal(
+        IntegrationPrincipal(
+            issuer=parent.expected_issuer,
+            subject="owner-object-id",
+            organization_id=parent.organization_id,
+            workspace_id=parent.workspace_id,
+            allowed_operation_ids=frozenset({"msteams.message.reply"}),
+        )
+    )
+    with pytest.raises(PermissionError):
+        notification.authorize_principal(
+            IntegrationPrincipal(
+                issuer=parent.expected_issuer,
+                subject="another-owner",
+                organization_id=parent.organization_id,
+                workspace_id=parent.workspace_id,
+                allowed_operation_ids=frozenset({"msteams.message.reply"}),
+            )
+        )
+    with pytest.raises(PermissionError):
+        notification.authorize_conversation(
+            tenant_id=tenant_id,
+            team_id="team-1",
+            channel_id="channel-1",
+            conversation_id="another-conversation",
+            root_thread_id="1740000000000",
+            service_url="https://smba.trafficmanager.net/amer/",
+        )
+    with pytest.raises(ConnectorHostConfigurationError):
+        parse_connector_host_settings(
+            {
+                "teamsMessages": {
+                    "profileRef": "teams-chat-host",
+                    "connectionRef": "teams-connection",
+                    "organizationId": "org-1",
+                    "workspaceId": "workspace-1",
+                    "tenantId": tenant_id,
+                    "allowedTeamIds": ["team-1"],
+                    "botAppId": "bot-app",
+                    "directPlugin": {
+                        "bindingId": "teams-ingress",
+                        "connectionRef": "grpcs://teams-ingress:50051",
+                        "transport": "local",
+                    },
+                    "expectedIssuer": (f"https://login.microsoftonline.com/{tenant_id}/v2.0"),
+                    "systemNotification": {
+                        "profileRef": "teams-chat-host",
+                        "ownerSubject": "owner-object-id",
+                        "fixedRoute": {
+                            "tenantId": tenant_id,
+                            "teamId": "team-1",
+                            "channelId": "channel-1",
+                            "conversationId": "19:conversation-id@thread.tacv2",
+                            "rootThreadId": "1740000000000",
+                            "serviceUrl": "https://smba.trafficmanager.net/amer/",
+                        },
+                    },
+                }
+            }
+        )
+
+
+def test_teams_dispatcher_fails_closed_for_notification_route_and_owner() -> None:
+    """The grant preparation path enforces the notification profile's full fixed scope."""
+
+    tenant_id = "00000000-0000-4000-8000-000000000001"
+    settings = parse_connector_host_settings(
+        {
+            "teamsMessages": {
+                "profileRef": "teams-chat-host",
+                "connectionRef": "teams-connection",
+                "organizationId": "org-1",
+                "workspaceId": "workspace-1",
+                "tenantId": tenant_id,
+                "allowedTeamIds": ["team-1"],
+                "allowedChannelIds": ["channel-1"],
+                "botAppId": "bot-app",
+                "directPlugin": {
+                    "bindingId": "teams-ingress",
+                    "connectionRef": "grpcs://teams-ingress:50051",
+                    "transport": "local",
+                },
+                "expectedIssuer": (f"https://login.microsoftonline.com/{tenant_id}/v2.0"),
+                "systemNotification": {
+                    "profileRef": "teams-system-notifications-v1",
+                    "ownerSubject": "owner-object-id",
+                    "fixedRoute": {
+                        "tenantId": tenant_id,
+                        "teamId": "team-1",
+                        "channelId": "channel-1",
+                        "conversationId": "19:conversation-id@thread.tacv2",
+                        "rootThreadId": "1740000000000",
+                        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+                    },
+                },
+            }
+        }
+    )
+    parent = settings.teams_messages
+    assert parent is not None
+    notification = parent.profile_for_ref("teams-system-notifications-v1")
+    assert notification is not None
+    dispatcher = ConnectorOperationDispatcher(
+        store=SimpleNamespace(),
+        accounts=SimpleNamespace(),
+        github=SimpleNamespace(),
+        authorization_cloud=None,
+        registry=None,
+    )
+    principal = IntegrationPrincipal(
+        issuer=notification.expected_issuer,
+        subject="owner-object-id",
+        organization_id=notification.organization_id,
+        workspace_id=notification.workspace_id,
+        allowed_operation_ids=frozenset({"msteams.message.reply"}),
+    )
+    route = {
+        "tenantId": tenant_id,
+        "teamId": "team-1",
+        "channelId": "channel-1",
+        "conversationId": "19:conversation-id@thread.tacv2",
+        "rootThreadId": "1740000000000",
+        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+    }
+    arguments = {"conversation": route, "text": "Credential authorization needs attention."}
+    request = {
+        "provider_id": "msteams",
+        "profile_ref": notification.profile_ref,
+        "operation_id": "msteams.message.reply",
+        "resource_ref": _teams_resource_ref(route),
+        "arguments": arguments,
+        "request_id": "notification-1",
+    }
+    prepared = dispatcher.prepare_teams_reply(
+        principal=principal,
+        profile=notification,
+        **request,
+    )
+    assert prepared.profile_ref == notification.profile_ref
+    assert prepared.connection_ref == parent.connection_ref
+
+    wrong_routes = (
+        {**route, "conversationId": "19:another-conversation@thread.tacv2"},
+        {**route, "rootThreadId": "1740000000001"},
+        {**route, "serviceUrl": "https://smba.trafficmanager.net/emea/"},
+    )
+    for index, wrong_route in enumerate(wrong_routes, start=2):
+        with pytest.raises(PermissionError):
+            dispatcher.prepare_teams_reply(
+                principal=principal,
+                profile=notification,
+                provider_id="msteams",
+                profile_ref=notification.profile_ref,
+                operation_id="msteams.message.reply",
+                resource_ref=_teams_resource_ref(wrong_route),
+                arguments={"conversation": wrong_route, "text": arguments["text"]},
+                request_id=f"notification-{index}",
+            )
+    wrong_owner = IntegrationPrincipal(
+        issuer=principal.issuer,
+        subject="another-owner",
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        allowed_operation_ids=principal.allowed_operation_ids,
+    )
+    with pytest.raises(PermissionError):
+        dispatcher.prepare_teams_reply(
+            principal=wrong_owner,
+            profile=notification,
+            **request,
+        )
 
 
 def test_connector_receipt_replay_conflict_and_restart_persistence(tmp_path) -> None:

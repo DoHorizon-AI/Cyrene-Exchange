@@ -70,6 +70,8 @@ ACCOUNT_METHODS = {
     "link_github_app_installation": "LinkGitHubAppInstallation",
     "link_huggingface_profile": "LinkHuggingFaceProfile",
     "rotate_huggingface_profile": "RotateHuggingFaceProfile",
+    "begin_huggingface_renewal": "BeginHuggingFaceRenewal",
+    "poll_huggingface_renewal": "PollHuggingFaceRenewal",
     "register_host_identity_profile": "RegisterHostIdentityProfile",
     "list_provider_profiles": "ListProviderProfiles",
     "create_provider_credential_lease": "CreateProviderCredentialLease",
@@ -741,6 +743,36 @@ class AccountCenterClient:
             },
         )
 
+    def begin_huggingface_renewal(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        session_ref: str,
+    ) -> dict[str, Any]:
+        """Start official HF device OAuth for one already linked profile."""
+
+        return self._invoke_user(
+            "begin_huggingface_renewal",
+            principal,
+            {"profile_ref": profile_ref, "session_ref": session_ref},
+        )
+
+    def poll_huggingface_renewal(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        session_ref: str,
+    ) -> dict[str, Any]:
+        """Poll one Account Center device session without exposing credential material."""
+
+        return self._invoke_user(
+            "poll_huggingface_renewal",
+            principal,
+            {"profile_ref": profile_ref, "session_ref": session_ref},
+        )
+
     def register_host_identity_profile(
         self,
         principal: IntegrationPrincipal,
@@ -962,6 +994,8 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         "link_github_app_installation": "LinkGitHubAppInstallationRequest",
         "link_huggingface_profile": "LinkHuggingFaceProfileRequest",
         "rotate_huggingface_profile": "RotateHuggingFaceProfileRequest",
+        "begin_huggingface_renewal": "BeginHuggingFaceRenewalRequest",
+        "poll_huggingface_renewal": "PollHuggingFaceRenewalRequest",
         "register_host_identity_profile": "RegisterHostIdentityProfileRequest",
         "list_provider_profiles": "ListProviderProfilesRequest",
         "create_provider_credential_lease": "CreateProviderCredentialLeaseRequest",

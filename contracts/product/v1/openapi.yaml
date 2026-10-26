@@ -3009,6 +3009,7 @@ components:
       - createdAt
       - expiresAt
       - authorizationUrl
+      - userCode
       - qrAttachmentRef
       - generation
       - reasonCode
@@ -3039,9 +3040,18 @@ components:
           - type: string
           - type: 'null'
           description: >-
-            Verified WeCom navigation URI: the fixed onboarding QR flow or the
-            existing-profile authorization management page. This generic field
-            does not imply that every URI is a QR flow.
+            Verified WeCom navigation URI or one of the exact Hugging Face
+            device-code URLs, https://hf.co/oauth/device and
+            https://huggingface.co/oauth/device. This generic field does not
+            imply that every URI is a QR flow.
+        userCode:
+          anyOf:
+          - type: string
+            minLength: 4
+            maxLength: 32
+            pattern: ^[A-Z0-9]{4}-[A-Z0-9]{4}$
+          - type: 'null'
+          description: Short-lived user-entered code for Hugging Face device OAuth only.
         qrAttachmentRef:
           anyOf:
           - type: string

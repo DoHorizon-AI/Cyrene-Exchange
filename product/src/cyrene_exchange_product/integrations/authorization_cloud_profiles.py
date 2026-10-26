@@ -12,6 +12,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 from cyrene_exchange_product.integrations.models import (
     CreateIntegrationConnection,
@@ -20,6 +21,7 @@ from cyrene_exchange_product.integrations.models import (
 )
 
 _ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$")
+_HUGGINGFACE_REPOSITORY_REF = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _RECIPIENT_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _PROVIDER_IDS = frozenset({"wecom", "azure", "gcp", "hf", "runpod", "tailscale"})
 _LOGGER = logging.getLogger(__name__)
@@ -168,6 +170,40 @@ class AuthorizationCloudProfileRegistry:
             raise PermissionError("cloud target is not allowed for the current actor")
         return target.display_name
 
+    @staticmethod
+    def account_center_profile_ref(
+        principal: IntegrationPrincipal,
+        profile: AuthorizationProviderProfile,
+        *,
+        target_alias: str,
+    ) -> str:
+        """Derive one stable Account Center UUID for one exact cloud target.
+
+        Workspace-operator profiles share one UUID across verified operators;
+        actor-owned profiles include the exact owner subject in the derivation.
+        Target alias and provider target are included because Account Center stores
+        one resource scope per identity profile. 中文：UUID 与单个 provider target 精确绑定。
+        """
+
+        target = profile.targets.get(target_alias)
+        if target is None:
+            raise AuthorizationCloudConfigurationError(
+                "Account Center identity reference requires a configured target alias"
+            )
+        owner_scope: tuple[str, ...] = (
+            principal.issuer,
+            principal.organization_id,
+            principal.workspace_id,
+            profile.provider,
+            profile.profile_ref,
+            target_alias,
+            target.target_ref,
+        )
+        if profile.access_mode == "actor_owned":
+            owner_scope = (*owner_scope, principal.subject)
+        value = "\x00".join(owner_scope)
+        return str(uuid5(NAMESPACE_URL, f"cyrene-account-center-host-profile:{value}"))
+
     def principal_allowed_for_profile(
         self,
         principal: IntegrationPrincipal,
@@ -287,6 +323,35 @@ class AuthorizationCloudProfileRegistry:
             ):
                 raise PermissionError("connection target is outside the actor resource allowlist")
         return context, profile
+
+    def profile_for_static_workspace_operator_connection(
+        self,
+        connection: IntegrationConnection,
+    ) -> tuple[AuthorizationProviderProfile, str]:
+        """Resolve a context-free cloud profile pinned to exactly its stored owner.
+
+        A fresh Platform connector grant is still required before any provider call;
+        this method only validates closed cloud/HF host pins without a user bearer.
+        中文：仅解析静态 owner pin，不代替后续逐次 Directory grant。
+        """
+
+        profile = self._profile(connection.provider, connection.binding_ref)
+        owner = (connection.actor_issuer, connection.actor_subject)
+        if (
+            connection.provider not in {"azure", "gcp", "hf", "runpod"}
+            or profile.access_mode != "workspace_operator"
+            or connection.access_mode != "workspace_operator"
+            or profile.expected_issuer != connection.actor_issuer
+            or profile.organization_id != connection.organization_id
+            or profile.workspace_id != connection.workspace_id
+            or profile.allowed_context_refs
+            or profile.allowed_actors != frozenset({owner})
+        ):
+            raise PermissionError("static cloud owner is outside its workspace profile")
+        target = profile.targets.get(connection.target_ref or "")
+        if target is None or target.allowed_context_refs:
+            raise PermissionError("static cloud target is outside its workspace profile")
+        return profile, target.target_ref
 
     def email_context_for_principal(self, principal: IntegrationPrincipal) -> AuthorityActorContext:
         """Require both a dedicated current deliver grant and the mail actor allowlist."""
@@ -606,7 +671,11 @@ def parse_authorization_cloud_settings(
                     "target actor allowlist exceeds its provider profile"
                 )
             targets[alias] = CloudTargetAlias(
-                target_ref=_alias(target["targetRef"], "provider targetRef"),
+                target_ref=_provider_target_ref(
+                    provider,
+                    target["targetRef"],
+                    "provider targetRef",
+                ),
                 display_name=_text(target["displayName"], "target displayName"),
                 allowed_context_refs=target_contexts,
             )
@@ -720,6 +789,18 @@ def _parse_huggingface_scopes(value: object) -> Mapping[str, object]:
             }
         )
     return {"repositories": output}
+
+
+def _provider_target_ref(provider: str, value: object, label: str) -> str:
+    """Validate provider targets without confusing HF resource IDs and aliases."""
+
+    if provider == "hf":
+        if isinstance(value, str) and _HUGGINGFACE_REPOSITORY_REF.fullmatch(value):
+            return value
+        raise AuthorizationCloudConfigurationError(
+            "HF targetRef must be one owner/repository identifier"
+        )
+    return _alias(value, label)
 
 
 def _parse_email_profile(

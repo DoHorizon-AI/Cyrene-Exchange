@@ -9,6 +9,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from cyrene_exchange_product.api import create_app
+from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations.api import IntegrationServices
 from cyrene_exchange_product.integrations.models import (
     AuthorizationCapabilityRecord,
@@ -310,6 +311,107 @@ def test_connection_list_and_unobserved_health_are_minimal_and_unknown(tmp_path:
     store.close()
 
 
+def test_cloud_connection_uses_host_derived_account_profile_uuid_idempotently(
+    tmp_path: Path,
+) -> None:
+    actor = _principal("actor-cloud", {"integrationCreateConnection", "integrationListConnections"})
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    services = _services(store, actor)
+    profile_ref = "30000000-0000-4000-8000-000000000003"
+    target = SimpleNamespace(target_ref="subscription-vm-prod", display_name="Production VM")
+    profile = SimpleNamespace(
+        profile_ref="azure-primary",
+        provider="azure",
+        identity_ref="azure-managed-identity",
+        access_mode="actor_owned",
+        targets={"vm-prod": target},
+    )
+
+    class Registry:
+        settings = SimpleNamespace(profiles={"azure-primary": profile})
+
+        def account_center_profile_ref(
+            self,
+            _principal: IntegrationPrincipal,
+            _profile: Any,
+            *,
+            target_alias: str,
+        ) -> str:
+            assert target_alias == "vm-prod"
+            return profile_ref
+
+        def display_name_for_connection(
+            self,
+            principal: IntegrationPrincipal,
+            request: CreateIntegrationConnection,
+        ) -> str:
+            assert principal.subject == actor.subject
+            assert request.account_link_ref == profile_ref
+            assert request.target_ref == "vm-prod"
+            return target.display_name
+
+    class Accounts:
+        def __init__(self) -> None:
+            self.profiles: list[dict[str, Any]] = []
+            self.register_calls: list[dict[str, Any]] = []
+
+        def list_provider_profiles(self, _principal: IntegrationPrincipal) -> dict[str, Any]:
+            return {"profiles": self.profiles}
+
+        def register_host_identity_profile(
+            self,
+            _principal: IntegrationPrincipal,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            self.register_calls.append(kwargs)
+            row = {
+                "profile_ref": kwargs["profile_ref"],
+                "provider": kwargs["provider"],
+                "identity_ref": kwargs["identity_ref"],
+                "target_scope": kwargs["target_scope"],
+                "access_mode": "actor_owned",
+                "auth_mode": "host_identity",
+                "auth_status": "unknown",
+                "external_subject": None,
+                "expires_at": None,
+            }
+            self.profiles.append(row)
+            return row
+
+    services.authorization_profile_registry = Registry()
+    services.connection_profile_resolver = (
+        services.authorization_profile_registry.display_name_for_connection
+    )
+    services.accounts = Accounts()
+    app = create_app(database_path=tmp_path / "gateway.sqlite3", integrations=services)
+    path = f"/api/v1/integrations/connections?workspaceId={_WORKSPACE}"
+    body = {"provider": "azure", "bindingRef": "azure-primary", "targetRef": "vm-prod"}
+    headers = {
+        "Authorization": "Bearer actor-token",
+        "Idempotency-Key": "azure-connection-1",
+    }
+
+    with TestClient(app) as client:
+        first = client.post(path, json=body, headers=headers)
+        replay = client.post(path, json=body, headers=headers)
+        saved = store.list_connections(actor)
+
+    assert first.status_code == replay.status_code == 201
+    assert first.json()["id"] == replay.json()["id"]
+    assert len(services.accounts.register_calls) == 1
+    registered = services.accounts.register_calls[0]
+    assert registered["profile_ref"] == profile_ref
+    assert registered["identity_ref"] == "azure-managed-identity"
+    assert registered["target_scope"] == {
+        "target_ref": "vm-prod",
+        "provider_target_ref": "subscription-vm-prod",
+    }
+    assert len(saved) == 1
+    assert saved[0].account_link_ref == profile_ref
+    assert saved[0].binding_ref == "azure-primary"
+    assert saved[0].target_ref == "vm-prod"
+
+
 def test_health_resources_feed_and_operation_serialize_utc_z_timestamps(tmp_path: Path) -> None:
     operations = {
         "integrationCreateConnection",
@@ -541,6 +643,380 @@ def test_renewal_replays_same_product_session_and_rechecks_status(tmp_path: Path
     assert provider.status_calls, (stored.state, stored.provider_session_ref, polled.json())
     assert polled.json()["state"] == "SUCCEEDED"
     assert provider.status_calls == [(_AUTH_REF, "provider-renewal-session-1")]
+    store.close()
+
+
+def test_huggingface_renewal_returns_device_code_and_tracks_recovery(tmp_path: Path) -> None:
+    """HF owner reauthorization reuses Product's durable renewal session API."""
+
+    profile_ref = "30000000-0000-4000-8000-000000000001"
+    session_expiry = datetime(2026, 10, 14, 13, tzinfo=UTC)
+    operations = {
+        "integrationCreateConnection",
+        "accountBeginRenewalSession",
+        "accountGetRenewalSession",
+    }
+    actor = _principal("actor-hf", operations)
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = store.create_connection(
+        actor,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-primary",
+            target_ref="selected-model",
+            account_link_ref=profile_ref,
+            display_name="Selected Hugging Face profile",
+        ),
+        idempotency_key="hf-renewal-connection",
+    )
+    _record_health(
+        store,
+        connection,
+        state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+        auth_ref=profile_ref,
+    )
+
+    class _HuggingFaceRenewal:
+        def __init__(self) -> None:
+            self.start_calls: list[tuple[str, str]] = []
+            self.poll_calls: list[tuple[str, str]] = []
+
+        def start_renewal(
+            self,
+            _principal: IntegrationPrincipal,
+            selected_connection: Any,
+            authorization_ref: str,
+            *,
+            request_id: str,
+        ) -> Any:
+            assert selected_connection.provider == "hf"
+            self.start_calls.append((authorization_ref, request_id))
+            return SimpleNamespace(
+                authorization_ref=authorization_ref,
+                session_ref=request_id,
+                state=RenewalState.WAITING_USER,
+                created_at=datetime(2026, 10, 14, 12, tzinfo=UTC),
+                expires_at=session_expiry,
+                authorization_url="https://hf.co/oauth/device",
+                user_code="ABCD-EFGH",
+                qr_attachment_ref=None,
+                generation=4,
+            )
+
+        def renewal_status(
+            self,
+            _principal: IntegrationPrincipal,
+            authorization_ref: str,
+            provider_session_ref: str,
+            *,
+            request_id: str,
+        ) -> Any:
+            self.poll_calls.append((authorization_ref, provider_session_ref))
+            return SimpleNamespace(
+                authorization_ref=authorization_ref,
+                session_ref=provider_session_ref,
+                state=RenewalState.SUCCEEDED,
+                expires_at=None,
+                authorization_url=None,
+                user_code=None,
+                qr_attachment_ref=None,
+                generation=5,
+            )
+
+    provider = _HuggingFaceRenewal()
+    services = _services(store, actor, authorization_cloud=provider)
+    services.authorization_profile_registry = SimpleNamespace(
+        profile_for_connection=lambda _principal, _connection, *, operation_id: (
+            SimpleNamespace(provider="hf", auth_mode="device_oauth"),
+            "org/private-model",
+        )
+    )
+    app = create_app(
+        database_path=tmp_path / "gateway.sqlite3",
+        integrations=services,
+    )
+    path = f"/api/v1/accounts/authorizations/{profile_ref}/renewal-sessions"
+    with TestClient(app) as client:
+        started = client.post(
+            f"{path}?workspaceId={_WORKSPACE}",
+            headers={
+                "Authorization": "Bearer actor-token",
+                "Idempotency-Key": "hf-renewal-1",
+            },
+        )
+        session_ref = started.json()["sessionRef"]
+        completed = client.get(
+            f"/api/v1/accounts/renewal-sessions/{session_ref}?workspaceId={_WORKSPACE}",
+            headers={"Authorization": "Bearer actor-token"},
+        )
+
+    assert started.status_code == 202, started.text
+    assert started.json()["authorizationUrl"] == "https://hf.co/oauth/device"
+    assert started.json()["userCode"] == "ABCD-EFGH"
+    assert started.json()["qrAttachmentRef"] is None
+    assert "device_code" not in started.text
+    assert "access_token" not in started.text
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["state"] == "SUCCEEDED"
+    assert completed.json()["userCode"] is None
+    assert provider.start_calls == [(profile_ref, session_ref)]
+    assert provider.poll_calls == [(profile_ref, session_ref)]
+    store.close()
+
+
+def test_fine_grained_hf_profile_rejects_device_renewal_before_persisting_session(
+    tmp_path: Path,
+) -> None:
+    profile_ref = "30000000-0000-4000-8000-000000000002"
+    actor = _principal(
+        "actor-hf",
+        {"integrationCreateConnection", "accountBeginRenewalSession"},
+    )
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = store.create_connection(
+        actor,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-primary",
+            target_ref="selected-model",
+            account_link_ref=profile_ref,
+            display_name="Selected Hugging Face profile",
+        ),
+        idempotency_key="hf-fine-grained-connection",
+    )
+    _record_health(
+        store,
+        connection,
+        state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+        auth_ref=profile_ref,
+    )
+
+    class _Provider:
+        def __init__(self) -> None:
+            self.start_calls: list[str] = []
+
+        def start_renewal(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.start_calls.append("called")
+            raise AssertionError("fine-grained profile must be rejected before provider I/O")
+
+    provider = _Provider()
+    services = _services(store, actor, authorization_cloud=provider)
+    services.authorization_profile_registry = SimpleNamespace(
+        profile_for_connection=lambda _principal, _connection, *, operation_id: (
+            SimpleNamespace(provider="hf", auth_mode="fine_grained_token"),
+            "org/private-model",
+        )
+    )
+    app = create_app(
+        database_path=tmp_path / "gateway.sqlite3",
+        integrations=services,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/accounts/authorizations/{profile_ref}/renewal-sessions"
+            f"?workspaceId={_WORKSPACE}",
+            headers={
+                "Authorization": "Bearer actor-token",
+                "Idempotency-Key": "hf-fine-grained-renewal",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "EXCHANGE_CONNECTOR_RENEWAL_UNSUPPORTED"
+    assert response.json()["context"]["reasonCode"] == "huggingface_device_oauth_required"
+    assert provider.start_calls == []
+    reopened = IntegrationStore(tmp_path / "integrations.sqlite3")
+    rows = reopened._connection.execute(
+        "SELECT COUNT(*) AS total FROM renewal_sessions WHERE authorization_ref=?",
+        (profile_ref,),
+    ).fetchone()
+    assert rows is not None and rows["total"] == 0
+    reopened.close()
+
+
+def test_definite_hf_renewal_rejection_is_failed_and_never_polled(tmp_path: Path) -> None:
+    profile_ref = "30000000-0000-4000-8000-000000000004"
+    actor = _principal(
+        "actor-hf",
+        {
+            "integrationCreateConnection",
+            "accountBeginRenewalSession",
+            "accountGetRenewalSession",
+        },
+    )
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = store.create_connection(
+        actor,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-primary",
+            target_ref="selected-model",
+            account_link_ref=profile_ref,
+            display_name="Selected Hugging Face profile",
+        ),
+        idempotency_key="hf-definite-denial-connection",
+    )
+    _record_health(
+        store,
+        connection,
+        state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+        auth_ref=profile_ref,
+    )
+
+    class _Provider:
+        supports_durable_renewal_replay = True
+        supports_request_id_status_lookup = True
+
+        def __init__(self) -> None:
+            self.start_calls = 0
+            self.poll_calls = 0
+
+        def start_renewal(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.start_calls += 1
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_AUTHORIZATION_DENIED",
+                title="Account Center denied renewal",
+                detail="Synthetic deterministic profile-scope denial.",
+                status=403,
+            )
+
+        def renewal_status(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.poll_calls += 1
+            raise AssertionError("a rejected renewal has no provider session to poll")
+
+        def renewal_status_by_request_id(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.poll_calls += 1
+            raise AssertionError("a rejected renewal has no provider session to poll")
+
+    provider = _Provider()
+    services = _services(store, actor, authorization_cloud=provider)
+    services.authorization_profile_registry = SimpleNamespace(
+        profile_for_connection=lambda _principal, _connection, *, operation_id: (
+            SimpleNamespace(provider="hf", auth_mode="device_oauth"),
+            "org/private-model",
+        )
+    )
+    app = create_app(
+        database_path=tmp_path / "gateway.sqlite3",
+        integrations=services,
+    )
+    path = f"/api/v1/accounts/authorizations/{profile_ref}/renewal-sessions"
+    with TestClient(app) as client:
+        rejected = client.post(
+            f"{path}?workspaceId={_WORKSPACE}",
+            headers={
+                "Authorization": "Bearer actor-token",
+                "Idempotency-Key": "hf-definite-denial",
+            },
+        )
+        row = store._connection.execute(
+            "SELECT document FROM renewal_sessions WHERE authorization_ref=?",
+            (profile_ref,),
+        ).fetchone()
+        assert row is not None
+        session = json.loads(row["document"])
+        replay = client.post(
+            f"{path}?workspaceId={_WORKSPACE}",
+            headers={
+                "Authorization": "Bearer actor-token",
+                "Idempotency-Key": "hf-definite-denial",
+            },
+        )
+        polled = client.get(
+            f"/api/v1/accounts/renewal-sessions/{session['sessionRef']}?workspaceId={_WORKSPACE}",
+            headers={"Authorization": "Bearer actor-token"},
+        )
+
+    assert rejected.status_code == 403
+    assert rejected.json()["code"] == "EXCHANGE_ACCOUNT_CENTER_AUTHORIZATION_DENIED"
+    assert session["state"] == "FAILED"
+    assert session["reasonCode"] == "provider_start_rejected"
+    assert replay.status_code == 202
+    assert replay.json()["state"] == "FAILED"
+    assert polled.status_code == 200
+    assert polled.json()["state"] == "FAILED"
+    assert provider.start_calls == 1
+    assert provider.poll_calls == 0
+
+
+def test_hf_renewal_idempotency_in_progress_remains_unknown_and_replays_same_request(
+    tmp_path: Path,
+) -> None:
+    actor = _principal("actor-a", {"integrationCreateConnection", "accountBeginRenewalSession"})
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = store.create_connection(
+        actor,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-primary",
+            target_ref="hf-model",
+            account_link_ref=_AUTH_REF,
+            display_name="Selected Hugging Face profile",
+        ),
+        idempotency_key="hf-idempotency-conflict-connection",
+    )
+    _record_health(store, connection, state=AuthorizationState.VALID, auth_ref=_AUTH_REF)
+
+    class _Provider:
+        supports_durable_renewal_replay = True
+        supports_request_id_status_lookup = True
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def start_renewal(
+            self,
+            _principal: IntegrationPrincipal,
+            _connection: Any,
+            authorization_ref: str,
+            *,
+            request_id: str,
+        ) -> Any:
+            self.calls.append(request_id)
+            if len(self.calls) == 1:
+                raise ExchangeProductError(
+                    code="EXCHANGE_IDEMPOTENCY_CONFLICT",
+                    title="Account Center start is still in progress",
+                    detail="Synthetic bounded ambiguous response.",
+                    status=409,
+                )
+            return SimpleNamespace(
+                authorization_ref=authorization_ref,
+                session_ref=request_id,
+                state=RenewalState.WAITING_USER,
+                expires_at=None,
+                authorization_url="https://hf.co/oauth/device",
+                user_code="ABCD-EFGH",
+                qr_attachment_ref=None,
+                generation=1,
+            )
+
+    provider = _Provider()
+    services = _services(store, actor, authorization_cloud=provider)
+    services.authorization_profile_registry = SimpleNamespace(
+        profile_for_connection=lambda _principal, _connection, *, operation_id: (
+            SimpleNamespace(provider="hf", auth_mode="device_oauth"),
+            "Qwen/Qwen2.5-0.5B-Instruct",
+        )
+    )
+    app = create_app(
+        database_path=tmp_path / "gateway.sqlite3",
+        integrations=services,
+    )
+    path = f"/api/v1/accounts/authorizations/{_AUTH_REF}/renewal-sessions?workspaceId={_WORKSPACE}"
+    headers = {
+        "Authorization": "Bearer actor-token",
+        "Idempotency-Key": "renewal-ac-in-progress",
+    }
+    with TestClient(app) as client:
+        first = client.post(path, headers=headers)
+        replay = client.post(path, headers=headers)
+
+    assert first.status_code == replay.status_code == 202
+    assert first.json()["state"] == "VERIFYING"
+    assert first.json()["reasonCode"] == "provider_start_outcome_unknown"
+    assert replay.json()["state"] == "WAITING_USER"
+    assert provider.calls == [first.json()["sessionRef"], first.json()["sessionRef"]]
     store.close()
 
 

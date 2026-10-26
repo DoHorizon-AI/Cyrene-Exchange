@@ -611,6 +611,12 @@ class RenewalSessionRecord(ContractModel):
     provider_session_ref: str | None = Field(default=None, max_length=300)
     expires_at: datetime | None = None
     authorization_url: str | None = Field(default=None, max_length=2000)
+    user_code: str | None = Field(
+        default=None,
+        min_length=4,
+        max_length=32,
+        pattern=r"^[A-Z0-9]{4}-[A-Z0-9]{4}$",
+    )
     qr_attachment_ref: str | None = Field(default=None, max_length=300)
     generation: int = Field(ge=0)
     reason_code: str | None = Field(default=None, max_length=200)

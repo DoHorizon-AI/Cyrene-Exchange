@@ -15,7 +15,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from threading import Event
+from threading import Event, Lock
 from typing import Protocol
 
 from cyrene_exchange_product.integrations.models import (
@@ -142,6 +142,7 @@ class ProviderRenewalSession:
     authorization_url: str | None
     qr_attachment_ref: str | None
     generation: int
+    user_code: str | None = None
 
 
 class EmailNotificationPort(Protocol):
@@ -206,14 +207,62 @@ class AuthorizationCloudRunner:
         self._email_recipient_resolver = email_recipient_resolver
         self._monitor_interval_seconds = monitor_interval_seconds
         self._idle_delay_seconds = idle_delay_seconds
+        self._claim_gate = Lock()
+        self._draining = Event()
 
-    def run_once(self, *, now: datetime | None = None) -> AuthorizationCloudRunResult:
+    @property
+    def monitor_interval_seconds(self) -> int:
+        """Expose the durable health cadence for host lifecycle validation."""
+
+        return self._monitor_interval_seconds
+
+    def begin_drain(self, *, timeout_seconds: float = 0.0) -> bool:
+        """Fence claims, then briefly synchronize with any gate already entered.
+
+        The bounded gate wait covers only local claim/start admission and never a
+        provider network call. A false result means the host must retain its
+        shutdown failure behavior instead of closing services under this worker.
+        """
+
+        if timeout_seconds < 0:
+            raise ValueError("authorization/cloud drain timeout is invalid")
+        self._draining.set()
+        if not self._claim_gate.acquire(timeout=timeout_seconds):
+            return False
+        self._claim_gate.release()
+        return True
+
+    def _allow_provider_io(self, stop_event: Event | None) -> bool:
+        """Admit one active-call intent against drain without locking across I/O."""
+
+        with self._claim_gate:
+            return not self._draining.is_set() and not _stop_requested(stop_event)
+
+    def _drain_requested(self, stop_event: Event | None) -> bool:
+        return self._draining.is_set() or _stop_requested(stop_event)
+
+    def run_once(
+        self,
+        *,
+        now: datetime | None = None,
+        stop_event: Event | None = None,
+    ) -> AuthorizationCloudRunResult:
         """Process due monitor checks, one refresh job, and one email job."""
 
         moment = now or utc_now()
-        checks = self._run_authorization_checks(moment)
-        refresh, refresh_deferred, refresh_unknown = self._run_cloud_refresh(moment)
-        email, email_deferred, email_unknown = self._run_email_notification(moment)
+        checks = self._run_authorization_checks(moment, stop_event=stop_event)
+        refresh = email = refresh_deferred = email_deferred = 0
+        refresh_unknown = email_unknown = 0
+        if not self._drain_requested(stop_event):
+            refresh, refresh_deferred, refresh_unknown = self._run_cloud_refresh(
+                moment,
+                stop_event=stop_event,
+            )
+        if not self._drain_requested(stop_event):
+            email, email_deferred, email_unknown = self._run_email_notification(
+                moment,
+                stop_event=stop_event,
+            )
         return AuthorizationCloudRunResult(
             authorization_checks=checks,
             cloud_refreshes=refresh,
@@ -225,8 +274,8 @@ class AuthorizationCloudRunner:
     def run_forever(self, stop_event: Event) -> None:
         """Poll durable jobs until the host signals shutdown."""
 
-        while not stop_event.is_set():
-            result = self.run_once()
+        while not self._drain_requested(stop_event):
+            result = self.run_once(stop_event=stop_event)
             if (
                 result.authorization_checks == 0
                 and result.cloud_refreshes == 0
@@ -234,12 +283,46 @@ class AuthorizationCloudRunner:
             ):
                 stop_event.wait(self._idle_delay_seconds)
 
-    def _run_authorization_checks(self, now: datetime) -> int:
-        claims = self._store.claim_authorization_checks(self._worker_id, now=now)
+    def _run_authorization_checks(self, now: datetime, *, stop_event: Event | None) -> int:
+        if self._drain_requested(stop_event):
+            return 0
+        # Claim one row at a time so shutdown never leaves a batch of unstarted
+        # monitors fenced to a worker that is already draining.
+        with self._claim_gate:
+            claims = (
+                []
+                if self._draining.is_set() or _stop_requested(stop_event)
+                else self._store.claim_authorization_checks(
+                    self._worker_id,
+                    now=now,
+                    limit=1,
+                )
+            )
         completed = 0
         for claim in claims:
+            if self._drain_requested(stop_event):
+                self._store.release_authorization_check(
+                    claim,
+                    now=now,
+                    retry_delay_seconds=1,
+                )
+                break
             previous = self._store.latest_authorization_health_for_monitor(claim)
+            if self._drain_requested(stop_event):
+                self._store.release_authorization_check(
+                    claim,
+                    now=now,
+                    retry_delay_seconds=1,
+                )
+                break
             principal = self._current_connection_principal(claim.connection, _MONITOR_OPERATION)
+            if self._drain_requested(stop_event):
+                self._store.release_authorization_check(
+                    claim,
+                    now=now,
+                    retry_delay_seconds=1,
+                )
+                break
             if principal is None:
                 observation = _unavailable_health(
                     claim.connection,
@@ -248,6 +331,13 @@ class AuthorizationCloudRunner:
                     reason_code="current_authority_unavailable",
                 )
             else:
+                if not self._allow_provider_io(stop_event):
+                    self._store.release_authorization_check(
+                        claim,
+                        now=now,
+                        retry_delay_seconds=1,
+                    )
+                    break
                 try:
                     observation = self._provider.authorization_health(principal, claim.connection)
                     _check_observation_scope(claim, principal, observation, _MONITOR_OPERATION)
@@ -284,12 +374,45 @@ class AuthorizationCloudRunner:
             completed += 1
         return completed
 
-    def _run_cloud_refresh(self, now: datetime) -> tuple[int, int, int]:
-        claim = self._store.claim_cloud_refresh(self._worker_id, now=now)
+    def _run_cloud_refresh(
+        self,
+        now: datetime,
+        *,
+        stop_event: Event | None,
+    ) -> tuple[int, int, int]:
+        if self._drain_requested(stop_event):
+            return 0, 0, 0
+        with self._claim_gate:
+            claim = (
+                None
+                if self._draining.is_set() or _stop_requested(stop_event)
+                else self._store.claim_cloud_refresh(self._worker_id, now=now)
+            )
         if claim is None:
             return 0, 0, 0
+        if self._drain_requested(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
+            return 0, 0, 0
         connection = self._store.connection_for_cloud_refresh(claim)
+        if self._drain_requested(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
+            return 0, 0, 0
         principal = self._current_connection_principal(connection, _REFRESH_OPERATION)
+        if self._drain_requested(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
+            return 0, 0, 0
         if principal is None:
             self._store.complete_cloud_refresh(
                 claim,
@@ -300,6 +423,13 @@ class AuthorizationCloudRunner:
             )
             return 1, 0, 0
         latest_health = self._store.latest_authorization_health_for_connection(connection)
+        if self._drain_requested(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
+            return 0, 0, 0
         if (
             latest_health is not None
             and latest_health.authorization_state == AuthorizationState.REAUTHORIZATION_REQUIRED
@@ -312,6 +442,13 @@ class AuthorizationCloudRunner:
                 result={"reasonCode": "connection_reauthorization_required"},
             )
             return 1, 0, 0
+        if not self._allow_provider_io(stop_event):
+            self._store.release_cloud_refresh_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+            )
+            return 0, 0, 0
         try:
             observations = self._provider.cloud_resources(principal, connection)
             if any(item.connection_id != connection.id for item in observations):
@@ -343,11 +480,31 @@ class AuthorizationCloudRunner:
         )
         return 1, 0, 0
 
-    def _run_email_notification(self, now: datetime) -> tuple[int, int, int]:
+    def _run_email_notification(
+        self,
+        now: datetime,
+        *,
+        stop_event: Event | None,
+    ) -> tuple[int, int, int]:
         if self._email is None:
             return 0, 0, 0
-        claim = self._store.claim_email_notification(self._worker_id, now=now)
+        if self._drain_requested(stop_event):
+            return 0, 0, 0
+        with self._claim_gate:
+            claim = (
+                None
+                if self._draining.is_set() or _stop_requested(stop_event)
+                else self._store.claim_email_notification(self._worker_id, now=now)
+            )
         if claim is None:
+            return 0, 0, 0
+        if self._drain_requested(stop_event):
+            self._store.release_email_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+                failure_reason_code="shutdown_before_send",
+            )
             return 0, 0, 0
         try:
             principal = self._contexts.for_claimed_notification(
@@ -357,6 +514,14 @@ class AuthorizationCloudRunner:
             )
         except Exception:
             principal = None
+        if self._drain_requested(stop_event):
+            self._store.release_email_claim(
+                claim,
+                now=now,
+                retry_delay_seconds=1,
+                failure_reason_code="shutdown_before_send",
+            )
+            return 0, 0, 0
         if principal is None or not _principal_matches_notification(principal, claim.job):
             self._store.release_email_claim(
                 claim,
@@ -371,6 +536,15 @@ class AuthorizationCloudRunner:
                 now=now,
             )
         except Exception:
+            return 0, 0, 0
+        if not self._allow_provider_io(stop_event):
+            self._store.release_email_send_before_provider(
+                claim.job.id,
+                claim_fence=claim.claim_fence,
+                now=now,
+                failure_reason_code="shutdown_before_send",
+                retry_delay_seconds=1,
+            )
             return 0, 0, 0
         try:
             evidence = self._email.send_notification(principal, claim.job)
@@ -450,6 +624,12 @@ class AuthorizationCloudRunner:
         if not _principal_matches_connection(principal, connection, operation_id):
             return None
         return principal
+
+
+def _stop_requested(stop_event: Event | None) -> bool:
+    """Return whether the host has begun draining this worker."""
+
+    return stop_event is not None and stop_event.is_set()
 
 
 def _principal_matches_connection(

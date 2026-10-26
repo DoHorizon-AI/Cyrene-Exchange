@@ -11,11 +11,14 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from cyrene_account_center_contracts import verify_context as verify_account_center_context
 from cyrene_plugin_runtime import DirectPayload
 
+from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
     tool_provider_pb2 as tool_wire,
 )
@@ -31,6 +34,8 @@ from cyrene_exchange_product.integrations.authorization_cloud_provider import (
     AuthorizationCloudDirectProvider,
     PlatformCurrentAuthorizationContextResolver,
 )
+from cyrene_exchange_product.integrations.connector_operations import _account_center_grant_proof
+from cyrene_exchange_product.integrations.connector_security import digest_arguments
 from cyrene_exchange_product.integrations.models import (
     AuthorizationHealthRecord,
     AuthorizationState,
@@ -76,7 +81,7 @@ def _principal(*, operations: set[str] | None = None, subject: str = _SUBJECT):
     )
 
 
-def _settings(*, include_wecom: bool = True, include_email: bool = True):
+def _settings(*, include_wecom: bool = True, include_email: bool = True, include_gcp: bool = False):
     profiles: dict[str, Any] = {
         "azure-prod": {
             "provider": "azure",
@@ -86,7 +91,7 @@ def _settings(*, include_wecom: bool = True, include_email: bool = True):
                 "transport": "local",
             },
             "callerWorkload": "exchange.integrations",
-            "audience": "cloud-resources",
+            "audience": "cloud-management",
             "expectedIssuer": _ISSUER,
             "contextKeyRef": "keys/cloud-azure",
             "organizationId": _ORG,
@@ -101,6 +106,29 @@ def _settings(*, include_wecom: bool = True, include_email: bool = True):
             },
         }
     }
+    if include_gcp:
+        profiles["gcp-prod"] = {
+            "provider": "gcp",
+            "directPlugin": {
+                "bindingId": "cloud.binding.gcp",
+                "connectionRef": "grpc://127.0.0.1:5504",
+                "transport": "local",
+            },
+            "callerWorkload": "exchange.integrations",
+            "audience": "cloud-management",
+            "expectedIssuer": _ISSUER,
+            "contextKeyRef": "keys/cloud-gcp",
+            "organizationId": _ORG,
+            "workspaceId": _WORKSPACE,
+            "allowedContextRefs": ["actor-a"],
+            "targets": {
+                "instance-prod": {
+                    "targetRef": "gcp-instance-prod",
+                    "displayName": "Production instance",
+                    "allowedContextRefs": ["actor-a"],
+                }
+            },
+        }
     if include_wecom:
         profiles["wecom-prod"] = {
             "provider": "wecom",
@@ -158,16 +186,97 @@ def _settings(*, include_wecom: bool = True, include_email: bool = True):
     )
 
 
+def _hf_settings():
+    return parse_authorization_cloud_settings(
+        {
+            "currentAuthority": {
+                "contexts": [
+                    {
+                        "contextRef": "actor-a",
+                        "issuer": _ISSUER,
+                        "subject": _SUBJECT,
+                        "organizationId": _ORG,
+                        "workspaceId": _WORKSPACE,
+                        "bearerTokenEnvRef": "bearers/actor-a",
+                    }
+                ]
+            },
+            "profiles": {
+                "hf-oauth": {
+                    "provider": "hf",
+                    "directPlugin": {
+                        "bindingId": "huggingface.binding.oauth",
+                        "connectionRef": "grpc://127.0.0.1:5510",
+                        "transport": "local",
+                    },
+                    "callerWorkload": "exchange-service",
+                    "audience": "huggingface-provider",
+                    "expectedIssuer": _ISSUER,
+                    "contextKeyRef": "keys/huggingface",
+                    "organizationId": _ORG,
+                    "workspaceId": _WORKSPACE,
+                    "allowedContextRefs": ["actor-a"],
+                    "credentialSecretRef": "huggingface/oauth-seed",
+                    "authMode": "device_oauth",
+                    "accountScopes": {
+                        "repositories": [
+                            {
+                                "repoType": "model",
+                                "repoId": "org/private-model",
+                                "permissions": ["read"],
+                            }
+                        ]
+                    },
+                    "targets": {
+                        "selected-model": {
+                            "targetRef": "org/private-model",
+                            "displayName": "Selected model",
+                        }
+                    },
+                }
+            },
+            "monitorIntervalSeconds": 900,
+        },
+        email_value={"enabled": False},
+    )
+
+
 def _connection(store: IntegrationStore, principal: IntegrationPrincipal, provider: str = "wecom"):
     return store.create_connection(
         principal,
         CreateIntegrationConnection(
             provider=provider,
-            binding_ref="wecom-prod" if provider == "wecom" else "azure-prod",
-            target_ref=None if provider == "wecom" else "vm-prod",
+            binding_ref=(
+                "wecom-prod"
+                if provider == "wecom"
+                else "gcp-prod"
+                if provider == "gcp"
+                else "azure-prod"
+            ),
+            target_ref=(
+                None if provider == "wecom" else "instance-prod" if provider == "gcp" else "vm-prod"
+            ),
             display_name="WeCom" if provider == "wecom" else "Production VM",
         ),
         idempotency_key=f"connection-{provider}",
+    )
+
+
+def _hf_connection(
+    store: IntegrationStore,
+    principal: IntegrationPrincipal,
+    account_profile_ref: str = "00000000-0000-4000-8000-000000000401",
+):
+    return store.create_connection(
+        principal,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-oauth",
+            target_ref="selected-model",
+            account_link_ref=account_profile_ref,
+            display_name="Selected HF model",
+        ),
+        idempotency_key="connection-hf-oauth",
     )
 
 
@@ -245,6 +354,20 @@ class _StaticContexts:
         assert connection.actor_subject == self.principal.subject
         return self.principal
 
+    def for_connection_with_connector_grant(
+        self,
+        connection,
+        *,
+        operation_id: str,
+        provider_operation_id: str,
+        arguments: dict[str, object],
+    ):
+        self.principal.require(operation_id)
+        assert connection.actor_subject == self.principal.subject
+        assert provider_operation_id == "huggingface.repo.get"
+        assert arguments == {"repo_type": "model", "repo_id": "org/private-model"}
+        return self.principal, None
+
     def for_claimed_notification(self, job, *, claim_fence: int, operation_id: str):
         self.principal.require(operation_id)
         assert job.actor_subject == self.principal.subject
@@ -256,6 +379,576 @@ class _StaticContexts:
         assert job.actor_subject == self.principal.subject
         assert job.claim_fence == claim_fence
         return self.principal
+
+
+def test_contextless_cloud_health_requires_a_fresh_workspace_connector_grant(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(include_wecom=False, include_email=False)
+    configured_profile = settings.profiles["azure-prod"]
+    profile = replace(
+        configured_profile,
+        allowed_context_refs=frozenset(),
+        allowed_actors=frozenset({(_ISSUER, _SUBJECT)}),
+        access_mode="workspace_operator",
+        targets={
+            alias: replace(target, allowed_context_refs=frozenset())
+            for alias, target in configured_profile.targets.items()
+        },
+    )
+    settings = replace(settings, contexts={}, profiles={"azure-prod": profile})
+    registry = AuthorizationCloudProfileRegistry(settings)
+    principal = _principal(
+        operations={
+            "integrationCreateConnection",
+            "integrationGetAuthorizationHealth",
+            "navigator.connector.operator.v1",
+        }
+    )
+    store = IntegrationStore(tmp_path / "cloud-contextless.sqlite3")
+    connection = store.create_connection(
+        principal,
+        CreateIntegrationConnection(
+            provider="azure",
+            binding_ref="azure-prod",
+            target_ref="vm-prod",
+            display_name="Production VM",
+        ),
+        idempotency_key="contextless-cloud-health",
+        access_mode="workspace_operator",
+    )
+
+    class _Authority:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def authorize_connector_operation(self, **kwargs: Any) -> bytes:
+            self.requests.append(kwargs)
+            return b"synthetic-signed-grant"
+
+    class _Verifier:
+        configured = True
+
+        def __init__(self) -> None:
+            self.expected: dict[str, Any] | None = None
+            self.consumed = 0
+
+        def validate_authority_response(self, _grant: bytes, *, expected: dict[str, Any]):
+            self.expected = expected
+
+        def consume(self, _grant: bytes, *, expected: dict[str, Any]):
+            assert self.expected == expected
+            self.consumed += 1
+            return SimpleNamespace(
+                principal_issuer=expected["principal_issuer"],
+                principal_subject=expected["principal_subject"],
+                organization_id=expected["organization_id"],
+                workspace_id=expected["workspace_id"],
+            )
+
+    authority = _Authority()
+    verifier = _Verifier()
+    resolver = PlatformCurrentAuthorizationContextResolver(
+        store=store,
+        identity_verifier=None,
+        registry=registry,
+        bearer_token=lambda _reference: pytest.fail("contextless profile must not read a bearer"),
+        connector_grant_authority=authority,
+        connector_grant_verifier=verifier,
+    )
+
+    fresh = resolver.for_connection(
+        connection,
+        operation_id="integrationGetAuthorizationHealth",
+    )
+
+    assert fresh is not None
+    assert fresh.issuer == _ISSUER
+    assert fresh.subject == _SUBJECT
+    assert fresh.organization_id == _ORG
+    assert fresh.workspace_id == _WORKSPACE
+    assert authority.requests[0]["provider_id"] == "azure"
+    assert authority.requests[0]["profile_ref"] == "azure-prod"
+    assert authority.requests[0]["operation_id"] == "cloud.provider.health.read"
+    assert authority.requests[0]["arguments_digest_sha256"] == bytes.fromhex(
+        digest_arguments({"profile_ref": "azure-prod"})
+    )
+    assert verifier.consumed == 1
+    assert (
+        resolver.for_connection(
+            connection,
+            operation_id="integrationRefreshConnectionResources",
+        )
+        is None
+    )
+    assert len(authority.requests) == 1
+    direct = _DirectClient({"resources": []})
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={"azure-prod": direct},
+        email_client=None,
+        account_center=None,
+        current_context_resolver=resolver,
+        context_key=lambda _reference: _KEY,
+    )
+    refresh_principal = _principal(operations={"integrationRefreshConnectionResources"})
+    with pytest.raises(PermissionError, match="current Platform grant"):
+        provider.cloud_resources(refresh_principal, connection)
+    assert direct.requests == []
+    store.close()
+
+
+def test_contextless_hf_health_projects_exact_grant_into_account_center_lease(
+    tmp_path: Path,
+) -> None:
+    settings = _hf_settings()
+    configured = settings.profiles["hf-oauth"]
+    profile = replace(
+        configured,
+        allowed_context_refs=frozenset(),
+        allowed_actors=frozenset({(_ISSUER, _SUBJECT)}),
+        access_mode="workspace_operator",
+        targets={
+            alias: replace(target, allowed_context_refs=frozenset())
+            for alias, target in configured.targets.items()
+        },
+    )
+    registry = AuthorizationCloudProfileRegistry(
+        replace(settings, contexts={}, profiles={"hf-oauth": profile})
+    )
+    store = IntegrationStore(tmp_path / "hf-contextless.sqlite3")
+    connection = store.create_connection(
+        _principal(),
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-oauth",
+            target_ref="selected-model",
+            account_link_ref="00000000-0000-4000-8000-000000000401",
+            display_name="Selected HF model",
+        ),
+        idempotency_key="hf-contextless-connection",
+        access_mode="workspace_operator",
+    )
+
+    class _Authority:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def authorize_connector_operation(self, **kwargs: Any) -> bytes:
+            self.requests.append(kwargs)
+            return b"synthetic-signed-grant"
+
+    class _Verifier:
+        configured = True
+
+        def validate_authority_response(self, _grant: bytes, *, expected: dict[str, Any]):
+            self.expected = expected
+
+        def consume(self, _grant: bytes, *, expected: dict[str, Any]):
+            assert self.expected == expected
+            return SimpleNamespace(
+                request_id=expected["request_id"],
+                audience="exchange",
+                organization_id=expected["organization_id"],
+                workspace_id=expected["workspace_id"],
+                principal_issuer=expected["principal_issuer"],
+                principal_subject=expected["principal_subject"],
+                connection_ref=expected["connection_ref"],
+                provider_id=expected["provider_id"],
+                profile_ref=expected["profile_ref"],
+                operation_id=expected["operation_id"],
+                resource_ref=expected["resource_ref"],
+                arguments_digest_sha256=expected["arguments_digest_sha256"],
+                issued_at_epoch=100.0,
+                expires_at_epoch=115.0,
+                grant_ref="sha256:" + "b" * 64,
+            )
+
+    authority = _Authority()
+    resolver = PlatformCurrentAuthorizationContextResolver(
+        store=store,
+        identity_verifier=None,
+        registry=registry,
+        bearer_token=lambda _reference: pytest.fail("contextless profile must not read a bearer"),
+        connector_grant_authority=authority,
+        connector_grant_verifier=_Verifier(),
+    )
+    target = {"repo_type": "model", "repo_id": "org/private-model"}
+    principal, claims = resolver.for_connection_with_connector_grant(
+        connection,
+        operation_id="integrationGetAuthorizationHealth",
+        provider_operation_id="huggingface.repo.get",
+        arguments=target,
+    )
+
+    assert principal is not None
+    assert claims is not None
+    proof = _account_center_grant_proof(
+        claims,
+        arguments_sha256=digest_arguments(target),
+    )
+    assert proof["profile_ref"] == connection.account_link_ref
+    assert proof["connection_ref"] == str(connection.id)
+    assert proof["provider_id"] == "huggingface"
+    assert proof["operation_id"] == "huggingface.repo.get"
+    assert proof["arguments_sha256"] == digest_arguments(target)
+    assert authority.requests[0]["resource_ref"].startswith("sha256:")
+    assert principal.allowed_operation_ids == frozenset(
+        {"integrationGetAuthorizationHealth", "huggingface.repo.get"}
+    )
+    denied_principal, denied_claims = resolver.for_connection_with_connector_grant(
+        connection,
+        operation_id="integrationRefreshConnectionResources",
+        provider_operation_id="cloud.provider.health.read",
+        arguments={"profile_ref": "hf-oauth"},
+    )
+    assert denied_principal is None and denied_claims is None
+    assert len(authority.requests) == 1
+    store.close()
+
+
+def test_hf_device_renewal_uses_the_fresh_actor_request_without_a_stored_bearer_context(
+    tmp_path: Path,
+) -> None:
+    settings = _hf_settings()
+    configured = settings.profiles["hf-oauth"]
+    profile = replace(
+        configured,
+        allowed_context_refs=frozenset(),
+        allowed_actors=frozenset({(_ISSUER, _SUBJECT)}),
+        access_mode="workspace_operator",
+        targets={
+            alias: replace(target, allowed_context_refs=frozenset())
+            for alias, target in configured.targets.items()
+        },
+    )
+    registry = AuthorizationCloudProfileRegistry(
+        replace(settings, contexts={}, profiles={"hf-oauth": profile})
+    )
+    principal = _principal(
+        operations={
+            "integrationCreateConnection",
+            "accountBeginRenewalSession",
+            "navigator.connector.operator.v1",
+        }
+    )
+    profile_ref = "00000000-0000-4000-8000-000000000401"
+    store = IntegrationStore(tmp_path / "hf-renewal-without-stored-context.sqlite3")
+    connection = store.create_connection(
+        principal,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-oauth",
+            target_ref="selected-model",
+            account_link_ref=profile_ref,
+            display_name="Selected HF model",
+        ),
+        idempotency_key="hf-static-owner-renewal",
+        access_mode="workspace_operator",
+    )
+
+    class _Accounts:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def begin_huggingface_renewal(
+            self,
+            selected: IntegrationPrincipal,
+            *,
+            profile_ref: str,
+            session_ref: str,
+        ) -> dict[str, Any]:
+            self.calls.append((selected.subject, profile_ref))
+            return {
+                "profile_ref": profile_ref,
+                "session_ref": session_ref,
+                "state": "waiting_user",
+                "verification_uri": "https://hf.co/oauth/device",
+                "user_code": "ABCD-EFGH",
+                "generation": 5,
+            }
+
+    accounts = _Accounts()
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={},
+        email_client=None,
+        account_center=accounts,
+        current_context_resolver=None,
+        context_key=lambda _reference: _KEY,
+    )
+
+    session = provider.start_renewal(
+        principal,
+        connection,
+        profile_ref,
+        request_id="renewal-session-owner-1",
+    )
+
+    assert session.authorization_ref == profile_ref
+    assert session.session_ref == "renewal-session-owner-1"
+    assert session.state.value == "WAITING_USER"
+    assert session.authorization_url == "https://hf.co/oauth/device"
+    assert session.user_code == "ABCD-EFGH"
+    assert accounts.calls == [(_SUBJECT, profile_ref)]
+    store.close()
+
+
+class _HuggingFaceAccounts:
+    def __init__(
+        self,
+        profile_ref: str,
+        *,
+        repositories: list[dict[str, Any]] | None = None,
+        denied_repo_id: str | None = None,
+    ) -> None:
+        self.profile_ref = profile_ref
+        self.revision = 5
+        self.list_calls = 0
+        self.lease_calls: list[dict[str, Any]] = []
+        self.repositories = repositories or [
+            {
+                "repo_type": "model",
+                "repo_id": "org/private-model",
+                "permissions": ["read"],
+            }
+        ]
+        self.denied_repo_id = denied_repo_id
+
+    def list_provider_profiles(self, principal: IntegrationPrincipal) -> dict[str, Any]:
+        assert principal.subject == _SUBJECT
+        self.list_calls += 1
+        return {
+            "profiles": [
+                {
+                    "profile_ref": self.profile_ref,
+                    "provider": "huggingface",
+                    "auth_mode": "device_oauth",
+                    "auth_status": "healthy",
+                    "target_scope": {"repositories": self.repositories},
+                    "credential_revision": self.revision,
+                    "expires_at": 1_800_000_000,
+                }
+            ]
+        }
+
+    def create_provider_credential_lease(self, principal: IntegrationPrincipal, **kwargs):
+        assert "huggingface.repo.get" in principal.allowed_operation_ids
+        self.lease_calls.append(kwargs)
+        if (
+            self.denied_repo_id is not None
+            and kwargs["target"].get("repo_id") == self.denied_repo_id
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_AUTHORIZATION_DENIED",
+                title="The selected HF repository is not readable",
+                detail="Synthetic target-specific authorization denial.",
+                status=403,
+            )
+        return {
+            "lease_ref": "00000000-0000-4000-8000-000000000402",
+            "profile_ref": kwargs["profile_ref"],
+            "provider": "huggingface",
+            "operation_id": kwargs["operation_id"],
+            "target": kwargs["target"],
+            "arguments_sha256": kwargs["arguments_sha256"],
+        }
+
+
+def test_hf_health_uses_account_center_lease_and_suppresses_oauth_access_ttl(
+    tmp_path: Path,
+) -> None:
+    settings = _hf_settings()
+    registry = AuthorizationCloudProfileRegistry(settings)
+    principal = _principal(
+        operations={
+            "integrationCreateConnection",
+            "integrationGetAuthorizationHealth",
+            "huggingface.repo.get",
+        }
+    )
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    account_profile_ref = "00000000-0000-4000-8000-000000000401"
+    connection = _hf_connection(store, principal, account_profile_ref)
+    accounts = _HuggingFaceAccounts(account_profile_ref)
+    direct = _DirectClient({"repo_id": "org/private-model"})
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={"hf-oauth": direct},
+        email_client=None,
+        account_center=accounts,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda reference: _KEY if reference == "keys/huggingface" else b"e" * 32,
+    )
+
+    observed = provider.authorization_health(principal, connection)
+
+    assert observed.login_state == LoginState.PRESENT, (
+        observed.reason_code,
+        accounts.lease_calls,
+        len(direct.requests),
+    )
+    assert observed.authorization_state == AuthorizationState.VALID
+    assert observed.authorization_ref == account_profile_ref
+    assert observed.expires_at is None
+    assert observed.generation == 5
+    assert observed.capabilities[0].state == AuthorizationState.VALID
+    assert accounts.list_calls == 2
+    assert len(accounts.lease_calls) == 1
+    assert accounts.lease_calls[0] | {"arguments_sha256": "removed"} == {
+        "profile_ref": account_profile_ref,
+        "operation_id": "huggingface.repo.get",
+        "target": {"repo_type": "model", "repo_id": "org/private-model"},
+        "arguments_sha256": "removed",
+    }
+    assert isinstance(accounts.lease_calls[0]["arguments_sha256"], str)
+    assert len(accounts.lease_calls[0]["arguments_sha256"]) == 64
+    assert direct.requests[0].provider_tool_id == "huggingface.repo.get"
+    envelope = json.loads(direct.requests[0].arguments_json)
+    assert set(envelope) == {"profile_ref", "lease_ref", "payload", "trusted_context"}
+    assert envelope["profile_ref"] == account_profile_ref
+    assert envelope["lease_ref"] == "00000000-0000-4000-8000-000000000402"
+    assert envelope["payload"] == {
+        "repo_type": "model",
+        "repo_id": "org/private-model",
+    }
+    signed_payload = {
+        "profile_ref": envelope["profile_ref"],
+        "lease_ref": envelope["lease_ref"],
+        "payload": envelope["payload"],
+    }
+    assert verify_account_center_context(
+        method="call_tool",
+        payload=signed_payload,
+        context=envelope["trusted_context"],
+        keys={"exchange-service": _KEY},
+        expected_caller_id="exchange-service",
+    )
+    store.close()
+
+
+def test_hf_health_probes_only_the_connection_selected_repository(
+    tmp_path: Path,
+) -> None:
+    settings = _hf_settings()
+    profile = settings.profiles["hf-oauth"]
+    repositories = [
+        {
+            "repo_type": "model",
+            "repo_id": "org/other-model",
+            "permissions": ["read"],
+        },
+        {
+            "repo_type": "model",
+            "repo_id": "org/selected-model",
+            "permissions": ["read"],
+        },
+    ]
+    profile = replace(
+        profile,
+        account_scopes={"repositories": repositories},
+        targets={
+            "selected-model": replace(
+                profile.targets["selected-model"],
+                target_ref="org/selected-model",
+            )
+        },
+    )
+    settings = replace(settings, profiles={"hf-oauth": profile})
+    registry = AuthorizationCloudProfileRegistry(settings)
+    principal = _principal(
+        operations={
+            "integrationCreateConnection",
+            "integrationGetAuthorizationHealth",
+            "huggingface.repo.get",
+        }
+    )
+    store = IntegrationStore(tmp_path / "hf-selected-target.sqlite3")
+    account_profile_ref = "00000000-0000-4000-8000-000000000401"
+    connection = _hf_connection(store, principal, account_profile_ref)
+    accounts = _HuggingFaceAccounts(
+        account_profile_ref,
+        repositories=repositories,
+        denied_repo_id="org/selected-model",
+    )
+    direct = _DirectClient({"repo_id": "org/other-model"})
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={"hf-oauth": direct},
+        email_client=None,
+        account_center=accounts,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda _reference: _KEY,
+    )
+
+    observed = provider.authorization_health(principal, connection)
+
+    assert observed.authorization_state == AuthorizationState.PERMISSION_DENIED
+    assert observed.reason_code == "account_center_authorization_denied"
+    assert len(accounts.lease_calls) == 1
+    assert accounts.lease_calls[0]["target"] == {
+        "repo_type": "model",
+        "repo_id": "org/selected-model",
+    }
+    assert direct.requests == []
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_state"),
+    [
+        ("EXCHANGE_CONNECTOR_AUTH_EXPIRED", AuthorizationState.REAUTHORIZATION_REQUIRED),
+        ("EXCHANGE_CONNECTOR_PERMISSION_DENIED", AuthorizationState.PERMISSION_DENIED),
+        ("EXCHANGE_CONNECTOR_PROVIDER_UNAVAILABLE", AuthorizationState.UNAVAILABLE),
+    ],
+)
+def test_hf_health_separates_reauth_permission_and_provider_unavailable(
+    tmp_path: Path,
+    error_code: str,
+    expected_state: AuthorizationState,
+) -> None:
+    settings = _hf_settings()
+    registry = AuthorizationCloudProfileRegistry(settings)
+    principal = _principal(
+        operations={
+            "integrationCreateConnection",
+            "integrationGetAuthorizationHealth",
+            "huggingface.repo.get",
+        }
+    )
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    account_profile_ref = "00000000-0000-4000-8000-000000000401"
+    connection = _hf_connection(store, principal, account_profile_ref)
+    accounts = _HuggingFaceAccounts(account_profile_ref)
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={"hf-oauth": _DirectClient({"repo_id": "unused"})},
+        email_client=None,
+        account_center=accounts,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda _reference: _KEY,
+    )
+
+    def failed_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise ExchangeProductError(
+            code=error_code,
+            title="fixed test failure",
+            detail="synthetic result",
+            status=503,
+        )
+
+    provider.invoke_connector_tool = failed_probe  # type: ignore[method-assign]
+    observed = provider.authorization_health(principal, connection)
+
+    assert observed.authorization_state == expected_state
+    assert observed.expires_at is None
+    assert observed.capabilities[0].state == expected_state
+    store.close()
 
 
 def test_current_authority_bearer_is_reread_and_operation_grant_is_fresh() -> None:
@@ -397,10 +1090,133 @@ def test_authorization_health_uses_fixed_signed_wecom_tool_and_native_ref(tmp_pa
     store.close()
 
 
-def test_cloud_query_uses_host_target_alias_and_projects_provider_observation(
+@pytest.mark.parametrize("provider_id", ["azure", "gcp"])
+def test_managed_cloud_token_ttl_is_not_projected_as_authorization_expiry(
+    tmp_path: Path,
+    provider_id: str,
+) -> None:
+    settings = _settings(
+        include_wecom=False,
+        include_email=False,
+        include_gcp=provider_id == "gcp",
+    )
+    registry = AuthorizationCloudProfileRegistry(settings)
+    principal = _principal()
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _connection(store, principal, provider=provider_id)
+    now = datetime.now(UTC)
+    direct = _DirectClient(
+        {
+            "profile_ref": f"{provider_id}-prod",
+            "provider": provider_id,
+            "identity_ref": "managed-identity://health-test",
+            "authentication_state": "VALID",
+            "authorization_state": "VALID",
+            "scope_refs": [f"{provider_id}.resource.read"],
+            "checked_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "expires_at": (now + timedelta(minutes=60))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+            "reason_code": None,
+        }
+    )
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={f"{provider_id}-prod": direct},
+        email_client=None,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda _reference: _KEY,
+    )
+
+    observed = provider.authorization_health(principal, connection)
+
+    assert observed.authorization_state == AuthorizationState.VALID
+    assert observed.expires_at is None
+    assert observed.capabilities[0].expires_at is None
+    assert observed.generation == 0
+    assert direct.requests[0].provider_tool_id == "cloud_provider_health"
+    envelope = sdk.parse_tool_envelope(json.loads(direct.requests[0].arguments_json))
+    assert dict(envelope.arguments) == {"profile_ref": f"{provider_id}-prod"}
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("authentication", "authorization", "expected_login", "expected_state"),
+    [
+        (
+            "INVALID",
+            "UNKNOWN",
+            LoginState.PRESENT,
+            AuthorizationState.REAUTHORIZATION_REQUIRED,
+        ),
+        (
+            "VALID",
+            "DENIED",
+            LoginState.PRESENT,
+            AuthorizationState.PERMISSION_DENIED,
+        ),
+        ("UNKNOWN", "UNKNOWN", LoginState.UNKNOWN, AuthorizationState.UNKNOWN),
+        ("MISSING", "UNKNOWN", LoginState.MISSING, AuthorizationState.UNKNOWN),
+    ],
+)
+def test_cloud_management_health_maps_auth_permission_and_transport_states(
+    tmp_path: Path,
+    authentication: str,
+    authorization: str,
+    expected_login: LoginState,
+    expected_state: AuthorizationState,
+) -> None:
+    registry = AuthorizationCloudProfileRegistry(
+        _settings(include_wecom=False, include_email=False)
+    )
+    principal = _principal()
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _connection(store, principal, provider="azure")
+    direct = _DirectClient(
+        {
+            "profile_ref": "azure-prod",
+            "provider": "azure",
+            "identity_ref": "managed-identity://health-test",
+            "authentication_state": authentication,
+            "authorization_state": authorization,
+            "scope_refs": ["azure.subscription.read"],
+            "checked_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "expires_at": None,
+            "reason_code": "PROVIDER_TIMEOUT"
+            if authentication == "UNKNOWN"
+            else "AUTHENTICATION_FAILED"
+            if authentication == "INVALID"
+            else "SCOPE_DENIED"
+            if authorization == "DENIED"
+            else "CREDENTIAL_MISSING"
+            if authentication == "MISSING"
+            else None,
+        }
+    )
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={"azure-prod": direct},
+        email_client=None,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda _reference: _KEY,
+    )
+
+    observed = provider.authorization_health(principal, connection)
+
+    assert observed.login_state == expected_login
+    assert observed.authorization_state == expected_state
+    assert observed.expires_at is None
+    store.close()
+
+
+def test_legacy_cloud_resources_query_uses_host_target_alias_and_projects_observation(
     tmp_path: Path,
 ) -> None:
     settings = _settings(include_wecom=False, include_email=False)
+    legacy_profile = replace(settings.profiles["azure-prod"], audience="cloud-resources")
+    settings = replace(settings, profiles={"azure-prod": legacy_profile})
     registry = AuthorizationCloudProfileRegistry(settings)
     principal = _principal()
     store = IntegrationStore(tmp_path / "integrations.sqlite3")
@@ -792,4 +1608,117 @@ def test_email_missing_live_bearer_defers_claim_without_sending_or_unknown(
     assert persisted.state.value == "READY"
     assert persisted.failure_reason_code == "current_authority_unavailable"
     assert persisted.attempts == 0
+    store.close()
+
+
+def test_huggingface_renewal_uses_owner_scoped_account_center_device_session(
+    tmp_path: Path,
+) -> None:
+    """HF renewal returns only official device metadata through its linked profile."""
+
+    class _AccountCenter:
+        def __init__(self, selected_profile_ref: str) -> None:
+            self.selected_profile_ref = selected_profile_ref
+            self.calls: list[tuple[str, str, str]] = []
+
+        def begin_huggingface_renewal(
+            self,
+            _principal: IntegrationPrincipal,
+            *,
+            profile_ref: str,
+            session_ref: str,
+        ) -> dict[str, Any]:
+            self.calls.append(("begin", profile_ref, session_ref))
+            return {
+                "profile_ref": self.selected_profile_ref,
+                "session_ref": session_ref,
+                "state": "waiting_user",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "https://hf.co/oauth/device",
+                "expires_at": 1_800_000_000,
+                "interval_seconds": 5,
+                "generation": 7,
+                "reason_code": None,
+            }
+
+        def poll_huggingface_renewal(
+            self,
+            _principal: IntegrationPrincipal,
+            *,
+            profile_ref: str,
+            session_ref: str,
+        ) -> dict[str, Any]:
+            self.calls.append(("poll", profile_ref, session_ref))
+            return {
+                "profile_ref": self.selected_profile_ref,
+                "session_ref": session_ref,
+                "state": "succeeded",
+                "user_code": None,
+                "verification_uri": None,
+                "expires_at": None,
+                "interval_seconds": None,
+                "generation": 8,
+                "reason_code": None,
+            }
+
+    principal = _principal()
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _hf_connection(store, principal)
+    profile_ref = connection.account_link_ref
+    assert profile_ref is not None
+    account_center = _AccountCenter(profile_ref)
+    registry = AuthorizationCloudProfileRegistry(_hf_settings())
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={},
+        email_client=None,
+        account_center=account_center,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda _reference: _KEY,
+    )
+    session_ref = "30000000-0000-4000-8000-000000000001"
+
+    started = provider.start_renewal(
+        principal,
+        connection,
+        profile_ref,
+        request_id=session_ref,
+    )
+    assert started.session_ref == session_ref
+    assert started.state.value == "WAITING_USER"
+    assert started.authorization_url == "https://hf.co/oauth/device"
+    assert started.user_code == "ABCD-EFGH"
+    assert started.qr_attachment_ref is None
+    assert account_center.calls == [("begin", profile_ref, session_ref)]
+
+    now = datetime(2026, 10, 26, 12, tzinfo=UTC)
+    claim = store.claim_authorization_checks("renewal-test", now=now)[0]
+    store.complete_authorization_check(
+        claim,
+        AuthorizationHealthRecord(
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            actor_issuer=connection.actor_issuer,
+            actor_subject=connection.actor_subject,
+            connection_id=connection.id,
+            authorization_ref=profile_ref,
+            login_state=LoginState.PRESENT,
+            authorization_state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+            checked_at=now,
+            generation=7,
+        ),
+        [],
+        now=now,
+    )
+    completed = provider.renewal_status(
+        principal,
+        profile_ref,
+        session_ref,
+        request_id="renewal-status-request",
+    )
+    assert completed.session_ref == session_ref
+    assert completed.state.value == "SUCCEEDED"
+    assert completed.user_code is None
+    assert account_center.calls[-1] == ("poll", profile_ref, session_ref)
     store.close()

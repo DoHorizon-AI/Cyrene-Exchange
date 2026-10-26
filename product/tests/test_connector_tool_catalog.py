@@ -58,6 +58,22 @@ def _catalog_payload(
     )
 
 
+def _definitions_for_operation_map(
+    operation_map: list[dict[str, object]],
+) -> tuple[ProviderToolDefinition, ...]:
+    """Build only the fixed descriptors requested by a CLI export test."""
+
+    return tuple(
+        ProviderToolDefinition(
+            tool_id=str(item["toolId"]),
+            name=f"Provider {item['toolId']}",
+            description="Fixed provider operation.",
+            input_schema={"type": "object", "properties": {}},
+        )
+        for item in operation_map
+    )
+
+
 def test_list_provider_tool_catalog_uses_fixed_direct_plugin_catalog_method() -> None:
     binding_id = "github-plugin-binding"
     schema = '{"type":"object","properties":{"repository":{"type":"string"}}}'
@@ -158,6 +174,9 @@ def test_connector_tool_catalog_cli_exports_real_schema_and_fixed_mutability(
         account_link_ref="github-profile-1",
         binding_ref="github-profile-alias",
         target_ref=None,
+        repository_id="123",
+        repository_name="acme/project",
+        access_mode="actor_owned",
     )
     operation_map = connector_binding_tools("github")
     provider_catalog = (
@@ -269,6 +288,9 @@ def test_connector_tool_catalog_cli_fails_without_a_required_provider_tool(
         account_link_ref="github-profile-1",
         binding_ref="github-profile-alias",
         target_ref=None,
+        repository_id="123",
+        repository_name="acme/project",
+        access_mode="actor_owned",
     )
 
     class _Store:
@@ -617,3 +639,442 @@ def test_connector_tool_catalog_cli_omits_legacy_oauth_issue_connections(
         == 0
     )
     assert json.loads(capsys.readouterr().out) == {"items": [], "schemaVersion": 1}
+
+
+@pytest.mark.parametrize(
+    ("repo_type", "repo_id", "list_operation_id"),
+    [
+        ("model", "Qwen/Qwen2.5-0.5B-Instruct", "huggingface.models.list"),
+        ("dataset", "example-org/private-dataset", "huggingface.datasets.list"),
+        ("space", "example-org/private-space", "huggingface.spaces.list"),
+    ],
+)
+def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+    repo_type: str,
+    repo_id: str,
+    list_operation_id: str,
+) -> None:
+    database_path = tmp_path / "integrations.sqlite3"
+    database_path.touch()
+    profile_ref = "00000000-0000-4000-8000-000000000401"
+    connection = SimpleNamespace(
+        id=uuid4(),
+        provider="hf",
+        organization_id="org-1",
+        workspace_id="workspace-1",
+        actor_issuer="https://issuer.example",
+        actor_subject="actor-1",
+        account_link_ref=profile_ref,
+        binding_ref="hf-primary",
+        target_ref=f"hf-{repo_type}",
+        access_mode="workspace_operator",
+    )
+    target_ref = repo_id
+    list_operation_ids = {
+        "huggingface.models.list",
+        "huggingface.datasets.list",
+        "huggingface.spaces.list",
+    }
+    read_only_map = [
+        item
+        for item in connector_binding_tools("huggingface")
+        if item["mutating"] is False
+        and (
+            item["operationId"] not in list_operation_ids
+            or item["operationId"] == list_operation_id
+        )
+    ]
+    provider_catalog = _definitions_for_operation_map(read_only_map)
+    account_profile = {
+        "profile_ref": profile_ref,
+        "provider": "huggingface",
+        "auth_status": "healthy",
+        "auth_mode": "device_oauth",
+        "access_mode": "workspace_operator",
+        "credential_revision": 3,
+        "target_scope": {
+            "repositories": [
+                {
+                    "repo_type": repo_type,
+                    "repo_id": target_ref,
+                    "permissions": ["read"],
+                }
+            ]
+        },
+    }
+    calls: dict[str, Any] = {}
+
+    class _Store:
+        def connector_bindings_for_actor(self, **kwargs: Any) -> list[Any]:
+            calls["scope"] = kwargs
+            return [connection]
+
+    class _Services:
+        store = _Store()
+        accounts = SimpleNamespace(
+            list_provider_profiles=lambda principal: (
+                calls.update(actor=(principal.issuer, principal.subject, principal.organization_id))
+                or {"profiles": [account_profile]}
+            )
+        )
+        authorization_cloud = SimpleNamespace(
+            list_tool_catalog=lambda binding_ref: (
+                calls.update(binding_ref=binding_ref) or provider_catalog
+            )
+        )
+        authorization_profile_registry = SimpleNamespace(
+            settings=SimpleNamespace(
+                profiles={
+                    "hf-primary": SimpleNamespace(
+                        profile_ref="hf-primary",
+                        provider="hf",
+                        account_scopes={
+                            "repositories": [
+                                {
+                                    "repo_type": repo_type,
+                                    "repo_id": target_ref,
+                                    "permissions": ["read"],
+                                }
+                            ]
+                        },
+                        targets={
+                            f"hf-{repo_type}": SimpleNamespace(
+                                target_ref=target_ref,
+                                display_name="Qwen target",
+                            )
+                        },
+                    )
+                }
+            )
+        )
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
+    monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
+
+    result = exchange_cli.run(
+        [
+            "integrations",
+            "connector-readiness",
+            "--integration-database",
+            str(database_path),
+            "--issuer",
+            "https://issuer.example",
+            "--subject",
+            "actor-1",
+            "--organization-id",
+            "org-1",
+            "--workspace-id",
+            "workspace-1",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert calls["closed"] is True
+    assert calls["binding_ref"] == "hf-primary"
+    assert calls["actor"] == ("https://issuer.example", "actor-1", "org-1")
+    assert output["schemaVersion"] == 1
+    assert output["actor"] == {
+        "issuer": "https://issuer.example",
+        "subject": "actor-1",
+        "organizationId": "org-1",
+        "workspaceId": "workspace-1",
+    }
+    profile = output["profiles"][0]
+    assert profile["profileRef"] == profile_ref
+    assert profile["profileAlias"] == "hf-primary"
+    assert profile["providerId"] == "huggingface"
+    assert profile["authMode"] == "device_oauth"
+    assert profile["credentialRevision"] == 3
+    binding = output["bindings"][0]
+    catalog_item = output["catalog"]["items"][0]
+    assert binding["profileRef"] == profile_ref
+    assert binding["connectionRef"] == str(connection.id)
+    assert {tool["toolId"] for tool in binding["tools"]} == {
+        tool["id"] for tool in catalog_item["tools"]
+    }
+    assert {tool["id"] for tool in catalog_item["tools"]} == {
+        str(item["toolId"]) for item in read_only_map
+    }
+    assert {tool["id"] for tool in catalog_item["tools"]}.isdisjoint(
+        list_operation_ids - {list_operation_id}
+    )
+    assert output["connections"][0]["targetScope"] == {
+        "repoType": repo_type,
+        "repoId": target_ref,
+        "permissions": ["read"],
+    }
+    serialized = json.dumps(output)
+    assert "authorizationRef" not in serialized
+    assert "credentialSecretRef" not in serialized
+
+
+def test_connector_readiness_fails_when_read_only_catalog_lacks_a_read_operation(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "integrations.sqlite3"
+    database_path.touch()
+    target_ref = "Qwen/Qwen2.5-0.5B-Instruct"
+    connection = SimpleNamespace(
+        id=uuid4(),
+        provider="azure",
+        organization_id="org-1",
+        workspace_id="workspace-1",
+        actor_issuer="https://issuer.example",
+        actor_subject="actor-1",
+        account_link_ref=None,
+        binding_ref="azure-primary",
+        target_ref="subscription-prod",
+        access_mode="workspace_operator",
+    )
+    operation_map = connector_binding_tools("azure")
+    read_only_map = [item for item in operation_map if item["mutating"] is False]
+    missing_read = next(
+        item for item in read_only_map if item["operationId"] == "cloud.resources.list"
+    )
+    provider_catalog = _definitions_for_operation_map(
+        [item for item in read_only_map if item is not missing_read]
+    )
+
+    class _Store:
+        def connector_bindings_for_actor(self, **_kwargs: Any) -> list[Any]:
+            return [connection]
+
+    class _Services:
+        store = _Store()
+        authorization_cloud = SimpleNamespace(
+            list_tool_catalog=lambda _binding_ref: provider_catalog
+        )
+        authorization_profile_registry = SimpleNamespace(
+            settings=SimpleNamespace(
+                profiles={
+                    "azure-primary": SimpleNamespace(
+                        profile_ref="azure-primary",
+                        provider="azure",
+                        auth_mode="managed_identity",
+                        targets={"subscription-prod": SimpleNamespace(target_ref=target_ref)},
+                    )
+                }
+            )
+        )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
+    monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
+
+    with pytest.raises(SystemExit, match="missing required Exchange read operations"):
+        exchange_cli.run(
+            [
+                "integrations",
+                "connector-readiness",
+                "--integration-database",
+                str(database_path),
+                "--issuer",
+                "https://issuer.example",
+                "--subject",
+                "actor-1",
+                "--organization-id",
+                "org-1",
+                "--workspace-id",
+                "workspace-1",
+            ]
+        )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_connector_readiness_fails_closed_on_hf_scope_drift(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "integrations.sqlite3"
+    database_path.touch()
+    profile_ref = "00000000-0000-4000-8000-000000000401"
+    target_ref = "Qwen/Qwen2.5-0.5B-Instruct"
+    connection = SimpleNamespace(
+        id=uuid4(),
+        provider="hf",
+        organization_id="org-1",
+        workspace_id="workspace-1",
+        actor_issuer="https://issuer.example",
+        actor_subject="actor-1",
+        account_link_ref=profile_ref,
+        binding_ref="hf-primary",
+        target_ref="hf-target",
+        access_mode="workspace_operator",
+    )
+    account_profile = {
+        "profile_ref": profile_ref,
+        "provider": "huggingface",
+        "auth_status": "healthy",
+        "auth_mode": "device_oauth",
+        "access_mode": "workspace_operator",
+        "target_scope": {
+            "repositories": [
+                {
+                    "repo_type": "model",
+                    "repo_id": target_ref,
+                    "permissions": ["read"],
+                }
+            ]
+        },
+    }
+
+    class _Store:
+        def connector_bindings_for_actor(self, **_kwargs: Any) -> list[Any]:
+            return [connection]
+
+    class _Services:
+        store = _Store()
+        accounts = SimpleNamespace(
+            list_provider_profiles=lambda _principal: {"profiles": [account_profile]}
+        )
+        authorization_cloud = SimpleNamespace(list_tool_catalog=lambda _binding: ())
+        authorization_profile_registry = SimpleNamespace(
+            settings=SimpleNamespace(
+                profiles={
+                    "hf-primary": SimpleNamespace(
+                        profile_ref="hf-primary",
+                        provider="hf",
+                        account_scopes={
+                            "repositories": [
+                                {
+                                    "repo_type": "model",
+                                    "repo_id": target_ref,
+                                    "permissions": ["read", "write"],
+                                }
+                            ]
+                        },
+                        targets={
+                            "hf-target": SimpleNamespace(
+                                target_ref=target_ref,
+                                display_name="Qwen target",
+                            )
+                        },
+                    )
+                }
+            )
+        )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
+    monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
+
+    with pytest.raises(SystemExit, match="Account Center scope does not match"):
+        exchange_cli.run(
+            [
+                "integrations",
+                "connector-readiness",
+                "--integration-database",
+                str(database_path),
+                "--issuer",
+                "https://issuer.example",
+                "--subject",
+                "actor-1",
+                "--organization-id",
+                "org-1",
+                "--workspace-id",
+                "workspace-1",
+            ]
+        )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_connector_readiness_filters_exact_live_cloud_read_only_catalog(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "integrations.sqlite3"
+    database_path.touch()
+    connection = SimpleNamespace(
+        id=uuid4(),
+        provider="azure",
+        organization_id="org-1",
+        workspace_id="workspace-1",
+        actor_issuer="https://issuer.example",
+        actor_subject="actor-1",
+        account_link_ref=None,
+        binding_ref="azure-primary",
+        target_ref="subscription-prod",
+        access_mode="workspace_operator",
+    )
+    operation_map = connector_binding_tools("azure")
+    read_only_map = [item for item in operation_map if item["mutating"] is False]
+    provider_catalog = _definitions_for_operation_map(read_only_map)
+
+    class _Store:
+        def connector_bindings_for_actor(self, **_kwargs: Any) -> list[Any]:
+            return [connection]
+
+    class _Services:
+        store = _Store()
+        authorization_cloud = SimpleNamespace(
+            list_tool_catalog=lambda _binding_ref: provider_catalog
+        )
+        authorization_profile_registry = SimpleNamespace(
+            settings=SimpleNamespace(
+                profiles={
+                    "azure-primary": SimpleNamespace(
+                        profile_ref="azure-primary",
+                        provider="azure",
+                        auth_mode="managed_identity",
+                        targets={
+                            "subscription-prod": SimpleNamespace(target_ref="subscription-id-123")
+                        },
+                    )
+                }
+            )
+        )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
+    monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
+
+    result = exchange_cli.run(
+        [
+            "integrations",
+            "connector-readiness",
+            "--integration-database",
+            str(database_path),
+            "--issuer",
+            "https://issuer.example",
+            "--subject",
+            "actor-1",
+            "--organization-id",
+            "org-1",
+            "--workspace-id",
+            "workspace-1",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert output["profiles"][0]["profileRef"] == "azure-primary"
+    assert output["profiles"][0]["authMode"] == "managed_identity"
+    assert output["profiles"][0]["readOnly"] is True
+    binding = output["bindings"][0]
+    catalog_item = output["catalog"]["items"][0]
+    assert {tool["toolId"] for tool in binding["tools"]} == {
+        str(item["toolId"]) for item in read_only_map
+    }
+    assert {tool["id"] for tool in catalog_item["tools"]} == {
+        str(item["toolId"]) for item in read_only_map
+    }
+    assert all(tool["readOnly"] for tool in catalog_item["tools"])

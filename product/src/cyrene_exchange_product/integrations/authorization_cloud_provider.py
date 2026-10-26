@@ -11,10 +11,12 @@ import json
 import logging
 import re
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from typing import Any, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
+from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations.authorization_cloud import (
     EmailAuthorizationUnavailable,
     EmailDeliveryRetryableError,
@@ -36,6 +38,15 @@ from cyrene_exchange_product.integrations.clients import (
     _raise_provider_error,
     list_provider_tool_catalog,
 )
+from cyrene_exchange_product.integrations.connector_operations import (
+    _account_center_grant_proof,
+    _resource_projection,
+    _resource_ref,
+)
+from cyrene_exchange_product.integrations.connector_security import (
+    ConnectorGrantClaims,
+    digest_arguments,
+)
 from cyrene_exchange_product.integrations.models import (
     AuthorizationCapabilityRecord,
     AuthorizationHealthRecord,
@@ -43,7 +54,9 @@ from cyrene_exchange_product.integrations.models import (
     CloudResourceRecord,
     CloudResourceState,
     EmailNotificationJob,
+    IntegrationConflict,
     IntegrationConnection,
+    IntegrationNotFound,
     IntegrationPrincipal,
     LoginState,
     RenewalState,
@@ -53,7 +66,7 @@ from cyrene_exchange_product.integrations.store import IntegrationStore
 
 
 class PlatformCurrentAuthorizationContextResolver:
-    """Reverify a host-owned live bearer and current catalog grant on every worker call."""
+    """Reverify bearer or one-use Directory proof before every worker call."""
 
     def __init__(
         self,
@@ -62,11 +75,15 @@ class PlatformCurrentAuthorizationContextResolver:
         identity_verifier: Any,
         registry: AuthorizationCloudProfileRegistry,
         bearer_token: Callable[[str], str | None],
+        connector_grant_authority: Any = None,
+        connector_grant_verifier: Any = None,
     ) -> None:
         self._store = store
         self._identity_verifier = identity_verifier
         self._registry = registry
         self._bearer_token = bearer_token
+        self._connector_grant_authority = connector_grant_authority
+        self._connector_grant_verifier = connector_grant_verifier
 
     def for_connection(
         self,
@@ -77,16 +94,26 @@ class PlatformCurrentAuthorizationContextResolver:
         """Reload the connection and reverify its owner before each provider call."""
 
         try:
-            current = self._store.current_connection_for_provider_call(connection.id)
-            if current is None or current != connection:
-                return None
-            context, _profile = self._registry.context_for_connection(current)
-            principal = self._verified_principal(context, operation_id=operation_id)
-            self._registry.profile_for_connection(
-                principal,
-                current,
+            current, profile, principal, used_static_owner = self._resolve_connection_principal(
+                connection,
                 operation_id=operation_id,
             )
+            if used_static_owner:
+                provider_operation_id, arguments = _health_grant_scope(
+                    current,
+                    profile,
+                    product_operation_id=operation_id,
+                )
+                if provider_operation_id is None or arguments is None:
+                    return None
+                principal, _claims = self._mint_connector_grant(
+                    current,
+                    profile,
+                    principal,
+                    operation_id=provider_operation_id,
+                    arguments=arguments,
+                    product_operation_id=operation_id,
+                )
             return principal
         except Exception as exc:
             _LOGGER.info(
@@ -94,6 +121,168 @@ class PlatformCurrentAuthorizationContextResolver:
                 type(exc).__name__,
             )
             return None
+
+    def for_connection_with_connector_grant(
+        self,
+        connection: IntegrationConnection,
+        *,
+        operation_id: str,
+        provider_operation_id: str,
+        arguments: Mapping[str, object],
+    ) -> tuple[IntegrationPrincipal | None, ConnectorGrantClaims | None]:
+        """Return a fresh principal plus one verified shared-profile proof.
+
+        Account Center consumes the projected claims when minting a shared HF lease.
+        The signed grant itself is verified and consumed by Exchange first.
+        中文：HF 共享租约同时交由 Account Center 按原 claims 消费。
+        """
+
+        try:
+            if operation_id != "integrationGetAuthorizationHealth":
+                return None, None
+            current, profile, principal, _used_static_owner = self._resolve_connection_principal(
+                connection,
+                operation_id=operation_id,
+            )
+            if current.access_mode != "workspace_operator":
+                return principal, None
+            if provider_operation_id not in {
+                "cloud.provider.health.read",
+                "huggingface.repo.get",
+            }:
+                return None, None
+            return self._mint_connector_grant(
+                current,
+                profile,
+                principal,
+                operation_id=provider_operation_id,
+                arguments=arguments,
+                product_operation_id=operation_id,
+            )
+        except Exception as exc:
+            _LOGGER.info(
+                "Current connector grant is unavailable for an integration connection (%s)",
+                type(exc).__name__,
+            )
+            return None, None
+
+    def _resolve_connection_principal(
+        self,
+        connection: IntegrationConnection,
+        *,
+        operation_id: str,
+    ) -> tuple[IntegrationConnection, AuthorizationProviderProfile, IntegrationPrincipal, bool]:
+        """Resolve a live bearer principal or a static owner awaiting Authority proof."""
+
+        current = self._store.current_connection_for_provider_call(connection.id)
+        if current is None or current != connection:
+            raise PermissionError("connection changed before current authorization")
+        try:
+            context, _profile = self._registry.context_for_connection(current)
+            principal = self._verified_principal(context, operation_id=operation_id)
+            profile, _target = self._registry.profile_for_connection(
+                principal,
+                current,
+                operation_id=operation_id,
+            )
+            return current, profile, principal, False
+        except PermissionError:
+            profile, _target = self._registry.profile_for_static_workspace_operator_connection(
+                current
+            )
+            principal = IntegrationPrincipal(
+                issuer=current.actor_issuer,
+                subject=current.actor_subject,
+                organization_id=current.organization_id,
+                workspace_id=current.workspace_id,
+                allowed_operation_ids=frozenset({operation_id}),
+            )
+            self._registry.profile_for_connection(
+                principal,
+                current,
+                operation_id=operation_id,
+            )
+            return current, profile, principal, True
+
+    def _mint_connector_grant(
+        self,
+        connection: IntegrationConnection,
+        profile: AuthorizationProviderProfile,
+        principal: IntegrationPrincipal,
+        *,
+        operation_id: str,
+        arguments: Mapping[str, object],
+        product_operation_id: str,
+    ) -> tuple[IntegrationPrincipal, ConnectorGrantClaims]:
+        """Mint, validate, and consume one exact live Directory connector proof."""
+
+        authority = self._connector_grant_authority
+        verifier = self._connector_grant_verifier
+        if authority is None or verifier is None or not verifier.configured:
+            raise PermissionError("Platform connector-grant authority is unavailable")
+        if profile.provider != connection.provider:
+            raise PermissionError("provider profile does not match the persisted connection")
+        provider_id = "huggingface" if connection.provider == "hf" else connection.provider
+        profile_ref = (
+            connection.account_link_ref if connection.provider == "hf" else connection.binding_ref
+        )
+        if not profile_ref:
+            raise PermissionError("provider profile reference is unavailable")
+        payload = dict(arguments)
+        arguments_digest = digest_arguments(payload)
+        target = _resource_projection(
+            provider_id=provider_id,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            arguments=payload,
+        )
+        resource_ref = _resource_ref(
+            provider_id=provider_id,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            target=target,
+        )
+        request_id = str(uuid4())
+        expected = {
+            "request_id": request_id,
+            "organization_id": connection.organization_id,
+            "workspace_id": connection.workspace_id,
+            "principal_issuer": connection.actor_issuer,
+            "principal_subject": connection.actor_subject,
+            "connection_ref": str(connection.id),
+            "provider_id": provider_id,
+            "profile_ref": profile_ref,
+            "operation_id": operation_id,
+            "resource_ref": resource_ref,
+            "arguments_digest_sha256": bytes.fromhex(arguments_digest),
+        }
+        grant_bytes = authority.authorize_connector_operation(
+            workspace_id=connection.workspace_id,
+            principal_issuer=connection.actor_issuer,
+            principal_subject=connection.actor_subject,
+            connection_ref=str(connection.id),
+            provider_id=provider_id,
+            profile_ref=profile_ref,
+            operation_id=operation_id,
+            resource_ref=resource_ref,
+            arguments_digest_sha256=bytes.fromhex(arguments_digest),
+            request_id=request_id,
+        )
+        verifier.validate_authority_response(grant_bytes, expected=expected)
+        claims = verifier.consume(grant_bytes, expected=expected)
+        verified_principal = IntegrationPrincipal(
+            issuer=claims.principal_issuer,
+            subject=claims.principal_subject,
+            organization_id=claims.organization_id,
+            workspace_id=claims.workspace_id,
+            allowed_operation_ids=frozenset({product_operation_id, operation_id}),
+        )
+        self._registry.profile_for_connection(
+            verified_principal,
+            connection,
+            operation_id=product_operation_id,
+        )
+        return verified_principal, claims
 
     def for_claimed_notification(
         self,
@@ -217,6 +406,41 @@ class PlatformCurrentAuthorizationContextResolver:
         return principal
 
 
+def _health_grant_scope(
+    connection: IntegrationConnection,
+    profile: AuthorizationProviderProfile,
+    *,
+    product_operation_id: str,
+) -> tuple[str | None, dict[str, object] | None]:
+    """Build one host-selected read target for a background health probe."""
+
+    if product_operation_id != "integrationGetAuthorizationHealth":
+        return None, None
+    if connection.provider == "hf":
+        target = profile.targets.get(connection.target_ref or "")
+        repositories = (profile.account_scopes or {}).get("repositories")
+        if target is None or not isinstance(repositories, list):
+            return None, None
+        selected = [
+            item
+            for item in repositories
+            if isinstance(item, Mapping)
+            and item.get("repo_id") == target.target_ref
+            and "read" in item.get("permissions", [])
+        ]
+        if len(selected) != 1:
+            return None, None
+        row = selected[0]
+        repo_type = row.get("repo_type")
+        repo_id = row.get("repo_id")
+        if repo_type not in {"model", "dataset", "space"} or not isinstance(repo_id, str):
+            return None, None
+        return "huggingface.repo.get", {"repo_type": repo_type, "repo_id": repo_id}
+    if connection.provider in {"azure", "gcp", "runpod"}:
+        return "cloud.provider.health.read", {"profile_ref": profile.profile_ref}
+    return None, None
+
+
 _OFFICIAL_WECOM_QR_URL = re.compile(
     r"^https://work\.weixin\.qq\.com/ai/qc/gen\?source=wecom_cli_external&scode=[A-Za-z0-9_-]{8,256}$"
 )
@@ -246,6 +470,53 @@ class IntegrationToolCallUnavailable(RuntimeError):
         self.retryable = retryable
 
 
+def _huggingface_health_record(
+    connection: IntegrationConnection,
+    *,
+    checked_at: datetime,
+    login_state: LoginState,
+    authorization_state: AuthorizationState,
+    generation: int = 0,
+    reason_code: str | None = None,
+    expires_at: datetime | None = None,
+    capabilities: list[AuthorizationCapabilityRecord] | None = None,
+) -> AuthorizationHealthRecord:
+    """Build one sanitized HF profile observation from the Account Center lease path."""
+
+    return AuthorizationHealthRecord(
+        organization_id=connection.organization_id,
+        workspace_id=connection.workspace_id,
+        actor_issuer=connection.actor_issuer,
+        actor_subject=connection.actor_subject,
+        connection_id=connection.id,
+        authorization_ref=connection.account_link_ref,
+        reason_code=reason_code,
+        login_state=login_state,
+        authorization_state=authorization_state,
+        checked_at=checked_at,
+        expires_at=expires_at,
+        generation=generation,
+        capabilities=capabilities or [],
+    )
+
+
+def _provider_timestamp(value: object) -> datetime | None:
+    """Parse one RFC3339 provider timestamp without accepting naive local time."""
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None  # diagnostic-allow: malformed optional expiry has no safe deadline.
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
 class AuthorizationCloudDirectProvider:
     """Invoke only SDK-whitelisted tools through trusted DirectPlugin bindings."""
 
@@ -259,6 +530,7 @@ class AuthorizationCloudDirectProvider:
         registry: AuthorizationCloudProfileRegistry,
         provider_clients: Mapping[str, DirectInvoker],
         email_client: DirectInvoker | None,
+        account_center: Any = None,
         current_context_resolver: Any,
         context_key: Callable[[str], bytes],
     ) -> None:
@@ -266,6 +538,7 @@ class AuthorizationCloudDirectProvider:
         self._registry = registry
         self._provider_clients = dict(provider_clients)
         self._email_client = email_client
+        self._account_center = account_center
         self._current_context_resolver = current_context_resolver
         self._context_key = context_key
 
@@ -293,6 +566,19 @@ class AuthorizationCloudDirectProvider:
         principal, profile, target_ref = self._verified_connection(
             principal, connection, operation_id="integrationGetAuthorizationHealth"
         )
+        if profile.provider == "hf":
+            return self._huggingface_authorization_health(
+                principal,
+                connection,
+                profile,
+                target_ref=target_ref,
+            )
+        if profile.provider in {"azure", "gcp", "runpod"}:
+            return self._cloud_management_authorization_health(
+                principal,
+                connection,
+                profile,
+            )
         if profile.provider == "wecom":
             tool_id = "wecom_authorization_health"
             arguments = {"authorization_ref": profile.authorization_ref}
@@ -318,6 +604,13 @@ class AuthorizationCloudDirectProvider:
         )
         if observed.authorization_ref != expected_ref:
             raise ProviderObservationUnavailable("authorization reference did not match binding")
+        access_token_expiry = observed.expires_at
+        capability_expiry = {item.capability_id: item.expires_at for item in observed.capabilities}
+        if profile.provider in {"azure", "gcp"}:
+            # These profiles reacquire short-lived bearer tokens during every
+            # health check; their token TTL is not the lifetime of the identity.
+            access_token_expiry = None
+            capability_expiry = {item.capability_id: None for item in observed.capabilities}
         return AuthorizationHealthRecord(
             organization_id=connection.organization_id,
             workspace_id=connection.workspace_id,
@@ -333,17 +626,442 @@ class AuthorizationCloudDirectProvider:
             login_state=LoginState(observed.login_state.value),
             authorization_state=AuthorizationState(observed.authorization_state.value),
             checked_at=observed.checked_at,
-            expires_at=observed.expires_at,
+            expires_at=access_token_expiry,
             generation=observed.generation,
             capabilities=[
                 AuthorizationCapabilityRecord(
                     capability_id=item.capability_id,
                     state=AuthorizationState(item.state.value),
                     last_verified_at=item.last_verified_at,
-                    expires_at=item.expires_at,
+                    expires_at=capability_expiry[item.capability_id],
                     reason_code=item.reason_code,
                 )
                 for item in observed.capabilities
+            ],
+        )
+
+    def _cloud_management_authorization_health(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        profile: AuthorizationProviderProfile,
+    ) -> AuthorizationHealthRecord:
+        """Normalize the native cloud-management health DTO for its live binding."""
+
+        result = self._call_profile(
+            profile,
+            principal,
+            tool_id="cloud_provider_health",
+            arguments={"profile_ref": profile.profile_ref},
+            request_id=str(uuid4()),
+        )
+        if (
+            result.get("profile_ref") != profile.profile_ref
+            or result.get("provider") != connection.provider
+        ):
+            raise ProviderObservationUnavailable("cloud profile health scope did not match")
+        authentication = result.get("authentication_state")
+        authorization = result.get("authorization_state")
+        if authentication not in {
+            "VALID",
+            "MISSING",
+            "INVALID",
+            "UNKNOWN",
+        } or authorization not in {"VALID", "UNKNOWN", "DENIED"}:
+            raise ProviderObservationUnavailable("cloud profile health state is invalid")
+        checked_at = _provider_timestamp(result.get("checked_at"))
+        if checked_at is None:
+            raise ProviderObservationUnavailable("cloud profile health timestamp is invalid")
+        if authentication == "MISSING":
+            login_state = LoginState.MISSING
+        elif authentication in {"VALID", "INVALID"}:
+            login_state = LoginState.PRESENT
+        else:
+            login_state = LoginState.UNKNOWN
+        if authorization == "DENIED":
+            authorization_state = AuthorizationState.PERMISSION_DENIED
+        elif authentication == "INVALID":
+            authorization_state = AuthorizationState.REAUTHORIZATION_REQUIRED
+        elif authorization == "VALID" and authentication == "VALID":
+            authorization_state = AuthorizationState.VALID
+        else:
+            authorization_state = AuthorizationState.UNKNOWN
+
+        raw_scopes = result.get("scope_refs")
+        if not isinstance(raw_scopes, list) or len(raw_scopes) > 100:
+            raise ProviderObservationUnavailable("cloud profile health scopes are invalid")
+        capability_ids = [
+            scope
+            for scope in raw_scopes
+            if isinstance(scope, str)
+            and 1 <= len(scope) <= 200
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", scope)
+        ]
+        if len(capability_ids) != len(raw_scopes):
+            raise ProviderObservationUnavailable("cloud profile health scopes are invalid")
+        reason_code = result.get("reason_code")
+        if not isinstance(reason_code, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}", reason_code
+        ):
+            reason_code = None
+        generation_value = result.get("generation", 0)
+        generation = (
+            generation_value
+            if isinstance(generation_value, int)
+            and not isinstance(generation_value, bool)
+            and generation_value >= 0
+            else 0
+        )
+        expires_at = _provider_timestamp(result.get("expires_at"))
+        if connection.provider in {"azure", "gcp"}:
+            # Managed identity and WIF token expiry is renewed automatically by
+            # the native cloud provider and is not the identity's lifetime.
+            expires_at = None
+        if not capability_ids:
+            capability_ids = ["cloud.provider.health.read"]
+        return AuthorizationHealthRecord(
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            actor_issuer=connection.actor_issuer,
+            actor_subject=connection.actor_subject,
+            connection_id=connection.id,
+            authorization_ref=None,
+            reason_code=reason_code,
+            login_state=login_state,
+            authorization_state=authorization_state,
+            checked_at=checked_at,
+            expires_at=expires_at,
+            generation=generation,
+            capabilities=[
+                AuthorizationCapabilityRecord(
+                    capability_id=scope,
+                    state=authorization_state,
+                    last_verified_at=checked_at,
+                    expires_at=expires_at,
+                    reason_code=reason_code,
+                )
+                for scope in capability_ids
+            ],
+        )
+
+    def _huggingface_authorization_health(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        profile: AuthorizationProviderProfile,
+        *,
+        target_ref: str | None,
+    ) -> AuthorizationHealthRecord:
+        """Probe only this connection's HF repository through an Account Center lease."""
+
+        checked_at = datetime.now(UTC)
+        profile_ref = connection.account_link_ref
+        if self._account_center is None or not profile_ref:
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.UNAVAILABLE,
+                authorization_state=AuthorizationState.UNAVAILABLE,
+                reason_code="account_center_unavailable",
+            )
+
+        try:
+            account_profiles = self._account_center.list_provider_profiles(principal)
+        except Exception:
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.UNAVAILABLE,
+                authorization_state=AuthorizationState.UNAVAILABLE,
+                reason_code="account_center_unavailable",
+            )
+        rows = account_profiles.get("profiles") if isinstance(account_profiles, Mapping) else None
+        account_profile = (
+            next(
+                (
+                    item
+                    for item in rows
+                    if isinstance(item, Mapping)
+                    and item.get("profile_ref") == profile_ref
+                    and item.get("provider") == "huggingface"
+                ),
+                None,
+            )
+            if isinstance(rows, list)
+            else None
+        )
+        if account_profile is None:
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.MISSING,
+                authorization_state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+                reason_code="account_profile_missing",
+            )
+
+        revision = account_profile.get("credential_revision", 0)
+        generation = 0
+        if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 0:
+            generation = revision
+        configured_auth_mode = profile.auth_mode or "fine_grained_token"
+        auth_mode = account_profile.get("auth_mode", "fine_grained_token")
+        account_scope = account_profile.get("target_scope")
+        if (
+            auth_mode != configured_auth_mode
+            or not isinstance(account_scope, Mapping)
+            or dict(account_scope) != dict(profile.account_scopes or {})
+        ):
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.PRESENT,
+                authorization_state=AuthorizationState.UNKNOWN,
+                generation=generation,
+                reason_code="account_profile_scope_mismatch",
+            )
+
+        auth_status = account_profile.get("auth_status")
+        if auth_status in {"reauthorization_required", "revoked"}:
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.PRESENT,
+                authorization_state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+                generation=generation,
+                reason_code="credential_reauthorization_required",
+            )
+        if auth_status != "healthy":
+            status = (
+                AuthorizationState.UNAVAILABLE
+                if auth_status == "unavailable"
+                else AuthorizationState.UNKNOWN
+            )
+            login = LoginState.UNAVAILABLE if auth_status == "unavailable" else LoginState.UNKNOWN
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=login,
+                authorization_state=status,
+                generation=generation,
+                reason_code="account_profile_unavailable",
+            )
+
+        repositories = account_scope.get("repositories")
+        selected_scope = (
+            [
+                item
+                for item in repositories
+                if isinstance(item, Mapping) and item.get("repo_id") == target_ref
+            ]
+            if isinstance(repositories, list) and isinstance(target_ref, str)
+            else []
+        )
+        read_scope = selected_scope[0] if len(selected_scope) == 1 else None
+        if (
+            read_scope is None
+            or read_scope.get("repo_type") not in {"model", "dataset", "space"}
+            or not isinstance(read_scope.get("repo_id"), str)
+            or "read" not in read_scope.get("permissions", [])
+        ):
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.PRESENT,
+                authorization_state=AuthorizationState.PERMISSION_DENIED,
+                generation=generation,
+                reason_code="huggingface_target_read_scope_missing",
+                capabilities=[
+                    AuthorizationCapabilityRecord(
+                        capability_id="huggingface.repository.read",
+                        state=AuthorizationState.PERMISSION_DENIED,
+                        last_verified_at=checked_at,
+                        reason_code="huggingface_target_read_scope_missing",
+                    )
+                ],
+            )
+
+        target = {
+            "repo_type": read_scope["repo_type"],
+            "repo_id": read_scope["repo_id"],
+        }
+        arguments_sha256 = digest_arguments(target)
+        operation_id = "huggingface.repo.get"
+        connector_grant: Mapping[str, object] | None = None
+        if self._current_context_resolver is None:
+            lease_principal = None
+        elif connection.access_mode == "workspace_operator":
+            for_grant = getattr(
+                self._current_context_resolver,
+                "for_connection_with_connector_grant",
+                None,
+            )
+            lease_principal, claims = (
+                for_grant(
+                    connection,
+                    operation_id="integrationGetAuthorizationHealth",
+                    provider_operation_id=operation_id,
+                    arguments=target,
+                )
+                if callable(for_grant)
+                else (None, None)
+            )
+            if claims is not None:
+                connector_grant = _account_center_grant_proof(
+                    claims,
+                    arguments_sha256=arguments_sha256,
+                )
+        else:
+            lease_principal = self._current_context_resolver.for_connection(
+                connection,
+                operation_id="integrationGetAuthorizationHealth",
+            )
+        if lease_principal is None:
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.UNKNOWN,
+                authorization_state=AuthorizationState.UNKNOWN,
+                generation=generation,
+                reason_code="current_authority_unavailable",
+            )
+
+        try:
+            lease_arguments: dict[str, object] = {
+                "profile_ref": profile_ref,
+                "operation_id": operation_id,
+                "target": target,
+                "arguments_sha256": arguments_sha256,
+            }
+            if connector_grant is not None:
+                lease_arguments["connector_grant"] = connector_grant
+            lease = self._account_center.create_provider_credential_lease(
+                lease_principal,
+                **lease_arguments,
+            )
+            lease_ref = lease.get("lease_ref") if isinstance(lease, Mapping) else None
+            if (
+                not isinstance(lease_ref, str)
+                or not lease_ref
+                or lease.get("profile_ref") != profile_ref
+                or lease.get("provider") != "huggingface"
+                or lease.get("operation_id") != operation_id
+                or lease.get("target") != target
+                or lease.get("arguments_sha256") != arguments_sha256
+            ):
+                raise ProviderObservationUnavailable("Account Center lease scope is invalid")
+            result = self.invoke_connector_tool(
+                lease_principal,
+                connection,
+                operation_id=operation_id,
+                tool_id=operation_id,
+                arguments={
+                    "profile_ref": profile_ref,
+                    "lease_ref": lease_ref,
+                    "payload": target,
+                },
+                request_id=str(uuid4()),
+            )
+        except ExchangeProductError as exc:
+            if exc.code == "EXCHANGE_CONNECTOR_AUTH_EXPIRED":
+                state = AuthorizationState.REAUTHORIZATION_REQUIRED
+                reason = "credential_reauthorization_required"
+            elif exc.code == "EXCHANGE_CONNECTOR_PERMISSION_DENIED":
+                state = AuthorizationState.PERMISSION_DENIED
+                reason = "permission_denied"
+            elif exc.code == "EXCHANGE_ACCOUNT_CENTER_AUTHORIZATION_DENIED":
+                state = AuthorizationState.PERMISSION_DENIED
+                reason = "account_center_authorization_denied"
+            else:
+                state = AuthorizationState.UNAVAILABLE
+                reason = "provider_observation_unavailable"
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.PRESENT,
+                authorization_state=state,
+                generation=generation,
+                reason_code=reason,
+                capabilities=[
+                    AuthorizationCapabilityRecord(
+                        capability_id="huggingface.repository.read",
+                        state=state,
+                        last_verified_at=checked_at,
+                        reason_code=reason,
+                    )
+                ],
+            )
+        except Exception:
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.UNAVAILABLE,
+                authorization_state=AuthorizationState.UNAVAILABLE,
+                generation=generation,
+                reason_code="provider_observation_unavailable",
+            )
+
+        if not isinstance(result, Mapping) or result.get("repo_id") != target["repo_id"]:
+            return _huggingface_health_record(
+                connection,
+                checked_at=checked_at,
+                login_state=LoginState.UNKNOWN,
+                authorization_state=AuthorizationState.UNKNOWN,
+                generation=generation,
+                reason_code="provider_observation_invalid",
+            )
+        try:
+            refreshed_profiles = self._account_center.list_provider_profiles(principal)
+            refreshed_rows = (
+                refreshed_profiles.get("profiles")
+                if isinstance(refreshed_profiles, Mapping)
+                else None
+            )
+            refreshed_profile = (
+                next(
+                    (
+                        item
+                        for item in refreshed_rows
+                        if isinstance(item, Mapping)
+                        and item.get("profile_ref") == profile_ref
+                        and item.get("provider") == "huggingface"
+                    ),
+                    account_profile,
+                )
+                if isinstance(refreshed_rows, list)
+                else account_profile
+            )
+        except Exception:
+            refreshed_profile = account_profile
+        refreshed_revision = refreshed_profile.get("credential_revision", generation)
+        generation = (
+            refreshed_revision
+            if isinstance(refreshed_revision, int)
+            and not isinstance(refreshed_revision, bool)
+            and refreshed_revision >= 0
+            else generation
+        )
+        credential_expiry = refreshed_profile.get("expires_at")
+        expires_at = None
+        if (
+            auth_mode != "device_oauth"
+            and isinstance(credential_expiry, int)
+            and not isinstance(credential_expiry, bool)
+        ):
+            expires_at = datetime.fromtimestamp(credential_expiry, UTC)
+        return _huggingface_health_record(
+            connection,
+            checked_at=checked_at,
+            login_state=LoginState.PRESENT,
+            authorization_state=AuthorizationState.VALID,
+            generation=generation,
+            expires_at=expires_at,
+            capabilities=[
+                AuthorizationCapabilityRecord(
+                    capability_id="huggingface.repository.read",
+                    state=AuthorizationState.VALID,
+                    last_verified_at=checked_at,
+                    expires_at=expires_at,
+                )
             ],
         )
 
@@ -377,6 +1095,18 @@ class AuthorizationCloudDirectProvider:
         )
         if arguments.get("profile_ref") != expected_profile_ref:
             raise PermissionError("provider profile argument does not match the connection")
+        if current.provider == "hf":
+            return _invoke_signed_huggingface_tool(
+                self._provider_clients.get(profile.profile_ref),
+                endpoint=profile.endpoint,
+                principal=principal,
+                profile=profile,
+                context_key=self._context_key(profile.context_key_ref),
+                tool_id=tool_id,
+                operation_id=operation_id,
+                arguments=arguments,
+                request_id=request_id,
+            )
         return self._call_profile(
             profile,
             principal,
@@ -457,14 +1187,38 @@ class AuthorizationCloudDirectProvider:
         *,
         request_id: str,
     ) -> ProviderRenewalSession:
-        principal, profile, _ = self._verified_connection(
-            principal, connection, operation_id="accountBeginRenewalSession"
-        )
-        if (
-            profile.provider != "wecom"
-            or authorization_ref != profile.authorization_ref
-            or not _OPAQUE_PROVIDER_REF.fullmatch(authorization_ref)
-        ):
+        if connection.provider == "hf":
+            principal, profile, _ = self._verified_request_connection(
+                principal,
+                connection,
+                operation_id="accountBeginRenewalSession",
+            )
+        else:
+            principal, profile, _ = self._verified_connection(
+                principal,
+                connection,
+                operation_id="accountBeginRenewalSession",
+            )
+        if not _OPAQUE_PROVIDER_REF.fullmatch(authorization_ref):
+            raise PermissionError("renewal authorization is not selected by the verified binding")
+        if profile.provider == "hf":
+            if (
+                profile.auth_mode != "device_oauth"
+                or connection.account_link_ref != authorization_ref
+                or self._account_center is None
+            ):
+                raise PermissionError("HF renewal is not selected by the linked OAuth profile")
+            result = self._account_center.begin_huggingface_renewal(
+                principal,
+                profile_ref=authorization_ref,
+                session_ref=request_id,
+            )
+            return _huggingface_renewal_session(
+                result,
+                expected_profile_ref=authorization_ref,
+                expected_session_ref=request_id,
+            )
+        if profile.provider != "wecom" or authorization_ref != profile.authorization_ref:
             raise PermissionError("renewal authorization is not selected by the verified binding")
         result = self._call_profile(
             profile,
@@ -483,17 +1237,41 @@ class AuthorizationCloudDirectProvider:
         *,
         request_id: str,
     ) -> ProviderRenewalSession:
-        connection = self._store.connection_for_authorization(
+        connection = _renewal_connection_for_provider(
+            self._store,
             principal,
             authorization_ref,
-            provider="wecom",
-            authorization_operation_id="accountGetRenewalSession",
-        )
-        principal, profile, _ = self._verified_connection(
-            principal,
-            connection,
             operation_id="accountGetRenewalSession",
         )
+        if connection.provider == "hf":
+            principal, profile, _ = self._verified_request_connection(
+                principal,
+                connection,
+                operation_id="accountGetRenewalSession",
+            )
+        else:
+            principal, profile, _ = self._verified_connection(
+                principal,
+                connection,
+                operation_id="accountGetRenewalSession",
+            )
+        if profile.provider == "hf":
+            if (
+                profile.auth_mode != "device_oauth"
+                or self._account_center is None
+                or connection.account_link_ref != authorization_ref
+            ):
+                raise PermissionError("HF renewal profile is not available in Account Center")
+            result = self._account_center.poll_huggingface_renewal(
+                principal,
+                profile_ref=authorization_ref,
+                session_ref=provider_session_ref,
+            )
+            return _huggingface_renewal_session(
+                result,
+                expected_profile_ref=authorization_ref,
+                expected_session_ref=provider_session_ref,
+            )
         result = self._call_profile(
             profile,
             principal,
@@ -511,17 +1289,41 @@ class AuthorizationCloudDirectProvider:
         request_id: str,
         status_request_id: str,
     ) -> ProviderRenewalSession:
-        connection = self._store.connection_for_authorization(
+        connection = _renewal_connection_for_provider(
+            self._store,
             principal,
             authorization_ref,
-            provider="wecom",
-            authorization_operation_id="accountGetRenewalSession",
-        )
-        principal, profile, _ = self._verified_connection(
-            principal,
-            connection,
             operation_id="accountGetRenewalSession",
         )
+        if connection.provider == "hf":
+            principal, profile, _ = self._verified_request_connection(
+                principal,
+                connection,
+                operation_id="accountGetRenewalSession",
+            )
+        else:
+            principal, profile, _ = self._verified_connection(
+                principal,
+                connection,
+                operation_id="accountGetRenewalSession",
+            )
+        if profile.provider == "hf":
+            if (
+                profile.auth_mode != "device_oauth"
+                or self._account_center is None
+                or connection.account_link_ref != authorization_ref
+            ):
+                raise PermissionError("HF renewal profile is not available in Account Center")
+            result = self._account_center.poll_huggingface_renewal(
+                principal,
+                profile_ref=authorization_ref,
+                session_ref=request_id,
+            )
+            return _huggingface_renewal_session(
+                result,
+                expected_profile_ref=authorization_ref,
+                expected_session_ref=request_id,
+            )
         result = self._call_profile(
             profile,
             principal,
@@ -630,6 +1432,26 @@ class AuthorizationCloudDirectProvider:
         )
         return fresh, profile, target_ref
 
+    def _verified_request_connection(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        *,
+        operation_id: str,
+    ) -> tuple[IntegrationPrincipal, AuthorizationProviderProfile, str | None]:
+        """Validate one current user request without requiring a stored bearer context."""
+
+        principal.require(operation_id)
+        current = self._store.current_connection_for_provider_call(connection.id)
+        if current is None or current != connection or not current.enabled:
+            raise PermissionError("connection changed before provider call")
+        profile, target_ref = self._registry.profile_for_connection(
+            principal,
+            current,
+            operation_id=operation_id,
+        )
+        return principal, profile, target_ref
+
     def _call_profile(
         self,
         profile: AuthorizationProviderProfile,
@@ -723,6 +1545,122 @@ def _renewal_session(
         authorization_url=safe_url,
         qr_attachment_ref=session.qr_attachment_ref,
         generation=session.generation,
+    )
+
+
+def _renewal_connection_for_provider(
+    store: IntegrationStore,
+    principal: IntegrationPrincipal,
+    authorization_ref: str,
+    *,
+    operation_id: str,
+) -> IntegrationConnection:
+    """Resolve exactly one attached WeCom or Hugging Face renewal connection."""
+
+    selected = []
+    for provider in ("wecom", "hf"):
+        try:
+            selected.append(
+                store.connection_for_authorization(
+                    principal,
+                    authorization_ref,
+                    provider=provider,
+                    authorization_operation_id=operation_id,
+                )
+            )
+        except IntegrationNotFound:
+            continue
+    if not selected:
+        raise IntegrationNotFound("authorization is not attached to this actor's connection")
+    if len(selected) != 1:
+        raise IntegrationConflict("authorization reference matches multiple provider bindings")
+    return selected[0]
+
+
+def _huggingface_renewal_session(
+    result: Mapping[str, Any],
+    *,
+    expected_profile_ref: str,
+    expected_session_ref: str,
+) -> ProviderRenewalSession:
+    """Validate Account Center device-flow metadata before Product persistence."""
+
+    states = {
+        "starting": RenewalState.VERIFYING,
+        "waiting_user": RenewalState.WAITING_USER,
+        "succeeded": RenewalState.SUCCEEDED,
+        "failed": RenewalState.FAILED,
+        "expired": RenewalState.EXPIRED,
+        "cancelled": RenewalState.CANCELLED,
+        "unknown": RenewalState.VERIFYING,
+    }
+    status = result.get("state")
+    session_ref = result.get("session_ref")
+    profile_ref = result.get("profile_ref")
+    if (
+        profile_ref != expected_profile_ref
+        or session_ref != expected_session_ref
+        or not isinstance(profile_ref, str)
+        or not _OPAQUE_PROVIDER_REF.fullmatch(profile_ref)
+        or not isinstance(session_ref, str)
+        or not _OPAQUE_PROVIDER_REF.fullmatch(session_ref)
+        or not isinstance(status, str)
+        or status not in states
+    ):
+        raise RuntimeError("Account Center renewal session escaped its fixed profile scope")
+    raw_user_code = result.get("user_code")
+    user_code = None
+    if raw_user_code is not None:
+        if (
+            not isinstance(raw_user_code, str)
+            or re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}", raw_user_code) is None
+        ):
+            raise RuntimeError("Account Center renewal user code is invalid")
+        user_code = raw_user_code
+    raw_url = result.get("verification_uri")
+    authorization_url = None
+    if raw_url is not None:
+        if raw_url not in {
+            "https://hf.co/oauth/device",
+            "https://huggingface.co/oauth/device",
+        }:
+            raise RuntimeError("Account Center renewal URL is outside the fixed HF route")
+        authorization_url = raw_url
+    if states[status] == RenewalState.WAITING_USER and (
+        user_code is None or authorization_url is None
+    ):
+        raise RuntimeError("Account Center waiting session has no user action metadata")
+    raw_expiry = result.get("expires_at")
+    if raw_expiry is not None and (
+        isinstance(raw_expiry, bool) or not isinstance(raw_expiry, int) or raw_expiry <= 0
+    ):
+        raise RuntimeError("Account Center renewal expiry is invalid")
+    raw_interval = result.get("interval_seconds")
+    if raw_interval is not None and (
+        isinstance(raw_interval, bool)
+        or not isinstance(raw_interval, int)
+        or not 1 <= raw_interval <= 300
+    ):
+        raise RuntimeError("Account Center polling interval is invalid")
+    generation = result.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise RuntimeError("Account Center profile generation is invalid")
+    reason_code = result.get("reason_code")
+    if reason_code is not None and (
+        not isinstance(reason_code, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}", reason_code) is None
+    ):
+        raise RuntimeError("Account Center renewal reason code is invalid")
+    return ProviderRenewalSession(
+        authorization_ref=profile_ref,
+        session_ref=session_ref,
+        state=states[status],
+        created_at=datetime.now(UTC),
+        expires_at=(datetime.fromtimestamp(raw_expiry, UTC) if raw_expiry is not None else None),
+        authorization_url=authorization_url,
+        qr_attachment_ref=None,
+        generation=generation,
+        user_code=user_code,
     )
 
 
@@ -918,6 +1856,140 @@ def _invoke_signed_tool(
             raise IntegrationToolCallUnavailable() from exc
         if isinstance(decoded, Mapping):
             values.append(dict(decoded))
+    if len(values) != 1:
+        raise IntegrationToolCallUnavailable()
+    return values[0]
+
+
+def _invoke_signed_huggingface_tool(
+    client: DirectInvoker | None,
+    *,
+    endpoint: DirectPluginEndpointConfig,
+    principal: IntegrationPrincipal,
+    profile: AuthorizationProviderProfile,
+    context_key: bytes,
+    tool_id: str,
+    operation_id: str,
+    arguments: Mapping[str, object],
+    request_id: str,
+) -> dict[str, Any]:
+    """Use the Hugging Face Plugin's lease envelope without serializing credentials."""
+
+    operation_for_tool = {
+        "huggingface.models.list": "huggingface.models.list",
+        "huggingface.datasets.list": "huggingface.datasets.list",
+        "huggingface.spaces.list": "huggingface.spaces.list",
+        "huggingface.repo.get": "huggingface.repo.get",
+        "huggingface.file.download": "huggingface.file.download",
+        "huggingface.file.upload": "huggingface.file.upload",
+    }
+    if (
+        client is None
+        or operation_for_tool.get(tool_id) != operation_id
+        or len(context_key) != 32
+        or not request_id
+        or principal.issuer != profile.expected_issuer
+    ):
+        raise PermissionError("Hugging Face provider binding is incomplete")
+    try:
+        from cyrene_account_center_contracts import sign_context
+
+        from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
+            tool_provider_pb2 as tool_wire,
+        )
+
+        profile_ref = arguments.get("profile_ref")
+        lease_ref = arguments.get("lease_ref")
+        payload = arguments.get("payload")
+        if (
+            not isinstance(profile_ref, str)
+            or not profile_ref
+            or not isinstance(lease_ref, str)
+            or not lease_ref
+            or not isinstance(payload, Mapping)
+        ):
+            raise ValueError("Hugging Face lease envelope is invalid")
+        signed_payload = {
+            "payload": dict(payload),
+            "profile_ref": profile_ref,
+            "lease_ref": lease_ref,
+        }
+        trusted_context = sign_context(
+            method="call_tool",
+            payload=signed_payload,
+            caller_id=profile.caller_workload,
+            issuer=principal.issuer,
+            subject=principal.subject,
+            organization_id=principal.organization_id,
+            workspace_id=principal.workspace_id,
+            binding_id=endpoint.binding_id,
+            request_id=request_id,
+            operation_id=operation_id,
+            key=context_key,
+        )
+        envelope = {
+            **signed_payload,
+            "trusted_context": trusted_context.as_dict(),
+        }
+        request = tool_wire.CallToolRequest(
+            binding_id=endpoint.binding_id,
+            provider_tool_id=tool_id,
+            arguments_json=json.dumps(
+                envelope,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+        )
+    except Exception as exc:
+        raise ProviderObservationUnavailable("Hugging Face signed lease is invalid") from exc
+
+    try:
+        response = client.invoke(
+            capability=PROVIDER_CAPABILITY,
+            interface_version="1",
+            method="call_tool",
+            request=_direct_payload(
+                "type.cyrene.io/cyrene.tool.provider.v1.CallToolRequest",
+                request.SerializeToString(deterministic=True),
+            ),
+            deadline_seconds=10.0,
+            request_id=request_id,
+        )
+    except Exception as exc:
+        raise IntegrationToolCallUnavailable(retryable=True) from exc
+    if response.type_url != "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse":
+        raise IntegrationToolCallUnavailable()
+    try:
+        typed_response = tool_wire.CallToolResponse.FromString(response.value)
+    except Exception as exc:
+        raise IntegrationToolCallUnavailable() from exc
+    if typed_response.WhichOneof("result") != "outcome":
+        raise IntegrationToolCallUnavailable()
+    values: list[dict[str, Any]] = []
+    for part in typed_response.outcome.content:
+        if part.WhichOneof("content") != "json":
+            continue
+        try:
+            decoded = json.loads(part.json.json)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decoded, dict):
+            values.append(decoded)
+    if typed_response.outcome.is_error:
+        error = next(
+            (value.get("error") for value in values if isinstance(value.get("error"), Mapping)),
+            None,
+        )
+        if error is None:
+            raise IntegrationToolCallUnavailable()
+        code = error.get("code")
+        if not isinstance(code, str) or not code:
+            raise IntegrationToolCallUnavailable()
+        _raise_provider_error(
+            code,
+            retryable=error.get("retryable") is True,
+            unknown=error.get("outcome") == "UNKNOWN",
+        )
     if len(values) != 1:
         raise IntegrationToolCallUnavailable()
     return values[0]
