@@ -390,6 +390,7 @@ class ConnectorOperationDispatcher:
             or principal.workspace_id != profile.workspace_id
         ):
             raise PermissionError("Teams actor or profile does not match the fixed host binding")
+        profile.authorize_principal(principal)
         principal.require(operation_id)
         selected = dict(arguments)
         _exact_fields(selected, required={"conversation", "text"})
@@ -412,6 +413,9 @@ class ConnectorOperationDispatcher:
                 tenant_id=_text(conversation["tenantId"], "tenantId"),
                 team_id=_text(conversation["teamId"], "teamId"),
                 channel_id=_text(conversation["channelId"], "channelId"),
+                conversation_id=_text(conversation["conversationId"], "conversationId"),
+                root_thread_id=_text(conversation["rootThreadId"], "rootThreadId"),
+                service_url=_text(conversation["serviceUrl"], "serviceUrl"),
             )
         except (ValueError, PermissionError) as exc:
             raise PermissionError("Teams conversation is outside the configured allowlist") from exc

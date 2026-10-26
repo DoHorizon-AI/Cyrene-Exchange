@@ -129,6 +129,63 @@ def test_account_center_direct_call_uses_fixed_method_and_signed_context() -> No
     )
 
 
+def test_account_center_huggingface_renewal_uses_exact_profile_and_session_refs() -> None:
+    transport = _DirectClient(
+        [
+            DirectPayload(
+                "type.googleapis.com/cyrene.account.center.v1.BeginHuggingFaceRenewalResponse",
+                b'{"profile_ref":"00000000-0000-4000-8000-000000000001",'
+                b'"session_ref":"00000000-0000-4000-8000-000000000002",'
+                b'"state":"waiting_user","user_code":"L94P-HPL8",'
+                b'"verification_uri":"https://hf.co/oauth/device",'
+                b'"expires_at":1800000000,"interval_seconds":5,'
+                b'"generation":7,"reason_code":null}',
+            ),
+            DirectPayload(
+                "type.googleapis.com/cyrene.account.center.v1.PollHuggingFaceRenewalResponse",
+                b'{"profile_ref":"00000000-0000-4000-8000-000000000001",'
+                b'"session_ref":"00000000-0000-4000-8000-000000000002",'
+                b'"state":"succeeded","user_code":null,"verification_uri":null,'
+                b'"expires_at":null,"interval_seconds":null,"generation":8,'
+                b'"reason_code":null}',
+            ),
+        ]
+    )
+    client = AccountCenterClient(
+        transport,
+        exchange_signer=AccountCenterRequestSigner(caller_id="exchange-service", key=b"a" * 32),
+        binding_id="account-center-binding",
+    )
+    profile_ref = "00000000-0000-4000-8000-000000000001"
+    session_ref = "00000000-0000-4000-8000-000000000002"
+
+    waiting = client.begin_huggingface_renewal(
+        _principal(),
+        profile_ref=profile_ref,
+        session_ref=session_ref,
+    )
+    completed = client.poll_huggingface_renewal(
+        _principal(),
+        profile_ref=profile_ref,
+        session_ref=session_ref,
+    )
+
+    assert waiting["user_code"] == "L94P-HPL8"
+    assert waiting["verification_uri"] == "https://hf.co/oauth/device"
+    assert completed["state"] == "succeeded"
+    assert completed["user_code"] is None
+    methods = ("begin_huggingface_renewal", "poll_huggingface_renewal")
+    for call, method in zip(transport.calls, methods, strict=True):
+        envelope = json.loads(call["request"].value)
+        assert call["method"] == method
+        assert envelope["payload"] == {
+            "profile_ref": profile_ref,
+            "session_ref": session_ref,
+        }
+        assert envelope["trusted_context"]["operation_id"] == method
+        assert not {"device_code", "access_token", "refresh_token"} & set(envelope["payload"])
+
+
 @pytest.mark.parametrize(
     ("configured_deadline", "expected_deadline"),
     [(None, 50.0), (42.0, 42.0)],

@@ -579,9 +579,30 @@ def test_minimal_teams_github_huggingface_profile_builds_without_legacy_services
     assert report["wecomBindingId"] is None
     assert report["currentAuthorityContextCount"] == 0
     assert report["teamsMessagesConfigured"] is True
+    assert report["teamsSystemNotificationConfigured"] is False
     assert "identity" not in configuration["platformAuthority"]
     assert "productWorkload" not in configuration["platformAuthority"]
     assert "wecom" not in configuration
+
+    notification_configuration = json.loads(json.dumps(configuration))
+    notification_configuration["connectorHost"]["teamsMessages"]["systemNotification"] = {
+        "profileRef": "teams-owner-notification-v1",
+        "ownerSubject": "owner-object-id-from-directory",
+        "fixedRoute": {
+            "tenantId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "teamId": "team-id-from-teams",
+            "channelId": "channel-id-from-teams",
+            "conversationId": "19:owner-thread@thread.tacv2",
+            "rootThreadId": "1740000000000",
+            "serviceUrl": "https://smba.trafficmanager.net/amer/",
+        },
+    }
+    notification_environ = {
+        **environ,
+        integration_cli.CONFIGURATION_ENV: json.dumps(notification_configuration),
+    }
+    notification_report = integration_cli.validate_host_configuration(environ=notification_environ)
+    assert notification_report["teamsSystemNotificationConfigured"] is True
 
     invalid_configuration = json.loads(json.dumps(configuration))
     invalid_configuration["accountCenter"]["githubAppInstallationDeadlineSeconds"] = 121

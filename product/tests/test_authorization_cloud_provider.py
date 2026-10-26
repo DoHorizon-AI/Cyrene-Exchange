@@ -78,7 +78,7 @@ def _principal(*, operations: set[str] | None = None, subject: str = _SUBJECT):
     )
 
 
-def _settings(*, include_wecom: bool = True, include_email: bool = True):
+def _settings(*, include_wecom: bool = True, include_email: bool = True, include_gcp: bool = False):
     profiles: dict[str, Any] = {
         "azure-prod": {
             "provider": "azure",
@@ -103,6 +103,29 @@ def _settings(*, include_wecom: bool = True, include_email: bool = True):
             },
         }
     }
+    if include_gcp:
+        profiles["gcp-prod"] = {
+            "provider": "gcp",
+            "directPlugin": {
+                "bindingId": "cloud.binding.gcp",
+                "connectionRef": "grpc://127.0.0.1:5504",
+                "transport": "local",
+            },
+            "callerWorkload": "exchange.integrations",
+            "audience": "cloud-management",
+            "expectedIssuer": _ISSUER,
+            "contextKeyRef": "keys/cloud-gcp",
+            "organizationId": _ORG,
+            "workspaceId": _WORKSPACE,
+            "allowedContextRefs": ["actor-a"],
+            "targets": {
+                "instance-prod": {
+                    "targetRef": "gcp-instance-prod",
+                    "displayName": "Production instance",
+                    "allowedContextRefs": ["actor-a"],
+                }
+            },
+        }
     if include_wecom:
         profiles["wecom-prod"] = {
             "provider": "wecom",
@@ -220,8 +243,16 @@ def _connection(store: IntegrationStore, principal: IntegrationPrincipal, provid
         principal,
         CreateIntegrationConnection(
             provider=provider,
-            binding_ref="wecom-prod" if provider == "wecom" else "azure-prod",
-            target_ref=None if provider == "wecom" else "vm-prod",
+            binding_ref=(
+                "wecom-prod"
+                if provider == "wecom"
+                else "gcp-prod"
+                if provider == "gcp"
+                else "azure-prod"
+            ),
+            target_ref=(
+                None if provider == "wecom" else "instance-prod" if provider == "gcp" else "vm-prod"
+            ),
             display_name="WeCom" if provider == "wecom" else "Production VM",
         ),
         idempotency_key=f"connection-{provider}",
@@ -643,34 +674,110 @@ def test_authorization_health_uses_fixed_signed_wecom_tool_and_native_ref(tmp_pa
     store.close()
 
 
+@pytest.mark.parametrize("provider_id", ["azure", "gcp"])
 def test_managed_cloud_token_ttl_is_not_projected_as_authorization_expiry(
     tmp_path: Path,
+    provider_id: str,
 ) -> None:
-    settings = _settings(include_wecom=False, include_email=False)
+    settings = _settings(
+        include_wecom=False,
+        include_email=False,
+        include_gcp=provider_id == "gcp",
+    )
     registry = AuthorizationCloudProfileRegistry(settings)
     principal = _principal()
     store = IntegrationStore(tmp_path / "integrations.sqlite3")
-    connection = _connection(store, principal, provider="azure")
+    connection = _connection(store, principal, provider=provider_id)
     now = datetime.now(UTC)
-    health = sdk.AuthorizationHealth(
-        schema_version=1,
-        authorization_ref="cloud.binding.azure",
-        login_state=sdk.LoginState.PRESENT,
-        authorization_state=sdk.AuthorizationState.VALID,
-        checked_at=now,
-        expires_at=now + timedelta(minutes=60),
-        generation=3,
-        capabilities=(
-            sdk.CapabilityAuthorizationHealth(
-                capability_id="cloud.vm.read",
-                state=sdk.AuthorizationState.VALID,
-                last_verified_at=now,
-                expires_at=now + timedelta(minutes=60),
-                reason_code=None,
-            ),
-        ),
+    direct = _DirectClient(
+        {
+            "profile_ref": f"{provider_id}-prod",
+            "provider": provider_id,
+            "identity_ref": "managed-identity://health-test",
+            "authentication_state": "VALID",
+            "authorization_state": "VALID",
+            "scope_refs": [f"{provider_id}.resource.read"],
+            "checked_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "expires_at": (now + timedelta(minutes=60))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+            "reason_code": None,
+        }
     )
-    direct = _DirectClient(sdk.serialize_authorization_health(health))
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={f"{provider_id}-prod": direct},
+        email_client=None,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda _reference: _KEY,
+    )
+
+    observed = provider.authorization_health(principal, connection)
+
+    assert observed.authorization_state == AuthorizationState.VALID
+    assert observed.expires_at is None
+    assert observed.capabilities[0].expires_at is None
+    assert observed.generation == 0
+    assert direct.requests[0].provider_tool_id == "cloud_provider_health"
+    envelope = sdk.parse_tool_envelope(json.loads(direct.requests[0].arguments_json))
+    assert dict(envelope.arguments) == {"profile_ref": f"{provider_id}-prod"}
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("authentication", "authorization", "expected_login", "expected_state"),
+    [
+        (
+            "INVALID",
+            "UNKNOWN",
+            LoginState.PRESENT,
+            AuthorizationState.REAUTHORIZATION_REQUIRED,
+        ),
+        (
+            "VALID",
+            "DENIED",
+            LoginState.PRESENT,
+            AuthorizationState.PERMISSION_DENIED,
+        ),
+        ("UNKNOWN", "UNKNOWN", LoginState.UNKNOWN, AuthorizationState.UNKNOWN),
+        ("MISSING", "UNKNOWN", LoginState.MISSING, AuthorizationState.UNKNOWN),
+    ],
+)
+def test_cloud_management_health_maps_auth_permission_and_transport_states(
+    tmp_path: Path,
+    authentication: str,
+    authorization: str,
+    expected_login: LoginState,
+    expected_state: AuthorizationState,
+) -> None:
+    registry = AuthorizationCloudProfileRegistry(
+        _settings(include_wecom=False, include_email=False)
+    )
+    principal = _principal()
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _connection(store, principal, provider="azure")
+    direct = _DirectClient(
+        {
+            "profile_ref": "azure-prod",
+            "provider": "azure",
+            "identity_ref": "managed-identity://health-test",
+            "authentication_state": authentication,
+            "authorization_state": authorization,
+            "scope_refs": ["azure.subscription.read"],
+            "checked_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "expires_at": None,
+            "reason_code": "PROVIDER_TIMEOUT"
+            if authentication == "UNKNOWN"
+            else "AUTHENTICATION_FAILED"
+            if authentication == "INVALID"
+            else "SCOPE_DENIED"
+            if authorization == "DENIED"
+            else "CREDENTIAL_MISSING"
+            if authentication == "MISSING"
+            else None,
+        }
+    )
     provider = AuthorizationCloudDirectProvider(
         store=store,
         registry=registry,
@@ -682,10 +789,9 @@ def test_managed_cloud_token_ttl_is_not_projected_as_authorization_expiry(
 
     observed = provider.authorization_health(principal, connection)
 
-    assert observed.authorization_state == AuthorizationState.VALID
+    assert observed.login_state == expected_login
+    assert observed.authorization_state == expected_state
     assert observed.expires_at is None
-    assert observed.capabilities[0].expires_at is None
-    assert observed.generation == 3
     store.close()
 
 
@@ -1084,4 +1190,117 @@ def test_email_missing_live_bearer_defers_claim_without_sending_or_unknown(
     assert persisted.state.value == "READY"
     assert persisted.failure_reason_code == "current_authority_unavailable"
     assert persisted.attempts == 0
+    store.close()
+
+
+def test_huggingface_renewal_uses_owner_scoped_account_center_device_session(
+    tmp_path: Path,
+) -> None:
+    """HF renewal returns only official device metadata through its linked profile."""
+
+    class _AccountCenter:
+        def __init__(self, selected_profile_ref: str) -> None:
+            self.selected_profile_ref = selected_profile_ref
+            self.calls: list[tuple[str, str, str]] = []
+
+        def begin_huggingface_renewal(
+            self,
+            _principal: IntegrationPrincipal,
+            *,
+            profile_ref: str,
+            session_ref: str,
+        ) -> dict[str, Any]:
+            self.calls.append(("begin", profile_ref, session_ref))
+            return {
+                "profile_ref": self.selected_profile_ref,
+                "session_ref": session_ref,
+                "state": "waiting_user",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "https://hf.co/oauth/device",
+                "expires_at": 1_800_000_000,
+                "interval_seconds": 5,
+                "generation": 7,
+                "reason_code": None,
+            }
+
+        def poll_huggingface_renewal(
+            self,
+            _principal: IntegrationPrincipal,
+            *,
+            profile_ref: str,
+            session_ref: str,
+        ) -> dict[str, Any]:
+            self.calls.append(("poll", profile_ref, session_ref))
+            return {
+                "profile_ref": self.selected_profile_ref,
+                "session_ref": session_ref,
+                "state": "succeeded",
+                "user_code": None,
+                "verification_uri": None,
+                "expires_at": None,
+                "interval_seconds": None,
+                "generation": 8,
+                "reason_code": None,
+            }
+
+    principal = _principal()
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _hf_connection(store, principal)
+    profile_ref = connection.account_link_ref
+    assert profile_ref is not None
+    account_center = _AccountCenter(profile_ref)
+    registry = AuthorizationCloudProfileRegistry(_hf_settings())
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={},
+        email_client=None,
+        account_center=account_center,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda _reference: _KEY,
+    )
+    session_ref = "30000000-0000-4000-8000-000000000001"
+
+    started = provider.start_renewal(
+        principal,
+        connection,
+        profile_ref,
+        request_id=session_ref,
+    )
+    assert started.session_ref == session_ref
+    assert started.state.value == "WAITING_USER"
+    assert started.authorization_url == "https://hf.co/oauth/device"
+    assert started.user_code == "ABCD-EFGH"
+    assert started.qr_attachment_ref is None
+    assert account_center.calls == [("begin", profile_ref, session_ref)]
+
+    now = datetime(2026, 10, 26, 12, tzinfo=UTC)
+    claim = store.claim_authorization_checks("renewal-test", now=now)[0]
+    store.complete_authorization_check(
+        claim,
+        AuthorizationHealthRecord(
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            actor_issuer=connection.actor_issuer,
+            actor_subject=connection.actor_subject,
+            connection_id=connection.id,
+            authorization_ref=profile_ref,
+            login_state=LoginState.PRESENT,
+            authorization_state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+            checked_at=now,
+            generation=7,
+        ),
+        [],
+        now=now,
+    )
+    completed = provider.renewal_status(
+        principal,
+        profile_ref,
+        session_ref,
+        request_id="renewal-status-request",
+    )
+    assert completed.session_ref == session_ref
+    assert completed.state.value == "SUCCEEDED"
+    assert completed.user_code is None
+    assert account_center.calls[-1] == ("poll", profile_ref, session_ref)
     store.close()

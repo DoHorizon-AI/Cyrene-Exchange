@@ -11,13 +11,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -56,6 +57,9 @@ from cyrene_exchange_product.store import ExchangeStore
 
 _MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 _SSE_DATA_PREFIX = "data:"
+_AUTHORIZATION_CLOUD_RUNNER_INTERVAL_SECONDS = 900
+_AUTHORIZATION_CLOUD_RUNNER_SHUTDOWN_TIMEOUT_SECONDS = 60
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -829,7 +833,10 @@ def build_product_app(
 
 
 def build_integration_app(
-    *, database_path: Path | str, integrations: IntegrationServices
+    *,
+    database_path: Path | str,
+    integrations: IntegrationServices,
+    enable_authorization_cloud_runner: bool = False,
 ) -> FastAPI:
     """Build an integration-only process without starting model gateway routes."""
 
@@ -840,16 +847,107 @@ def build_integration_app(
         integrations=integrations,
     )
     app.state.integration_store = integrations.store
+    _attach_authorization_cloud_runner(
+        app,
+        integrations,
+        enabled=enable_authorization_cloud_runner,
+    )
 
     @app.get("/healthz")
     def integration_healthz() -> dict[str, str]:
-        return {"status": "ok"}
+        response = {"status": "ok"}
+        if enable_authorization_cloud_runner:
+            response["authorizationCloudRunner"] = app.state.authorization_cloud_runner_state
+        return response
 
     @app.get("/readyz")
     def integration_readyz() -> JSONResponse:
-        return JSONResponse(status_code=200, content={"status": "ready"})
+        runner_state = app.state.authorization_cloud_runner_state
+        if enable_authorization_cloud_runner and runner_state != "running":
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "authorization-cloud-runner-unavailable",
+                    "authorizationCloudRunner": runner_state,
+                },
+            )
+        response = {"status": "ready"}
+        if enable_authorization_cloud_runner:
+            response["authorizationCloudRunner"] = runner_state
+        return JSONResponse(status_code=200, content=response)
 
     return app
+
+
+def _attach_authorization_cloud_runner(
+    app: FastAPI,
+    integrations: IntegrationServices | None,
+    *,
+    enabled: bool,
+) -> None:
+    """Run the existing durable authorization monitor inside its Exchange app.
+
+    The monitor is one app-owned worker. Shutdown signals its existing stop event
+    and waits before IntegrationServices closes the SQLite store or RPC channels.
+    中文：只托管现有runner，不创建第二轮询源。
+    """
+
+    app.state.authorization_cloud_runner_state = "disabled"
+    if not enabled:
+        return
+    runner = getattr(integrations, "authorization_cloud_runner", None)
+    if runner is None:
+        raise ValueError("authorization/cloud runner is enabled but not configured")
+    if runner.monitor_interval_seconds != _AUTHORIZATION_CLOUD_RUNNER_INTERVAL_SECONDS:
+        raise ValueError("authorization/cloud runner requires a 900-second health cadence")
+
+    stop_event = Event()
+    state_lock = Lock()
+    worker: Thread | None = None
+    app.state.authorization_cloud_runner_state = "starting"
+
+    def set_state(state: str) -> None:
+        with state_lock:
+            app.state.authorization_cloud_runner_state = state
+
+    def run_runner() -> None:
+        try:
+            runner.run_forever(stop_event)
+        except Exception:
+            set_state("failed")
+            _LOGGER.error("authorization/cloud runner exited unexpectedly")
+            return
+        set_state("stopped" if stop_event.is_set() else "failed")
+
+    def start_runner() -> None:
+        nonlocal worker
+        if worker is not None and worker.is_alive():
+            raise RuntimeError("authorization/cloud runner was started more than once")
+        set_state("running")
+        worker = Thread(
+            target=run_runner,
+            name="exchange-authorization-cloud-runner",
+            daemon=False,
+        )
+        worker.start()
+
+    def stop_runner() -> None:
+        if worker is None:
+            set_state("stopped")
+            return
+        set_state("stopping")
+        stop_event.set()
+        worker.join(timeout=_AUTHORIZATION_CLOUD_RUNNER_SHUTDOWN_TIMEOUT_SECONDS)
+        if worker.is_alive():
+            set_state("shutdown_timeout")
+            raise RuntimeError("authorization/cloud runner did not drain before shutdown")
+        if app.state.authorization_cloud_runner_state != "failed":
+            set_state("stopped")
+
+    app.router.on_startup.append(start_runner)
+    # IntegrationServices already owns the next shutdown callback. Stop its
+    # background user first so the runner never races a closed store/client.
+    app.router.on_shutdown.insert(0, stop_runner)
 
 
 async def _sse(body: Any, cancel_event: Event) -> AsyncIterator[str]:

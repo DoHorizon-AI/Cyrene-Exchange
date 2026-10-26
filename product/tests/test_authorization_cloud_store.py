@@ -190,6 +190,41 @@ def test_monitor_claim_is_fenced_and_observation_survives_restart(tmp_path) -> N
     restarted.close()
 
 
+def test_monitor_restart_with_reused_worker_id_still_increments_claim_fence(tmp_path) -> None:
+    store = IntegrationStore(tmp_path / "monitor-restart.sqlite3")
+    _principal, connection = _connection(store)
+    start = datetime(2026, 10, 14, 12, tzinfo=UTC)
+    worker_id = "exchange-connectors"
+
+    before_restart = store.claim_authorization_checks(
+        worker_id,
+        now=start,
+        lease_seconds=5,
+    )[0]
+    after_restart = store.claim_authorization_checks(
+        worker_id,
+        now=start + timedelta(seconds=6),
+        lease_seconds=5,
+    )[0]
+
+    assert after_restart.worker_id == before_restart.worker_id
+    assert after_restart.claim_fence == before_restart.claim_fence + 1
+    with pytest.raises(IntegrationConflict):
+        store.complete_authorization_check(
+            before_restart,
+            _health(connection),
+            [],
+            now=start + timedelta(seconds=6),
+        )
+    store.complete_authorization_check(
+        after_restart,
+        _health(connection),
+        [],
+        now=start + timedelta(seconds=6),
+    )
+    store.close()
+
+
 def test_unknown_health_is_preserved_without_inventing_validity(tmp_path) -> None:
     store = IntegrationStore(tmp_path / "integrations.sqlite3")
     principal, connection = _connection(store)

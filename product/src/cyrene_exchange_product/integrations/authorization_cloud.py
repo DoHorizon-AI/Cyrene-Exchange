@@ -142,6 +142,7 @@ class ProviderRenewalSession:
     authorization_url: str | None
     qr_attachment_ref: str | None
     generation: int
+    user_code: str | None = None
 
 
 class EmailNotificationPort(Protocol):
@@ -206,6 +207,12 @@ class AuthorizationCloudRunner:
         self._email_recipient_resolver = email_recipient_resolver
         self._monitor_interval_seconds = monitor_interval_seconds
         self._idle_delay_seconds = idle_delay_seconds
+
+    @property
+    def monitor_interval_seconds(self) -> int:
+        """Expose the durable health cadence for host lifecycle validation."""
+
+        return self._monitor_interval_seconds
 
     def run_once(self, *, now: datetime | None = None) -> AuthorizationCloudRunResult:
         """Process due monitor checks, one refresh job, and one email job."""

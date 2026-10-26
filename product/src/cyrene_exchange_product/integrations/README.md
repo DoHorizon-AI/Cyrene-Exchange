@@ -242,6 +242,20 @@ starting Uvicorn. Leave both unset only for local development HTTP. The internal
 root CA belongs on Navigator's HTTPS client trust path and is not mounted as an
 Exchange server secret.
 
+The durable authorization monitor normally remains an operator-managed worker.
+For a deployment that needs automatic authorization checks and notification
+outbox delivery, explicitly set
+`CYRENE_EXCHANGE_AUTHORIZATION_CLOUD_RUNNER_ENABLED=true` on the
+`integration-only` Exchange process. It starts the existing
+`AuthorizationCloudRunner` from that process's `IntegrationServices`; it does
+not create another service or database. Keep
+`authorizationCloud.monitorIntervalSeconds` at exactly `900`. Startup fails
+closed if the runner is not configured or the cadence differs. On shutdown the
+app signals the runner and waits up to 60 seconds before closing its SQLite
+store and provider channels, so the container should allow at least 70 seconds
+of stop grace. `/healthz` reports the runner state and `/readyz` becomes
+unready if the enabled worker exits. The switch defaults to `false`.
+
 Initial profile setup is a local operator action, not an HTTP endpoint. Copy the
 [`private-connector-bootstrap.template.json`](../../../examples/private-connector-bootstrap.template.json)
 to a 0600 private file and fill the expected `actor` issuer/subject/organization/
@@ -371,6 +385,33 @@ schema, wrong Plugin binding, or credential-like schema property aborts export;
 no partial or fabricated catalog is emitted. Message connectors such as Teams
 are not model tools and remain on the message egress facade.
 
+For activation readback, prefer the single Exchange-side readiness export:
+
+```bash
+cyrene-exchange integrations connector-readiness \
+  --integration-database /var/lib/cyrene/exchange/integrations.sqlite3 \
+  --issuer "$CONNECTOR_ACTOR_ISSUER" \
+  --subject "$CONNECTOR_ACTOR_SUBJECT" \
+  --organization-id "$CONNECTOR_ORGANIZATION_ID" \
+  --workspace-id "$CONNECTOR_WORKSPACE_ID"
+```
+
+It reads the exact actor-scoped Exchange connection rows, verifies linked
+GitHub/Hugging Face profiles through Account Center, resolves cloud profile and
+target aliases from host configuration, and calls each selected provider's
+typed `list_tools`. Its closed top-level shape is
+`{schemaVersion:1,actor,profiles,connections,bindings,catalog}`. Profile
+metadata contains only issued profile references, provider, access/auth mode,
+status, credential revision when available, and allowlisted target scope. The
+connection rows contain issued connection/profile references and target scope.
+The export omits credentials, secret references, OAuth/device codes, and
+authorization references. HF write tools are excluded only when the connected
+repository's Account Center grant is read-only. A cloud catalog may be complete
+or exactly its canonical read-only operation set; every required read operation
+must be present. Missing or partial read catalogs abort the export. This is a
+host activation readback, not a provider health check or proof of external
+business operations.
+
 The legacy GitHub issue-sync Product API still accepts its exact actor-owned
 repository connection shape without provider-profile selectors. That connection
 continues through the existing sync-binding and ActorBinding flow. It is not a
@@ -465,6 +506,13 @@ remains `uncertain` and is not automatically repeated.
 才同时省略两者并使用 HTTP。内部根 CA 只供 Navigator HTTPS 客户端验证服务端证书，不作为 Exchange
 监听器密钥挂载。
 
+需要自动检查授权并投递 durable notification outbox 时，仅在 `integration-only` Exchange 进程显式设置
+`CYRENE_EXCHANGE_AUTHORIZATION_CLOUD_RUNNER_ENABLED=true`。该开关复用同一 `IntegrationServices` 中的
+`AuthorizationCloudRunner`，不创建第二服务或数据库；`authorizationCloud.monitorIntervalSeconds` 必须精确为
+`900`，缺少 runner 或周期不符会在启动时失败。应用关闭时先停止 runner，最多等待 60 秒，再关闭 SQLite
+store 和 Provider 通道；容器至少配置 70 秒 stop grace。`/healthz` 输出 runner 状态，启用后若 worker 退出，
+`/readyz` 会返回未就绪。开关默认 `false`。
+
 首次连接配置仅能从本地 operator 命令执行，不开放 HTTP 管理入口。复制
 [`private-connector-bootstrap.template.json`](../../../examples/private-connector-bootstrap.template.json)
 到权限为 0600 的私有文件，填写期望 actor 的 issuer/subject/organization/workspace，以及 GitHub
@@ -540,6 +588,26 @@ cyrene-exchange integrations connector-tool-catalog \
 tools:[{id,name,description,readOnly,inputSchema}]}]}`。工具名称、说明和 schema 直接来自对应 Provider 的
 typed `list_tools` 响应；Exchange 只保留闭合 operation map 中的工具，并从同一授权 mutability 表推导
 `readOnly`。缺少必需工具、schema 格式错误、插件 binding 不匹配或 schema 属性包含类似凭据的字段时，命令失败且不输出部分或伪造目录。Teams 等消息 connector 仍通过消息发送 facade，不作为模型工具暴露。
+
+激活前读取实际 Exchange 绑定时，优先使用一次性 readiness 导出：
+
+```bash
+cyrene-exchange integrations connector-readiness \
+  --integration-database /var/lib/cyrene/exchange/integrations.sqlite3 \
+  --issuer "$CONNECTOR_ACTOR_ISSUER" \
+  --subject "$CONNECTOR_ACTOR_SUBJECT" \
+  --organization-id "$CONNECTOR_ORGANIZATION_ID" \
+  --workspace-id "$CONNECTOR_WORKSPACE_ID"
+```
+
+它从 Exchange 数据库读取精确 actor 连接，使用 Account Center 回读 GitHub/HF profile，并从 host configuration
+解析 cloud profile/target alias，再调用选中 Plugin 的 typed `list_tools`。闭合顶层结构为
+`{schemaVersion:1,actor,profiles,connections,bindings,catalog}`。profile 仅包含签发的 profile reference、provider、
+access/auth mode、状态、可用时的 credential revision 和白名单 target scope；connection 行包含签发的
+connection/profile reference 与 target scope。输出不包含凭据、secret reference、OAuth/device code 或
+authorization reference。只有 Account Center 精确连接目标 grant 只读时，HF 写工具才会过滤；cloud catalog
+必须完整或恰好等于规范只读 operation 集，所有必需读取操作仍须存在，否则导出失败。该命令只做 host activation
+readback，不是 Provider health check，也不代表外部业务操作已验收。
 
 旧 GitHub issue-sync Product API 仍支持完全不含 provider profile selector 的 actor-owned 仓库连接，并继续
 走现有 sync-binding / ActorBinding 流程。该连接不代表 GitHub App profile，也不会进入 Directory 授权工具目录；

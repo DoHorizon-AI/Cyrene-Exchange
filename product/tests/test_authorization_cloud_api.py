@@ -544,6 +544,117 @@ def test_renewal_replays_same_product_session_and_rechecks_status(tmp_path: Path
     store.close()
 
 
+def test_huggingface_renewal_returns_device_code_and_tracks_recovery(tmp_path: Path) -> None:
+    """HF owner reauthorization reuses Product's durable renewal session API."""
+
+    profile_ref = "30000000-0000-4000-8000-000000000001"
+    session_expiry = datetime(2026, 10, 14, 13, tzinfo=UTC)
+    operations = {
+        "integrationCreateConnection",
+        "accountBeginRenewalSession",
+        "accountGetRenewalSession",
+    }
+    actor = _principal("actor-hf", operations)
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = store.create_connection(
+        actor,
+        CreateIntegrationConnection(
+            provider="hf",
+            binding_ref="hf-primary",
+            target_ref="selected-model",
+            account_link_ref=profile_ref,
+            display_name="Selected Hugging Face profile",
+        ),
+        idempotency_key="hf-renewal-connection",
+    )
+    _record_health(
+        store,
+        connection,
+        state=AuthorizationState.REAUTHORIZATION_REQUIRED,
+        auth_ref=profile_ref,
+    )
+
+    class _HuggingFaceRenewal:
+        def __init__(self) -> None:
+            self.start_calls: list[tuple[str, str]] = []
+            self.poll_calls: list[tuple[str, str]] = []
+
+        def start_renewal(
+            self,
+            _principal: IntegrationPrincipal,
+            selected_connection: Any,
+            authorization_ref: str,
+            *,
+            request_id: str,
+        ) -> Any:
+            assert selected_connection.provider == "hf"
+            self.start_calls.append((authorization_ref, request_id))
+            return SimpleNamespace(
+                authorization_ref=authorization_ref,
+                session_ref=request_id,
+                state=RenewalState.WAITING_USER,
+                created_at=datetime(2026, 10, 14, 12, tzinfo=UTC),
+                expires_at=session_expiry,
+                authorization_url="https://hf.co/oauth/device",
+                user_code="ABCD-EFGH",
+                qr_attachment_ref=None,
+                generation=4,
+            )
+
+        def renewal_status(
+            self,
+            _principal: IntegrationPrincipal,
+            authorization_ref: str,
+            provider_session_ref: str,
+            *,
+            request_id: str,
+        ) -> Any:
+            self.poll_calls.append((authorization_ref, provider_session_ref))
+            return SimpleNamespace(
+                authorization_ref=authorization_ref,
+                session_ref=provider_session_ref,
+                state=RenewalState.SUCCEEDED,
+                expires_at=None,
+                authorization_url=None,
+                user_code=None,
+                qr_attachment_ref=None,
+                generation=5,
+            )
+
+    provider = _HuggingFaceRenewal()
+    app = create_app(
+        database_path=tmp_path / "gateway.sqlite3",
+        integrations=_services(store, actor, authorization_cloud=provider),
+    )
+    path = f"/api/v1/accounts/authorizations/{profile_ref}/renewal-sessions"
+    with TestClient(app) as client:
+        started = client.post(
+            f"{path}?workspaceId={_WORKSPACE}",
+            headers={
+                "Authorization": "Bearer actor-token",
+                "Idempotency-Key": "hf-renewal-1",
+            },
+        )
+        session_ref = started.json()["sessionRef"]
+        completed = client.get(
+            f"/api/v1/accounts/renewal-sessions/{session_ref}?workspaceId={_WORKSPACE}",
+            headers={"Authorization": "Bearer actor-token"},
+        )
+
+    assert started.status_code == 202, started.text
+    assert started.json()["authorizationUrl"] == "https://hf.co/oauth/device"
+    assert started.json()["userCode"] == "ABCD-EFGH"
+    assert started.json()["qrAttachmentRef"] is None
+    assert "device_code" not in started.text
+    assert "access_token" not in started.text
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["state"] == "SUCCEEDED"
+    assert completed.json()["userCode"] is None
+    assert provider.start_calls == [(profile_ref, session_ref)]
+    assert provider.poll_calls == [(profile_ref, session_ref)]
+    store.close()
+
+
 def test_ambiguous_renewal_start_replays_only_same_key_and_request_id(tmp_path: Path) -> None:
     operations = {"integrationCreateConnection", "accountBeginRenewalSession"}
     actor = _principal("actor-a", operations)

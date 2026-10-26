@@ -56,6 +56,7 @@ from cyrene_exchange_product.integrations.models import (
     CreateSyncBinding,
     EnqueueIssueAction,
     IntegrationAuthorizationError,
+    IntegrationConflict,
     IntegrationNotFound,
     IntegrationNotification,
     IntegrationPrincipal,
@@ -84,6 +85,35 @@ def _safe_health_reason_code(value: object) -> str | None:
     if isinstance(value, str) and _SAFE_HEALTH_REASON_CODE.fullmatch(value):
         return value
     return None
+
+
+def _connection_for_renewal(
+    store: IntegrationStore,
+    principal: IntegrationPrincipal,
+    authorization_ref: str,
+    *,
+    operation_id: str,
+) -> Any:
+    """Resolve one actor-owned WeCom or HF connection for its stored auth ref."""
+
+    selected = []
+    for provider in ("wecom", "hf"):
+        try:
+            selected.append(
+                store.connection_for_authorization(
+                    principal,
+                    authorization_ref,
+                    provider=provider,
+                    authorization_operation_id=operation_id,
+                )
+            )
+        except IntegrationNotFound:
+            continue
+    if not selected:
+        raise IntegrationNotFound("authorization is not attached to this actor's connection")
+    if len(selected) != 1:
+        raise IntegrationConflict("authorization reference matches multiple provider bindings")
+    return selected[0]
 
 
 async def _invoke_connector_dispatcher(
@@ -442,6 +472,13 @@ class RenewalSessionResponse(_HttpResponseModel):
     created_at: datetime = Field(alias="createdAt")
     expires_at: datetime | None = Field(default=None, alias="expiresAt")
     authorization_url: str | None = Field(default=None, alias="authorizationUrl")
+    user_code: str | None = Field(
+        default=None,
+        alias="userCode",
+        min_length=4,
+        max_length=32,
+        pattern=r"^[A-Z0-9]{4}-[A-Z0-9]{4}$",
+    )
     qr_attachment_ref: str | None = Field(default=None, alias="qrAttachmentRef")
     generation: int = Field(ge=0)
     reason_code: str | None = Field(default=None, alias="reasonCode")
@@ -1331,6 +1368,7 @@ def _renewal_response(session: RenewalSessionRecord) -> dict[str, Any]:
         "createdAt": _http_timestamp_value(session.created_at),
         "expiresAt": _http_timestamp_value(session.expires_at),
         "authorizationUrl": session.authorization_url,
+        "userCode": session.user_code,
         "qrAttachmentRef": session.qr_attachment_ref,
         "generation": session.generation,
         "reasonCode": session.reason_code,
@@ -2081,10 +2119,13 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 context={"reasonCode": "connector_authority_not_configured"},
             )
         try:
-            if body.connection_ref == getattr(
-                services.teams_message_profile, "connection_ref", None
-            ):
-                profile = services.teams_message_profile
+            teams_root_profile = services.teams_message_profile
+            if body.connection_ref == getattr(teams_root_profile, "connection_ref", None):
+                profile = (
+                    teams_root_profile.profile_for_ref(body.profile_ref)
+                    if teams_root_profile is not None
+                    else None
+                )
                 if profile is None:
                     raise PermissionError("Teams message profile is not configured")
                 principal_value = IntegrationPrincipal(
@@ -2594,11 +2635,65 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 detail="The egress request must use the configured msteams provider.",
                 status=403,
             )
+        encoded = request.headers.get("x-cyrene-connector-grant-bin", "")
+        try:
+            grant_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The connector grant header is malformed.",
+                status=403,
+            ) from exc
+        try:
+            provisional = verifier.inspect(grant_bytes)
+        except PermissionError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The signed Teams actor grant is invalid.",
+                status=403,
+            ) from exc
+        teams_root_profile = services.teams_message_profile
+        profile = (
+            teams_root_profile.profile_for_ref(provisional.profile_ref)
+            if teams_root_profile is not None
+            else None
+        )
+        if profile is None or profile.connection_ref != provisional.connection_ref:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The signed grant does not select a configured Teams profile.",
+                status=403,
+                context={"reasonCode": "teams_profile_mismatch"},
+            )
+        if provisional.principal_issuer != profile.expected_issuer:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The signed Teams actor issuer does not match the configured tenant.",
+                status=403,
+            )
+        if (
+            profile.fixed_owner_subject is not None
+            and provisional.principal_subject != profile.fixed_owner_subject
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Teams connector authorization denied",
+                detail="The signed Teams actor does not match the fixed notification owner.",
+                status=403,
+                context={"reasonCode": "teams_notification_owner_mismatch"},
+            )
         try:
             profile.authorize_conversation(
                 tenant_id=body.conversation.tenant_id,
                 team_id=body.conversation.team_id,
                 channel_id=body.conversation.channel_id,
+                conversation_id=body.conversation.conversation_id,
+                root_thread_id=body.conversation.root_thread_id,
+                service_url=body.conversation.service_url,
             )
             validate_teams_service_url(
                 body.conversation.service_url,
@@ -2639,24 +2734,6 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 status=400,
             )
         resource_ref = _teams_resource_ref(conversation)
-        encoded = request.headers.get("x-cyrene-connector-grant-bin", "")
-        try:
-            grant_bytes = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error) as exc:
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
-                title="Teams connector authorization denied",
-                detail="The connector grant header is malformed.",
-                status=403,
-            ) from exc
-        provisional = verifier.inspect(grant_bytes)
-        if provisional.principal_issuer != profile.expected_issuer:
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
-                title="Teams connector authorization denied",
-                detail="The signed Teams actor issuer does not match the configured tenant.",
-                status=403,
-            )
         expected = {
             "request_id": body.request_id,
             "organization_id": profile.organization_id,
@@ -3087,11 +3164,11 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 detail="Select a server-owned opaque provider authorization reference.",
                 status=422,
             )
-        connection = services.store.connection_for_authorization(
+        connection = _connection_for_renewal(
+            services.store,
             actor,
             authorization_id,
-            provider="wecom",
-            authorization_operation_id="accountBeginRenewalSession",
+            operation_id="accountBeginRenewalSession",
         )
         session, created = services.store.begin_renewal_session(
             actor,
@@ -3146,6 +3223,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         state=RenewalState(provider_session.state),
                         expires_at=provider_session.expires_at,
                         authorization_url=provider_session.authorization_url,
+                        user_code=getattr(provider_session, "user_code", None),
                         qr_attachment_ref=provider_session.qr_attachment_ref,
                         generation=provider_session.generation,
                     )
@@ -3191,11 +3269,11 @@ def create_router(services: IntegrationServices) -> APIRouter:
             str(session_id),
             authorization_operation_id="accountGetRenewalSession",
         )
-        services.store.connection_for_authorization(
+        _connection_for_renewal(
+            services.store,
             actor,
             session.authorization_ref,
-            provider="wecom",
-            authorization_operation_id="accountGetRenewalSession",
+            operation_id="accountGetRenewalSession",
         )
         authorization_id = session.authorization_ref
         has_provider_session = session.provider_session_ref is not None
@@ -3242,6 +3320,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     state=RenewalState(provider_session.state),
                     expires_at=provider_session.expires_at,
                     authorization_url=provider_session.authorization_url,
+                    user_code=getattr(provider_session, "user_code", None),
                     qr_attachment_ref=provider_session.qr_attachment_ref,
                     generation=provider_session.generation,
                     provider_session_ref=provider_session.session_ref,
@@ -3262,6 +3341,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         state=session.state,
                         expires_at=session.expires_at,
                         authorization_url=session.authorization_url,
+                        user_code=session.user_code,
                         qr_attachment_ref=session.qr_attachment_ref,
                         generation=session.generation,
                         reason_code="provider_status_unavailable",

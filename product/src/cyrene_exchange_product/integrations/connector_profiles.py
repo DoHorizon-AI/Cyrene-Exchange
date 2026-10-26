@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -58,6 +58,25 @@ class TeamsMessageProfile:
     bot_app_id: str
     endpoint: DirectPluginEndpointConfig
     expected_issuer: str
+    fixed_owner_subject: str | None = None
+    fixed_route: TeamsFixedRoute | None = None
+    system_notification_profile: TeamsMessageProfile | None = None
+
+    def profile_for_ref(self, profile_ref: str) -> TeamsMessageProfile | None:
+        """Resolve only the configured chat profile or its one closed notification profile."""
+
+        if profile_ref == self.profile_ref:
+            return self
+        notification = self.system_notification_profile
+        if notification is not None and profile_ref == notification.profile_ref:
+            return notification
+        return None
+
+    def authorize_principal(self, principal: Any) -> None:
+        """Bind a notification-only profile to its configured owner subject."""
+
+        if self.fixed_owner_subject is not None and principal.subject != self.fixed_owner_subject:
+            raise PermissionError("Teams notification profile is outside its fixed owner binding")
 
     def authorize_conversation(
         self,
@@ -65,8 +84,11 @@ class TeamsMessageProfile:
         tenant_id: str,
         team_id: str,
         channel_id: str,
+        conversation_id: str | None = None,
+        root_thread_id: str | None = None,
+        service_url: str | None = None,
     ) -> None:
-        """Require one grant-bound channel inside this bot's configured tenant."""
+        """Require one grant-bound channel or the exact configured notification thread."""
 
         if tenant_id != self.tenant_id:
             raise PermissionError("Teams tenant is outside the configured bot binding")
@@ -74,6 +96,31 @@ class TeamsMessageProfile:
             raise PermissionError("Teams team is outside the configured bot binding")
         if self.allowed_channel_ids and channel_id not in self.allowed_channel_ids:
             raise PermissionError("Teams channel is outside the configured bot binding")
+        if self.fixed_route is not None:
+            observed_route = TeamsFixedRoute(
+                tenant_id=tenant_id,
+                team_id=team_id,
+                channel_id=channel_id,
+                conversation_id=conversation_id or "",
+                root_thread_id=root_thread_id or "",
+                service_url=service_url or "",
+            )
+            if observed_route != self.fixed_route:
+                raise PermissionError(
+                    "Teams notification route is outside its fixed thread binding"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class TeamsFixedRoute:
+    """One immutable Bot Framework thread route for system-owned notifications."""
+
+    tenant_id: str
+    team_id: str
+    channel_id: str
+    conversation_id: str
+    root_thread_id: str
+    service_url: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,7 +282,7 @@ def _parse_teams(value: object) -> TeamsMessageProfile | None:
             "directPlugin",
             "expectedIssuer",
         },
-        optional={"allowedChannelIds"},
+        optional={"allowedChannelIds", "systemNotification"},
         label="connectorHost.teamsMessages",
     )
     profile_ref = _alias(item["profileRef"], "teamsMessages.profileRef")
@@ -247,7 +294,7 @@ def _parse_teams(value: object) -> TeamsMessageProfile | None:
     issuer_match = _AAD_ISSUER.fullmatch(issuer)
     if issuer_match is None or issuer_match.group(1).lower() != tenant_id:
         raise ConnectorHostConfigurationError("Teams issuer must match the configured tenant")
-    return TeamsMessageProfile(
+    profile = TeamsMessageProfile(
         profile_ref=profile_ref,
         connection_ref=connection_ref,
         organization_id=_text(item["organizationId"], "teamsMessages.organizationId"),
@@ -260,6 +307,95 @@ def _parse_teams(value: object) -> TeamsMessageProfile | None:
         bot_app_id=_text(item["botAppId"], "teamsMessages.botAppId"),
         endpoint=_endpoint(item["directPlugin"], "teamsMessages.directPlugin"),
         expected_issuer=issuer,
+    )
+    notification_value = item.get("systemNotification")
+    if notification_value is None:
+        return profile
+    notification = _parse_teams_notification(
+        notification_value,
+        parent=profile,
+    )
+    if notification.profile_ref == profile.profile_ref:
+        raise ConnectorHostConfigurationError(
+            "Teams systemNotification profileRef must be distinct from its parent"
+        )
+    return replace(profile, system_notification_profile=notification)
+
+
+def _parse_teams_notification(
+    value: object,
+    *,
+    parent: TeamsMessageProfile,
+) -> TeamsMessageProfile:
+    """Build a trusted notification profile by inheriting the configured Teams transport."""
+
+    item = _object(
+        value,
+        required={"profileRef", "ownerSubject", "fixedRoute"},
+        optional=set(),
+        label="connectorHost.teamsMessages.systemNotification",
+    )
+    profile_ref = _alias(item["profileRef"], "teamsMessages.systemNotification.profileRef")
+    owner_subject = _text(item["ownerSubject"], "teamsMessages.systemNotification.ownerSubject")
+    raw_route = _object(
+        item["fixedRoute"],
+        required={
+            "tenantId",
+            "teamId",
+            "channelId",
+            "conversationId",
+            "rootThreadId",
+            "serviceUrl",
+        },
+        optional=set(),
+        label="connectorHost.teamsMessages.systemNotification.fixedRoute",
+    )
+    tenant_id = _text(raw_route["tenantId"], "fixedRoute.tenantId").lower()
+    team_id = _text(raw_route["teamId"], "fixedRoute.teamId")
+    channel_id = _text(raw_route["channelId"], "fixedRoute.channelId")
+    conversation_id = _text(raw_route["conversationId"], "fixedRoute.conversationId")
+    if len(conversation_id) > 1000:
+        raise ConnectorHostConfigurationError(
+            "Teams notification fixedRoute conversationId exceeds its fixed limit"
+        )
+    try:
+        root_thread_id = validate_teams_root_thread_id(
+            _text(raw_route["rootThreadId"], "fixedRoute.rootThreadId")
+        )
+        service_url = validate_teams_service_url(
+            _text(raw_route["serviceUrl"], "fixedRoute.serviceUrl"),
+            tenant_id=tenant_id,
+        )
+    except ValueError as exc:
+        raise ConnectorHostConfigurationError(
+            "Teams notification fixedRoute has an invalid Bot Framework route"
+        ) from exc
+    if tenant_id != parent.tenant_id:
+        raise ConnectorHostConfigurationError(
+            "Teams notification fixedRoute tenant must match its parent profile"
+        )
+    if team_id not in parent.allowed_team_ids:
+        raise ConnectorHostConfigurationError(
+            "Teams notification fixedRoute team must be allowed by its parent profile"
+        )
+    if parent.allowed_channel_ids and channel_id not in parent.allowed_channel_ids:
+        raise ConnectorHostConfigurationError(
+            "Teams notification fixedRoute channel must be allowed by its parent profile"
+        )
+    route = TeamsFixedRoute(
+        tenant_id=tenant_id,
+        team_id=team_id,
+        channel_id=channel_id,
+        conversation_id=conversation_id,
+        root_thread_id=root_thread_id,
+        service_url=service_url,
+    )
+    return replace(
+        parent,
+        profile_ref=profile_ref,
+        fixed_owner_subject=owner_subject,
+        fixed_route=route,
+        system_notification_profile=None,
     )
 
 

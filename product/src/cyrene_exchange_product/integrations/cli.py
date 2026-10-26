@@ -1221,6 +1221,10 @@ def validate_host_configuration(
         ),
         "navigatorConnectorConfigured": connector_settings.navigator is not None,
         "teamsMessagesConfigured": connector_settings.teams_messages is not None,
+        "teamsSystemNotificationConfigured": bool(
+            connector_settings.teams_messages is not None
+            and connector_settings.teams_messages.system_notification_profile is not None
+        ),
         "computerRunnerConfigured": connector_settings.computer_runner is not None,
     }
 

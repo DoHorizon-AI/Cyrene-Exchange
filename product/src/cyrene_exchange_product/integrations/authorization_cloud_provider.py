@@ -46,7 +46,9 @@ from cyrene_exchange_product.integrations.models import (
     CloudResourceRecord,
     CloudResourceState,
     EmailNotificationJob,
+    IntegrationConflict,
     IntegrationConnection,
+    IntegrationNotFound,
     IntegrationPrincipal,
     LoginState,
     RenewalState,
@@ -279,6 +281,23 @@ def _huggingface_health_record(
     )
 
 
+def _provider_timestamp(value: object) -> datetime | None:
+    """Parse one RFC3339 provider timestamp without accepting naive local time."""
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
 class AuthorizationCloudDirectProvider:
     """Invoke only SDK-whitelisted tools through trusted DirectPlugin bindings."""
 
@@ -330,6 +349,12 @@ class AuthorizationCloudDirectProvider:
         )
         if profile.provider == "hf":
             return self._huggingface_authorization_health(
+                principal,
+                connection,
+                profile,
+            )
+        if profile.provider in {"azure", "gcp", "runpod"}:
+            return self._cloud_management_authorization_health(
                 principal,
                 connection,
                 profile,
@@ -392,6 +417,110 @@ class AuthorizationCloudDirectProvider:
                     reason_code=item.reason_code,
                 )
                 for item in observed.capabilities
+            ],
+        )
+
+    def _cloud_management_authorization_health(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        profile: AuthorizationProviderProfile,
+    ) -> AuthorizationHealthRecord:
+        """Normalize the native cloud-management health DTO for its live binding."""
+
+        result = self._call_profile(
+            profile,
+            principal,
+            tool_id="cloud_provider_health",
+            arguments={"profile_ref": profile.profile_ref},
+            request_id=str(uuid4()),
+        )
+        if (
+            result.get("profile_ref") != profile.profile_ref
+            or result.get("provider") != connection.provider
+        ):
+            raise ProviderObservationUnavailable("cloud profile health scope did not match")
+        authentication = result.get("authentication_state")
+        authorization = result.get("authorization_state")
+        if authentication not in {
+            "VALID",
+            "MISSING",
+            "INVALID",
+            "UNKNOWN",
+        } or authorization not in {"VALID", "UNKNOWN", "DENIED"}:
+            raise ProviderObservationUnavailable("cloud profile health state is invalid")
+        checked_at = _provider_timestamp(result.get("checked_at"))
+        if checked_at is None:
+            raise ProviderObservationUnavailable("cloud profile health timestamp is invalid")
+        if authentication == "MISSING":
+            login_state = LoginState.MISSING
+        elif authentication in {"VALID", "INVALID"}:
+            login_state = LoginState.PRESENT
+        else:
+            login_state = LoginState.UNKNOWN
+        if authorization == "DENIED":
+            authorization_state = AuthorizationState.PERMISSION_DENIED
+        elif authentication == "INVALID":
+            authorization_state = AuthorizationState.REAUTHORIZATION_REQUIRED
+        elif authorization == "VALID" and authentication == "VALID":
+            authorization_state = AuthorizationState.VALID
+        else:
+            authorization_state = AuthorizationState.UNKNOWN
+
+        raw_scopes = result.get("scope_refs")
+        if not isinstance(raw_scopes, list) or len(raw_scopes) > 100:
+            raise ProviderObservationUnavailable("cloud profile health scopes are invalid")
+        capability_ids = [
+            scope
+            for scope in raw_scopes
+            if isinstance(scope, str)
+            and 1 <= len(scope) <= 200
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", scope)
+        ]
+        if len(capability_ids) != len(raw_scopes):
+            raise ProviderObservationUnavailable("cloud profile health scopes are invalid")
+        reason_code = result.get("reason_code")
+        if not isinstance(reason_code, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}", reason_code
+        ):
+            reason_code = None
+        generation_value = result.get("generation", 0)
+        generation = (
+            generation_value
+            if isinstance(generation_value, int)
+            and not isinstance(generation_value, bool)
+            and generation_value >= 0
+            else 0
+        )
+        expires_at = _provider_timestamp(result.get("expires_at"))
+        if connection.provider in {"azure", "gcp"}:
+            # Managed identity and WIF token expiry is renewed automatically by
+            # the native cloud provider and is not the identity's lifetime.
+            expires_at = None
+        if not capability_ids:
+            capability_ids = ["cloud.provider.health.read"]
+        return AuthorizationHealthRecord(
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            actor_issuer=connection.actor_issuer,
+            actor_subject=connection.actor_subject,
+            connection_id=connection.id,
+            authorization_ref=None,
+            reason_code=reason_code,
+            login_state=login_state,
+            authorization_state=authorization_state,
+            checked_at=checked_at,
+            expires_at=expires_at,
+            generation=generation,
+            capabilities=[
+                AuthorizationCapabilityRecord(
+                    capability_id=scope,
+                    state=authorization_state,
+                    last_verified_at=checked_at,
+                    expires_at=expires_at,
+                    reason_code=reason_code,
+                )
+                for scope in capability_ids
             ],
         )
 
@@ -813,11 +942,26 @@ class AuthorizationCloudDirectProvider:
         principal, profile, _ = self._verified_connection(
             principal, connection, operation_id="accountBeginRenewalSession"
         )
-        if (
-            profile.provider != "wecom"
-            or authorization_ref != profile.authorization_ref
-            or not _OPAQUE_PROVIDER_REF.fullmatch(authorization_ref)
-        ):
+        if not _OPAQUE_PROVIDER_REF.fullmatch(authorization_ref):
+            raise PermissionError("renewal authorization is not selected by the verified binding")
+        if profile.provider == "hf":
+            if (
+                profile.auth_mode != "device_oauth"
+                or connection.account_link_ref != authorization_ref
+                or self._account_center is None
+            ):
+                raise PermissionError("HF renewal is not selected by the linked OAuth profile")
+            result = self._account_center.begin_huggingface_renewal(
+                principal,
+                profile_ref=authorization_ref,
+                session_ref=request_id,
+            )
+            return _huggingface_renewal_session(
+                result,
+                expected_profile_ref=authorization_ref,
+                expected_session_ref=request_id,
+            )
+        if profile.provider != "wecom" or authorization_ref != profile.authorization_ref:
             raise PermissionError("renewal authorization is not selected by the verified binding")
         result = self._call_profile(
             profile,
@@ -836,17 +980,30 @@ class AuthorizationCloudDirectProvider:
         *,
         request_id: str,
     ) -> ProviderRenewalSession:
-        connection = self._store.connection_for_authorization(
+        connection = _renewal_connection_for_provider(
+            self._store,
             principal,
             authorization_ref,
-            provider="wecom",
-            authorization_operation_id="accountGetRenewalSession",
+            operation_id="accountGetRenewalSession",
         )
         principal, profile, _ = self._verified_connection(
             principal,
             connection,
             operation_id="accountGetRenewalSession",
         )
+        if profile.provider == "hf":
+            if self._account_center is None or connection.account_link_ref != authorization_ref:
+                raise PermissionError("HF renewal profile is not available in Account Center")
+            result = self._account_center.poll_huggingface_renewal(
+                principal,
+                profile_ref=authorization_ref,
+                session_ref=provider_session_ref,
+            )
+            return _huggingface_renewal_session(
+                result,
+                expected_profile_ref=authorization_ref,
+                expected_session_ref=provider_session_ref,
+            )
         result = self._call_profile(
             profile,
             principal,
@@ -864,17 +1021,30 @@ class AuthorizationCloudDirectProvider:
         request_id: str,
         status_request_id: str,
     ) -> ProviderRenewalSession:
-        connection = self._store.connection_for_authorization(
+        connection = _renewal_connection_for_provider(
+            self._store,
             principal,
             authorization_ref,
-            provider="wecom",
-            authorization_operation_id="accountGetRenewalSession",
+            operation_id="accountGetRenewalSession",
         )
         principal, profile, _ = self._verified_connection(
             principal,
             connection,
             operation_id="accountGetRenewalSession",
         )
+        if profile.provider == "hf":
+            if self._account_center is None or connection.account_link_ref != authorization_ref:
+                raise PermissionError("HF renewal profile is not available in Account Center")
+            result = self._account_center.poll_huggingface_renewal(
+                principal,
+                profile_ref=authorization_ref,
+                session_ref=request_id,
+            )
+            return _huggingface_renewal_session(
+                result,
+                expected_profile_ref=authorization_ref,
+                expected_session_ref=request_id,
+            )
         result = self._call_profile(
             profile,
             principal,
@@ -1076,6 +1246,122 @@ def _renewal_session(
         authorization_url=safe_url,
         qr_attachment_ref=session.qr_attachment_ref,
         generation=session.generation,
+    )
+
+
+def _renewal_connection_for_provider(
+    store: IntegrationStore,
+    principal: IntegrationPrincipal,
+    authorization_ref: str,
+    *,
+    operation_id: str,
+) -> IntegrationConnection:
+    """Resolve exactly one attached WeCom or Hugging Face renewal connection."""
+
+    selected = []
+    for provider in ("wecom", "hf"):
+        try:
+            selected.append(
+                store.connection_for_authorization(
+                    principal,
+                    authorization_ref,
+                    provider=provider,
+                    authorization_operation_id=operation_id,
+                )
+            )
+        except IntegrationNotFound:
+            continue
+    if not selected:
+        raise IntegrationNotFound("authorization is not attached to this actor's connection")
+    if len(selected) != 1:
+        raise IntegrationConflict("authorization reference matches multiple provider bindings")
+    return selected[0]
+
+
+def _huggingface_renewal_session(
+    result: Mapping[str, Any],
+    *,
+    expected_profile_ref: str,
+    expected_session_ref: str,
+) -> ProviderRenewalSession:
+    """Validate Account Center device-flow metadata before Product persistence."""
+
+    states = {
+        "starting": RenewalState.VERIFYING,
+        "waiting_user": RenewalState.WAITING_USER,
+        "succeeded": RenewalState.SUCCEEDED,
+        "failed": RenewalState.FAILED,
+        "expired": RenewalState.EXPIRED,
+        "cancelled": RenewalState.CANCELLED,
+        "unknown": RenewalState.VERIFYING,
+    }
+    status = result.get("state")
+    session_ref = result.get("session_ref")
+    profile_ref = result.get("profile_ref")
+    if (
+        profile_ref != expected_profile_ref
+        or session_ref != expected_session_ref
+        or not isinstance(profile_ref, str)
+        or not _OPAQUE_PROVIDER_REF.fullmatch(profile_ref)
+        or not isinstance(session_ref, str)
+        or not _OPAQUE_PROVIDER_REF.fullmatch(session_ref)
+        or not isinstance(status, str)
+        or status not in states
+    ):
+        raise RuntimeError("Account Center renewal session escaped its fixed profile scope")
+    raw_user_code = result.get("user_code")
+    user_code = None
+    if raw_user_code is not None:
+        if (
+            not isinstance(raw_user_code, str)
+            or re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}", raw_user_code) is None
+        ):
+            raise RuntimeError("Account Center renewal user code is invalid")
+        user_code = raw_user_code
+    raw_url = result.get("verification_uri")
+    authorization_url = None
+    if raw_url is not None:
+        if raw_url not in {
+            "https://hf.co/oauth/device",
+            "https://huggingface.co/oauth/device",
+        }:
+            raise RuntimeError("Account Center renewal URL is outside the fixed HF route")
+        authorization_url = raw_url
+    if states[status] == RenewalState.WAITING_USER and (
+        user_code is None or authorization_url is None
+    ):
+        raise RuntimeError("Account Center waiting session has no user action metadata")
+    raw_expiry = result.get("expires_at")
+    if raw_expiry is not None and (
+        isinstance(raw_expiry, bool) or not isinstance(raw_expiry, int) or raw_expiry <= 0
+    ):
+        raise RuntimeError("Account Center renewal expiry is invalid")
+    raw_interval = result.get("interval_seconds")
+    if raw_interval is not None and (
+        isinstance(raw_interval, bool)
+        or not isinstance(raw_interval, int)
+        or not 1 <= raw_interval <= 300
+    ):
+        raise RuntimeError("Account Center polling interval is invalid")
+    generation = result.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise RuntimeError("Account Center profile generation is invalid")
+    reason_code = result.get("reason_code")
+    if reason_code is not None and (
+        not isinstance(reason_code, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}", reason_code) is None
+    ):
+        raise RuntimeError("Account Center renewal reason code is invalid")
+    return ProviderRenewalSession(
+        authorization_ref=profile_ref,
+        session_ref=session_ref,
+        state=states[status],
+        created_at=datetime.now(UTC),
+        expires_at=(datetime.fromtimestamp(raw_expiry, UTC) if raw_expiry is not None else None),
+        authorization_url=authorization_url,
+        qr_attachment_ref=None,
+        generation=generation,
+        user_code=user_code,
     )
 
 

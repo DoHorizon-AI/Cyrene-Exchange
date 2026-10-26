@@ -47,6 +47,7 @@ from cyrene_exchange_product.integrations._generated.cyrene.workspace.product.v2
 from cyrene_exchange_product.integrations.api import (
     IntegrationServices,
     _invoke_connector_dispatcher,
+    _teams_resource_ref,
 )
 from cyrene_exchange_product.integrations.auth import PlatformAuthorityIdentityVerifier
 from cyrene_exchange_product.integrations.clients import DirectPluginHealthClient
@@ -77,6 +78,295 @@ from cyrene_exchange_product.integrations.models import (
     SnapshotFreshness,
 )
 from cyrene_exchange_product.integrations.store import IntegrationStore
+
+
+def test_system_notification_grant_mint_resolves_exact_profile_owner_and_route(
+    tmp_path: Path,
+) -> None:
+    """The signed Navigator grant path admits only the configured notification identity."""
+
+    tenant_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+    owner_subject = "11111111-1111-4111-8111-111111111111"
+    settings = parse_connector_host_settings(
+        {
+            "teamsMessages": {
+                "profileRef": "teams-chat-host",
+                "connectionRef": "teams-connection",
+                "organizationId": "org-teams",
+                "workspaceId": "workspace-teams",
+                "tenantId": tenant_id,
+                "allowedTeamIds": ["team-1"],
+                "allowedChannelIds": ["channel-1"],
+                "botAppId": "bot-app",
+                "directPlugin": {
+                    "bindingId": "teams-ingress",
+                    "connectionRef": "grpcs://teams-ingress:50051",
+                    "transport": "local",
+                },
+                "expectedIssuer": issuer,
+                "systemNotification": {
+                    "profileRef": "teams-notifications-v1",
+                    "ownerSubject": owner_subject,
+                    "fixedRoute": {
+                        "tenantId": tenant_id,
+                        "teamId": "team-1",
+                        "channelId": "channel-1",
+                        "conversationId": "19:conversation-id@thread.tacv2",
+                        "rootThreadId": "1740000000000",
+                        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+                    },
+                },
+            }
+        }
+    )
+    root_profile = settings.teams_messages
+    assert root_profile is not None
+    notification_profile = root_profile.profile_for_ref("teams-notifications-v1")
+    assert notification_profile is not None
+    key = b"n" * 32
+    key_file = tmp_path / "navigator-system-notification.key"
+    key_file.write_bytes(key)
+    key_file.chmod(0o600)
+    store = IntegrationStore(tmp_path / "system-notification.sqlite3")
+    authority_calls: list[dict[str, Any]] = []
+    grant_claims: dict[bytes, ConnectorGrantClaims] = {}
+
+    class Authority:
+        def authorize_connector_operation(self, **kwargs: Any) -> bytes:
+            authority_calls.append(kwargs)
+            return b"signed-synthetic-authority-grant"
+
+    class GrantVerifier:
+        def validate_authority_response(
+            self,
+            grant: bytes,
+            *,
+            expected: Mapping[str, Any],
+        ) -> ConnectorGrantClaims:
+            now_epoch = float(int(time.time()))
+            claims = ConnectorGrantClaims(
+                request_id=str(expected["request_id"]),
+                audience="exchange",
+                organization_id=str(expected["organization_id"]),
+                workspace_id=str(expected["workspace_id"]),
+                principal_issuer=str(expected["principal_issuer"]),
+                principal_subject=str(expected["principal_subject"]),
+                connection_ref=str(expected["connection_ref"]),
+                provider_id=str(expected["provider_id"]),
+                profile_ref=str(expected["profile_ref"]),
+                operation_id=str(expected["operation_id"]),
+                resource_ref=str(expected["resource_ref"]),
+                arguments_digest_sha256=expected["arguments_digest_sha256"],
+                issued_at_epoch=now_epoch,
+                expires_at_epoch=now_epoch + 15,
+                grant_ref="sha256:" + "c" * 64,
+            )
+            grant_claims[grant] = claims
+            return claims
+
+        def inspect(
+            self,
+            grant: bytes,
+            *,
+            expected: Mapping[str, Any] | None = None,
+        ) -> ConnectorGrantClaims:
+            claims = grant_claims.get(grant)
+            if claims is None:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Connector authorization denied",
+                    detail="Synthetic grant is unavailable.",
+                    status=403,
+                )
+            if expected is not None:
+                observed = {
+                    "request_id": claims.request_id,
+                    "organization_id": claims.organization_id,
+                    "workspace_id": claims.workspace_id,
+                    "principal_issuer": claims.principal_issuer,
+                    "principal_subject": claims.principal_subject,
+                    "connection_ref": claims.connection_ref,
+                    "provider_id": claims.provider_id,
+                    "profile_ref": claims.profile_ref,
+                    "operation_id": claims.operation_id,
+                    "resource_ref": claims.resource_ref,
+                    "arguments_digest_sha256": claims.arguments_digest_sha256,
+                }
+                if any(observed[key] != value for key, value in expected.items()):
+                    raise ExchangeProductError(
+                        code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                        title="Connector authorization denied",
+                        detail="Synthetic grant scope mismatch.",
+                        status=403,
+                    )
+            return claims
+
+        def consume(
+            self,
+            grant: bytes,
+            *,
+            expected: Mapping[str, Any],
+        ) -> ConnectorGrantClaims:
+            return self.inspect(grant, expected=expected)
+
+    class MessageClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def send_reply(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                accepted=True,
+                vendor_message_id="synthetic-message-1",
+                evidence={"status": "ACCEPTED"},
+            )
+
+    dispatcher = ConnectorOperationDispatcher(
+        store=store,
+        accounts=SimpleNamespace(),
+        github=SimpleNamespace(),
+        authorization_cloud=None,
+        registry=None,
+    )
+    grant_verifier = GrantVerifier()
+    message_client = MessageClient()
+    owner = IntegrationPrincipal(
+        issuer=issuer,
+        subject=owner_subject,
+        organization_id="org-teams",
+        workspace_id="workspace-teams",
+        allowed_operation_ids=frozenset(),
+    )
+    services = IntegrationServices(
+        store=store,
+        authorizer=None,
+        accounts=SimpleNamespace(),  # type: ignore[arg-type]
+        github=SimpleNamespace(),  # type: ignore[arg-type]
+        webhook_verifier=SimpleNamespace(),  # type: ignore[arg-type]
+        delegation_authorizer=None,
+        callback_principal=owner,
+        navigator_hmac_authenticator=NavigatorHmacAuthenticator(
+            NavigatorHmacSettings(key_id="navigator-system-test-v1", key_file=key_file),
+            replay_guard=store,
+        ),
+        connector_grant_authority=Authority(),
+        connector_grant_verifier=grant_verifier,
+        connector_operation_dispatcher=dispatcher,
+        teams_message_profile=root_profile,
+        teams_message_client=message_client,
+    )
+    app = create_app(
+        database_path=tmp_path / "system-notification.sqlite3",
+        integrations=services,
+    )
+    path = "/internal/v1/connector-operation-grants"
+    route = {
+        "tenantId": tenant_id,
+        "teamId": "team-1",
+        "channelId": "channel-1",
+        "conversationId": "19:conversation-id@thread.tacv2",
+        "rootThreadId": "1740000000000",
+        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+    }
+    arguments = {"conversation": route, "text": "Credential authorization needs attention."}
+
+    def signed_headers(body: bytes) -> dict[str, str]:
+        timestamp = str(int(time.time()))
+        message = (
+            b"POST\n" + path.encode("utf-8") + b"\n" + timestamp.encode("ascii") + b"\n" + body
+        )
+        return {
+            "content-type": "application/json",
+            "x-cyrene-navigator-key-id": "navigator-system-test-v1",
+            "x-cyrene-navigator-timestamp": timestamp,
+            "x-cyrene-navigator-signature": hmac.new(
+                key,
+                message,
+                hashlib.sha256,
+            ).hexdigest(),
+        }
+
+    def grant_payload(
+        *,
+        request_id: str,
+        profile_ref: str = "teams-notifications-v1",
+        subject: str = owner_subject,
+        selected_arguments: dict[str, Any] = arguments,
+    ) -> bytes:
+        payload = {
+            "request_id": request_id,
+            "workspace_id": "workspace-teams",
+            "principal_issuer": issuer,
+            "principal_subject": subject,
+            "connection_ref": "teams-connection",
+            "provider_id": "msteams",
+            "profile_ref": profile_ref,
+            "operation_id": "msteams.message.reply",
+            "resource_ref": _teams_resource_ref(selected_arguments["conversation"]),
+            "arguments": selected_arguments,
+            "arguments_digest_sha256": digest_arguments(selected_arguments),
+        }
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    try:
+        with TestClient(app) as client:
+            accepted_body = grant_payload(request_id="teams-notify-accepted")
+            accepted = client.post(
+                path,
+                content=accepted_body,
+                headers=signed_headers(accepted_body),
+            )
+            assert accepted.status_code == 200, accepted.text
+            assert accepted.json()["claims"]["profileRef"] == "teams-notifications-v1"
+            assert authority_calls[-1]["principal_subject"] == owner_subject
+            notification_body = {
+                "requestId": "teams-notify-accepted",
+                "conversation": route,
+                "text": arguments["text"],
+            }
+            sent = client.post(
+                "/internal/v1/teams/messages",
+                json=notification_body,
+                headers={"x-cyrene-connector-grant-bin": accepted.json()["connectorGrantBin"]},
+            )
+            assert sent.status_code == 200, sent.text
+            assert sent.json()["status"] == "accepted"
+            assert message_client.calls[0]["root_thread_id"] == "1740000000000"
+            wrong_thread = client.post(
+                "/internal/v1/teams/messages",
+                json={
+                    **notification_body,
+                    "conversation": {**route, "rootThreadId": "1740000000001"},
+                },
+                headers={"x-cyrene-connector-grant-bin": accepted.json()["connectorGrantBin"]},
+            )
+            assert wrong_thread.status_code == 403, wrong_thread.text
+            assert len(message_client.calls) == 1
+
+            bad_cases = (
+                grant_payload(
+                    request_id="teams-notify-host-alias",
+                    profile_ref="teams-chat-host-alias",
+                ),
+                grant_payload(
+                    request_id="teams-notify-wrong-owner",
+                    subject="22222222-2222-4222-8222-222222222222",
+                ),
+                grant_payload(
+                    request_id="teams-notify-wrong-thread",
+                    selected_arguments={
+                        "conversation": {**route, "rootThreadId": "1740000000001"},
+                        "text": arguments["text"],
+                    },
+                ),
+            )
+            for raw_body in bad_cases:
+                rejected = client.post(path, content=raw_body, headers=signed_headers(raw_body))
+                assert rejected.status_code == 403, rejected.text
+            assert len(authority_calls) == 1
+    finally:
+        services.close()
 
 
 def test_slow_connector_dispatch_keeps_event_loop_responsive() -> None:
@@ -1369,8 +1659,8 @@ def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_
     key_file = tmp_path / "navigator-hmac.key"
     key_file.write_bytes(key)
     key_file.chmod(0o600)
-    issued_at_epoch = float(int(time.time())) + 0.25
-    expires_at_epoch = issued_at_epoch + 15.0
+    grant_times: dict[str, float] = {"issued_at": 0.0, "expires_at": 0.0}
+    request_clock = {"now": int(time.time())}
 
     class CountingHmacAuthenticator(NavigatorHmacAuthenticator):
         verify_calls = 0
@@ -1394,6 +1684,8 @@ def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_
             *,
             expected: dict[str, Any],
         ) -> ConnectorGrantClaims:
+            grant_times["issued_at"] = float(int(time.time())) + 0.25
+            grant_times["expires_at"] = grant_times["issued_at"] + 15.0
             return ConnectorGrantClaims(
                 request_id=str(expected["request_id"]),
                 audience="exchange",
@@ -1407,8 +1699,8 @@ def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_
                 operation_id=str(expected["operation_id"]),
                 resource_ref=str(expected["resource_ref"]),
                 arguments_digest_sha256=expected["arguments_digest_sha256"],
-                issued_at_epoch=issued_at_epoch,
-                expires_at_epoch=expires_at_epoch,
+                issued_at_epoch=grant_times["issued_at"],
+                expires_at_epoch=grant_times["expires_at"],
                 grant_ref="sha256:" + "a" * 64,
             )
 
@@ -1454,6 +1746,7 @@ def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_
     authenticator = CountingHmacAuthenticator(
         NavigatorHmacSettings(key_id="navigator-test-v1", key_file=key_file),
         replay_guard=store,
+        clock=lambda: request_clock["now"],
     )
     services = IntegrationServices(
         store=store,
@@ -1471,7 +1764,8 @@ def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_
     app = create_app(database_path=tmp_path / "large-upload-product.sqlite3", integrations=services)
 
     def headers(raw_body: bytes) -> dict[str, str]:
-        timestamp = str(int(time.time()))
+        request_clock["now"] = int(time.time())
+        timestamp = str(request_clock["now"])
         message = (
             b"POST\n/internal/v1/connector-operation-grants\n"
             + timestamp.encode("ascii")
@@ -1564,10 +1858,9 @@ def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_
             assert grant["claims"]["argumentsDigestSha256"] == digest_arguments(arguments)
             assert type(grant["issuedAt"]) is int
             assert type(grant["expiresAt"]) is int
-            assert grant["issuedAt"] == int(issued_at_epoch)
-            assert grant["expiresAt"] == int(expires_at_epoch)
+            assert grant["issuedAt"] == int(grant_times["issued_at"])
+            assert grant["expiresAt"] == int(grant_times["expires_at"])
             assert 0 < grant["expiresAt"] - grant["issuedAt"] <= 15
-            assert grant["expiresAt"] > int(time.time())
             assert authenticator.verify_calls == 1
             assert len(authority.calls) == 1
             assert authority.calls[0]["arguments_digest_sha256"] == bytes.fromhex(

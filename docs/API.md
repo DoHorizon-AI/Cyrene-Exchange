@@ -178,12 +178,15 @@ its response is `text/event-stream`, not JSON. It uses the exact
 checks; streaming the same feed does not add a privilege.
 
 Renewal creates a Product session intent before the provider call. A confirmed
-session exposes the provider's strictly verified WeCom navigation URI in the
-existing `authorizationUrl` field: either the fixed onboarding QR flow or the
-existing-profile authorization management page. The field is a navigation URI,
-not a QR discriminator. Exchange validates each path with its own exact host and
-query rules, then canonicalizes the management URL. An opaque QR attachment ref
-may also be returned. If the start result is ambiguous, the session remains `VERIFYING`
+WeCom session exposes its strictly verified navigation URI in `authorizationUrl`:
+either the fixed onboarding QR flow or the existing-profile authorization page.
+An HF device OAuth session instead exposes exactly `https://hf.co/oauth/device`
+or `https://huggingface.co/oauth/device` and a short-lived uppercase
+`userCode` in `XXXX-XXXX` form; the device code and OAuth credentials remain
+inside Account Center. The field is a
+navigation URI, not a QR discriminator. Exchange validates the HF URL exactly and
+validates WeCom paths with their own host and query rules. An opaque WeCom QR
+attachment ref may also be returned. If the start result is ambiguous, the session remains `VERIFYING`
 with a `provider_start_outcome_unknown` reason and no URL. Exchange does not start
 another session automatically; once the provider's durable replay implementation
 is enabled, the caller may repeat the exact POST with the same `Idempotency-Key` to
@@ -209,10 +212,13 @@ Endpoint、Shell 命令、凭据或模型选择的范围。Provider 读取失败
 freshness 随时间变为 `STALE`；不会据此报告资源已停止。独立邮件发件箱会先持久化
 `SENDING` 再调用邮件适配器；发送结果丢失或不明确时标记为 `UNKNOWN`，且不会自动重发。
 
-重新授权会在调用 Provider 前持久化 Product session intent。确认创建的 session 在现有
-`authorizationUrl` 字段中返回经过严格校验的 WeCom 导航 URI：固定 onboarding QR 流程或既有
-profile 的授权管理页。该字段表示导航 URI，不表示其一定是二维码。Exchange 对两种路径分别执行精确
-Host/query 校验，并对管理页 URL 规范化；也可返回 opaque QR attachment ref。启动结果不明确时，session
+重新授权会在调用 Provider 前持久化 Product session intent。WeCom session 在现有
+`authorizationUrl` 字段中返回经过严格校验的导航 URI：固定 onboarding QR 流程或既有 profile
+授权管理页。HF device OAuth session 则返回精确的
+`https://hf.co/oauth/device` 或 `https://huggingface.co/oauth/device`，以及`XXXX-XXXX`形式的大写短期
+`userCode`；device code 和 OAuth 凭据留在 Account Center。
+该字段表示导航 URI，不表示其一定是二维码。Exchange 精确校验 HF URL，并按各自 Host/query 规则校验
+WeCom URI；WeCom 也可返回 opaque QR attachment ref。启动结果不明确时，session
 保持 `VERIFYING`，附 `provider_start_outcome_unknown`，不提供 URL。Exchange 不会自动启动另一个
 session；Provider 的持久化重放实现启用后，调用方可使用相同 `Idempotency-Key` 重放完全相同的
 POST，以取回同一 session。新 key 表示新的用户授权操作。

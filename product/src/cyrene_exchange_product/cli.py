@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from threading import Event
+from typing import Any
 from uuid import UUID
 
 import uvicorn
@@ -44,6 +45,16 @@ from cyrene_exchange_product.store import ExchangeStore
 
 _INTEGRATION_TLS_CERT_ENV = "CYRENE_EXCHANGE_TLS_CERT_FILE"
 _INTEGRATION_TLS_KEY_ENV = "CYRENE_EXCHANGE_TLS_KEY_FILE"
+_AUTHORIZATION_CLOUD_RUNNER_ENV = "CYRENE_EXCHANGE_AUTHORIZATION_CLOUD_RUNNER_ENABLED"
+
+
+def _authorization_cloud_runner_enabled() -> bool:
+    """Read the explicit host switch for the app-owned authorization worker."""
+
+    value = os.environ.get(_AUTHORIZATION_CLOUD_RUNNER_ENV, "false").strip().lower()
+    if value not in {"true", "false"}:
+        raise SystemExit(f"{_AUTHORIZATION_CLOUD_RUNNER_ENV} must be true or false")
+    return value == "true"
 
 
 def _bindings(entries: list[str]) -> dict[str, OpenAICompatibleProvider]:
@@ -140,6 +151,11 @@ def _serve(arguments: argparse.Namespace) -> int:
         )
     if runtime_mode in {"gateway-only", "combined"} and arguments.database is None:
         raise SystemExit("--database is required for gateway-only and combined modes")
+    authorization_cloud_runner_enabled = _authorization_cloud_runner_enabled()
+    if authorization_cloud_runner_enabled and runtime_mode != "integration-only":
+        raise SystemExit(
+            f"{_AUTHORIZATION_CLOUD_RUNNER_ENV} is supported only in integration-only mode"
+        )
     listener_tls = _integration_listener_tls_options(arguments, runtime_mode=runtime_mode)
     integrations = None
     if runtime_mode != "gateway-only":
@@ -158,6 +174,7 @@ def _serve(arguments: argparse.Namespace) -> int:
             app = build_integration_app(
                 database_path=integration_database,
                 integrations=integrations,
+                enable_authorization_cloud_runner=authorization_cloud_runner_enabled,
             )
             if listener_tls:
                 uvicorn.run(
@@ -425,73 +442,462 @@ def _integration_authorization_cloud(arguments: argparse.Namespace, *, once: boo
         services.close()
 
 
-def _integration_connector_bindings(arguments: argparse.Namespace) -> int:
-    """Export the launcher-owned connection map from trusted Exchange SQLite rows."""
+def _integration_connector_export_data(
+    services: Any,
+    arguments: argparse.Namespace,
+    *,
+    include_profile_metadata: bool,
+    include_live_catalog: bool,
+) -> dict[str, Any]:
+    """Build one exact actor-scoped snapshot from Exchange and live plugin catalogs.
 
-    from cyrene_exchange_product.integrations.cli import build_production_services
+    Read-only Hugging Face operations come from the selected Account Center target's
+    read grant. Cloud catalogs may be complete or the exact canonical read-only set;
+    all other missing operations fail closed. No credential or authorization ref is
+    copied into the projection. 中文：只导出固定连接范围与无凭据 profile 元数据。
+    """
+
+    from collections.abc import Mapping
+
+    from cyrene_exchange_product.integrations.clients import ProviderToolDefinition
     from cyrene_exchange_product.integrations.connector_operations import (
         connector_binding_tools,
+        validate_computer_tool_schema,
     )
+    from cyrene_exchange_product.integrations.models import IntegrationPrincipal
+
+    connections = services.store.connector_bindings_for_actor(
+        issuer=arguments.issuer,
+        subject=arguments.subject,
+        organization_id=arguments.organization_id,
+        workspace_id=arguments.workspace_id,
+    )
+    account_connections = [row for row in connections if row.provider in {"github", "hf"}]
+    need_account_profiles = include_profile_metadata or any(
+        row.provider == "hf" for row in account_connections
+    )
+    account_profiles: dict[tuple[str, str], dict[str, Any]] = {}
+    if need_account_profiles and account_connections:
+        if not arguments.organization_id:
+            raise SystemExit("provider profile export requires --organization-id")
+        principal = IntegrationPrincipal(
+            issuer=arguments.issuer,
+            subject=arguments.subject,
+            organization_id=arguments.organization_id,
+            workspace_id=arguments.workspace_id,
+            allowed_operation_ids=frozenset({"accountListProviderProfiles"}),
+        )
+        response = services.accounts.list_provider_profiles(principal)
+        rows = response.get("profiles") if isinstance(response, Mapping) else None
+        if not isinstance(rows, list):
+            raise SystemExit("Account Center provider profile readback is unavailable")
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise SystemExit("Account Center returned malformed profile metadata")
+            profile_ref = row.get("profile_ref")
+            provider = row.get("provider")
+            auth_status = row.get("auth_status")
+            access_mode = row.get("access_mode", "actor_owned")
+            if (
+                not isinstance(profile_ref, str)
+                or not profile_ref
+                or provider not in {"github", "huggingface"}
+                or not isinstance(auth_status, str)
+                or not isinstance(access_mode, str)
+                or access_mode not in {"actor_owned", "workspace_operator"}
+            ):
+                raise SystemExit("Account Center returned unsupported profile metadata")
+            raw_scope = row.get("target_scope")
+            if not isinstance(raw_scope, Mapping) or set(raw_scope) != {"repositories"}:
+                raise SystemExit("Account Center returned an unsupported provider scope")
+            repositories = raw_scope.get("repositories")
+            if not isinstance(repositories, list) or not repositories:
+                raise SystemExit("Account Center returned an empty provider scope")
+            safe_repositories: list[dict[str, Any]] = []
+            for repository in repositories:
+                if not isinstance(repository, Mapping):
+                    raise SystemExit("Account Center returned malformed provider scope")
+                if provider == "huggingface":
+                    repo_type = repository.get("repo_type")
+                    repo_id = repository.get("repo_id")
+                    permissions = repository.get("permissions")
+                    if (
+                        repo_type not in {"model", "dataset", "space"}
+                        or not isinstance(repo_id, str)
+                        or not repo_id
+                        or not isinstance(permissions, list)
+                        or not permissions
+                        or any(value not in {"read", "write"} for value in permissions)
+                        or "read" not in permissions
+                    ):
+                        raise SystemExit("Account Center returned invalid Hugging Face scope")
+                    safe_repositories.append(
+                        {
+                            "repoType": repo_type,
+                            "repoId": repo_id,
+                            "permissions": sorted(set(permissions)),
+                        }
+                    )
+                else:
+                    repository_id = repository.get("repository_id")
+                    owner = repository.get("owner")
+                    name = repository.get("name")
+                    if not all(
+                        isinstance(value, str) and value for value in (repository_id, owner, name)
+                    ):
+                        raise SystemExit("Account Center returned invalid GitHub scope")
+                    safe_repositories.append(
+                        {"repositoryId": repository_id, "owner": owner, "name": name}
+                    )
+            auth_mode = row.get("auth_mode")
+            if auth_mode is not None and (
+                provider != "huggingface" or auth_mode not in {"fine_grained_token", "device_oauth"}
+            ):
+                raise SystemExit("Account Center returned unsupported authentication mode")
+            revision = row.get("credential_revision")
+            if revision is not None and (
+                not isinstance(revision, int) or isinstance(revision, bool) or revision < 0
+            ):
+                raise SystemExit("Account Center returned invalid credential revision")
+            key = (profile_ref, str(provider))
+            if key in account_profiles:
+                raise SystemExit("Account Center returned duplicate provider profile metadata")
+            account_profiles[key] = {
+                "profileRef": profile_ref,
+                "providerId": str(provider),
+                "authStatus": auth_status,
+                "accessMode": access_mode,
+                "targetScope": {"repositories": safe_repositories},
+                **({"authMode": auth_mode} if isinstance(auth_mode, str) else {}),
+                **({"credentialRevision": revision} if revision is not None else {}),
+            }
+
+    bindings: list[dict[str, Any]] = []
+    catalog_items: list[dict[str, Any]] = []
+    profile_metadata: dict[tuple[str, str], dict[str, Any]] = {}
+    connection_metadata: list[dict[str, Any]] = []
+    catalog_cache: dict[tuple[str, str], dict[str, ProviderToolDefinition]] = {}
+    registry = getattr(services, "authorization_profile_registry", None)
+
+    for connection in connections:
+        provider_id = "huggingface" if connection.provider == "hf" else connection.provider
+        full_map = connector_binding_tools(provider_id)
+        if not full_map:
+            continue
+        profile_ref = (
+            connection.account_link_ref
+            if connection.provider in {"github", "hf"}
+            else connection.binding_ref
+        )
+        if (
+            provider_id == "github"
+            and profile_ref is None
+            and connection.binding_ref is None
+            and connection.target_ref is None
+        ):
+            continue
+        if not profile_ref or (connection.provider != "github" and not connection.target_ref):
+            raise SystemExit("an enabled connector connection has no complete host profile scope")
+
+        read_only_hf_target = False
+        connection_target_scope: dict[str, Any] | None = None
+        account_profile: dict[str, Any] | None = None
+        host_profile: Any = None
+        target: Any = None
+        if connection.provider in {"github", "hf"}:
+            provider_name = "huggingface" if connection.provider == "hf" else "github"
+            account_profile = account_profiles.get((str(profile_ref), provider_name))
+            if need_account_profiles and account_profile is None:
+                raise SystemExit("Exchange connection does not match an Account Center profile")
+            if connection.provider == "github":
+                connection_target_scope = {
+                    "repositoryId": connection.repository_id,
+                    "repository": connection.repository_name,
+                }
+            else:
+                if registry is None:
+                    raise SystemExit("Hugging Face connection profile registry is unavailable")
+                host_profile = registry.settings.profiles.get(str(connection.binding_ref))
+                target = (
+                    host_profile.targets.get(str(connection.target_ref))
+                    if host_profile is not None
+                    else None
+                )
+                if host_profile is None or host_profile.provider != "hf" or target is None:
+                    raise SystemExit("Hugging Face connection target is not host configured")
+                if account_profile is None:
+                    raise SystemExit("Hugging Face Account Center profile readback is unavailable")
+                repositories = account_profile["targetScope"]["repositories"]
+                target_rows = [row for row in repositories if row["repoId"] == target.target_ref]
+                if len(target_rows) != 1:
+                    raise SystemExit("Hugging Face target does not match its issued profile scope")
+                target_row = target_rows[0]
+                read_only_hf_target = "write" not in target_row["permissions"]
+                connection_target_scope = {
+                    "repoType": target_row["repoType"],
+                    "repoId": target_row["repoId"],
+                    "permissions": target_row["permissions"],
+                }
+        elif provider_id in {"azure", "gcp", "runpod"} and include_profile_metadata:
+            if registry is None:
+                raise SystemExit("cloud connection profile registry is unavailable")
+            host_profile = registry.settings.profiles.get(str(connection.binding_ref))
+            target = (
+                host_profile.targets.get(str(connection.target_ref))
+                if host_profile is not None
+                else None
+            )
+            if host_profile is None or host_profile.provider != provider_id or target is None:
+                raise SystemExit("cloud connection does not match a configured profile target")
+            connection_target_scope = {
+                "targetAlias": str(connection.target_ref),
+                "targetRef": target.target_ref,
+            }
+        elif provider_id == "github":
+            connection_target_scope = {
+                "repositoryId": connection.repository_id,
+                "repository": connection.repository_name,
+            }
+
+        source_binding = "github" if provider_id == "github" else str(connection.binding_ref)
+        cache_key = (provider_id, source_binding)
+        expected = {str(entry["toolId"]): entry for entry in full_map}
+        if len(expected) != len(full_map):
+            raise SystemExit("Exchange connector operation map contains duplicate tool IDs")
+        expected_ids = set(expected)
+        read_ids = {
+            tool_id for tool_id, mapping in expected.items() if mapping.get("mutating") is False
+        }
+        descriptors: dict[str, ProviderToolDefinition] = {}
+        if include_live_catalog:
+            descriptors = catalog_cache.get(cache_key, {})
+            if not descriptors:
+                if provider_id == "github":
+                    provider_catalog = services.github.list_tool_catalog()
+                else:
+                    if services.authorization_cloud is None:
+                        raise SystemExit("configured connector provider catalog is unavailable")
+                    provider_catalog = services.authorization_cloud.list_tool_catalog(
+                        source_binding
+                    )
+                descriptors = {descriptor.tool_id: descriptor for descriptor in provider_catalog}
+                catalog_cache[cache_key] = descriptors
+        descriptor_ids = set(descriptors)
+        if provider_id == "huggingface" and read_only_hf_target:
+            selected_ids = read_ids
+        elif include_live_catalog and provider_id in {"azure", "gcp", "runpod"}:
+            available = descriptor_ids & expected_ids
+            if available == expected_ids:
+                selected_ids = expected_ids
+            elif read_ids and available == read_ids:
+                selected_ids = read_ids
+            else:
+                raise SystemExit(
+                    "configured provider catalog is missing required Exchange read operations"
+                )
+        else:
+            selected_ids = expected_ids
+        if include_live_catalog and selected_ids - descriptor_ids:
+            raise SystemExit("configured provider catalog is missing required Exchange operations")
+
+        tools: list[dict[str, Any]] = []
+        binding_tools: list[dict[str, object]] = []
+        for tool_id in sorted(selected_ids):
+            mapping = expected[tool_id]
+            mutating = mapping.get("mutating")
+            if not isinstance(mutating, bool):
+                raise SystemExit("Exchange connector operation map has invalid mutability")
+            binding_tools.append(mapping)
+            if include_live_catalog:
+                definition = descriptors[tool_id]
+                tools.append(
+                    {
+                        "id": definition.tool_id,
+                        "name": definition.name,
+                        "description": definition.description,
+                        "readOnly": not mutating,
+                        "inputSchema": definition.input_schema,
+                    }
+                )
+        binding_id = f"exchange-{provider_id}-{connection.id}"
+        connection_ref = str(connection.id)
+        bindings.append(
+            {
+                "bindingId": binding_id,
+                "connectionRef": connection_ref,
+                "providerId": provider_id,
+                "profileRef": str(profile_ref),
+                "tools": binding_tools,
+            }
+        )
+        if include_live_catalog:
+            catalog_items.append(
+                {
+                    "bindingId": binding_id,
+                    "capabilityId": "tool.provider.v1",
+                    "providerId": provider_id,
+                    "connectionRef": connection_ref,
+                    "profileRef": str(profile_ref),
+                    "tools": tools,
+                }
+            )
+
+        if account_profile is not None:
+            profile_key = (str(profile_ref), provider_id)
+            profile_metadata[profile_key] = {
+                **account_profile,
+                "profileAlias": str(connection.binding_ref)
+                if connection.binding_ref is not None
+                else None,
+            }
+        elif include_profile_metadata and host_profile is not None:
+            profile_key = (str(host_profile.profile_ref), provider_id)
+            profile_metadata[profile_key] = {
+                "profileRef": host_profile.profile_ref,
+                "profileAlias": host_profile.profile_ref,
+                "providerId": provider_id,
+                "accessMode": connection.access_mode,
+                "targetScope": {
+                    "targets": {
+                        alias: {"targetRef": configured_target.target_ref}
+                        for alias, configured_target in host_profile.targets.items()
+                    }
+                },
+                **(
+                    {"authMode": host_profile.auth_mode}
+                    if isinstance(host_profile.auth_mode, str)
+                    else {}
+                ),
+                "readOnly": selected_ids == read_ids,
+            }
+        connection_metadata.append(
+            {
+                "connectionRef": connection_ref,
+                "providerId": provider_id,
+                "profileRef": str(profile_ref),
+                "profileAlias": str(connection.binding_ref)
+                if connection.binding_ref is not None
+                else None,
+                "targetAlias": str(connection.target_ref)
+                if connection.target_ref is not None
+                else None,
+                "accessMode": connection.access_mode,
+                "readOnly": selected_ids == read_ids,
+                **({"targetScope": connection_target_scope} if connection_target_scope else {}),
+            }
+        )
+
+    computer_profile = getattr(services, "computer_runner_profile", None)
+    if (
+        computer_profile is not None
+        and computer_profile.expected_issuer == arguments.issuer
+        and computer_profile.organization_id == arguments.organization_id
+        and computer_profile.workspace_id == arguments.workspace_id
+    ):
+        operation_map = connector_binding_tools("computer")
+        expected = {str(item["toolId"]): item for item in operation_map}
+        tools = []
+        if len(expected) != len(operation_map):
+            raise SystemExit("computer runner operation map contains duplicate tool IDs")
+        if include_live_catalog:
+            computer_client = getattr(services, "computer_runner_client", None)
+            if computer_client is None:
+                raise SystemExit("configured computer runner tool catalog is unavailable")
+            descriptors = {item.tool_id: item for item in computer_client.list_tool_catalog()}
+            if set(expected) - set(descriptors):
+                raise SystemExit("computer runner catalog is missing a required fixed operation")
+            for tool_id in sorted(expected):
+                definition = descriptors[tool_id]
+                mapping = expected[tool_id]
+                validate_computer_tool_schema(
+                    computer_profile,
+                    tool_id=tool_id,
+                    input_schema=definition.input_schema,
+                )
+                mutating = mapping.get("mutating")
+                if not isinstance(mutating, bool):
+                    raise SystemExit("computer runner operation map has invalid mutability")
+                tools.append(
+                    {
+                        "id": definition.tool_id,
+                        "name": definition.name,
+                        "description": definition.description,
+                        "readOnly": not mutating,
+                        "inputSchema": definition.input_schema,
+                    }
+                )
+        connection_ref = computer_profile.connection_ref
+        binding_id = f"exchange-computer-{connection_ref}"
+        bindings.append(
+            {
+                "bindingId": binding_id,
+                "connectionRef": connection_ref,
+                "providerId": "computer",
+                "profileRef": computer_profile.profile_ref,
+                "tools": operation_map,
+            }
+        )
+        if include_live_catalog:
+            catalog_items.append(
+                {
+                    "bindingId": binding_id,
+                    "capabilityId": "tool.provider.v1",
+                    "providerId": "computer",
+                    "connectionRef": connection_ref,
+                    "profileRef": computer_profile.profile_ref,
+                    "tools": tools,
+                }
+            )
+        if include_profile_metadata:
+            profile_metadata[(computer_profile.profile_ref, "computer")] = {
+                "profileRef": computer_profile.profile_ref,
+                "profileAlias": computer_profile.profile_ref,
+                "providerId": "computer",
+                "accessMode": "workspace_operator",
+                "targetScope": {
+                    "maxCommandTimeoutMs": computer_profile.max_command_timeout_ms,
+                    "maxFileBytes": computer_profile.max_file_bytes,
+                    "maxReadBytes": computer_profile.max_read_bytes,
+                    "maxDirectoryDepth": computer_profile.max_directory_depth,
+                },
+            }
+            connection_metadata.append(
+                {
+                    "connectionRef": connection_ref,
+                    "providerId": "computer",
+                    "profileRef": computer_profile.profile_ref,
+                    "profileAlias": computer_profile.profile_ref,
+                    "accessMode": "workspace_operator",
+                    "readOnly": False,
+                }
+            )
+
+    return {
+        "profiles": [profile_metadata[key] for key in sorted(profile_metadata)],
+        "connections": connection_metadata,
+        "bindings": bindings,
+        "catalog": {"schemaVersion": 1, "items": catalog_items},
+    }
+
+
+def _integration_connector_bindings(arguments: argparse.Namespace) -> int:
+    """Export the launcher-owned connection map from live Exchange state."""
+
+    from cyrene_exchange_product.integrations.cli import build_production_services
 
     database_path = Path(arguments.integration_database).expanduser().resolve()
     if not database_path.is_file():
         raise SystemExit("Exchange integration database does not exist")
     services = build_production_services(database_path)
     try:
-        connections = services.store.connector_bindings_for_actor(
-            issuer=arguments.issuer,
-            subject=arguments.subject,
-            workspace_id=arguments.workspace_id,
+        exported = _integration_connector_export_data(
+            services,
+            arguments,
+            include_profile_metadata=False,
+            include_live_catalog=False,
         )
-        bindings: list[dict[str, object]] = []
-        skipped = 0
-        for connection in connections:
-            provider_id = "huggingface" if connection.provider == "hf" else connection.provider
-            tools = connector_binding_tools(provider_id)
-            if not tools:
-                continue
-            profile_ref = (
-                connection.account_link_ref
-                if connection.provider in {"github", "hf"}
-                else connection.binding_ref
-            )
-            if not profile_ref or (connection.provider != "github" and not connection.target_ref):
-                skipped += 1
-                continue
-            bindings.append(
-                {
-                    "bindingId": f"exchange-{provider_id}-{connection.id}",
-                    "connectionRef": str(connection.id),
-                    "providerId": provider_id,
-                    "profileRef": profile_ref,
-                    "tools": tools,
-                }
-            )
-        computer_profile = getattr(services, "computer_runner_profile", None)
-        if (
-            computer_profile is not None
-            and computer_profile.expected_issuer == arguments.issuer
-            and computer_profile.workspace_id == arguments.workspace_id
-        ):
-            if not arguments.organization_id:
-                raise SystemExit("computer connector binding export requires --organization-id")
-            if computer_profile.organization_id == arguments.organization_id:
-                bindings.append(
-                    {
-                        "bindingId": f"exchange-computer-{computer_profile.connection_ref}",
-                        "connectionRef": computer_profile.connection_ref,
-                        "providerId": "computer",
-                        "profileRef": computer_profile.profile_ref,
-                        "tools": connector_binding_tools("computer"),
-                    }
-                )
-        if skipped:
-            print(
-                f"Skipped {skipped} provider connection(s) without a configured profile or target.",
-                file=sys.stderr,
-            )
         payload = json.dumps(
-            {"schemaVersion": 1, "bindings": bindings},
+            {"schemaVersion": 1, "bindings": exported["bindings"]},
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -511,149 +917,20 @@ def _integration_connector_tool_catalog(arguments: argparse.Namespace) -> int:
     """
 
     from cyrene_exchange_product.integrations.cli import build_production_services
-    from cyrene_exchange_product.integrations.clients import ProviderToolDefinition
-    from cyrene_exchange_product.integrations.connector_operations import (
-        connector_binding_tools,
-        validate_computer_tool_schema,
-    )
 
     database_path = Path(arguments.integration_database).expanduser().resolve()
     if not database_path.is_file():
         raise SystemExit("Exchange integration database does not exist")
     services = build_production_services(database_path)
     try:
-        connections = services.store.connector_bindings_for_actor(
-            issuer=arguments.issuer,
-            subject=arguments.subject,
-            organization_id=arguments.organization_id,
-            workspace_id=arguments.workspace_id,
+        exported = _integration_connector_export_data(
+            services,
+            arguments,
+            include_profile_metadata=False,
+            include_live_catalog=True,
         )
-        items: list[dict[str, object]] = []
-        catalog_cache: dict[tuple[str, str], dict[str, ProviderToolDefinition]] = {}
-        for connection in connections:
-            if connection.organization_id != arguments.organization_id:
-                continue
-            provider_id = "huggingface" if connection.provider == "hf" else connection.provider
-            operation_map = connector_binding_tools(provider_id)
-            if not operation_map:
-                continue
-            profile_ref = (
-                connection.account_link_ref
-                if connection.provider in {"github", "hf"}
-                else connection.binding_ref
-            )
-            if (
-                provider_id == "github"
-                and profile_ref is None
-                and connection.binding_ref is None
-                and connection.target_ref is None
-            ):
-                continue
-            if not profile_ref or (connection.provider != "github" and not connection.target_ref):
-                raise SystemExit(
-                    "an enabled connector connection has no complete host profile scope"
-                )
-
-            source_binding = "github" if provider_id == "github" else str(connection.binding_ref)
-            cache_key = (provider_id, source_binding)
-            descriptors = catalog_cache.get(cache_key)
-            if descriptors is None:
-                if provider_id == "github":
-                    provider_catalog = services.github.list_tool_catalog()
-                else:
-                    if services.authorization_cloud is None:
-                        raise SystemExit("configured connector provider catalog is unavailable")
-                    provider_catalog = services.authorization_cloud.list_tool_catalog(
-                        str(connection.binding_ref)
-                    )
-                descriptors = {descriptor.tool_id: descriptor for descriptor in provider_catalog}
-                catalog_cache[cache_key] = descriptors
-
-            expected = {str(entry["toolId"]): entry for entry in operation_map}
-            if len(expected) != len(operation_map):
-                raise SystemExit("Exchange connector operation map contains duplicate tool IDs")
-            missing = set(expected) - set(descriptors)
-            if missing:
-                raise SystemExit(
-                    "configured provider catalog is missing required Exchange operations"
-                )
-            tools: list[dict[str, object]] = []
-            for tool_id in sorted(expected):
-                definition = descriptors[tool_id]
-                mapping = expected[tool_id]
-                mutating = mapping.get("mutating")
-                if not isinstance(mutating, bool):
-                    raise SystemExit("Exchange connector operation map has invalid mutability")
-                tools.append(
-                    {
-                        "id": definition.tool_id,
-                        "name": definition.name,
-                        "description": definition.description,
-                        "readOnly": not mutating,
-                        "inputSchema": definition.input_schema,
-                    }
-                )
-            items.append(
-                {
-                    "bindingId": f"exchange-{provider_id}-{connection.id}",
-                    "capabilityId": "tool.provider.v1",
-                    "providerId": provider_id,
-                    "connectionRef": str(connection.id),
-                    "profileRef": profile_ref,
-                    "tools": tools,
-                }
-            )
-
-        computer_profile = getattr(services, "computer_runner_profile", None)
-        if (
-            computer_profile is not None
-            and computer_profile.expected_issuer == arguments.issuer
-            and computer_profile.organization_id == arguments.organization_id
-            and computer_profile.workspace_id == arguments.workspace_id
-        ):
-            computer_client = getattr(services, "computer_runner_client", None)
-            if computer_client is None:
-                raise SystemExit("configured computer runner tool catalog is unavailable")
-            descriptors = computer_client.list_tool_catalog()
-            by_id = {descriptor.tool_id: descriptor for descriptor in descriptors}
-            operation_map = connector_binding_tools("computer")
-            expected = {str(item["toolId"]): item for item in operation_map}
-            if len(expected) != len(operation_map) or set(expected) - set(by_id):
-                raise SystemExit("computer runner catalog is missing a required fixed operation")
-            computer_tools: list[dict[str, object]] = []
-            for tool_id in sorted(expected):
-                definition = by_id[tool_id]
-                mapping = expected[tool_id]
-                validate_computer_tool_schema(
-                    computer_profile,
-                    tool_id=tool_id,
-                    input_schema=definition.input_schema,
-                )
-                mutating = mapping.get("mutating")
-                if not isinstance(mutating, bool):
-                    raise SystemExit("computer runner operation map has invalid mutability")
-                computer_tools.append(
-                    {
-                        "id": definition.tool_id,
-                        "name": definition.name,
-                        "description": definition.description,
-                        "readOnly": not mutating,
-                        "inputSchema": definition.input_schema,
-                    }
-                )
-            items.append(
-                {
-                    "bindingId": f"exchange-computer-{computer_profile.connection_ref}",
-                    "capabilityId": "tool.provider.v1",
-                    "providerId": "computer",
-                    "connectionRef": computer_profile.connection_ref,
-                    "profileRef": computer_profile.profile_ref,
-                    "tools": computer_tools,
-                }
-            )
-
         output = json.dumps(
-            {"schemaVersion": 1, "items": items},
+            exported["catalog"],
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -663,6 +940,46 @@ def _integration_connector_tool_catalog(arguments: argparse.Namespace) -> int:
     finally:
         services.close()
     print(output)
+    return 0
+
+
+def _integration_connector_readiness(arguments: argparse.Namespace) -> int:
+    """Export a credential-free readiness snapshot from the pinned Exchange runtime."""
+
+    from cyrene_exchange_product.integrations.cli import build_production_services
+
+    database_path = Path(arguments.integration_database).expanduser().resolve()
+    if not database_path.is_file():
+        raise SystemExit("Exchange integration database does not exist")
+    services = build_production_services(database_path)
+    try:
+        exported = _integration_connector_export_data(
+            services,
+            arguments,
+            include_profile_metadata=True,
+            include_live_catalog=True,
+        )
+        output = {
+            "schemaVersion": 1,
+            "actor": {
+                "issuer": arguments.issuer,
+                "subject": arguments.subject,
+                "organizationId": arguments.organization_id,
+                "workspaceId": arguments.workspace_id,
+            },
+            **exported,
+        }
+        serialized = json.dumps(
+            output,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(serialized.encode("utf-8")) > 16 * 1024 * 1024:
+            raise SystemExit("connector readiness snapshot exceeds its size limit")
+    finally:
+        services.close()
+    print(serialized)
     return 0
 
 
@@ -1086,6 +1403,18 @@ def parser() -> argparse.ArgumentParser:
     catalog_export.add_argument("--subject", required=True)
     catalog_export.add_argument("--organization-id", required=True)
     catalog_export.add_argument("--workspace-id", required=True)
+    readiness_export = integration_commands.add_parser(
+        "connector-readiness",
+        help=(
+            "Export Exchange-issued profiles, connections, and live tool catalogs "
+            "without credentials"
+        ),
+    )
+    readiness_export.add_argument("--integration-database", type=Path, required=True)
+    readiness_export.add_argument("--issuer", required=True)
+    readiness_export.add_argument("--subject", required=True)
+    readiness_export.add_argument("--organization-id", required=True)
+    readiness_export.add_argument("--workspace-id", required=True)
     bootstrap_connectors = integration_commands.add_parser(
         "bootstrap-connectors",
         help="Provision initial GitHub and Hugging Face profiles from a private operator file",
@@ -1122,6 +1451,8 @@ def run(argv: list[str] | None = None) -> int:
             return _integration_connector_bindings(arguments)
         if arguments.integration_command == "connector-tool-catalog":
             return _integration_connector_tool_catalog(arguments)
+        if arguments.integration_command == "connector-readiness":
+            return _integration_connector_readiness(arguments)
         if arguments.integration_command == "bootstrap-connectors":
             return _integration_connector_bootstrap(arguments)
         if arguments.integration_command.startswith("authorization-cloud"):
