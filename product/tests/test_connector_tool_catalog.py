@@ -17,6 +17,9 @@ from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 imp
     tool_provider_pb2 as tool_wire,
 )
 from cyrene_exchange_product.integrations.auth import AccountCenterRequestSigner
+from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
+    AuthorizationCloudProfileRegistry,
+)
 from cyrene_exchange_product.integrations.clients import (
     COMPUTER_TOOL_IDS,
     GitHubIssuesClient,
@@ -25,6 +28,7 @@ from cyrene_exchange_product.integrations.clients import (
 )
 from cyrene_exchange_product.integrations.connector_operations import connector_binding_tools
 from cyrene_exchange_product.integrations.connector_profiles import parse_connector_host_settings
+from cyrene_exchange_product.integrations.models import IntegrationPrincipal
 
 
 class _DirectClient:
@@ -713,6 +717,56 @@ def test_connector_readiness_exports_target_scoped_hf_catalog_read_only_state(
             ]
         },
     }
+    account_center_profiles = [
+        account_profile,
+        {
+            "profile_ref": "github-profile",
+            "provider": "github",
+            "identity_ref": "12345678",
+            "auth_status": "healthy",
+            "auth_mode": "github_app",
+            "access_mode": "actor_owned",
+            "target_scope": {
+                "repositories": [
+                    {
+                        "repository_id": "123",
+                        "owner": "example-org",
+                        "name": "private-repo",
+                    }
+                ]
+            },
+        },
+        {
+            "profile_ref": "azure-account-profile",
+            "provider": "azure",
+            "identity_ref": "azure-managed-identity",
+            "auth_status": "unknown",
+            "auth_mode": "host_identity",
+            "access_mode": "workspace_operator",
+            "target_scope": {
+                "target_ref": "azure-primary-target",
+                "provider_target_ref": "subscription-id-123",
+            },
+            "external_subject": None,
+            "expires_at": None,
+            "credential_revision": 0,
+        },
+        {
+            "profile_ref": "gcp-account-profile",
+            "provider": "gcp",
+            "identity_ref": "projects/123/serviceAccounts/reader@example.iam.gserviceaccount.com",
+            "auth_status": "unknown",
+            "auth_mode": "host_identity",
+            "access_mode": "workspace_operator",
+            "target_scope": {
+                "target_ref": "gcp-primary-target",
+                "provider_target_ref": "projects/project-123",
+            },
+            "external_subject": None,
+            "expires_at": None,
+            "credential_revision": 0,
+        },
+    ]
     calls: dict[str, Any] = {}
 
     class _Store:
@@ -725,7 +779,7 @@ def test_connector_readiness_exports_target_scoped_hf_catalog_read_only_state(
         accounts = SimpleNamespace(
             list_provider_profiles=lambda principal: (
                 calls.update(actor=(principal.issuer, principal.subject, principal.organization_id))
-                or {"profiles": [account_profile]}
+                or {"profiles": account_center_profiles}
             )
         )
         authorization_cloud = SimpleNamespace(
@@ -826,6 +880,114 @@ def test_connector_readiness_exports_target_scoped_hf_catalog_read_only_state(
     assert "credentialSecretRef" not in serialized
 
 
+@pytest.mark.parametrize(
+    ("provider", "auth_mode", "expected"),
+    [
+        ("github", "github_app", True),
+        ("github", None, True),
+        ("huggingface", "fine_grained_token", True),
+        ("huggingface", "device_oauth", True),
+        ("huggingface", None, True),
+        ("azure", "host_identity", True),
+        ("azure", None, True),
+        ("azure", "managed_identity", False),
+        ("gcp", "host_identity", True),
+        ("gcp", None, True),
+        ("gcp", "service_identity", False),
+        ("runpod", "host_identity", True),
+        ("future-provider", "host_identity", False),
+        ("github", "managed_identity", False),
+        ("github", "host_identity", False),
+        ("azure", "github_app", False),
+        ("huggingface", "host_identity", False),
+        ("gcp", True, False),
+    ],
+)
+def test_account_center_provider_auth_modes_are_closed_with_legacy_null_support(
+    provider: str,
+    auth_mode: object,
+    expected: bool,
+) -> None:
+    assert exchange_cli._account_center_auth_mode_allowed(provider, auth_mode) is expected
+
+
+def test_account_center_provider_scopes_keep_provider_specific_closed_shapes() -> None:
+    assert exchange_cli._account_center_profile_scope(
+        "github",
+        {"repositories": [{"repository_id": "123", "owner": "example-org", "name": "repo"}]},
+    ) == {"repositories": [{"repositoryId": "123", "owner": "example-org", "name": "repo"}]}
+    assert exchange_cli._account_center_profile_scope(
+        "huggingface",
+        {
+            "repositories": [
+                {
+                    "repo_type": "model",
+                    "repo_id": "example-org/model",
+                    "permissions": ["write", "read"],
+                }
+            ]
+        },
+    ) == {
+        "repositories": [
+            {
+                "repoType": "model",
+                "repoId": "example-org/model",
+                "permissions": ["read", "write"],
+            }
+        ]
+    }
+    assert exchange_cli._account_center_profile_scope(
+        "azure",
+        {"target_ref": "azure-target", "provider_target_ref": "subscription-123"},
+    ) == {"targetAlias": "azure-target", "targetRef": "subscription-123"}
+    assert exchange_cli._account_center_profile_scope(
+        "gcp",
+        {"target_ref": "gcp-target", "provider_target_ref": "projects/project-123"},
+    ) == {"targetAlias": "gcp-target", "targetRef": "projects/project-123"}
+
+    with pytest.raises(SystemExit, match="provider scope"):
+        exchange_cli._account_center_profile_scope(
+            "azure",
+            {
+                "target_ref": "azure-target",
+                "provider_target_ref": "subscription-123",
+                "unexpected_scope_field": "placeholder",
+            },
+        )
+    with pytest.raises(SystemExit, match="provider scope"):
+        exchange_cli._account_center_profile_scope(
+            "huggingface",
+            {"repositories": [], "unexpected": "field"},
+        )
+    with pytest.raises(SystemExit, match="GitHub scope"):
+        exchange_cli._account_center_profile_scope(
+            "github",
+            {
+                "repositories": [
+                    {
+                        "repository_id": "123",
+                        "owner": "example-org",
+                        "name": "repo",
+                        "permissions": ["read"],
+                    }
+                ]
+            },
+        )
+    with pytest.raises(SystemExit, match="Hugging Face scope"):
+        exchange_cli._account_center_profile_scope(
+            "huggingface",
+            {
+                "repositories": [
+                    {
+                        "repo_type": "model",
+                        "repo_id": "example-org/model",
+                        "permissions": ["read", "read"],
+                    }
+                ]
+            },
+        )
+
+
 def test_connector_readiness_fails_when_read_only_catalog_lacks_a_read_operation(
     tmp_path: Path,
     monkeypatch: Any,
@@ -834,6 +996,29 @@ def test_connector_readiness_fails_when_read_only_catalog_lacks_a_read_operation
     database_path = tmp_path / "integrations.sqlite3"
     database_path.touch()
     target_ref = "Qwen/Qwen2.5-0.5B-Instruct"
+    principal = IntegrationPrincipal(
+        issuer="https://issuer.example",
+        subject="actor-1",
+        organization_id="org-1",
+        workspace_id="workspace-1",
+        allowed_operation_ids=frozenset({"accountListProviderProfiles"}),
+    )
+    host_profile = SimpleNamespace(
+        profile_ref="azure-primary",
+        provider="azure",
+        identity_ref="azure-managed-identity",
+        access_mode="workspace_operator",
+        auth_mode="managed_identity",
+        targets={"subscription-prod": SimpleNamespace(target_ref=target_ref)},
+    )
+    registry = AuthorizationCloudProfileRegistry(
+        SimpleNamespace(contexts={}, profiles={"azure-primary": host_profile})
+    )
+    account_profile_ref = registry.account_center_profile_ref(
+        principal,
+        host_profile,
+        target_alias="subscription-prod",
+    )
     connection = SimpleNamespace(
         id=uuid4(),
         provider="azure",
@@ -841,7 +1026,7 @@ def test_connector_readiness_fails_when_read_only_catalog_lacks_a_read_operation
         workspace_id="workspace-1",
         actor_issuer="https://issuer.example",
         actor_subject="actor-1",
-        account_link_ref=None,
+        account_link_ref=account_profile_ref,
         binding_ref="azure-primary",
         target_ref="subscription-prod",
         access_mode="workspace_operator",
@@ -861,21 +1046,31 @@ def test_connector_readiness_fails_when_read_only_catalog_lacks_a_read_operation
 
     class _Services:
         store = _Store()
+        accounts = SimpleNamespace(
+            list_provider_profiles=lambda _principal: {
+                "profiles": [
+                    {
+                        "profile_ref": account_profile_ref,
+                        "provider": "azure",
+                        "identity_ref": "azure-managed-identity",
+                        "target_scope": {
+                            "target_ref": "subscription-prod",
+                            "provider_target_ref": target_ref,
+                        },
+                        "auth_status": "unknown",
+                        "auth_mode": "host_identity",
+                        "access_mode": "workspace_operator",
+                        "external_subject": None,
+                        "expires_at": None,
+                        "credential_revision": 0,
+                    }
+                ]
+            }
+        )
         authorization_cloud = SimpleNamespace(
             list_tool_catalog=lambda _binding_ref: provider_catalog
         )
-        authorization_profile_registry = SimpleNamespace(
-            settings=SimpleNamespace(
-                profiles={
-                    "azure-primary": SimpleNamespace(
-                        profile_ref="azure-primary",
-                        provider="azure",
-                        auth_mode="managed_identity",
-                        targets={"subscription-prod": SimpleNamespace(target_ref=target_ref)},
-                    )
-                }
-            )
-        )
+        authorization_profile_registry = registry
 
         def close(self) -> None:
             return None
@@ -1005,13 +1200,47 @@ def test_connector_readiness_fails_closed_on_hf_scope_drift(
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize(
+    ("account_scope_target_ref", "account_identity_ref", "should_succeed"),
+    [
+        ("subscription-id-123", "azure-managed-identity", True),
+        ("another-subscription", "azure-managed-identity", False),
+        ("subscription-id-123", "different-identity", False),
+    ],
+)
 def test_connector_readiness_filters_exact_live_cloud_read_only_catalog(
     tmp_path: Path,
     monkeypatch: Any,
     capsys: pytest.CaptureFixture[str],
+    account_scope_target_ref: str,
+    account_identity_ref: str,
+    should_succeed: bool,
 ) -> None:
     database_path = tmp_path / "integrations.sqlite3"
     database_path.touch()
+    principal = IntegrationPrincipal(
+        issuer="https://issuer.example",
+        subject="actor-1",
+        organization_id="org-1",
+        workspace_id="workspace-1",
+        allowed_operation_ids=frozenset({"accountListProviderProfiles"}),
+    )
+    host_profile = SimpleNamespace(
+        profile_ref="azure-primary",
+        provider="azure",
+        identity_ref="azure-managed-identity",
+        access_mode="workspace_operator",
+        auth_mode="managed_identity",
+        targets={"subscription-prod": SimpleNamespace(target_ref="subscription-id-123")},
+    )
+    registry = AuthorizationCloudProfileRegistry(
+        SimpleNamespace(contexts={}, profiles={"azure-primary": host_profile})
+    )
+    account_profile_ref = registry.account_center_profile_ref(
+        principal,
+        host_profile,
+        target_alias="subscription-prod",
+    )
     connection = SimpleNamespace(
         id=uuid4(),
         provider="azure",
@@ -1019,7 +1248,7 @@ def test_connector_readiness_filters_exact_live_cloud_read_only_catalog(
         workspace_id="workspace-1",
         actor_issuer="https://issuer.example",
         actor_subject="actor-1",
-        account_link_ref=None,
+        account_link_ref=account_profile_ref,
         binding_ref="azure-primary",
         target_ref="subscription-prod",
         access_mode="workspace_operator",
@@ -1034,23 +1263,31 @@ def test_connector_readiness_filters_exact_live_cloud_read_only_catalog(
 
     class _Services:
         store = _Store()
+        accounts = SimpleNamespace(
+            list_provider_profiles=lambda _principal: {
+                "profiles": [
+                    {
+                        "profile_ref": account_profile_ref,
+                        "provider": "azure",
+                        "identity_ref": account_identity_ref,
+                        "target_scope": {
+                            "target_ref": "subscription-prod",
+                            "provider_target_ref": account_scope_target_ref,
+                        },
+                        "auth_status": "unknown",
+                        "auth_mode": "host_identity",
+                        "access_mode": "workspace_operator",
+                        "external_subject": None,
+                        "expires_at": None,
+                        "credential_revision": 0,
+                    }
+                ]
+            }
+        )
         authorization_cloud = SimpleNamespace(
             list_tool_catalog=lambda _binding_ref: provider_catalog
         )
-        authorization_profile_registry = SimpleNamespace(
-            settings=SimpleNamespace(
-                profiles={
-                    "azure-primary": SimpleNamespace(
-                        profile_ref="azure-primary",
-                        provider="azure",
-                        auth_mode="managed_identity",
-                        targets={
-                            "subscription-prod": SimpleNamespace(target_ref="subscription-id-123")
-                        },
-                    )
-                }
-            )
-        )
+        authorization_profile_registry = registry
 
         def close(self) -> None:
             return None
@@ -1058,22 +1295,27 @@ def test_connector_readiness_filters_exact_live_cloud_read_only_catalog(
     monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
     monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
 
-    result = exchange_cli.run(
-        [
-            "integrations",
-            "connector-readiness",
-            "--integration-database",
-            str(database_path),
-            "--issuer",
-            "https://issuer.example",
-            "--subject",
-            "actor-1",
-            "--organization-id",
-            "org-1",
-            "--workspace-id",
-            "workspace-1",
-        ]
-    )
+    arguments = [
+        "integrations",
+        "connector-readiness",
+        "--integration-database",
+        str(database_path),
+        "--issuer",
+        "https://issuer.example",
+        "--subject",
+        "actor-1",
+        "--organization-id",
+        "org-1",
+        "--workspace-id",
+        "workspace-1",
+    ]
+    if not should_succeed:
+        with pytest.raises(SystemExit, match="cloud Account Center profile"):
+            exchange_cli.run(arguments)
+        assert capsys.readouterr().out == ""
+        return
+
+    result = exchange_cli.run(arguments)
 
     output = json.loads(capsys.readouterr().out)
     assert result == 0

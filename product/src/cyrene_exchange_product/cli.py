@@ -47,6 +47,97 @@ from cyrene_exchange_product.store import ExchangeStore
 _INTEGRATION_TLS_CERT_ENV = "CYRENE_EXCHANGE_TLS_CERT_FILE"
 _INTEGRATION_TLS_KEY_ENV = "CYRENE_EXCHANGE_TLS_KEY_FILE"
 _AUTHORIZATION_CLOUD_RUNNER_ENV = "CYRENE_EXCHANGE_AUTHORIZATION_CLOUD_RUNNER_ENABLED"
+_ACCOUNT_CENTER_PROFILE_AUTH_MODES = {
+    "github": frozenset({"github_app"}),
+    "huggingface": frozenset({"fine_grained_token", "device_oauth"}),
+    "azure": frozenset({"host_identity"}),
+    "gcp": frozenset({"host_identity"}),
+    "runpod": frozenset({"host_identity"}),
+}
+
+
+def _account_center_auth_mode_allowed(provider: str, value: object) -> bool:
+    """Keep known provider modes closed while accepting legacy missing modes."""
+
+    modes = _ACCOUNT_CENTER_PROFILE_AUTH_MODES.get(provider)
+    return modes is not None and (value is None or (isinstance(value, str) and value in modes))
+
+
+def _account_center_profile_scope(provider: str, value: object) -> dict[str, Any]:
+    """Validate and project one provider's non-secret Account Center scope.
+
+    中文：按 provider 类型校验 Account Center 的真实 scope 结构，不接受额外字段。
+    """
+
+    if not isinstance(value, Mapping):
+        raise SystemExit("Account Center returned an unsupported provider scope")
+    if provider in {"github", "huggingface"}:
+        if set(value) != {"repositories"}:
+            raise SystemExit("Account Center returned an unsupported provider scope")
+        repositories = value.get("repositories")
+        if not isinstance(repositories, list) or not repositories:
+            raise SystemExit("Account Center returned an empty provider scope")
+        safe_repositories: list[dict[str, Any]] = []
+        for repository in repositories:
+            if not isinstance(repository, Mapping):
+                raise SystemExit("Account Center returned malformed provider scope")
+            if provider == "huggingface":
+                repo_type = repository.get("repo_type")
+                repo_id = repository.get("repo_id")
+                permissions = repository.get("permissions")
+                if (
+                    set(repository) != {"repo_type", "repo_id", "permissions"}
+                    or not isinstance(repo_type, str)
+                    or repo_type not in {"model", "dataset", "space"}
+                    or not isinstance(repo_id, str)
+                    or not repo_id
+                    or not isinstance(permissions, list)
+                    or not permissions
+                    or any(
+                        not isinstance(permission, str) or permission not in {"read", "write"}
+                        for permission in permissions
+                    )
+                    or len(permissions) != len(set(permissions))
+                    or "read" not in permissions
+                ):
+                    raise SystemExit("Account Center returned invalid Hugging Face scope")
+                safe_repositories.append(
+                    {
+                        "repoType": repo_type,
+                        "repoId": repo_id,
+                        "permissions": sorted(set(permissions)),
+                    }
+                )
+            else:
+                if set(repository) != {"repository_id", "owner", "name"}:
+                    raise SystemExit("Account Center returned invalid GitHub scope")
+                repository_id = repository.get("repository_id")
+                owner = repository.get("owner")
+                name = repository.get("name")
+                if not all(isinstance(item, str) and item for item in (repository_id, owner, name)):
+                    raise SystemExit("Account Center returned invalid GitHub scope")
+                safe_repositories.append(
+                    {"repositoryId": repository_id, "owner": owner, "name": name}
+                )
+        return {"repositories": safe_repositories}
+
+    if provider in {"azure", "gcp", "runpod"}:
+        if set(value) != {"target_ref", "provider_target_ref"}:
+            raise SystemExit("Account Center returned an unsupported provider scope")
+        target_alias = value.get("target_ref")
+        provider_target_ref = value.get("provider_target_ref")
+        if (
+            not isinstance(target_alias, str)
+            or not target_alias
+            or len(target_alias) > 200
+            or not isinstance(provider_target_ref, str)
+            or not provider_target_ref
+            or len(provider_target_ref) > 1000
+        ):
+            raise SystemExit("Account Center returned an invalid cloud target scope")
+        return {"targetAlias": target_alias, "targetRef": provider_target_ref}
+
+    raise SystemExit("Account Center returned unsupported profile metadata")
 
 
 def _authorization_cloud_runner_enabled() -> bool:
@@ -514,18 +605,24 @@ def _integration_connector_export_data(
     need_account_profiles = include_profile_metadata or any(
         row.provider == "hf" for row in account_connections
     )
+    needs_cloud_profile_readback = include_profile_metadata and any(
+        row.provider in {"azure", "gcp", "runpod"} for row in connections
+    )
     account_profiles: dict[tuple[str, str], dict[str, Any]] = {}
-    if need_account_profiles and account_connections:
+    account_profile_identity_refs: dict[tuple[str, str], str] = {}
+    seen_account_profile_refs: set[str] = set()
+    account_profile_principal: IntegrationPrincipal | None = None
+    if need_account_profiles and (account_connections or needs_cloud_profile_readback):
         if not arguments.organization_id:
             raise SystemExit("provider profile export requires --organization-id")
-        principal = IntegrationPrincipal(
+        account_profile_principal = IntegrationPrincipal(
             issuer=arguments.issuer,
             subject=arguments.subject,
             organization_id=arguments.organization_id,
             workspace_id=arguments.workspace_id,
             allowed_operation_ids=frozenset({"accountListProviderProfiles"}),
         )
-        response = services.accounts.list_provider_profiles(principal)
+        response = services.accounts.list_provider_profiles(account_profile_principal)
         rows = response.get("profiles") if isinstance(response, Mapping) else None
         if not isinstance(rows, list):
             raise SystemExit("Account Center provider profile readback is unavailable")
@@ -539,73 +636,43 @@ def _integration_connector_export_data(
             if (
                 not isinstance(profile_ref, str)
                 or not profile_ref
-                or provider not in {"github", "huggingface"}
+                or not isinstance(provider, str)
+                or provider not in _ACCOUNT_CENTER_PROFILE_AUTH_MODES
                 or not isinstance(auth_status, str)
                 or not isinstance(access_mode, str)
                 or access_mode not in {"actor_owned", "workspace_operator"}
             ):
                 raise SystemExit("Account Center returned unsupported profile metadata")
-            raw_scope = row.get("target_scope")
-            if not isinstance(raw_scope, Mapping) or set(raw_scope) != {"repositories"}:
-                raise SystemExit("Account Center returned an unsupported provider scope")
-            repositories = raw_scope.get("repositories")
-            if not isinstance(repositories, list) or not repositories:
-                raise SystemExit("Account Center returned an empty provider scope")
-            safe_repositories: list[dict[str, Any]] = []
-            for repository in repositories:
-                if not isinstance(repository, Mapping):
-                    raise SystemExit("Account Center returned malformed provider scope")
-                if provider == "huggingface":
-                    repo_type = repository.get("repo_type")
-                    repo_id = repository.get("repo_id")
-                    permissions = repository.get("permissions")
-                    if (
-                        repo_type not in {"model", "dataset", "space"}
-                        or not isinstance(repo_id, str)
-                        or not repo_id
-                        or not isinstance(permissions, list)
-                        or not permissions
-                        or any(value not in {"read", "write"} for value in permissions)
-                        or "read" not in permissions
-                    ):
-                        raise SystemExit("Account Center returned invalid Hugging Face scope")
-                    safe_repositories.append(
-                        {
-                            "repoType": repo_type,
-                            "repoId": repo_id,
-                            "permissions": sorted(set(permissions)),
-                        }
-                    )
-                else:
-                    repository_id = repository.get("repository_id")
-                    owner = repository.get("owner")
-                    name = repository.get("name")
-                    if not all(
-                        isinstance(value, str) and value for value in (repository_id, owner, name)
-                    ):
-                        raise SystemExit("Account Center returned invalid GitHub scope")
-                    safe_repositories.append(
-                        {"repositoryId": repository_id, "owner": owner, "name": name}
-                    )
+            safe_scope = _account_center_profile_scope(provider, row.get("target_scope"))
             auth_mode = row.get("auth_mode")
-            if auth_mode is not None and (
-                provider != "huggingface" or auth_mode not in {"fine_grained_token", "device_oauth"}
-            ):
+            if not _account_center_auth_mode_allowed(provider, auth_mode):
                 raise SystemExit("Account Center returned unsupported authentication mode")
+            identity_ref = row.get("identity_ref")
+            if provider in {"azure", "gcp", "runpod"} and (
+                not isinstance(identity_ref, str) or not identity_ref
+            ):
+                raise SystemExit("Account Center returned invalid cloud identity metadata")
+            if provider in {"azure", "gcp", "runpod"} and (
+                row.get("external_subject") is not None or row.get("expires_at") is not None
+            ):
+                raise SystemExit("Account Center returned invalid cloud identity metadata")
             revision = row.get("credential_revision")
             if revision is not None and (
                 not isinstance(revision, int) or isinstance(revision, bool) or revision < 0
             ):
                 raise SystemExit("Account Center returned invalid credential revision")
             key = (profile_ref, str(provider))
-            if key in account_profiles:
+            if profile_ref in seen_account_profile_refs:
                 raise SystemExit("Account Center returned duplicate provider profile metadata")
+            seen_account_profile_refs.add(profile_ref)
+            if isinstance(identity_ref, str):
+                account_profile_identity_refs[key] = identity_ref
             account_profiles[key] = {
                 "profileRef": profile_ref,
                 "providerId": str(provider),
                 "authStatus": auth_status,
                 "accessMode": access_mode,
-                "targetScope": {"repositories": safe_repositories},
+                "targetScope": safe_scope,
                 **({"authMode": auth_mode} if isinstance(auth_mode, str) else {}),
                 **({"credentialRevision": revision} if revision is not None else {}),
             }
@@ -692,6 +759,8 @@ def _integration_connector_export_data(
         elif provider_id in {"azure", "gcp", "runpod"} and include_profile_metadata:
             if registry is None:
                 raise SystemExit("cloud connection profile registry is unavailable")
+            if account_profile_principal is None:
+                raise SystemExit("cloud Account Center profile readback is unavailable")
             host_profile = registry.settings.profiles.get(str(connection.binding_ref))
             target = (
                 host_profile.targets.get(str(connection.target_ref))
@@ -700,6 +769,29 @@ def _integration_connector_export_data(
             )
             if host_profile is None or host_profile.provider != provider_id or target is None:
                 raise SystemExit("cloud connection does not match a configured profile target")
+            account_profile_ref = connection.account_link_ref
+            if not isinstance(account_profile_ref, str) or not account_profile_ref:
+                raise SystemExit("cloud connection has no Account Center profile reference")
+            account_profile_key = (account_profile_ref, provider_id)
+            cloud_account_profile = account_profiles.get(account_profile_key)
+            expected_account_profile_ref = registry.account_center_profile_ref(
+                account_profile_principal,
+                host_profile,
+                target_alias=str(connection.target_ref),
+            )
+            expected_account_scope = {
+                "targetAlias": str(connection.target_ref),
+                "targetRef": target.target_ref,
+            }
+            expected_identity_ref = str(host_profile.identity_ref or host_profile.profile_ref)
+            if (
+                cloud_account_profile is None
+                or account_profile_ref != expected_account_profile_ref
+                or cloud_account_profile["targetScope"] != expected_account_scope
+                or cloud_account_profile["accessMode"] != connection.access_mode
+                or account_profile_identity_refs.get(account_profile_key) != expected_identity_ref
+            ):
+                raise SystemExit("cloud Account Center profile does not match its host target")
             connection_target_scope = {
                 "targetAlias": str(connection.target_ref),
                 "targetRef": target.target_ref,

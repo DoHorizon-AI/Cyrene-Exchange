@@ -12,7 +12,7 @@ import json
 import stat
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from cyrene_exchange_product.errors import ExchangeProductError
@@ -56,6 +56,7 @@ def provision_connector_profiles(
     hf_alias = ""
     hf_target_alias = ""
     hf_idempotency_key = ""
+    hf_profile_ref: str | None = None
     hf_expected_access_mode = "actor_owned"
     hf_profile_config = None
     if "huggingface" in specification:
@@ -240,28 +241,77 @@ def provision_connector_profiles(
             ]
         return plan
 
+    profile_readbacks = services.accounts.list_provider_profiles(principal)
     existing_cloud_profiles = _read_cloud_profile_readbacks(
-        services.accounts, principal, cloud_entries
-    )
-
-    github_profile = services.accounts.link_github_app_installation(
+        services.accounts,
         principal,
-        profile_ref=github_profile_ref,
-        installation_id=installation_id,
-        repositories=repositories,
-        idempotency_key=github_idempotency_key,
+        cloud_entries,
+        profile_response=profile_readbacks,
     )
-    _verify_linked_profile(
-        github_profile,
-        profile_ref=github_profile_ref,
-        provider="github",
+    existing_github_profile = _provider_profile_row(
+        profile_readbacks,
+        github_profile_ref,
+        "github",
     )
-    github_access_mode = _verify_profile_readback(
-        services.accounts.list_provider_profiles(principal),
-        profile_ref=github_profile_ref,
-        provider="github",
-        expected_access_mode=github_access_mode,
+    if existing_github_profile is not None:
+        github_access_mode = _verify_profile_readback(
+            profile_readbacks,
+            profile_ref=github_profile_ref,
+            provider="github",
+            expected_auth_mode="github_app",
+            expected_access_mode=github_access_mode,
+            expected_identity_ref=installation_id,
+            expected_target_scope={"repositories": repositories},
+            require_external_subject=True,
+        )
+
+    hf_profile_ref = (
+        _provider_profile_ref(principal, hf_idempotency_key) if hf_spec is not None else None
     )
+    existing_hf_profile = (
+        _provider_profile_row(profile_readbacks, hf_profile_ref, "huggingface")
+        if hf_profile_ref is not None
+        else None
+    )
+    if (
+        hf_profile_ref is not None
+        and existing_hf_profile is not None
+        and hf_profile_config is not None
+    ):
+        hf_access_mode = _verify_profile_readback(
+            profile_readbacks,
+            profile_ref=hf_profile_ref,
+            provider="huggingface",
+            expected_auth_mode=hf_profile_config.auth_mode or "fine_grained_token",
+            expected_access_mode=hf_expected_access_mode,
+            expected_target_scope=hf_profile_config.account_scopes,
+            require_external_subject=True,
+        )
+
+    if existing_github_profile is None:
+        github_profile = services.accounts.link_github_app_installation(
+            principal,
+            profile_ref=github_profile_ref,
+            installation_id=installation_id,
+            repositories=repositories,
+            idempotency_key=github_idempotency_key,
+        )
+        _verify_linked_profile(
+            github_profile,
+            profile_ref=github_profile_ref,
+            provider="github",
+        )
+        profile_readbacks = services.accounts.list_provider_profiles(principal)
+        github_access_mode = _verify_profile_readback(
+            profile_readbacks,
+            profile_ref=github_profile_ref,
+            provider="github",
+            expected_auth_mode="github_app",
+            expected_access_mode=github_access_mode,
+            expected_identity_ref=installation_id,
+            expected_target_scope={"repositories": repositories},
+            require_external_subject=True,
+        )
 
     github_connection_rows: list[dict[str, str]] = []
     for repository in repositories:
@@ -300,23 +350,32 @@ def provision_connector_profiles(
         },
     }
     if hf_spec is not None and hf_profile_config is not None:
-        hf_profile_ref = _provider_profile_ref(principal, hf_idempotency_key)
-        hf_profile = services.accounts.link_huggingface_profile(
-            principal,
-            profile_ref=hf_profile_ref,
-            credential_secret_ref=hf_profile_config.credential_secret_ref,
-            scopes=hf_profile_config.account_scopes,
-            idempotency_key=hf_idempotency_key,
-            auth_mode=hf_profile_config.auth_mode,
-        )
-        _verify_linked_profile(hf_profile, profile_ref=hf_profile_ref, provider="huggingface")
-        hf_access_mode = _verify_profile_readback(
-            services.accounts.list_provider_profiles(principal),
-            profile_ref=hf_profile_ref,
-            provider="huggingface",
-            expected_auth_mode=hf_profile_config.auth_mode or "fine_grained_token",
-            expected_access_mode=hf_expected_access_mode,
-        )
+        if hf_profile_ref is None:
+            raise _bootstrap_error("huggingface_profile_reference_unavailable")
+        if existing_hf_profile is None:
+            hf_profile = services.accounts.link_huggingface_profile(
+                principal,
+                profile_ref=hf_profile_ref,
+                credential_secret_ref=hf_profile_config.credential_secret_ref,
+                scopes=hf_profile_config.account_scopes,
+                idempotency_key=hf_idempotency_key,
+                auth_mode=hf_profile_config.auth_mode,
+            )
+            _verify_linked_profile(
+                hf_profile,
+                profile_ref=hf_profile_ref,
+                provider="huggingface",
+            )
+            profile_readbacks = services.accounts.list_provider_profiles(principal)
+            hf_access_mode = _verify_profile_readback(
+                profile_readbacks,
+                profile_ref=hf_profile_ref,
+                provider="huggingface",
+                expected_auth_mode=hf_profile_config.auth_mode or "fine_grained_token",
+                expected_access_mode=hf_expected_access_mode,
+                expected_target_scope=hf_profile_config.account_scopes,
+                require_external_subject=True,
+            )
 
         hf_connection_id = _stable_connection_id(
             issuer=issuer,
@@ -470,12 +529,18 @@ def _read_cloud_profile_readbacks(
     accounts: Any,
     principal: IntegrationPrincipal,
     entries: list[dict[str, Any]],
+    *,
+    profile_response: object | None = None,
 ) -> dict[str, dict[str, Any] | None]:
     """Read Account Center profile metadata before mutating Exchange or AC state."""
 
     if not entries:
         return {}
-    response = accounts.list_provider_profiles(principal)
+    response = (
+        profile_response
+        if profile_response is not None
+        else accounts.list_provider_profiles(principal)
+    )
     return {
         entry["account_profile_ref"]: _cloud_profile_readback(
             response,
@@ -718,6 +783,24 @@ def _verify_linked_profile(
         raise _bootstrap_error(f"{provider}_profile_link_not_healthy")
 
 
+def _provider_profile_row(
+    response: object,
+    profile_ref: str,
+    provider: str,
+) -> Mapping[str, Any] | None:
+    """Find one owner-scoped profile row without confusing a mismatch with absence."""
+
+    profiles = response.get("profiles") if isinstance(response, Mapping) else None
+    if not isinstance(profiles, list) or any(not isinstance(item, Mapping) for item in profiles):
+        raise _bootstrap_error(f"{provider}_profile_readback_invalid")
+    matches = [item for item in profiles if item.get("profile_ref") == profile_ref]
+    if not matches:
+        return None
+    if len(matches) != 1 or matches[0].get("provider") != provider:
+        raise _bootstrap_error(f"{provider}_profile_readback_mismatch")
+    return cast(Mapping[str, Any], matches[0])
+
+
 def _verify_profile_readback(
     response: object,
     *,
@@ -725,28 +808,26 @@ def _verify_profile_readback(
     provider: str,
     expected_auth_mode: str | None = None,
     expected_access_mode: str = "actor_owned",
+    expected_identity_ref: str | None = None,
+    expected_target_scope: Mapping[str, Any] | None = None,
+    require_external_subject: bool = False,
 ) -> str:
-    profiles = response.get("profiles") if isinstance(response, Mapping) else None
-    matches = (
-        [
-            item
-            for item in profiles
-            if isinstance(item, Mapping)
-            and item.get("profile_ref") == profile_ref
-            and item.get("provider") == provider
-            and item.get("auth_status") == "healthy"
-            and (
-                expected_auth_mode is None
-                or item.get("auth_mode") == expected_auth_mode
-                or (expected_auth_mode == "fine_grained_token" and item.get("auth_mode") is None)
-            )
-        ]
-        if isinstance(profiles, list)
-        else []
-    )
-    if len(matches) != 1:
+    profile = _provider_profile_row(response, profile_ref, provider)
+    if profile is None or profile.get("auth_status") != "healthy":
         raise _bootstrap_error(f"{provider}_profile_readback_not_healthy")
-    access_mode = matches[0].get("access_mode", "actor_owned")
+    allowed_auth_modes = {
+        "github": {"github_app"},
+        "huggingface": {"fine_grained_token", "device_oauth"},
+    }.get(provider)
+    actual_auth_mode = profile.get("auth_mode")
+    if (
+        allowed_auth_modes is None
+        or not isinstance(actual_auth_mode, str)
+        or actual_auth_mode not in allowed_auth_modes
+        or (expected_auth_mode is not None and actual_auth_mode != expected_auth_mode)
+    ):
+        raise _bootstrap_error(f"{provider}_profile_auth_mode_mismatch")
+    access_mode = profile.get("access_mode")
     if not isinstance(access_mode, str) or access_mode not in {
         "actor_owned",
         "workspace_operator",
@@ -754,6 +835,25 @@ def _verify_profile_readback(
         raise _bootstrap_error(f"{provider}_profile_access_mode_invalid")
     if access_mode != expected_access_mode:
         raise _bootstrap_error(f"{provider}_profile_access_mode_mismatch")
+    if expected_identity_ref is not None and profile.get("identity_ref") != expected_identity_ref:
+        raise _bootstrap_error(f"{provider}_profile_identity_mismatch")
+    if expected_target_scope is not None and profile.get("target_scope") != dict(
+        expected_target_scope
+    ):
+        raise _bootstrap_error(f"{provider}_profile_scope_mismatch")
+    if require_external_subject:
+        external_subject = profile.get("external_subject")
+        if not isinstance(external_subject, str) or not external_subject:
+            raise _bootstrap_error(f"{provider}_profile_identity_mismatch")
+        if provider == "huggingface" and profile.get("identity_ref") != external_subject:
+            raise _bootstrap_error(f"{provider}_profile_identity_mismatch")
+    credential_revision = profile.get("credential_revision")
+    if credential_revision is not None and (
+        not isinstance(credential_revision, int)
+        or isinstance(credential_revision, bool)
+        or credential_revision < 0
+    ):
+        raise _bootstrap_error(f"{provider}_profile_readback_invalid")
     return str(access_mode)
 
 
