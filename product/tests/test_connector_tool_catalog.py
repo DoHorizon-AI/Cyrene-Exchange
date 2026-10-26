@@ -642,20 +642,27 @@ def test_connector_tool_catalog_cli_omits_legacy_oauth_issue_connections(
 
 
 @pytest.mark.parametrize(
-    ("repo_type", "repo_id", "list_operation_id"),
+    ("repo_type", "repo_id", "list_operation_id", "permissions"),
     [
-        ("model", "Qwen/Qwen2.5-0.5B-Instruct", "huggingface.models.list"),
-        ("dataset", "example-org/private-dataset", "huggingface.datasets.list"),
-        ("space", "example-org/private-space", "huggingface.spaces.list"),
+        ("model", "Qwen/Qwen2.5-0.5B-Instruct", "huggingface.models.list", ["read"]),
+        ("dataset", "example-org/private-dataset", "huggingface.datasets.list", ["read"]),
+        ("space", "example-org/private-space", "huggingface.spaces.list", ["read"]),
+        (
+            "model",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "huggingface.models.list",
+            ["read", "write"],
+        ),
     ],
 )
-def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
+def test_connector_readiness_exports_target_scoped_hf_catalog_read_only_state(
     tmp_path: Path,
     monkeypatch: Any,
     capsys: pytest.CaptureFixture[str],
     repo_type: str,
     repo_id: str,
     list_operation_id: str,
+    permissions: list[str],
 ) -> None:
     database_path = tmp_path / "integrations.sqlite3"
     database_path.touch()
@@ -678,16 +685,17 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
         "huggingface.datasets.list",
         "huggingface.spaces.list",
     }
-    read_only_map = [
+    selected_operation_map = [
         item
         for item in connector_binding_tools("huggingface")
-        if item["mutating"] is False
-        and (
-            item["operationId"] not in list_operation_ids
-            or item["operationId"] == list_operation_id
-        )
+        if item["operationId"] not in list_operation_ids or item["operationId"] == list_operation_id
     ]
-    provider_catalog = _definitions_for_operation_map(read_only_map)
+    read_only_target = "write" not in permissions
+    if read_only_target:
+        selected_operation_map = [
+            item for item in selected_operation_map if item["mutating"] is False
+        ]
+    provider_catalog = _definitions_for_operation_map(selected_operation_map)
     account_profile = {
         "profile_ref": profile_ref,
         "provider": "huggingface",
@@ -700,7 +708,7 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
                 {
                     "repo_type": repo_type,
                     "repo_id": target_ref,
-                    "permissions": ["read"],
+                    "permissions": permissions,
                 }
             ]
         },
@@ -736,7 +744,7 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
                                 {
                                     "repo_type": repo_type,
                                     "repo_id": target_ref,
-                                    "permissions": ["read"],
+                                    "permissions": permissions,
                                 }
                             ]
                         },
@@ -800,7 +808,7 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
         tool["id"] for tool in catalog_item["tools"]
     }
     assert {tool["id"] for tool in catalog_item["tools"]} == {
-        str(item["toolId"]) for item in read_only_map
+        str(item["toolId"]) for item in selected_operation_map
     }
     assert {tool["id"] for tool in catalog_item["tools"]}.isdisjoint(
         list_operation_ids - {list_operation_id}
@@ -808,8 +816,11 @@ def test_connector_readiness_exports_real_read_only_hf_profile_and_catalog(
     assert output["connections"][0]["targetScope"] == {
         "repoType": repo_type,
         "repoId": target_ref,
-        "permissions": ["read"],
+        "permissions": permissions,
     }
+    assert output["connections"][0]["readOnly"] is read_only_target
+    assert all(tool["readOnly"] for tool in catalog_item["tools"]) is read_only_target
+    assert all(tool["mutating"] is False for tool in binding["tools"]) is read_only_target
     serialized = json.dumps(output)
     assert "authorizationRef" not in serialized
     assert "credentialSecretRef" not in serialized
@@ -1078,3 +1089,4 @@ def test_connector_readiness_filters_exact_live_cloud_read_only_catalog(
         str(item["toolId"]) for item in read_only_map
     }
     assert all(tool["readOnly"] for tool in catalog_item["tools"])
+    assert output["connections"][0]["readOnly"] is True

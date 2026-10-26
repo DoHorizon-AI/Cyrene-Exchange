@@ -773,6 +773,7 @@ def _integration_connector_export_data(
 
         tools: list[dict[str, Any]] = []
         binding_tools: list[dict[str, object]] = []
+        selected_catalog_is_read_only = bool(selected_ids) and selected_ids <= read_ids
         for tool_id in sorted(selected_ids):
             mapping = expected[tool_id]
             mutating = mapping.get("mutating")
@@ -839,7 +840,7 @@ def _integration_connector_export_data(
                     if isinstance(host_profile.auth_mode, str)
                     else {}
                 ),
-                "readOnly": selected_ids == read_ids,
+                "readOnly": selected_catalog_is_read_only,
             }
         connection_metadata.append(
             {
@@ -853,7 +854,7 @@ def _integration_connector_export_data(
                 if connection.target_ref is not None
                 else None,
                 "accessMode": connection.access_mode,
-                "readOnly": selected_ids == read_ids,
+                "readOnly": selected_catalog_is_read_only,
                 **({"targetScope": connection_target_scope} if connection_target_scope else {}),
             }
         )
