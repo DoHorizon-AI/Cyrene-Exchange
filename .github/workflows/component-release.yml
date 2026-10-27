@@ -82,6 +82,8 @@ jobs:
       - run: uv run --no-sync mypy
       - name: Run Product tests and the required pinned connector spines
         env:
+          # Collection imports the SDK before session fixtures run.
+          PYTHONPATH: ${{ env.PLUGINS_WORKTREE }}/sdk/python/cyrene_account_center_contracts/src:${{ github.workspace }}/src:${{ github.workspace }}/product/src
           CYRENE_PLUGINS_ROOT: ${{ env.PLUGINS_WORKTREE }}
           CYRENE_PLUGINS_WORKTREE: ${{ env.PLUGINS_WORKTREE }}
           CYRENE_PLUGINS_SHA: ${{ steps.plugins-pin.outputs.revision }}
