@@ -44,13 +44,53 @@ jobs:
           python-version: "3.12"
       - name: Install test tooling
         run: python -m pip install --disable-pip-version-check uv==0.12.3
+      - name: Configure the pinned Plugins checkout path
+        run: echo "PLUGINS_WORKTREE=$RUNNER_TEMP/Cyrene-Plugins-Official" >> "$GITHUB_ENV"
+      - name: Resolve the exact Plugins source pin from the consumer lock
+        id: plugins-pin
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import re
+          from pathlib import Path
+
+          lock = json.loads(Path("contracts-message.lock.json").read_text(encoding="utf-8"))
+          revision = lock.get("sourceRevision")
+          if (
+              lock.get("sourceRepository") != "DoHorizon-AI/Cyrene-Plugins-Official"
+              or not isinstance(revision, str)
+              or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+          ):
+              raise SystemExit("Exchange Plugins consumer lock has no immutable source revision")
+          print(f"revision={revision}")
+          PY
+      - name: Fetch the locked Plugins checkout
+        run: |
+          git init --quiet "$PLUGINS_WORKTREE"
+          git -C "$PLUGINS_WORKTREE" remote add origin \
+            https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git
+          git -C "$PLUGINS_WORKTREE" fetch --quiet --depth 1 origin \
+            "${{ steps.plugins-pin.outputs.revision }}"
+          git -C "$PLUGINS_WORKTREE" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$PLUGINS_WORKTREE" rev-parse HEAD)" = \
+            "${{ steps.plugins-pin.outputs.revision }}"
       - run: python -m json.tool ../service.json >/dev/null
       - run: python ../scripts/check_silent_exceptions.py
       - run: uv sync --frozen --group dev --extra integrations --no-install-local
       - run: uv run --no-sync ruff check --no-cache src tests
       - run: uv run --no-sync ruff format --check --no-cache src tests
       - run: uv run --no-sync mypy
-      - run: uv run --no-sync pytest -p no:cacheprovider -q
+      - name: Run Product tests and the required pinned connector spines
+        env:
+          # Collection imports the SDK before session fixtures run.
+          PYTHONPATH: ${{ env.PLUGINS_WORKTREE }}/sdk/python/cyrene_account_center_contracts/src:${{ github.workspace }}/src:${{ github.workspace }}/product/src
+          CYRENE_PLUGINS_ROOT: ${{ env.PLUGINS_WORKTREE }}
+          CYRENE_PLUGINS_WORKTREE: ${{ env.PLUGINS_WORKTREE }}
+          CYRENE_PLUGINS_SHA: ${{ steps.plugins-pin.outputs.revision }}
+          CYRENE_AUTH_SPINE_REQUIRED: "1"
+          CYRENE_TEAMS_SPINE_REQUIRED: "1"
+          CYRENE_REQUIRE_PLUGINS_WORKTREE: "1"
+        run: uv run --no-sync pytest -p no:cacheprovider -q
       - run: uv run --no-sync openapi-spec-validator ../contracts/product/v1/openapi.yaml
 
   product-native-build:

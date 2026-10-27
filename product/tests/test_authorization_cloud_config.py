@@ -293,6 +293,131 @@ def test_documented_host_configuration_sample_matches_the_closed_parser() -> Non
     assert settings.email.enabled is False
 
 
+def test_microsoft_profiles_use_fixed_host_plan_and_source_allowlists(tmp_path: Path) -> None:
+    configuration, _ = _config(tmp_path)
+    cloud = configuration["authorizationCloud"]
+    tenant_id = "11111111-2222-4333-8444-555555555555"
+    oid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+    cloud["currentAuthority"]["contexts"].append(
+        {
+            "contextRef": "entra-actor",
+            "issuer": issuer,
+            "subject": oid,
+            "organizationId": "org-a",
+            "workspaceId": "workspace-a",
+            "bearerTokenEnvRef": "bearers/actor-a",
+        }
+    )
+    common = {
+        "directPlugin": {
+            "bindingId": "microsoft-provider-binding",
+            "connectionRef": "grpc://127.0.0.1:5510",
+            "transport": "local",
+        },
+        "audience": "microsoft-provider",
+        "expectedIssuer": issuer,
+        "contextKeyRef": "keys/azure",
+        "organizationId": "org-a",
+        "workspaceId": "workspace-a",
+        "allowedContextRefs": ["entra-actor"],
+        "accessMode": "actor_owned",
+    }
+    cloud["profiles"]["graph-planner"] = {
+        **common,
+        "provider": "microsoft_graph",
+        "callerWorkload": "microsoft-graph-provider",
+        "plannerPlanIds": ["xqQg5FS2LkCp935s-FIFm2QAFkHM"],
+        "sharepointTargets": {
+            "siteId": (
+                "contoso.sharepoint.com,11111111-2222-4333-8444-555555555555,"
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            ),
+            "listIds": ["bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"],
+        },
+    }
+    cloud["profiles"]["ado-pipeline"] = {
+        **common,
+        "directPlugin": {**common["directPlugin"], "bindingId": "ado-provider-binding"},
+        "provider": "azure_devops",
+        "callerWorkload": "azure-devops-observation-provider",
+        "tenantId": tenant_id,
+        "organization": "contoso",
+        "authorizedSources": [
+            {
+                "source_id": "pipeline-source-a",
+                "kind": "pipeline_runs",
+                "project_id": "22222222-3333-4444-8555-666666666666",
+                "project_name": "Builds",
+                "profile_ref": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+                "pipeline_id": 31,
+            }
+        ],
+    }
+
+    settings = parse_authorization_cloud_settings(
+        cloud,
+        email_value=configuration["emailNotifications"],
+    )
+
+    assert settings.profiles["graph-planner"].microsoft_graph_plan_ids == (
+        "xqQg5FS2LkCp935s-FIFm2QAFkHM",
+    )
+    assert settings.profiles["graph-planner"].microsoft_graph_sharepoint_list_ids == (
+        "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+    )
+    ado_source = settings.profiles["ado-pipeline"].authorized_sources["pipeline-source-a"]
+    assert ado_source.profile_ref == "66666666-7777-4888-8999-aaaaaaaaaaaa"
+
+
+def test_microsoft_host_allowlist_defaults_empty_and_rejects_duplicate_plan_ids(
+    tmp_path: Path,
+) -> None:
+    configuration, _ = _config(tmp_path)
+    cloud = configuration["authorizationCloud"]
+    cloud["profiles"]["graph-disabled"] = {
+        "provider": "microsoft_graph",
+        "directPlugin": {
+            "bindingId": "graph-disabled-binding",
+            "connectionRef": "grpc://127.0.0.1:5511",
+            "transport": "local",
+        },
+        "callerWorkload": "microsoft-graph-provider",
+        "audience": "microsoft-provider",
+        "expectedIssuer": "https://identity.example.test",
+        "contextKeyRef": "keys/azure",
+        "organizationId": "org-a",
+        "workspaceId": "workspace-a",
+        "allowedContextRefs": ["actor-a"],
+    }
+    settings = parse_authorization_cloud_settings(
+        cloud,
+        email_value=configuration["emailNotifications"],
+    )
+    assert settings.profiles["graph-disabled"].microsoft_graph_plan_ids == ()
+
+    cloud["profiles"]["graph-disabled"]["plannerPlanIds"] = ["same-plan", "same-plan"]
+    with pytest.raises(AuthorizationCloudConfigurationError, match="duplicates"):
+        parse_authorization_cloud_settings(
+            cloud,
+            email_value=configuration["emailNotifications"],
+        )
+
+    cloud["profiles"]["graph-disabled"].pop("plannerPlanIds")
+    cloud["profiles"]["graph-disabled"]["sharepointTargets"] = {
+        "siteId": (
+            "contoso.sharepoint.com,11111111-2222-4333-8444-555555555555,"
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        ),
+        "listIds": ["not-a-uuid"],
+    }
+    with pytest.raises(AuthorizationCloudConfigurationError, match="invalid ID"):
+        parse_authorization_cloud_settings(
+            cloud,
+            email_value=configuration["emailNotifications"],
+        )
+
+
 def test_documented_configuration_schema_accepts_default_and_enabled_email_examples() -> None:
     """Keep the reusable schema synchronized with both copyable configuration examples."""
 

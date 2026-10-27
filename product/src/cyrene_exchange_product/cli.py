@@ -50,6 +50,8 @@ _AUTHORIZATION_CLOUD_RUNNER_ENV = "CYRENE_EXCHANGE_AUTHORIZATION_CLOUD_RUNNER_EN
 _ACCOUNT_CENTER_PROFILE_AUTH_MODES = {
     "github": frozenset({"github_app"}),
     "huggingface": frozenset({"fine_grained_token", "device_oauth"}),
+    "azure_devops": frozenset({"delegated_oauth"}),
+    "microsoft_graph": frozenset({"delegated_oauth"}),
     "azure": frozenset({"host_identity"}),
     "gcp": frozenset({"host_identity"}),
     "runpod": frozenset({"host_identity"}),
@@ -120,6 +122,22 @@ def _account_center_profile_scope(provider: str, value: object) -> dict[str, Any
                     {"repositoryId": repository_id, "owner": owner, "name": name}
                 )
         return {"repositories": safe_repositories}
+
+    if provider == "microsoft_graph":
+        from cyrene_exchange_product.integrations.microsoft_graph import public_profile_scope
+
+        try:
+            return public_profile_scope(value)
+        except ValueError as exc:
+            raise SystemExit("Account Center returned invalid Microsoft Graph scope") from exc
+
+    if provider == "azure_devops":
+        from cyrene_exchange_product.integrations.azure_devops import public_profile_scope
+
+        try:
+            return public_profile_scope(value)
+        except ValueError as exc:
+            raise SystemExit("Account Center returned invalid Azure DevOps scope") from exc
 
     if provider in {"azure", "gcp", "runpod"}:
         if set(value) != {"target_ref", "provider_target_ref"}:
@@ -601,9 +619,13 @@ def _integration_connector_export_data(
         organization_id=arguments.organization_id,
         workspace_id=arguments.workspace_id,
     )
-    account_connections = [row for row in connections if row.provider in {"github", "hf"}]
+    account_connections = [
+        row
+        for row in connections
+        if row.provider in {"github", "hf", "microsoft_graph", "azure_devops"}
+    ]
     need_account_profiles = include_profile_metadata or any(
-        row.provider == "hf" for row in account_connections
+        row.provider in {"hf", "microsoft_graph", "azure_devops"} for row in account_connections
     )
     needs_cloud_profile_readback = include_profile_metadata and any(
         row.provider in {"azure", "gcp", "runpod"} for row in connections
@@ -656,6 +678,36 @@ def _integration_connector_export_data(
                 row.get("external_subject") is not None or row.get("expires_at") is not None
             ):
                 raise SystemExit("Account Center returned invalid cloud identity metadata")
+            if provider == "microsoft_graph":
+                from cyrene_exchange_product.integrations.microsoft_graph import (
+                    validate_profile_identity,
+                )
+
+                try:
+                    validate_profile_identity(
+                        row,
+                        profile_ref=profile_ref,
+                        principal=account_profile_principal,
+                    )
+                except ValueError as exc:
+                    raise SystemExit(
+                        "Account Center returned invalid Microsoft Graph identity metadata"
+                    ) from exc
+            if provider == "azure_devops":
+                from cyrene_exchange_product.integrations.azure_devops import (
+                    validate_profile_identity,
+                )
+
+                try:
+                    validate_profile_identity(
+                        row,
+                        profile_ref=profile_ref,
+                        principal=account_profile_principal,
+                    )
+                except ValueError as exc:
+                    raise SystemExit(
+                        "Account Center returned invalid Azure DevOps identity metadata"
+                    ) from exc
             revision = row.get("credential_revision")
             if revision is not None and (
                 not isinstance(revision, int) or isinstance(revision, bool) or revision < 0
@@ -691,7 +743,7 @@ def _integration_connector_export_data(
             continue
         profile_ref = (
             connection.account_link_ref
-            if connection.provider in {"github", "hf"}
+            if connection.provider in {"github", "hf", "microsoft_graph", "azure_devops"}
             else connection.binding_ref
         )
         if (
@@ -701,7 +753,9 @@ def _integration_connector_export_data(
             and connection.target_ref is None
         ):
             continue
-        if not profile_ref or (connection.provider != "github" and not connection.target_ref):
+        if not profile_ref or (
+            connection.provider not in {"github", "microsoft_graph"} and not connection.target_ref
+        ):
             raise SystemExit("an enabled connector connection has no complete host profile scope")
 
         read_only_hf_target = False
@@ -710,8 +764,10 @@ def _integration_connector_export_data(
         account_profile: dict[str, Any] | None = None
         host_profile: Any = None
         target: Any = None
-        if connection.provider in {"github", "hf"}:
-            provider_name = "huggingface" if connection.provider == "hf" else "github"
+        if connection.provider in {"github", "hf", "microsoft_graph", "azure_devops"}:
+            provider_name = (
+                "huggingface" if connection.provider == "hf" else str(connection.provider)
+            )
             account_profile = account_profiles.get((str(profile_ref), provider_name))
             if need_account_profiles and account_profile is None:
                 raise SystemExit("Exchange connection does not match an Account Center profile")
@@ -720,7 +776,7 @@ def _integration_connector_export_data(
                     "repositoryId": connection.repository_id,
                     "repository": connection.repository_name,
                 }
-            else:
+            elif connection.provider == "hf":
                 if registry is None:
                     raise SystemExit("Hugging Face connection profile registry is unavailable")
                 host_profile = registry.settings.profiles.get(str(connection.binding_ref))
@@ -755,6 +811,105 @@ def _integration_connector_export_data(
                     "repoType": target_row["repoType"],
                     "repoId": target_row["repoId"],
                     "permissions": target_row["permissions"],
+                }
+            elif connection.provider == "microsoft_graph":
+                if account_profile is None:
+                    raise SystemExit(
+                        "Microsoft Graph Account Center profile readback is unavailable"
+                    )
+                if account_profile["accessMode"] != "actor_owned":
+                    raise SystemExit("Microsoft Graph profile is not actor owned")
+                host_profile = (
+                    registry.settings.profiles.get(str(connection.binding_ref))
+                    if registry is not None
+                    else None
+                )
+                if (
+                    host_profile is None
+                    or host_profile.provider != "microsoft_graph"
+                    or host_profile.access_mode != "actor_owned"
+                    or not host_profile.microsoft_graph_plan_ids
+                    or connection.target_ref is not None
+                ):
+                    raise SystemExit("Microsoft Graph host binding does not match the connection")
+                if (
+                    tuple(account_profile["targetScope"]["planner"]["planIds"])
+                    != host_profile.microsoft_graph_plan_ids
+                ):
+                    raise SystemExit("Microsoft Graph Account Center plans differ from host config")
+                sharepoint_scope = account_profile["targetScope"]["sharepoint"]
+                if sharepoint_scope["enabled"] and (
+                    sharepoint_scope["siteId"] != host_profile.microsoft_graph_sharepoint_site_id
+                    or tuple(sharepoint_scope["listIds"])
+                    != host_profile.microsoft_graph_sharepoint_list_ids
+                ):
+                    raise SystemExit("Microsoft Graph SharePoint scope differs from host config")
+                connection_target_scope = account_profile["targetScope"]
+            else:
+                if account_profile is None:
+                    raise SystemExit("Azure DevOps Account Center profile readback is unavailable")
+                host_profile = (
+                    registry.settings.profiles.get(str(connection.binding_ref))
+                    if registry is not None
+                    else None
+                )
+                source = (
+                    (host_profile.authorized_sources or {}).get(str(connection.target_ref))
+                    if host_profile is not None
+                    else None
+                )
+                if (
+                    host_profile is None
+                    or host_profile.provider != "azure_devops"
+                    or host_profile.access_mode != "actor_owned"
+                    or source is None
+                    or source.source_id != connection.target_ref
+                    or source.profile_ref != profile_ref
+                    or connection.access_mode != "actor_owned"
+                ):
+                    raise SystemExit("Azure DevOps connection is outside host authorized_sources")
+                from cyrene_exchange_product.integrations.azure_devops import (
+                    public_profile_scope,
+                    scope_for_authorized_source,
+                )
+
+                source_config = {
+                    "source_id": source.source_id,
+                    "kind": source.kind,
+                    "project_id": source.project_id,
+                    "project_name": source.project_name,
+                    "profile_ref": source.profile_ref,
+                    **(
+                        {"pipeline_id": source.pipeline_id}
+                        if source.pipeline_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"definition_id": source.definition_id}
+                        if source.definition_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"definition_environment_id": source.definition_environment_id}
+                        if source.definition_environment_id is not None
+                        else {}
+                    ),
+                }
+                expected_scope = public_profile_scope(
+                    scope_for_authorized_source(
+                        tenant_id=str(host_profile.azure_devops_tenant_id),
+                        organization=str(host_profile.azure_devops_organization),
+                        source=source_config,
+                    )
+                )
+                if account_profile["targetScope"] != expected_scope:
+                    raise SystemExit(
+                        "Azure DevOps Account Center scope differs from its host source"
+                    )
+                connection_target_scope = {
+                    "id": source.source_id,
+                    "kind": source.kind,
+                    "bindingId": host_profile.endpoint.binding_id,
                 }
         elif provider_id in {"azure", "gcp", "runpod"} and include_profile_metadata:
             if registry is None:
@@ -848,6 +1003,40 @@ def _integration_connector_export_data(
             }
             if read_only_hf_target:
                 selected_ids &= read_ids
+        elif provider_id == "microsoft_graph":
+            if account_profile is None or account_profile["authStatus"] != "healthy":
+                selected_ids = set()
+            else:
+                scope = account_profile["targetScope"]
+                planner = scope["planner"]
+                sharepoint = scope["sharepoint"]
+                selected_ids = set()
+                for tool_id, mapping in expected.items():
+                    operation_id = str(mapping["operationId"])
+                    if mapping.get("mutating") is False:
+                        sharepoint_read = (
+                            operation_id.startswith("microsoft_graph.sharepoint.")
+                            and sharepoint["enabled"]
+                        )
+                        planner_read = (
+                            operation_id.startswith("microsoft_graph.planner.")
+                            and planner["tasksRead"]
+                            and planner["planIds"]
+                        )
+                        if sharepoint_read or planner_read:
+                            selected_ids.add(tool_id)
+                    elif (
+                        mapping.get("mutating") is True
+                        and operation_id.startswith("microsoft_graph.planner.")
+                        and planner["tasksWrite"]
+                        and planner["planIds"]
+                    ):
+                        selected_ids.add(tool_id)
+        elif provider_id == "azure_devops":
+            if account_profile is None or account_profile["authStatus"] != "healthy":
+                selected_ids = set()
+            else:
+                selected_ids = expected_ids
         elif include_live_catalog and provider_id in {"azure", "gcp", "runpod"}:
             available = descriptor_ids & expected_ids
             if available == expected_ids:

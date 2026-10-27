@@ -1175,6 +1175,49 @@ def test_teams_reply_forwards_validated_regional_service_url() -> None:
     assert evidence.accepted is True
 
 
+def test_teams_private_send_uses_exact_actor_route_and_private_proto() -> None:
+    delivery = message_wire.DeliveryResult(
+        status=message_wire.DELIVERY_STATUS_ACCEPTED,
+        vendor_message_id="private-message-1",
+    )
+    transport = _DirectClient(
+        [
+            DirectPayload(
+                "type.cyrene.io/cyrene.message.connector.v1.DeliveryResult",
+                delivery.SerializeToString(deterministic=True),
+            )
+        ]
+    )
+    client = TeamsMessageClient(transport)
+    tenant_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    actor_id = "11111111-1111-4111-8111-111111111111"
+    service_url = "https://smba.trafficmanager.net/emea/"
+    evidence = client.send_private(
+        bot_app_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        tenant_id=tenant_id,
+        actor_aad_object_id=actor_id,
+        conversation_id="a:host-resolved-private-chat",
+        service_url=service_url,
+        text="The scheduled task needs attention.",
+        request_id="private-send-1",
+    )
+    request = message_wire.SendMessageRequest.FromString(transport.calls[0]["request"].value)
+    facts = {fact.name: fact.value for fact in request.vendor_extension.facts}
+
+    assert request.conversation.kind == message_wire.CONVERSATION_KIND_PRIVATE
+    assert request.conversation.account_id == "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    assert request.conversation.conversation_id == "a:host-resolved-private-chat"
+    assert not request.HasField("reply")
+    assert facts == {
+        "tenant_id": tenant_id,
+        "target_kind": "owner_private",
+        "actor_aad_object_id": actor_id,
+        "service_url": service_url,
+    }
+    assert evidence.accepted is True
+    assert evidence.vendor_message_id == "private-message-1"
+
+
 def test_github_webhook_verifier_sends_original_bytes_without_connection_claim() -> None:
     transport = _DirectClient(
         [

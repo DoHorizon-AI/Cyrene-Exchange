@@ -46,7 +46,7 @@ class NavigatorConnectorSettings:
 
 @dataclass(frozen=True, slots=True)
 class TeamsMessageProfile:
-    """One fixed Teams bot and conversation allowlist for Exchange message egress."""
+    """One fixed Teams bot, channel scope, and actor allowlist for message egress."""
 
     profile_ref: str
     connection_ref: str
@@ -58,6 +58,7 @@ class TeamsMessageProfile:
     bot_app_id: str
     endpoint: DirectPluginEndpointConfig
     expected_issuer: str
+    personal_actor_subjects: frozenset[str] = frozenset()
     fixed_owner_subject: str | None = None
     fixed_route: TeamsFixedRoute | None = None
     system_notification_profile: TeamsMessageProfile | None = None
@@ -77,6 +78,37 @@ class TeamsMessageProfile:
 
         if self.fixed_owner_subject is not None and principal.subject != self.fixed_owner_subject:
             raise PermissionError("Teams notification profile is outside its fixed owner binding")
+
+    def authorize_personal_target(
+        self,
+        *,
+        principal_subject: str,
+        tenant_id: str,
+        bot_app_id: str,
+        actor_aad_object_id: str,
+        conversation_id: str,
+        service_url: str,
+    ) -> None:
+        """Bind a private send to one allowlisted Entra actor and the fixed bot tenant."""
+
+        actor_id = validate_teams_actor_aad_object_id(actor_aad_object_id)
+        if principal_subject != actor_id:
+            raise PermissionError("Teams private actor differs from the signed grant subject")
+        if actor_id not in self.personal_actor_subjects:
+            raise PermissionError(
+                "Teams private actor is outside the host personal actor allowlist"
+            )
+        if tenant_id != self.tenant_id or bot_app_id != self.bot_app_id:
+            raise PermissionError("Teams private target differs from the fixed tenant or bot")
+        if (
+            not conversation_id.startswith("a:")
+            or len(conversation_id) < 3
+            or len(conversation_id) > 512
+            or conversation_id != conversation_id.strip()
+            or any(ord(character) < 0x20 for character in conversation_id)
+        ):
+            raise ValueError("Teams private conversation ID is invalid")
+        validate_teams_service_url(service_url, tenant_id=tenant_id)
 
     def authorize_conversation(
         self,
@@ -227,6 +259,14 @@ def validate_teams_root_thread_id(root_thread_id: str) -> str:
     return root_thread_id
 
 
+def validate_teams_actor_aad_object_id(value: object) -> str:
+    """Require a canonical lowercase UUID for a Teams personal-chat actor."""
+
+    if not isinstance(value, str) or not _UUID_PATH.fullmatch(value) or value != value.lower():
+        raise ValueError("Teams actor Aad object ID must be a canonical lowercase UUID")
+    return value
+
+
 def parse_connector_host_settings(value: object) -> ConnectorHostSettings:
     """Parse the exact host-owned Navigator, Teams, and computer profiles."""
 
@@ -282,7 +322,7 @@ def _parse_teams(value: object) -> TeamsMessageProfile | None:
             "directPlugin",
             "expectedIssuer",
         },
-        optional={"allowedChannelIds", "systemNotification"},
+        optional={"allowedChannelIds", "personalActorSubjects", "systemNotification"},
         label="connectorHost.teamsMessages",
     )
     profile_ref = _alias(item["profileRef"], "teamsMessages.profileRef")
@@ -294,6 +334,19 @@ def _parse_teams(value: object) -> TeamsMessageProfile | None:
     issuer_match = _AAD_ISSUER.fullmatch(issuer)
     if issuer_match is None or issuer_match.group(1).lower() != tenant_id:
         raise ConnectorHostConfigurationError("Teams issuer must match the configured tenant")
+    personal_actor_subjects = _string_set(
+        item.get("personalActorSubjects", []),
+        "teamsMessages.personalActorSubjects",
+        allow_empty=True,
+    )
+    try:
+        personal_actor_subjects = frozenset(
+            validate_teams_actor_aad_object_id(subject) for subject in personal_actor_subjects
+        )
+    except ValueError as exc:
+        raise ConnectorHostConfigurationError(
+            "Teams personalActorSubjects must contain canonical lowercase Entra object IDs"
+        ) from exc
     profile = TeamsMessageProfile(
         profile_ref=profile_ref,
         connection_ref=connection_ref,
@@ -307,6 +360,7 @@ def _parse_teams(value: object) -> TeamsMessageProfile | None:
         bot_app_id=_text(item["botAppId"], "teamsMessages.botAppId"),
         endpoint=_endpoint(item["directPlugin"], "teamsMessages.directPlugin"),
         expected_issuer=issuer,
+        personal_actor_subjects=personal_actor_subjects,
     )
     notification_value = item.get("systemNotification")
     if notification_value is None:

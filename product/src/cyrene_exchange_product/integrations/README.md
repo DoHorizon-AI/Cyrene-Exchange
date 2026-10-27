@@ -225,6 +225,23 @@ stay in their regional Bot Framework endpoint. The Teams provider alone reads it
 bot secret. A `429` preserves `Retry-After`; a delivery with unknown outcome is
 persisted and returned as `uncertain` without creating a resend.
 
+The same internal route also accepts the closed `owner_private` body
+`{requestId,providerId,targetKind,conversation,text}`. Its conversation is exactly
+`{tenantId,botAppId,actorAadObjectId,conversationId,serviceUrl}`. Exchange requires
+the signed grant subject to equal `actorAadObjectId`, checks tenant and bot against
+the host profile, and requires the actor in
+`connectorHost.teamsMessages.personalActorSubjects`; an omitted or empty list keeps
+personal delivery disabled. The grant binds exactly
+`{targetKind:"owner_private",conversation,text}` and resource reference
+`msteams-personal:` plus the RFC 8785 SHA-256 of the conversation. Connection and
+profile references remain in the signed grant, not the request body. The operation
+remains `msteams.message.reply` and is not exposed as a model tool. Exchange passes
+a PRIVATE `SendMessageRequest` through `message.connector.v1`; the Teams provider
+keeps its own personal-chat activation gate. Duplicate sends return their durable
+receipt, and unknown outcomes are retained as `uncertain` without a retry.
+The host actor list is only a destination allowlist; each send still requires a
+fresh signed Directory grant.
+
 Directory-authorized provider operations are available only to actors granted
 `navigator.connector.operator.v1`. Typed provider API tools bind their fixed
 resource scope; GitHub, Azure, GCP, and RunPod CLI calls bind the host-owned
@@ -504,6 +521,18 @@ tenant/team/channel 和官方服务 URL 路由。完整会话对象参与 resour
 `{conversation,text}` 参数摘要；Exchange 将 `serviceUrl` 作为 `service_url` vendor fact 传给
 Teams provider，使回复留在原区域。Bot secret 只由 Teams provider 读取。`429` 会保留
 `Retry-After`；发送结果未知时 Exchange 持久化并返回 `uncertain`，不创建重发。
+
+同一路由也支持封闭的 `owner_private` 请求体
+`{requestId,providerId,targetKind,conversation,text}`；conversation 精确包含
+`{tenantId,botAppId,actorAadObjectId,conversationId,serviceUrl}`。Exchange 要求签名 grant subject
+与 `actorAadObjectId` 一致，tenant 和 bot 必须匹配 Host profile，actor 还必须出现在
+`connectorHost.teamsMessages.personalActorSubjects` 中；省略或使用空列表会关闭个人消息发送。Grant
+精确绑定 `{targetKind:"owner_private",conversation,text}`，resource reference 为
+`msteams-personal:` 加 conversation 的 RFC 8785 SHA-256。连接与 profile 引用只存在于签名 grant，不进入
+请求体。该操作仍为 `msteams.message.reply`，不会作为模型工具暴露。Exchange 通过
+`message.connector.v1` 发送 PRIVATE `SendMessageRequest`；Teams provider 继续执行自己的个人聊天激活检查。
+重复发送返回持久回执，未知结果保留为 `uncertain`，不会重试。
+Host actor 列表只允许个人发送目标；每次发送仍需新的签名 Directory grant。
 
 只有获得 `navigator.connector.operator.v1` 的主体才能使用 Directory 授权的连接器操作。类型化
 Provider API 工具绑定固定资源范围；GitHub、Azure、GCP 和 RunPod 的原生 CLI

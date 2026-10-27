@@ -515,6 +515,322 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/accounts/provider-profiles:
+    get:
+      summary: List Provider Profiles
+      operationId: accountListProviderProfiles
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Non-secret metadata for provider profiles visible to the verified actor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountProviderProfilesResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/provider-profiles/microsoft-graph/link-sessions:
+    post:
+      summary: Begin Microsoft Graph Link
+      operationId: accountBeginMicrosoftGraphLink
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeginMicrosoftGraphLinkBody'
+      responses:
+        '201':
+          description: OAuth navigation session; no provider credential is returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MicrosoftGraphOAuthSessionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/provider-profiles/azure-devops/link-sessions:
+    post:
+      summary: Begin Azure DevOps Link
+      operationId: accountBeginAzureDevOpsLink
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeginAzureDevOpsLinkBody'
+      responses:
+        '201':
+          description: OAuth navigation session; no provider credential is returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MicrosoftGraphOAuthSessionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/azure-devops/callback:
+    get:
+      summary: Complete Azure DevOps Link
+      operationId: accountCompleteAzureDevOpsLink
+      parameters:
+      - name: state
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 32
+          maxLength: 512
+      - name: code
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 4096
+      responses:
+        '200':
+          description: Actor-owned non-secret profile metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkedAzureDevOpsProfileResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/accounts/microsoft-graph/callback:
+    get:
+      summary: Complete Microsoft Graph Link
+      operationId: accountCompleteMicrosoftGraphLink
+      parameters:
+      - name: state
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 32
+          maxLength: 512
+      - name: code
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 4096
+      responses:
+        '200':
+          description: Actor-owned non-secret profile metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkedMicrosoftGraphProfileResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/enable-planner-write:
+    post:
+      summary: Begin Microsoft Graph Planner Write Consent
+      operationId: accountBeginMicrosoftGraphPlannerWriteUpgrade
+      parameters:
+      - name: profile_ref
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 300
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '201':
+          description: OAuth navigation session for the fixed Tasks.ReadWrite consent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MicrosoftGraphOAuthSessionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/select-sharepoint-target:
+    post:
+      summary: Begin Microsoft Graph Selected SharePoint Consent
+      operationId: accountBeginMicrosoftGraphSharePointScopeUpgrade
+      parameters:
+      - name: profile_ref
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 300
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SelectMicrosoftGraphSharePointScopeBody'
+      responses:
+        '201':
+          description: OAuth navigation session for the selected site/list consent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MicrosoftGraphOAuthSessionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/microsoft-graph/scope-upgrade/callback:
+    get:
+      summary: Complete Microsoft Graph Scope Upgrade
+      operationId: accountCompleteMicrosoftGraphScopeUpgrade
+      parameters:
+      - name: state
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 32
+          maxLength: 512
+      - name: code
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 4096
+      responses:
+        '200':
+          description: Actor-owned non-secret profile metadata after consent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkedMicrosoftGraphProfileResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/accounts/link-sessions/wecom/confirm:
     post:
       summary: Confirm Wecom Link
@@ -2170,6 +2486,63 @@ components:
         strict:
           type: boolean
       additionalProperties: false
+    InternalTeamsPrivateConversation:
+      type: object
+      description: Internal owner-private route tuple; accepted only from a fresh signed connector grant.
+      required:
+      - tenantId
+      - botAppId
+      - actorAadObjectId
+      - conversationId
+      - serviceUrl
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        botAppId:
+          type: string
+          format: uuid
+        actorAadObjectId:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        conversationId:
+          type: string
+          minLength: 3
+          maxLength: 512
+          pattern: '^a:.+$'
+        serviceUrl:
+          type: string
+          format: uri
+          maxLength: 512
+      additionalProperties: false
+    InternalTeamsPrivateMessageRequest:
+      type: object
+      description: Internal Teams egress body, not a public API operation; its route and exact arguments are covered by the fresh Authority grant.
+      required:
+      - requestId
+      - providerId
+      - targetKind
+      - conversation
+      - text
+      properties:
+        requestId:
+          type: string
+          minLength: 1
+          maxLength: 200
+        providerId:
+          type: string
+          const: msteams
+        targetKind:
+          type: string
+          const: owner_private
+        conversation:
+          $ref: '#/components/schemas/InternalTeamsPrivateConversation'
+        text:
+          type: string
+          minLength: 1
+          maxLength: 24000
+      additionalProperties: false
     NamedToolChoice:
       type: object
       required:
@@ -2692,6 +3065,299 @@ components:
       - provider
       title: BeginLinkBody
       description: Fixed external account provider selector.
+    BeginMicrosoftGraphLinkBody:
+      type: object
+      additionalProperties: false
+      required:
+      - bindingRef
+      properties:
+        bindingRef:
+          type: string
+          minLength: 1
+          maxLength: 300
+      title: BeginMicrosoftGraphLinkBody
+      description: Select a host binding with fixed Planner plan IDs for delegated Tasks.Read consent.
+    BeginAzureDevOpsLinkBody:
+      type: object
+      additionalProperties: false
+      required:
+      - bindingRef
+      - sourceId
+      properties:
+        bindingRef:
+          type: string
+          minLength: 1
+          maxLength: 300
+        sourceId:
+          type: string
+          minLength: 1
+          maxLength: 300
+      title: BeginAzureDevOpsLinkBody
+      description: Select one source from a host-owned Azure DevOps authorized_sources binding.
+    SelectMicrosoftGraphSharePointScopeBody:
+      type: object
+      additionalProperties: false
+      required:
+      - bindingRef
+      properties:
+        bindingRef:
+          type: string
+          minLength: 1
+          maxLength: 300
+      title: SelectMicrosoftGraphSharePointScopeBody
+      description: Select a host binding whose site/list allowlist is fixed for Sites.Selected consent.
+    MicrosoftGraphProfileScope:
+      type: object
+      additionalProperties: false
+      required:
+      - tenantId
+      - planner
+      - sharepoint
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        planner:
+          type: object
+          additionalProperties: false
+          required:
+          - planIds
+          - tasksRead
+          - tasksWrite
+          properties:
+            planIds:
+              type: array
+              minItems: 1
+              maxItems: 100
+              uniqueItems: true
+              items:
+                type: string
+                pattern: ^[A-Za-z0-9_-]{1,128}$
+            tasksRead:
+              type: boolean
+              const: true
+            tasksWrite:
+              type: boolean
+        sharepoint:
+          type: object
+          additionalProperties: false
+          required:
+          - enabled
+          - siteId
+          - listIds
+          properties:
+            enabled:
+              type: boolean
+            siteId:
+              anyOf:
+              - type: string
+                pattern: ^[A-Za-z0-9.-]{1,255},[0-9a-fA-F-]{36},[0-9a-fA-F-]{36}$
+              - type: 'null'
+            listIds:
+              type: array
+              maxItems: 100
+              uniqueItems: true
+              items:
+                type: string
+                format: uuid
+                pattern: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+      title: MicrosoftGraphProfileScope
+      description: Exact non-secret scope returned by the actor-owned Account Center profile.
+    AzureDevOpsProfileScope:
+      type: object
+      additionalProperties: false
+      required:
+      - tenantId
+      - organization
+      - projectId
+      - sourceId
+      - sourceKind
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        organization:
+          type: string
+        projectId:
+          type: string
+          format: uuid
+        sourceId:
+          type: string
+        sourceKind:
+          type: string
+          enum:
+          - project_pipelines
+          - pipeline_runs
+          - release_deployments
+        pipelineId:
+          type: integer
+          minimum: 1
+        definitionId:
+          type: integer
+          minimum: 1
+        definitionEnvironmentId:
+          type: integer
+          minimum: 1
+      title: AzureDevOpsProfileScope
+      description: Exact non-secret tenant, project, and selected source scope.
+    MicrosoftGraphOAuthSessionResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - linkSessionRef
+      - authorizationUrl
+      - expiresAt
+      properties:
+        linkSessionRef:
+          type: string
+          format: uuid
+        authorizationUrl:
+          type: string
+          format: uri
+        expiresAt:
+          type: string
+          format: date-time
+      title: MicrosoftGraphOAuthSessionResponse
+    LinkedMicrosoftGraphProfileResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - profileRef
+      - provider
+      - authStatus
+      - accessMode
+      - externalSubject
+      - expiresAt
+      - authMode
+      - targetScope
+      properties:
+        profileRef:
+          type: string
+          format: uuid
+        provider:
+          type: string
+          const: microsoft_graph
+        authStatus:
+          type: string
+          enum:
+          - healthy
+          - reauthorization_required
+          - revoked
+        accessMode:
+          type: string
+          const: actor_owned
+        externalSubject:
+          type: string
+          minLength: 1
+        expiresAt:
+          type: string
+          format: date-time
+        authMode:
+          type: string
+          const: delegated_oauth
+        targetScope:
+          $ref: '#/components/schemas/MicrosoftGraphProfileScope'
+      title: LinkedMicrosoftGraphProfileResponse
+    LinkedAzureDevOpsProfileResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - profileRef
+      - provider
+      - authStatus
+      - accessMode
+      - externalSubject
+      - expiresAt
+      - authMode
+      - targetScope
+      properties:
+        profileRef:
+          type: string
+          format: uuid
+        provider:
+          type: string
+          const: azure_devops
+        authStatus:
+          type: string
+          enum:
+          - healthy
+          - reauthorization_required
+          - revoked
+        accessMode:
+          type: string
+          const: actor_owned
+        externalSubject:
+          type: string
+          minLength: 1
+        expiresAt:
+          type: string
+          format: date-time
+        authMode:
+          type: string
+          const: delegated_oauth
+        targetScope:
+          $ref: '#/components/schemas/AzureDevOpsProfileScope'
+      title: LinkedAzureDevOpsProfileResponse
+    AccountProviderProfilesResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - profiles
+      properties:
+        profiles:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+            - profileRef
+            - provider
+            - targetScope
+            - authStatus
+            - accessMode
+            properties:
+              profileRef:
+                type: string
+                minLength: 1
+                maxLength: 300
+              provider:
+                type: string
+                minLength: 1
+              identityRef:
+                anyOf:
+                - type: string
+                - type: 'null'
+              targetScope:
+                type: object
+              authStatus:
+                type: string
+                enum:
+                - unknown
+                - configured
+                - healthy
+                - unavailable
+                - reauthorization_required
+                - revoked
+              accessMode:
+                type: string
+                enum:
+                - actor_owned
+                - workspace_operator
+              externalSubject:
+                anyOf:
+                - type: string
+                - type: 'null'
+              expiresAt:
+                anyOf:
+                - type: string
+                  format: date-time
+                - type: integer
+                - type: 'null'
+              authMode:
+                anyOf:
+                - type: string
+                - type: 'null'
+      title: AccountProviderProfilesResponse
     CommentBody:
       properties:
         issueNumber:
@@ -2802,6 +3468,8 @@ components:
           - azure
           - gcp
           - hf
+          - microsoft_graph
+          - azure_devops
           - runpod
           - tailscale
           default: github
@@ -2856,6 +3524,8 @@ components:
           - azure
           - gcp
           - hf
+          - microsoft_graph
+          - azure_devops
           - runpod
           - tailscale
           title: Provider
@@ -2956,6 +3626,8 @@ components:
           - azure
           - gcp
           - hf
+          - microsoft_graph
+          - azure_devops
           - runpod
           - tailscale
         authorizationRef:
@@ -3154,6 +3826,8 @@ components:
           - azure
           - gcp
           - hf
+          - microsoft_graph
+          - azure_devops
           - runpod
           - tailscale
         checkedAt:

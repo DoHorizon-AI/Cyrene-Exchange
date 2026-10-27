@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from functools import partial
 from math import floor
 from typing import Annotated, Any, Literal, Protocol
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Header, Query, Request
@@ -36,7 +37,19 @@ from pydantic import (
 from pydantic.alias_generators import to_camel
 
 from cyrene_exchange_product.errors import ExchangeProductError
+from cyrene_exchange_product.integrations.azure_devops import (
+    public_profile_scope as azure_devops_public_profile_scope,
+)
+from cyrene_exchange_product.integrations.azure_devops import (
+    scope_for_authorized_source as azure_devops_scope_for_authorized_source,
+)
+from cyrene_exchange_product.integrations.azure_devops import (
+    validate_profile_identity as validate_azure_devops_profile_identity,
+)
 from cyrene_exchange_product.integrations.clients import AccountCenterClient, GitHubIssuesClient
+from cyrene_exchange_product.integrations.connector_operations import (
+    teams_personal_resource_ref,
+)
 from cyrene_exchange_product.integrations.connector_profiles import (
     validate_teams_root_thread_id,
     validate_teams_service_url,
@@ -47,6 +60,16 @@ from cyrene_exchange_product.integrations.connector_security import (
     digest_arguments,
     navigator_hmac_body_limit,
     parse_signed_json_object,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    public_profile_scope as microsoft_graph_public_profile_scope,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    validate_profile_identity as validate_microsoft_graph_profile_identity,
+)
+from cyrene_exchange_product.integrations.microsoft_identity import (
+    MicrosoftActorMismatch,
+    microsoft_identity_for_principal,
 )
 from cyrene_exchange_product.integrations.models import (
     AuthorizationHealthRecord,
@@ -67,6 +90,7 @@ from cyrene_exchange_product.integrations.models import (
 )
 from cyrene_exchange_product.integrations.ports import (
     PluginHealthObservation,
+    TeamsMessagePort,
     ValidatedExecutionProof,
 )
 from cyrene_exchange_product.integrations.store import (
@@ -389,6 +413,25 @@ class LinkHuggingFaceProfileBody(IntegrationRequestBody):
     profile_alias: str = Field(min_length=1, max_length=300)
 
 
+class BeginMicrosoftGraphLinkBody(IntegrationRequestBody):
+    """Select one fixed host Graph binding whose plan IDs Exchange controls."""
+
+    binding_ref: str = Field(min_length=1, max_length=300)
+
+
+class BeginAzureDevOpsLinkBody(IntegrationRequestBody):
+    """Select one fixed host binding/source alias for delegated ADO consent."""
+
+    binding_ref: str = Field(min_length=1, max_length=300)
+    source_id: str = Field(min_length=1, max_length=300)
+
+
+class SelectMicrosoftGraphSharePointScopeBody(IntegrationRequestBody):
+    """Select only a host binding whose site/list allowlist is fixed."""
+
+    binding_ref: str = Field(min_length=1, max_length=300)
+
+
 class ConfirmWeComBody(IntegrationRequestBody):
     """Challenge confirmation tied to an Account Center link session."""
 
@@ -432,11 +475,16 @@ class CreateConnectionBody(IntegrationRequestBody):
                 raise ValueError("GitHub connections do not accept cloud targetRef")
         elif self.repository_id or self.repository_name:
             raise ValueError("provider connections cannot include GitHub repository fields")
-        elif self.provider in {"azure", "gcp", "hf", "runpod", "tailscale"}:
+        elif self.provider in {"azure", "azure_devops", "gcp", "hf", "runpod", "tailscale"}:
             if self.binding_ref is None or self.target_ref is None:
                 raise ValueError("cloud connections require bindingRef and targetRef")
         elif self.provider == "wecom" and self.binding_ref is None:
             raise ValueError("WeCom authorization connections require bindingRef")
+        elif self.provider == "microsoft_graph":
+            if not self.account_link_ref or not self.binding_ref or self.target_ref is not None:
+                raise ValueError(
+                    "Microsoft Graph connections require an Account Center profile and host binding"
+                )
         return self
 
 
@@ -760,12 +808,34 @@ class TeamsConversationBody(IntegrationRequestBody):
         return self
 
 
+class TeamsPrivateConversationBody(IntegrationRequestBody):
+    """One host-resolved owner-private chat tuple with its original Entra actor."""
+
+    tenant_id: str = Field(min_length=1, max_length=100)
+    bot_app_id: str = Field(min_length=1, max_length=300)
+    actor_aad_object_id: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
+    conversation_id: str = Field(min_length=3, max_length=512, pattern=r"^a:.+$")
+    service_url: str = Field(min_length=1, max_length=512)
+
+
 class TeamsMessageBody(IntegrationRequestBody):
     """One exact Teams thread reply sent via the host-configured message provider."""
 
     request_id: str = Field(min_length=1, max_length=200)
     provider_id: Literal["msteams"] | None = None
     conversation: TeamsConversationBody
+    text: str = Field(min_length=1, max_length=24_000)
+
+
+class TeamsPrivateMessageBody(IntegrationRequestBody):
+    """One exact, closed owner-private Teams send through the existing connector path."""
+
+    request_id: str = Field(min_length=1, max_length=200)
+    provider_id: Literal["msteams"]
+    target_kind: Literal["owner_private"]
+    conversation: TeamsPrivateConversationBody
     text: str = Field(min_length=1, max_length=24_000)
 
 
@@ -838,7 +908,7 @@ class IntegrationServices:
         connector_grant_authority: Any = None,
         connector_grant_verifier: Any = None,
         connector_operation_dispatcher: Any = None,
-        teams_message_client: Any = None,
+        teams_message_client: TeamsMessagePort | None = None,
         teams_message_profile: Any = None,
         computer_runner_client: Any = None,
         computer_runner_profile: Any = None,
@@ -883,6 +953,74 @@ class IntegrationServices:
         request: CreateIntegrationConnection,
     ) -> str:
         """Authorize aliases for this current principal and resolve display metadata."""
+
+        if request.provider == "microsoft_graph":
+            if (
+                not request.account_link_ref
+                or not request.binding_ref
+                or request.target_ref is not None
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Microsoft Graph profile is not configured",
+                    detail="Select this actor's linked Graph profile and the fixed host binding.",
+                    status=403,
+                )
+            registry = self.authorization_profile_registry
+            host_profile = (
+                registry.settings.profiles.get(request.binding_ref)
+                if registry is not None
+                else None
+            )
+            if (
+                host_profile is None
+                or host_profile.provider != "microsoft_graph"
+                or host_profile.access_mode != "actor_owned"
+                or not host_profile.microsoft_graph_plan_ids
+                or not registry.principal_allowed_for_profile(principal, host_profile)
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_UNAVAILABLE",
+                    title="Microsoft Graph provider is not configured",
+                    detail="The fixed Graph binding has no authorized Planner plan targets.",
+                    status=503,
+                    retryable=True,
+                )
+            _microsoft_graph_profile_for_actor(
+                self.accounts,
+                principal,
+                request.account_link_ref,
+                expected_plan_ids=host_profile.microsoft_graph_plan_ids,
+                expected_sharepoint_targets=(
+                    host_profile.microsoft_graph_sharepoint_site_id,
+                    host_profile.microsoft_graph_sharepoint_list_ids,
+                ),
+            )
+        elif request.provider == "azure_devops":
+            registry = self.authorization_profile_registry
+            host_profile = (
+                registry.settings.profiles.get(request.binding_ref or "")
+                if registry is not None
+                else None
+            )
+            source = (
+                (host_profile.authorized_sources or {}).get(request.target_ref or "")
+                if host_profile is not None
+                else None
+            )
+            if (
+                host_profile is None
+                or host_profile.provider != "azure_devops"
+                or source is None
+                or request.account_link_ref != source.profile_ref
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Azure DevOps source is not configured",
+                    detail="Select only a source in the fixed host authorized_sources profile.",
+                    status=403,
+                )
+            _azure_devops_profile_for_actor(self.accounts, principal, host_profile, source)
 
         if (
             request.provider == "github"
@@ -1042,6 +1180,85 @@ class IntegrationServices:
         request: CreateIntegrationConnection,
     ) -> str:
         """Resolve sharing only from Account Center or immutable host profile metadata."""
+
+        if request.provider == "microsoft_graph":
+            if (
+                not request.account_link_ref
+                or not request.binding_ref
+                or request.target_ref is not None
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Microsoft Graph profile is not configured",
+                    detail="Select this actor's linked Graph profile and the fixed host binding.",
+                    status=403,
+                )
+            registry = self.authorization_profile_registry
+            host_profile = (
+                registry.settings.profiles.get(request.binding_ref)
+                if registry is not None
+                else None
+            )
+            if (
+                host_profile is None
+                or host_profile.provider != "microsoft_graph"
+                or host_profile.access_mode != "actor_owned"
+                or not host_profile.microsoft_graph_plan_ids
+                or not registry.principal_allowed_for_profile(principal, host_profile)
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_UNAVAILABLE",
+                    title="Microsoft Graph provider is not configured",
+                    detail="The fixed Graph binding has no authorized Planner plan targets.",
+                    status=503,
+                    retryable=True,
+                )
+            row, _scope = _microsoft_graph_profile_for_actor(
+                self.accounts,
+                principal,
+                request.account_link_ref,
+                expected_plan_ids=host_profile.microsoft_graph_plan_ids,
+                expected_sharepoint_targets=(
+                    host_profile.microsoft_graph_sharepoint_site_id,
+                    host_profile.microsoft_graph_sharepoint_list_ids,
+                ),
+            )
+            if row.get("access_mode", "actor_owned") != "actor_owned":
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Microsoft Graph credentials cannot be shared across actor identities.",
+                    status=502,
+                )
+            return "actor_owned"
+
+        if request.provider == "azure_devops":
+            registry = self.authorization_profile_registry
+            host_profile = (
+                registry.settings.profiles.get(request.binding_ref or "")
+                if registry is not None
+                else None
+            )
+            source = (
+                (host_profile.authorized_sources or {}).get(request.target_ref or "")
+                if host_profile is not None
+                else None
+            )
+            if (
+                host_profile is None
+                or host_profile.provider != "azure_devops"
+                or source is None
+                or request.account_link_ref != source.profile_ref
+                or host_profile.access_mode != "actor_owned"
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                    title="Azure DevOps source is not configured",
+                    detail="The selected source/profile is outside the actor-owned host binding.",
+                    status=403,
+                )
+            _azure_devops_profile_for_actor(self.accounts, principal, host_profile, source)
+            return "actor_owned"
 
         if (
             request.provider == "github"
@@ -1400,10 +1617,357 @@ def _provider_profile_ref(principal: IntegrationPrincipal, idempotency_key: str)
     return str(uuid5(NAMESPACE_URL, f"cyrene-provider-profile:{seed}"))
 
 
+def _microsoft_graph_profile_for_actor(
+    accounts: AccountCenterClient,
+    principal: IntegrationPrincipal,
+    profile_ref: str,
+    *,
+    require_healthy: bool = True,
+    expected_plan_ids: tuple[str, ...] | None = None,
+    expected_sharepoint_targets: tuple[str | None, tuple[str, ...]] | None = None,
+) -> tuple[Mapping[str, Any], dict[str, Any]]:
+    """Resolve one live, actor-owned Graph profile and classify its current auth state."""
+
+    try:
+        microsoft_identity_for_principal(principal)
+    except ValueError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+            title="Microsoft account identity required",
+            detail="Use the original verified Entra actor to access this Microsoft profile.",
+            status=403,
+        ) from exc
+    response = accounts.list_provider_profiles(principal)
+    rows = response.get("profiles") if isinstance(response, Mapping) else None
+    if not isinstance(rows, list):
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned invalid Microsoft Graph profile metadata.",
+            status=502,
+        )
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, Mapping)
+        and row.get("profile_ref") == profile_ref
+        and row.get("provider") == "microsoft_graph"
+    ]
+    if len(matches) != 1:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+            title="Microsoft Graph profile unavailable",
+            detail="The selected Microsoft Graph profile does not belong to this verified actor.",
+            status=403,
+        )
+    row = matches[0]
+    try:
+        scope = validate_microsoft_graph_profile_identity(
+            row,
+            profile_ref=profile_ref,
+            principal=principal,
+        )
+    except MicrosoftActorMismatch as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+            title="Microsoft Graph profile belongs to another actor",
+            detail="The linked Graph identity does not match the original verified Entra actor.",
+            status=403,
+        ) from exc
+    except ValueError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned a mismatched Microsoft Graph identity or scope.",
+            status=502,
+        ) from exc
+    if expected_plan_ids is not None and tuple(scope["planner"]["plan_ids"]) != expected_plan_ids:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+            title="Microsoft Graph profile does not match its host plan targets",
+            detail="The Account Center Planner plan set differs from the fixed host binding.",
+            status=403,
+            context={"reasonCode": "microsoft_graph_plan_scope_mismatch"},
+        )
+    if scope["sharepoint"]["enabled"] and (
+        expected_sharepoint_targets is None
+        or scope["sharepoint"]["site_id"] != expected_sharepoint_targets[0]
+        or tuple(scope["sharepoint"]["list_ids"]) != expected_sharepoint_targets[1]
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+            title="Microsoft Graph profile does not match its host SharePoint targets",
+            detail="The Account Center site/list scope differs from the fixed host binding.",
+            status=403,
+            context={"reasonCode": "microsoft_graph_sharepoint_scope_mismatch"},
+        )
+    auth_status = row.get("auth_status")
+    if require_healthy and int(row["expires_at"]) <= int(datetime.now(UTC).timestamp()):
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+            title="Microsoft Graph reauthorization required",
+            detail="The actor's delegated Graph access token has expired.",
+            status=409,
+            context={"reasonCode": "microsoft_graph_token_expired"},
+        )
+    if require_healthy and auth_status in {"reauthorization_required", "revoked"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+            title="Microsoft Graph reauthorization required",
+            detail="Account Center reports that this actor's Microsoft Graph link needs consent.",
+            status=409,
+            context={"reasonCode": "microsoft_graph_reauthorization_required"},
+        )
+    if require_healthy and auth_status in {"unknown", "unavailable"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_UNAVAILABLE",
+            title="Microsoft Graph authorization is unavailable",
+            detail="Account Center could not confirm the current Microsoft Graph profile.",
+            status=503,
+            retryable=True,
+            context={"reasonCode": "microsoft_graph_profile_unavailable"},
+        )
+    if require_healthy and auth_status != "healthy":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_AUTHORIZATION_NOT_READY",
+            title="Microsoft Graph authorization is not ready",
+            detail="Complete and verify Microsoft Graph consent before using this profile.",
+            status=409,
+            context={"reasonCode": "microsoft_graph_profile_not_healthy"},
+        )
+    return row, scope
+
+
+def _azure_devops_profile_for_actor(
+    accounts: AccountCenterClient,
+    principal: IntegrationPrincipal,
+    host_profile: Any,
+    source: Any,
+    *,
+    require_healthy: bool = True,
+) -> tuple[Mapping[str, Any], dict[str, Any]]:
+    """Require the actor-owned ADO profile to match one closed host source row."""
+
+    profile_ref = getattr(source, "profile_ref", None)
+    tenant_id = getattr(host_profile, "azure_devops_tenant_id", None)
+    organization = getattr(host_profile, "azure_devops_organization", None)
+    if (
+        not isinstance(profile_ref, str)
+        or not profile_ref
+        or not isinstance(tenant_id, str)
+        or not tenant_id
+        or not isinstance(organization, str)
+        or not organization
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_INVALID",
+            title="Azure DevOps source binding is invalid",
+            detail=(
+                "The fixed host source row is missing its actor profile or organization binding."
+            ),
+            status=503,
+        )
+    source_config = {
+        "source_id": getattr(source, "source_id", None),
+        "kind": getattr(source, "kind", None),
+        "project_id": getattr(source, "project_id", None),
+        "project_name": getattr(source, "project_name", None),
+        "profile_ref": profile_ref,
+        **({"pipeline_id": source.pipeline_id} if source.pipeline_id is not None else {}),
+        **({"definition_id": source.definition_id} if source.definition_id is not None else {}),
+        **(
+            {"definition_environment_id": source.definition_environment_id}
+            if source.definition_environment_id is not None
+            else {}
+        ),
+    }
+    try:
+        actor_tenant, _object_id, _subject = microsoft_identity_for_principal(principal)
+    except ValueError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+            title="Microsoft account identity required",
+            detail="Use the original verified Entra actor to access this Azure DevOps profile.",
+            status=403,
+        ) from exc
+    if actor_tenant != tenant_id:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+            title="Azure DevOps tenant differs from the signed actor",
+            detail="The selected ADO source is outside the original actor's Entra tenant.",
+            status=403,
+        )
+    try:
+        expected_scope = azure_devops_scope_for_authorized_source(
+            tenant_id=tenant_id,
+            organization=organization,
+            source=source_config,
+        )
+    except ValueError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_INVALID",
+            title="Azure DevOps source binding is invalid",
+            detail="The fixed host source row does not match the closed provider schema.",
+            status=503,
+        ) from exc
+    result = accounts.list_provider_profiles(principal)
+    rows = result.get("profiles") if isinstance(result, Mapping) else None
+    if not isinstance(rows, list):
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned invalid Azure DevOps profile metadata.",
+            status=502,
+        )
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, Mapping)
+        and row.get("profile_ref") == profile_ref
+        and row.get("provider") == "azure_devops"
+    ]
+    if len(matches) != 1:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+            title="Azure DevOps profile unavailable",
+            detail="The selected Account Center profile does not belong to this verified actor.",
+            status=403,
+        )
+    row = matches[0]
+    try:
+        scope = validate_azure_devops_profile_identity(
+            row,
+            profile_ref=profile_ref,
+            principal=principal,
+        )
+    except MicrosoftActorMismatch as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+            title="Azure DevOps profile belongs to another actor",
+            detail="The linked Entra identity does not match the original verified actor.",
+            status=403,
+        ) from exc
+    except ValueError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned a mismatched Azure DevOps identity or OAuth scope.",
+            status=502,
+        ) from exc
+    if scope != expected_scope:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+            title="Azure DevOps profile does not match its configured source",
+            detail="The actor-owned Account Center profile differs from the fixed host source row.",
+            status=403,
+            context={"reasonCode": "azure_devops_profile_scope_mismatch"},
+        )
+    auth_status = row.get("auth_status")
+    if require_healthy and int(row["expires_at"]) <= int(datetime.now(UTC).timestamp()):
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+            title="Azure DevOps reauthorization required",
+            detail="The actor's delegated Azure DevOps token has expired.",
+            status=409,
+            context={"reasonCode": "azure_devops_token_expired"},
+        )
+    if require_healthy and auth_status in {"reauthorization_required", "revoked"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+            title="Azure DevOps reauthorization required",
+            detail="Account Center reports that this actor's Entra link needs reauthorization.",
+            status=409,
+            context={"reasonCode": "azure_devops_reauthorization_required"},
+        )
+    if require_healthy and auth_status in {"unknown", "unavailable"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_UNAVAILABLE",
+            title="Azure DevOps authorization is unavailable",
+            detail="Account Center could not confirm the current Azure DevOps profile.",
+            status=503,
+            retryable=True,
+            context={"reasonCode": "azure_devops_profile_unavailable"},
+        )
+    if require_healthy and auth_status != "healthy":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_AUTHORIZATION_NOT_READY",
+            title="Azure DevOps authorization is not ready",
+            detail="Complete and verify the actor-owned Entra consent before using this profile.",
+            status=409,
+            context={"reasonCode": "azure_devops_profile_not_healthy"},
+        )
+    return row, scope
+
+
+def _microsoft_graph_oauth_session_response(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one Account Center Graph OAuth session after URL and expiry checks."""
+
+    session_ref = result.get("link_session_ref")
+    authorization_url = result.get("authorization_url")
+    expires_at = result.get("expires_at")
+    if (
+        not isinstance(session_ref, str)
+        or not session_ref
+        or not isinstance(authorization_url, str)
+        or not isinstance(expires_at, int)
+        or isinstance(expires_at, bool)
+        or expires_at <= int(datetime.now(UTC).timestamp())
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned an invalid Microsoft Graph OAuth session.",
+            status=502,
+        )
+    try:
+        UUID(session_ref)
+        parsed = urlsplit(authorization_url)
+        port = parsed.port
+        path_parts = parsed.path.split("/", maxsplit=2)
+        if len(path_parts) < 2:
+            raise ValueError("authorization path is incomplete")
+        valid_authority = re.fullmatch(
+            r"/(?:common|organizations|[0-9a-fA-F-]{36})/oauth2/v2\.0/authorize",
+            parsed.path,
+        )
+        valid_tenant = path_parts[1]
+        if valid_tenant not in {"common", "organizations"}:
+            UUID(valid_tenant)
+    except (IndexError, ValueError) as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned a Microsoft authorization URL outside the fixed route.",
+            status=502,
+        ) from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "login.microsoftonline.com"
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or authorization_url.strip() != authorization_url
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in authorization_url)
+        or valid_authority is None
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned a Microsoft authorization URL outside the fixed route.",
+            status=502,
+        )
+    return {
+        "linkSessionRef": session_ref,
+        "authorizationUrl": authorization_url,
+        "expiresAt": _http_utc_timestamp(datetime.fromtimestamp(expires_at, UTC)),
+    }
+
+
 def _linked_provider_profile_response(
     result: Mapping[str, Any],
     *,
-    expected_profile_ref: str,
+    expected_profile_ref: str | None,
     expected_provider: str,
 ) -> dict[str, Any]:
     """Validate and project a non-secret Account Center profile link result."""
@@ -1416,7 +1980,9 @@ def _linked_provider_profile_response(
     auth_mode = result.get("auth_mode")
     access_mode = result.get("access_mode", "actor_owned")
     if (
-        profile_ref != expected_profile_ref
+        (expected_profile_ref is not None and profile_ref != expected_profile_ref)
+        or not isinstance(profile_ref, str)
+        or not profile_ref
         or provider != expected_provider
         or not isinstance(auth_status, str)
         or auth_status
@@ -1439,9 +2005,14 @@ def _linked_provider_profile_response(
         or (
             auth_mode is not None
             and (
-                expected_provider != "huggingface"
+                (expected_provider not in {"huggingface", "microsoft_graph", "azure_devops"})
                 or not isinstance(auth_mode, str)
-                or auth_mode not in {"fine_grained_token", "device_oauth"}
+                or (
+                    expected_provider == "huggingface"
+                    and auth_mode not in {"fine_grained_token", "device_oauth"}
+                )
+                or (expected_provider == "microsoft_graph" and auth_mode != "delegated_oauth")
+                or (expected_provider == "azure_devops" and auth_mode != "delegated_oauth")
             )
         )
     ):
@@ -1465,6 +2036,45 @@ def _linked_provider_profile_response(
     }
     if isinstance(auth_mode, str):
         projection["authMode"] = auth_mode
+    if expected_provider == "microsoft_graph":
+        if auth_status != "healthy" or access_mode != "actor_owned":
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center did not confirm an actor-owned Graph link.",
+                status=502,
+            )
+        try:
+            scope = validate_microsoft_graph_profile_identity(result, profile_ref=str(profile_ref))
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned an invalid Microsoft Graph scope or identity.",
+                status=502,
+            ) from exc
+        projection["targetScope"] = microsoft_graph_public_profile_scope(scope)
+    elif expected_provider == "azure_devops":
+        if auth_status != "healthy" or access_mode != "actor_owned":
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center did not confirm an actor-owned Azure DevOps link.",
+                status=502,
+            )
+        try:
+            scope = validate_azure_devops_profile_identity(
+                result,
+                profile_ref=str(profile_ref),
+            )
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned an invalid Azure DevOps scope or identity.",
+                status=502,
+            ) from exc
+        projection["targetScope"] = azure_devops_public_profile_scope(scope)
     return projection
 
 
@@ -1817,6 +2427,305 @@ def create_router(services: IntegrationServices) -> APIRouter:
             idempotency_key=idempotency_key,
         )
 
+    @router.post(
+        "/api/v1/accounts/provider-profiles/microsoft-graph/link-sessions",
+        status_code=201,
+        operation_id="accountBeginMicrosoftGraphLink",
+    )
+    async def begin_microsoft_graph_link(
+        body: BeginMicrosoftGraphLinkBody,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        try:
+            microsoft_identity_for_principal(actor)
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+                title="Microsoft account identity required",
+                detail="Link Microsoft profiles only from the matching verified Entra actor.",
+                status=403,
+            ) from exc
+        registry = services.authorization_profile_registry
+        host_profile = (
+            registry.settings.profiles.get(body.binding_ref) if registry is not None else None
+        )
+        if (
+            host_profile is None
+            or host_profile.provider != "microsoft_graph"
+            or host_profile.access_mode != "actor_owned"
+            or not host_profile.microsoft_graph_plan_ids
+            or not registry.principal_allowed_for_profile(actor, host_profile)
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_UNAVAILABLE",
+                title="Microsoft Graph provider is not configured",
+                detail="Select a fixed Graph binding with host-authorized Planner plan IDs.",
+                status=503,
+                retryable=True,
+            )
+        profile_ref = _provider_profile_ref(actor, idempotency_key)
+        result = services.accounts.begin_microsoft_graph_link(
+            actor,
+            profile_ref=profile_ref,
+            planner_plan_ids=list(host_profile.microsoft_graph_plan_ids),
+            idempotency_key=idempotency_key,
+        )
+        return _microsoft_graph_oauth_session_response(result)
+
+    @router.post(
+        "/api/v1/accounts/provider-profiles/azure-devops/link-sessions",
+        status_code=201,
+        operation_id="accountBeginAzureDevOpsLink",
+    )
+    async def begin_azure_devops_link(
+        body: BeginAzureDevOpsLinkBody,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        registry = services.authorization_profile_registry
+        host_profile = (
+            registry.settings.profiles.get(body.binding_ref) if registry is not None else None
+        )
+        source = (
+            (host_profile.authorized_sources or {}).get(body.source_id)
+            if host_profile is not None
+            else None
+        )
+        if (
+            host_profile is None
+            or host_profile.provider != "azure_devops"
+            or host_profile.access_mode != "actor_owned"
+            or source is None
+            or source.source_id != body.source_id
+            or not registry.principal_allowed_for_profile(actor, host_profile)
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                title="Azure DevOps source is not configured",
+                detail="Select a source from the fixed host authorized_sources profile.",
+                status=403,
+            )
+        try:
+            actor_tenant, _object_id, _subject = microsoft_identity_for_principal(actor)
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+                title="Microsoft account identity required",
+                detail="Link Azure DevOps from the original verified Entra actor.",
+                status=403,
+            ) from exc
+        try:
+            target_scope = azure_devops_scope_for_authorized_source(
+                tenant_id=str(host_profile.azure_devops_tenant_id),
+                organization=str(host_profile.azure_devops_organization),
+                source={
+                    "source_id": source.source_id,
+                    "kind": source.kind,
+                    "project_id": source.project_id,
+                    "project_name": source.project_name,
+                    "profile_ref": source.profile_ref,
+                    **(
+                        {"pipeline_id": source.pipeline_id}
+                        if source.pipeline_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"definition_id": source.definition_id}
+                        if source.definition_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"definition_environment_id": source.definition_environment_id}
+                        if source.definition_environment_id is not None
+                        else {}
+                    ),
+                },
+            )
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_INVALID",
+                title="Azure DevOps source binding is invalid",
+                detail="The selected source does not match the closed host profile schema.",
+                status=503,
+            ) from exc
+        if actor_tenant != target_scope["tenant_id"]:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                title="Azure DevOps tenant differs from the signed actor",
+                detail="Link an Azure DevOps source in the original Entra actor's tenant.",
+                status=403,
+            )
+        result = services.accounts.begin_azure_devops_link(
+            actor,
+            profile_ref=source.profile_ref,
+            tenant_id=target_scope["tenant_id"],
+            organization=target_scope["organization"],
+            project_id=target_scope["project_id"],
+            source_id=target_scope["source_id"],
+            source_kind=target_scope["source_kind"],
+            pipeline_id=target_scope.get("pipeline_id"),
+            definition_id=target_scope.get("definition_id"),
+            definition_environment_id=target_scope.get("definition_environment_id"),
+            idempotency_key=idempotency_key,
+        )
+        return _microsoft_graph_oauth_session_response(result)
+
+    @router.get(
+        "/api/v1/accounts/azure-devops/callback",
+        operation_id="accountCompleteAzureDevOpsLink",
+    )
+    def complete_azure_devops_link(
+        state: str = Query(min_length=32, max_length=512),
+        code: str = Query(min_length=1, max_length=4096),
+    ) -> dict[str, Any]:
+        result = services.accounts.complete_azure_devops_link(
+            services.callback_principal,
+            state=state,
+            code=code,
+        )
+        return _linked_provider_profile_response(
+            result,
+            expected_profile_ref=None,
+            expected_provider="azure_devops",
+        )
+
+    @router.get(
+        "/api/v1/accounts/microsoft-graph/callback",
+        operation_id="accountCompleteMicrosoftGraphLink",
+    )
+    def complete_microsoft_graph_link(
+        state: str = Query(min_length=32, max_length=512),
+        code: str = Query(min_length=1, max_length=4096),
+    ) -> dict[str, Any]:
+        result = services.accounts.complete_microsoft_graph_link(
+            services.callback_principal,
+            state=state,
+            code=code,
+        )
+        return _linked_provider_profile_response(
+            result,
+            expected_profile_ref=None,
+            expected_provider="microsoft_graph",
+        )
+
+    @router.post(
+        "/api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/enable-planner-write",
+        status_code=201,
+        operation_id="accountBeginMicrosoftGraphPlannerWriteUpgrade",
+    )
+    async def begin_microsoft_graph_planner_write_upgrade(
+        profile_ref: str,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        _microsoft_graph_profile_for_actor(services.accounts, actor, profile_ref)
+        result = services.accounts.begin_microsoft_graph_scope_upgrade(
+            actor,
+            profile_ref=profile_ref,
+            permission="planner_tasks_write",
+            idempotency_key=idempotency_key,
+        )
+        return _microsoft_graph_oauth_session_response(result)
+
+    @router.post(
+        "/api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/select-sharepoint-target",
+        status_code=201,
+        operation_id="accountBeginMicrosoftGraphSharePointScopeUpgrade",
+    )
+    async def begin_microsoft_graph_sharepoint_scope_upgrade(
+        profile_ref: str,
+        body: SelectMicrosoftGraphSharePointScopeBody,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        registry = services.authorization_profile_registry
+        host_profile = (
+            registry.settings.profiles.get(body.binding_ref) if registry is not None else None
+        )
+        if (
+            host_profile is None
+            or host_profile.provider != "microsoft_graph"
+            or host_profile.access_mode != "actor_owned"
+            or not host_profile.microsoft_graph_plan_ids
+            or host_profile.microsoft_graph_sharepoint_site_id is None
+            or not host_profile.microsoft_graph_sharepoint_list_ids
+            or not registry.principal_allowed_for_profile(actor, host_profile)
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_UNAVAILABLE",
+                title="SharePoint target is not configured",
+                detail="The selected Graph binding has no fixed SharePoint site/list allowlist.",
+                status=503,
+                retryable=True,
+            )
+        _microsoft_graph_profile_for_actor(
+            services.accounts,
+            actor,
+            profile_ref,
+            expected_plan_ids=host_profile.microsoft_graph_plan_ids,
+            expected_sharepoint_targets=(
+                host_profile.microsoft_graph_sharepoint_site_id,
+                host_profile.microsoft_graph_sharepoint_list_ids,
+            ),
+        )
+        result = services.accounts.begin_microsoft_graph_scope_upgrade(
+            actor,
+            profile_ref=profile_ref,
+            permission="sharepoint_selected",
+            site_id=host_profile.microsoft_graph_sharepoint_site_id,
+            list_ids=list(host_profile.microsoft_graph_sharepoint_list_ids),
+            idempotency_key=idempotency_key,
+        )
+        return _microsoft_graph_oauth_session_response(result)
+
+    @router.get(
+        "/api/v1/accounts/microsoft-graph/scope-upgrade/callback",
+        operation_id="accountCompleteMicrosoftGraphScopeUpgrade",
+    )
+    def complete_microsoft_graph_scope_upgrade(
+        state: str = Query(min_length=32, max_length=512),
+        code: str = Query(min_length=1, max_length=4096),
+    ) -> dict[str, Any]:
+        result = services.accounts.complete_microsoft_graph_scope_upgrade(
+            services.callback_principal,
+            state=state,
+            code=code,
+        )
+        return _linked_provider_profile_response(
+            result,
+            expected_profile_ref=None,
+            expected_provider="microsoft_graph",
+        )
+
     @router.get("/api/v1/accounts/links", operation_id="accountListLinks")
     async def list_links(
         request: Request, workspace_id: str | None = Query(default=None, alias="workspaceId")
@@ -1873,14 +2782,19 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     status=502,
                 )
             if auth_mode is not None and (
-                provider != "huggingface"
+                provider not in {"huggingface", "microsoft_graph", "azure_devops"}
                 or not isinstance(auth_mode, str)
-                or auth_mode not in {"fine_grained_token", "device_oauth"}
+                or (
+                    provider == "huggingface"
+                    and auth_mode not in {"fine_grained_token", "device_oauth"}
+                )
+                or (provider == "microsoft_graph" and auth_mode != "delegated_oauth")
+                or (provider == "azure_devops" and auth_mode != "delegated_oauth")
             ):
                 raise ExchangeProductError(
                     code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
                     title="Account Center response invalid",
-                    detail="Account Center returned an unsupported Hugging Face auth mode.",
+                    detail="Account Center returned an unsupported provider auth mode.",
                     status=502,
                 )
             if not isinstance(access_mode, str) or access_mode not in {
@@ -1893,22 +2807,74 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     detail="Account Center returned an unsupported provider access mode.",
                     status=502,
                 )
+            if provider == "microsoft_graph" and access_mode != "actor_owned":
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Microsoft Graph provider profiles must remain bound to one actor.",
+                    status=502,
+                )
+            if provider == "microsoft_graph":
+                try:
+                    graph_scope = validate_microsoft_graph_profile_identity(
+                        item,
+                        profile_ref=str(profile_ref),
+                        principal=actor,
+                    )
+                    target_scope = microsoft_graph_public_profile_scope(graph_scope)
+                except ValueError as exc:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                        title="Account Center response invalid",
+                        detail="Account Center returned an invalid Microsoft Graph profile.",
+                        status=502,
+                    ) from exc
+            elif provider == "azure_devops":
+                if access_mode != "actor_owned":
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                        title="Account Center response invalid",
+                        detail="Azure DevOps provider profiles must remain bound to one actor.",
+                        status=502,
+                    )
+                try:
+                    ado_scope = validate_azure_devops_profile_identity(
+                        item,
+                        profile_ref=str(profile_ref),
+                        principal=actor,
+                    )
+                    target_scope = azure_devops_public_profile_scope(ado_scope)
+                except ValueError as exc:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                        title="Account Center response invalid",
+                        detail="Account Center returned an invalid Azure DevOps profile.",
+                        status=502,
+                    ) from exc
+            else:
+                target_scope = (
+                    dict(item["target_scope"])
+                    if isinstance(item.get("target_scope"), Mapping)
+                    else {}
+                )
             projected.append(
                 {
                     "profileRef": profile_ref,
                     "provider": provider,
                     "identityRef": identity_ref if isinstance(identity_ref, str) else None,
-                    "targetScope": item.get("target_scope")
-                    if isinstance(item.get("target_scope"), Mapping)
-                    else {},
+                    "targetScope": target_scope,
                     "authStatus": auth_status,
                     "accessMode": access_mode,
                     "externalSubject": item.get("external_subject")
                     if isinstance(item.get("external_subject"), str)
                     else None,
-                    "expiresAt": item.get("expires_at")
-                    if isinstance(item.get("expires_at"), int)
-                    else None,
+                    "expiresAt": (
+                        _http_utc_timestamp(datetime.fromtimestamp(item["expires_at"], UTC))
+                        if provider == "microsoft_graph" and isinstance(item.get("expires_at"), int)
+                        else item.get("expires_at")
+                        if isinstance(item.get("expires_at"), int)
+                        else None
+                    ),
                     **({"authMode": auth_mode} if isinstance(auth_mode, str) else {}),
                 }
             )
@@ -2720,7 +3686,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
     async def send_teams_message(
         request: Request,
     ) -> dict[str, Any] | JSONResponse:
-        """Reply to one fixed Teams thread under a fresh signed Authority grant."""
+        """Deliver one fixed Teams channel or owner-private message under a fresh grant."""
 
         if request.url.query or request.headers.get("authorization"):
             raise ExchangeProductError(
@@ -2746,8 +3712,13 @@ def create_router(services: IntegrationServices) -> APIRouter:
             )
         raw_body = await _read_bounded_request_body(request, max_bytes=64 * 1024)
         payload = parse_signed_json_object(raw_body)
+        is_owner_private = payload.get("targetKind") == "owner_private"
         try:
-            body = TeamsMessageBody.model_validate(payload)
+            body = (
+                TeamsPrivateMessageBody.model_validate(payload)
+                if is_owner_private
+                else TeamsMessageBody.model_validate(payload)
+            )
         except ValidationError as exc:
             raise ExchangeProductError(
                 code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
@@ -2825,54 +3796,119 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 status=403,
                 context={"reasonCode": "teams_notification_owner_mismatch"},
             )
-        try:
-            profile.authorize_conversation(
-                tenant_id=body.conversation.tenant_id,
-                team_id=body.conversation.team_id,
-                channel_id=body.conversation.channel_id,
-                conversation_id=body.conversation.conversation_id,
-                root_thread_id=body.conversation.root_thread_id,
-                service_url=body.conversation.service_url,
-            )
-            validate_teams_service_url(
-                body.conversation.service_url,
-                tenant_id=body.conversation.tenant_id,
-            )
-        except PermissionError as exc:
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
-                title="Teams connector authorization denied",
-                detail="The requested Teams channel is outside the host-configured allowlist.",
-                status=403,
-                context={"reasonCode": "teams_channel_scope_mismatch"},
-            ) from exc
-        except ValueError as exc:
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
-                title="Teams service URL is invalid",
-                detail="The Teams serviceUrl is outside the fixed official Bot Framework routes.",
-                status=400,
-            ) from exc
-        arguments = {
-            "conversation": {
-                "tenantId": body.conversation.tenant_id,
-                "teamId": body.conversation.team_id,
-                "channelId": body.conversation.channel_id,
-                "conversationId": body.conversation.conversation_id,
-                "rootThreadId": body.conversation.root_thread_id,
-                "serviceUrl": body.conversation.service_url,
-            },
-            "text": body.text,
-        }
-        conversation = arguments["conversation"]
-        if not isinstance(conversation, Mapping):
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
-                title="Teams connector request is invalid",
-                detail="The Teams conversation route must be a structured object.",
-                status=400,
-            )
-        resource_ref = _teams_resource_ref(conversation)
+        if is_owner_private:
+            if not isinstance(body, TeamsPrivateMessageBody):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                    title="Teams connector request is invalid",
+                    detail="The private Teams target does not match its closed request schema.",
+                    status=400,
+                )
+            private_conversation = body.conversation
+            if provisional.principal_subject != private_conversation.actor_aad_object_id:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Teams connector authorization denied",
+                    detail="The signed grant actor does not match the personal chat recipient.",
+                    status=403,
+                    context={"reasonCode": "teams_private_actor_mismatch"},
+                )
+            try:
+                profile.authorize_personal_target(
+                    principal_subject=provisional.principal_subject,
+                    tenant_id=private_conversation.tenant_id,
+                    bot_app_id=private_conversation.bot_app_id,
+                    actor_aad_object_id=private_conversation.actor_aad_object_id,
+                    conversation_id=private_conversation.conversation_id,
+                    service_url=private_conversation.service_url,
+                )
+            except PermissionError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Teams connector authorization denied",
+                    detail="The owner-private Teams target is outside its host actor allowlist.",
+                    status=403,
+                    context={"reasonCode": "teams_private_actor_scope_mismatch"},
+                ) from exc
+            except ValueError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                    title="Teams private route is invalid",
+                    detail="The owner-private Teams route is outside fixed Bot Framework routes.",
+                    status=400,
+                    context={"reasonCode": "teams_private_route_invalid"},
+                ) from exc
+            conversation: dict[str, Any] = {
+                "tenantId": private_conversation.tenant_id,
+                "botAppId": private_conversation.bot_app_id,
+                "actorAadObjectId": private_conversation.actor_aad_object_id,
+                "conversationId": private_conversation.conversation_id,
+                "serviceUrl": private_conversation.service_url,
+            }
+            arguments = {
+                "targetKind": "owner_private",
+                "conversation": conversation,
+                "text": body.text,
+            }
+            resource_ref = teams_personal_resource_ref(conversation)
+        else:
+            if not isinstance(body, TeamsMessageBody):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                    title="Teams connector request is invalid",
+                    detail="The channel Teams target does not match its closed request schema.",
+                    status=400,
+                )
+            try:
+                profile.authorize_conversation(
+                    tenant_id=body.conversation.tenant_id,
+                    team_id=body.conversation.team_id,
+                    channel_id=body.conversation.channel_id,
+                    conversation_id=body.conversation.conversation_id,
+                    root_thread_id=body.conversation.root_thread_id,
+                    service_url=body.conversation.service_url,
+                )
+                validate_teams_service_url(
+                    body.conversation.service_url,
+                    tenant_id=body.conversation.tenant_id,
+                )
+            except PermissionError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                    title="Teams connector authorization denied",
+                    detail="The requested Teams channel is outside the host-configured allowlist.",
+                    status=403,
+                    context={"reasonCode": "teams_channel_scope_mismatch"},
+                ) from exc
+            except ValueError as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                    title="Teams service URL is invalid",
+                    detail=(
+                        "The Teams serviceUrl is outside the fixed official Bot Framework routes."
+                    ),
+                    status=400,
+                ) from exc
+            arguments = {
+                "conversation": {
+                    "tenantId": body.conversation.tenant_id,
+                    "teamId": body.conversation.team_id,
+                    "channelId": body.conversation.channel_id,
+                    "conversationId": body.conversation.conversation_id,
+                    "rootThreadId": body.conversation.root_thread_id,
+                    "serviceUrl": body.conversation.service_url,
+                },
+                "text": body.text,
+            }
+            channel_conversation = arguments["conversation"]
+            if not isinstance(channel_conversation, Mapping):
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                    title="Teams connector request is invalid",
+                    detail="The Teams conversation route must be a structured object.",
+                    status=400,
+                )
+            resource_ref = _teams_resource_ref(channel_conversation)
         expected = {
             "request_id": body.request_id,
             "organization_id": profile.organization_id,
@@ -2974,17 +4010,30 @@ def create_router(services: IntegrationServices) -> APIRouter:
             grant_ref=claims.grant_ref,
         )
         try:
-            evidence = client.send_reply(
-                bot_app_id=profile.bot_app_id,
-                tenant_id=body.conversation.tenant_id,
-                team_id=body.conversation.team_id,
-                channel_id=body.conversation.channel_id,
-                conversation_id=body.conversation.conversation_id,
-                root_thread_id=body.conversation.root_thread_id,
-                service_url=body.conversation.service_url,
-                text=body.text,
-                request_id=body.request_id,
-            )
+            if isinstance(body, TeamsPrivateMessageBody):
+                evidence = await run_in_threadpool(
+                    client.send_private,
+                    bot_app_id=body.conversation.bot_app_id,
+                    tenant_id=body.conversation.tenant_id,
+                    actor_aad_object_id=body.conversation.actor_aad_object_id,
+                    conversation_id=body.conversation.conversation_id,
+                    service_url=body.conversation.service_url,
+                    text=body.text,
+                    request_id=body.request_id,
+                )
+            else:
+                evidence = await run_in_threadpool(
+                    client.send_reply,
+                    bot_app_id=profile.bot_app_id,
+                    tenant_id=body.conversation.tenant_id,
+                    team_id=body.conversation.team_id,
+                    channel_id=body.conversation.channel_id,
+                    conversation_id=body.conversation.conversation_id,
+                    root_thread_id=body.conversation.root_thread_id,
+                    service_url=body.conversation.service_url,
+                    text=body.text,
+                    request_id=body.request_id,
+                )
         except ExchangeProductError as exc:
             known_rejection = {
                 "EXCHANGE_TEAMS_AUTH_EXPIRED": "auth_expired",

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "sourceRepository": "DoHorizon-AI/Cyrene-Plugins-Official",
-  "sourceRevision": "be048068f09b84d1b661395451aa5c54a551a86e",
+  "sourceRevision": "1da8f0abb4f1fd76f5a2921e33cf8a6c3ae81a11",
   "sourceRevisionStatus": "accepted-source-merged",
   "protoSha256": {
     "contracts/proto/cyrene/message/connector/v1/message_connector.proto": "62b042119777209d61132e9332079072f5afd12b2a393d00574b82feb8f434fd",

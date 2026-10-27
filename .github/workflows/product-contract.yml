@@ -173,7 +173,8 @@ jobs:
       - run: uv run --no-sync ruff check --no-cache src tests
       - run: uv run --no-sync ruff format --check --no-cache src tests
       - run: uv run --no-sync mypy
-      - run: uv run --no-sync pytest -p no:cacheprovider -q
+      # The required auth spine runs below against the locked sibling checkout.
+      - run: uv run --no-sync pytest -p no:cacheprovider -q --ignore=tests/test_microsoft_auth_lease_spine.py --ignore=tests/test_teams_owner_private_spine.py
       - run: uv run --no-sync openapi-spec-validator ../contracts/product/v1/openapi.yaml
 
   product-hub-integration:
@@ -232,3 +233,15 @@ jobs:
         env:
           CYRENE_PLUGINS_WORKTREE: ${{ env.PLUGINS_WORKTREE }}
         run: uv run --no-sync pytest -p no:cacheprovider -q tests/test_integration_hub_e2e.py
+      - name: Run the pinned Microsoft Graph and Azure DevOps lease spine
+        env:
+          CYRENE_PLUGINS_ROOT: ${{ env.PLUGINS_WORKTREE }}
+          CYRENE_PLUGINS_SHA: ${{ steps.plugins-pin.outputs.revision }}
+          CYRENE_AUTH_SPINE_REQUIRED: "1"
+        run: uv run --no-sync pytest -p no:cacheprovider -q tests/test_microsoft_auth_lease_spine.py
+      - name: Run the pinned Exchange to Teams private message spine
+        env:
+          CYRENE_PLUGINS_ROOT: ${{ env.PLUGINS_WORKTREE }}
+          CYRENE_PLUGINS_SHA: ${{ steps.plugins-pin.outputs.revision }}
+          CYRENE_TEAMS_SPINE_REQUIRED: "1"
+        run: uv run --no-sync pytest -p no:cacheprovider -q tests/test_teams_owner_private_spine.py
