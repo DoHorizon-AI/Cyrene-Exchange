@@ -1359,13 +1359,8 @@ def test_cloud_management_health_contract_reaches_durable_runner_observation(
         assert [item.kind for item in notifications] == [
             IntegrationNotificationKind.AUTHORIZATION_REQUIRED
         ]
-    elif expected_state in {AuthorizationState.VALID, AuthorizationState.UNKNOWN}:
-        assert notifications == []
     else:
-        assert all(
-            item.kind != IntegrationNotificationKind.AUTHORIZATION_REQUIRED
-            for item in notifications
-        )
+        assert notifications == []
     store.close()
 
 
