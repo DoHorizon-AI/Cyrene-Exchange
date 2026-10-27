@@ -646,7 +646,15 @@ class AuthorizationCloudDirectProvider:
         connection: IntegrationConnection,
         profile: AuthorizationProviderProfile,
     ) -> AuthorizationHealthRecord:
-        """Normalize the native cloud-management health DTO for its live binding."""
+        """Normalize the cloud-management health DTO for this live binding.
+
+        Plugin ``PERMISSION_DENIED`` keeps the login present and reports an insufficient
+        provider scope; ``REAUTHORIZATION_REQUIRED`` signals that the credential needs
+        owner action. ``UNKNOWN`` remains non-actionable so retryable provider outages do
+        not become revocation notices.
+
+        中文：权限拒绝保留登录有效状态；只有明确需重授权才触发失效通知。
+        """
 
         result = self._call_profile(
             profile,
@@ -667,7 +675,12 @@ class AuthorizationCloudDirectProvider:
             "MISSING",
             "INVALID",
             "UNKNOWN",
-        } or authorization not in {"VALID", "UNKNOWN", "DENIED"}:
+        } or authorization not in {
+            "VALID",
+            "REAUTHORIZATION_REQUIRED",
+            "PERMISSION_DENIED",
+            "UNKNOWN",
+        }:
             raise ProviderObservationUnavailable("cloud profile health state is invalid")
         checked_at = _provider_timestamp(result.get("checked_at"))
         if checked_at is None:
@@ -678,9 +691,9 @@ class AuthorizationCloudDirectProvider:
             login_state = LoginState.PRESENT
         else:
             login_state = LoginState.UNKNOWN
-        if authorization == "DENIED":
+        if authorization == "PERMISSION_DENIED":
             authorization_state = AuthorizationState.PERMISSION_DENIED
-        elif authentication == "INVALID":
+        elif authorization == "REAUTHORIZATION_REQUIRED" or authentication == "INVALID":
             authorization_state = AuthorizationState.REAUTHORIZATION_REQUIRED
         elif authorization == "VALID" and authentication == "VALID":
             authorization_state = AuthorizationState.VALID
