@@ -24,6 +24,7 @@ from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 imp
 )
 from cyrene_exchange_product.integrations.authorization_cloud import (
     AuthorizationCloudRunner,
+    ProviderObservationUnavailable,
 )
 from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
     AuthorizationCloudConfigurationError,
@@ -1146,21 +1147,32 @@ def test_managed_cloud_token_ttl_is_not_projected_as_authorization_expiry(
     [
         (
             "INVALID",
-            "UNKNOWN",
+            "REAUTHORIZATION_REQUIRED",
             LoginState.PRESENT,
             AuthorizationState.REAUTHORIZATION_REQUIRED,
         ),
         (
+            "MISSING",
+            "REAUTHORIZATION_REQUIRED",
+            LoginState.MISSING,
+            AuthorizationState.REAUTHORIZATION_REQUIRED,
+        ),
+        (
             "VALID",
-            "DENIED",
+            "PERMISSION_DENIED",
             LoginState.PRESENT,
             AuthorizationState.PERMISSION_DENIED,
         ),
+        (
+            "VALID",
+            "VALID",
+            LoginState.PRESENT,
+            AuthorizationState.VALID,
+        ),
         ("UNKNOWN", "UNKNOWN", LoginState.UNKNOWN, AuthorizationState.UNKNOWN),
-        ("MISSING", "UNKNOWN", LoginState.MISSING, AuthorizationState.UNKNOWN),
     ],
 )
-def test_cloud_management_health_maps_auth_permission_and_transport_states(
+def test_cloud_management_health_maps_official_auth_permission_and_unknown_states(
     tmp_path: Path,
     authentication: str,
     authorization: str,
@@ -1186,11 +1198,11 @@ def test_cloud_management_health_maps_auth_permission_and_transport_states(
             "reason_code": "PROVIDER_TIMEOUT"
             if authentication == "UNKNOWN"
             else "AUTHENTICATION_FAILED"
-            if authentication == "INVALID"
-            else "SCOPE_DENIED"
-            if authorization == "DENIED"
+            if authorization == "REAUTHORIZATION_REQUIRED" and authentication == "INVALID"
             else "CREDENTIAL_MISSING"
             if authentication == "MISSING"
+            else "SCOPE_DENIED"
+            if authorization == "PERMISSION_DENIED"
             else None,
         }
     )
@@ -1208,6 +1220,147 @@ def test_cloud_management_health_maps_auth_permission_and_transport_states(
     assert observed.login_state == expected_login
     assert observed.authorization_state == expected_state
     assert observed.expires_at is None
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("authentication", "authorization"),
+    [("VALID", "DENIED"), ("INVALID", "NOT_A_PROVIDER_STATE")],
+)
+def test_cloud_management_health_rejects_noncanonical_state_values(
+    tmp_path: Path,
+    authentication: str,
+    authorization: str,
+) -> None:
+    registry = AuthorizationCloudProfileRegistry(
+        _settings(include_wecom=False, include_email=False)
+    )
+    principal = _principal()
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _connection(store, principal, provider="azure")
+    direct = _DirectClient(
+        {
+            "profile_ref": "azure-prod",
+            "provider": "azure",
+            "identity_ref": "managed-identity://health-test",
+            "authentication_state": authentication,
+            "authorization_state": authorization,
+            "scope_refs": ["azure.subscription.read"],
+            "checked_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "expires_at": None,
+            "reason_code": "AUTHENTICATION_FAILED",
+        }
+    )
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={"azure-prod": direct},
+        email_client=None,
+        current_context_resolver=_StaticContexts(principal),
+        context_key=lambda _reference: _KEY,
+    )
+
+    with pytest.raises(ProviderObservationUnavailable, match="health state is invalid"):
+        provider.authorization_health(principal, connection)
+
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("authentication", "authorization", "reason_code", "expected_login", "expected_state"),
+    [
+        (
+            "INVALID",
+            "REAUTHORIZATION_REQUIRED",
+            "AUTHENTICATION_FAILED",
+            LoginState.PRESENT,
+            AuthorizationState.REAUTHORIZATION_REQUIRED,
+        ),
+        (
+            "VALID",
+            "PERMISSION_DENIED",
+            "SCOPE_DENIED",
+            LoginState.PRESENT,
+            AuthorizationState.PERMISSION_DENIED,
+        ),
+        (
+            "VALID",
+            "VALID",
+            None,
+            LoginState.PRESENT,
+            AuthorizationState.VALID,
+        ),
+        (
+            "UNKNOWN",
+            "UNKNOWN",
+            "PROVIDER_UNAVAILABLE",
+            LoginState.UNKNOWN,
+            AuthorizationState.UNKNOWN,
+        ),
+    ],
+)
+def test_cloud_management_health_contract_reaches_durable_runner_observation(
+    tmp_path: Path,
+    authentication: str,
+    authorization: str,
+    reason_code: str | None,
+    expected_login: LoginState,
+    expected_state: AuthorizationState,
+) -> None:
+    """Persist the native provider DTO before classifying authorization notifications."""
+
+    settings = _settings(include_wecom=False, include_email=False, include_gcp=True)
+    registry = AuthorizationCloudProfileRegistry(settings)
+    principal = _principal()
+    store = IntegrationStore(tmp_path / "integrations.sqlite3")
+    connection = _connection(store, principal, provider="gcp")
+    checked_at = datetime.now(UTC)
+    direct = _DirectClient(
+        {
+            "profile_ref": "gcp-prod",
+            "provider": "gcp",
+            "identity_ref": "workload-identity://health-test",
+            "authentication_state": authentication,
+            "authorization_state": authorization,
+            "scope_refs": ["gcp.project.read"],
+            "checked_at": checked_at.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "expires_at": None,
+            "reason_code": reason_code,
+        }
+    )
+    contexts = _StaticContexts(principal)
+    provider = AuthorizationCloudDirectProvider(
+        store=store,
+        registry=registry,
+        provider_clients={"gcp-prod": direct},
+        email_client=None,
+        current_context_resolver=contexts,
+        context_key=lambda _reference: _KEY,
+    )
+    runner = AuthorizationCloudRunner(
+        store=store,
+        contexts=contexts,
+        provider=provider,
+        email=None,
+        worker_id="gcp-health-contract-test",
+    )
+
+    result = runner.run_once(now=checked_at + timedelta(seconds=1))
+
+    observed = store.latest_authorization_health(principal, connection.id)
+    assert result.authorization_checks == 1
+    assert observed is not None
+    assert observed.login_state == expected_login
+    assert observed.authorization_state == expected_state
+    assert observed.reason_code == reason_code
+    assert observed.expires_at is None
+    notifications = store.list_notifications(principal)
+    if expected_state == AuthorizationState.REAUTHORIZATION_REQUIRED:
+        assert [item.kind for item in notifications] == [
+            IntegrationNotificationKind.AUTHORIZATION_REQUIRED
+        ]
+    else:
+        assert notifications == []
     store.close()
 
 
