@@ -369,6 +369,15 @@
               "uniqueItems": true,
               "items": { "type": "string", "minLength": 1, "maxLength": 300 }
             },
+            "personalActorSubjects": {
+              "type": "array",
+              "uniqueItems": true,
+              "description": "Optional Entra object IDs authorized for owner-private delivery; an empty or omitted list disables it.",
+              "items": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              }
+            },
             "botAppId": { "type": "string", "format": "uuid" },
             "expectedIssuer": { "type": "string", "format": "uri" },
             "directPlugin": { "$ref": "#/$defs/endpoint" }

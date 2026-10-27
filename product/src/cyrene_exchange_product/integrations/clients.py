@@ -31,6 +31,7 @@ from cyrene_exchange_product.integrations.auth import (
 from cyrene_exchange_product.integrations.connector_profiles import (
     validate_teams_service_url,
 )
+from cyrene_exchange_product.integrations.microsoft_graph import validate_scope_digest
 from cyrene_exchange_product.integrations.models import IntegrationPrincipal
 from cyrene_exchange_product.integrations.ports import (
     AccountAuthorization,
@@ -72,6 +73,12 @@ ACCOUNT_METHODS = {
     "rotate_huggingface_profile": "RotateHuggingFaceProfile",
     "begin_huggingface_renewal": "BeginHuggingFaceRenewal",
     "poll_huggingface_renewal": "PollHuggingFaceRenewal",
+    "begin_microsoft_graph_link": "BeginMicrosoftGraphLink",
+    "complete_microsoft_graph_link": "CompleteMicrosoftGraphLink",
+    "begin_microsoft_graph_scope_upgrade": "BeginMicrosoftGraphScopeUpgrade",
+    "complete_microsoft_graph_scope_upgrade": "CompleteMicrosoftGraphScopeUpgrade",
+    "begin_azure_devops_link": "BeginAzureDevOpsLink",
+    "complete_azure_devops_link": "CompleteAzureDevOpsLink",
     "register_host_identity_profile": "RegisterHostIdentityProfile",
     "list_provider_profiles": "ListProviderProfiles",
     "create_provider_credential_lease": "CreateProviderCredentialLease",
@@ -773,6 +780,131 @@ class AccountCenterClient:
             {"profile_ref": profile_ref, "session_ref": session_ref},
         )
 
+    def begin_microsoft_graph_link(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        planner_plan_ids: list[str],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Begin one actor-owned delegated Graph link for exact Planner plans."""
+
+        return self._invoke_user(
+            "begin_microsoft_graph_link",
+            principal,
+            {
+                "profile_ref": profile_ref,
+                "planner_plan_ids": list(planner_plan_ids),
+                "idempotency_key": idempotency_key,
+            },
+        )
+
+    def complete_microsoft_graph_link(
+        self,
+        callback_principal: IntegrationPrincipal,
+        *,
+        state: str,
+        code: str,
+    ) -> dict[str, Any]:
+        """Complete Graph OAuth from callback state without caller-supplied identity."""
+
+        return self._invoke_service(
+            "complete_microsoft_graph_link",
+            self._callback_signer,
+            callback_principal,
+            {"state": state, "code": code},
+        )
+
+    def begin_microsoft_graph_scope_upgrade(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        permission: str,
+        idempotency_key: str,
+        site_id: str | None = None,
+        list_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Begin one fixed Planner-write or selected-SharePoint consent upgrade."""
+
+        payload: dict[str, object] = {
+            "profile_ref": profile_ref,
+            "permission": permission,
+            "idempotency_key": idempotency_key,
+        }
+        if site_id is not None:
+            payload["site_id"] = site_id
+        if list_ids is not None:
+            payload["list_ids"] = list(list_ids)
+        return self._invoke_user("begin_microsoft_graph_scope_upgrade", principal, payload)
+
+    def complete_microsoft_graph_scope_upgrade(
+        self,
+        callback_principal: IntegrationPrincipal,
+        *,
+        state: str,
+        code: str,
+    ) -> dict[str, Any]:
+        """Complete the fixed Graph permission upgrade selected by stored OAuth state."""
+
+        return self._invoke_service(
+            "complete_microsoft_graph_scope_upgrade",
+            self._callback_signer,
+            callback_principal,
+            {"state": state, "code": code},
+        )
+
+    def begin_azure_devops_link(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        tenant_id: str,
+        organization: str,
+        project_id: str,
+        source_id: str,
+        source_kind: str,
+        idempotency_key: str,
+        pipeline_id: int | None = None,
+        definition_id: int | None = None,
+        definition_environment_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Begin Entra delegated ADO consent for one host-authorized source tuple."""
+
+        payload: dict[str, object] = {
+            "profile_ref": profile_ref,
+            "tenant_id": tenant_id,
+            "organization": organization,
+            "project_id": project_id,
+            "source_id": source_id,
+            "source_kind": source_kind,
+            "idempotency_key": idempotency_key,
+        }
+        if pipeline_id is not None:
+            payload["pipeline_id"] = pipeline_id
+        if definition_id is not None:
+            payload["definition_id"] = definition_id
+        if definition_environment_id is not None:
+            payload["definition_environment_id"] = definition_environment_id
+        return self._invoke_user("begin_azure_devops_link", principal, payload)
+
+    def complete_azure_devops_link(
+        self,
+        callback_principal: IntegrationPrincipal,
+        *,
+        state: str,
+        code: str,
+    ) -> dict[str, Any]:
+        """Complete ADO Entra OAuth using only the stored state and returned code."""
+
+        return self._invoke_service(
+            "complete_azure_devops_link",
+            self._callback_signer,
+            callback_principal,
+            {"state": state, "code": code},
+        )
+
     def register_host_identity_profile(
         self,
         principal: IntegrationPrincipal,
@@ -996,6 +1128,12 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         "rotate_huggingface_profile": "RotateHuggingFaceProfileRequest",
         "begin_huggingface_renewal": "BeginHuggingFaceRenewalRequest",
         "poll_huggingface_renewal": "PollHuggingFaceRenewalRequest",
+        "begin_microsoft_graph_link": "BeginMicrosoftGraphLinkRequest",
+        "complete_microsoft_graph_link": "CompleteMicrosoftGraphLinkRequest",
+        "begin_microsoft_graph_scope_upgrade": "BeginMicrosoftGraphScopeUpgradeRequest",
+        "complete_microsoft_graph_scope_upgrade": "CompleteMicrosoftGraphScopeUpgradeRequest",
+        "begin_azure_devops_link": "BeginAzureDevOpsLinkRequest",
+        "complete_azure_devops_link": "CompleteAzureDevOpsLinkRequest",
         "register_host_identity_profile": "RegisterHostIdentityProfileRequest",
         "list_provider_profiles": "ListProviderProfilesRequest",
         "create_provider_credential_lease": "CreateProviderCredentialLeaseRequest",
@@ -1012,6 +1150,11 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
     if dto_type is None:
         raise ValueError("unsupported Account Center method")
     values = dict(payload)
+    if method in {
+        "begin_microsoft_graph_scope_upgrade",
+        "begin_azure_devops_link",
+    }:
+        values = {key: value for key, value in values.items() if value is not None}
     if method == "create_provider_credential_lease" and "connector_grant" in values:
         dto_fields = getattr(dto_type, "__dataclass_fields__", {})
         if "connector_grant" not in dto_fields:
@@ -1039,7 +1182,13 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         if not isinstance(resource, Mapping):
             raise ValueError("Account Center resource must be a typed resource object")
         values["resource"] = Resource(**dict(resource))
-    return asdict(dto_type(**values))
+    serialized = asdict(dto_type(**values))
+    if method in {
+        "begin_microsoft_graph_scope_upgrade",
+        "begin_azure_devops_link",
+    }:
+        serialized = {key: value for key, value in serialized.items() if value is not None}
+    return serialized
 
 
 class IntegrationAccountCenterPort:
@@ -1050,6 +1199,11 @@ class IntegrationAccountCenterPort:
         client: AccountCenterClient,
     ) -> None:
         self._client = client
+
+    def list_provider_profiles(self, principal: IntegrationPrincipal) -> dict[str, Any]:
+        """Read the current actor's non-secret profiles for per-operation isolation checks."""
+
+        return self._client.list_provider_profiles(principal)
 
     def get_authorization(
         self,
@@ -1188,15 +1342,32 @@ class IntegrationAccountCenterPort:
         lease_ref = lease.get("lease_ref")
         provider = lease.get("provider")
         expires_at = lease.get("expires_at")
+        scope_digest = lease.get("profile_scope_sha256")
         if (
             not isinstance(lease_ref, str)
             or not lease_ref
             or not isinstance(provider, str)
-            or provider not in {"github", "huggingface"}
+            or provider not in {"github", "huggingface", "microsoft_graph", "azure_devops"}
             or isinstance(expires_at, bool)
             or not isinstance(expires_at, int)
         ):
             raise RuntimeError("Account Center returned malformed provider lease metadata")
+        if provider in {"microsoft_graph", "azure_devops"} and expires_at <= int(
+            datetime.now(UTC).timestamp()
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned an already-expired Microsoft provider lease.",
+                status=502,
+            )
+        try:
+            checked_scope_digest = validate_scope_digest(
+                scope_digest,
+                required=provider in {"microsoft_graph", "azure_devops"},
+            )
+        except ValueError as exc:
+            raise RuntimeError("Account Center returned an invalid provider scope digest") from exc
         return ProviderCredentialLeaseEvidence(
             lease_ref=lease_ref,
             profile_ref=profile_ref,
@@ -1205,6 +1376,7 @@ class IntegrationAccountCenterPort:
             target=dict(target),
             arguments_sha256=arguments_sha256,
             expires_at=datetime.fromtimestamp(expires_at, UTC),
+            profile_scope_sha256=checked_scope_digest,
         )
 
 
@@ -1987,7 +2159,7 @@ class WeComMessageClient:
 
 
 class TeamsMessageClient:
-    """Send one grant-bound reply through the configured Teams message Plugin."""
+    """Send one grant-bound Teams reply or private message through its Plugin."""
 
     def __init__(self, client: DirectInvoker, *, deadline_seconds: float = 10.0) -> None:
         if deadline_seconds <= 0:
@@ -2050,6 +2222,77 @@ class TeamsMessageClient:
             ),
         )
         request.reply.message_id = root_thread_id
+        return self._send_message_request(request, request_id=request_id)
+
+    def send_private(
+        self,
+        *,
+        bot_app_id: str,
+        tenant_id: str,
+        actor_aad_object_id: str,
+        conversation_id: str,
+        service_url: str,
+        text: str,
+        request_id: str,
+    ) -> MessageEvidence:
+        """Send one exact host-resolved owner-private Teams message."""
+
+        values = (
+            bot_app_id,
+            tenant_id,
+            actor_aad_object_id,
+            conversation_id,
+            service_url,
+            request_id,
+        )
+        try:
+            canonical_actor_id = str(UUID(actor_aad_object_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("Teams private actor must be a canonical Entra object ID") from exc
+        if (
+            any(not isinstance(value, str) or not value.strip() for value in values)
+            or canonical_actor_id != actor_aad_object_id
+            or not conversation_id.startswith("a:")
+            or len(conversation_id) > 512
+            or not text.strip()
+            or len(text) > 24_000
+        ):
+            raise ValueError("Teams private target, text, and request id are required")
+        validate_teams_service_url(service_url, tenant_id=tenant_id)
+        from cyrene_exchange_product.integrations._generated.cyrene.message.connector.v1 import (
+            message_connector_pb2 as message_wire,
+        )
+
+        request = message_wire.SendMessageRequest(
+            conversation=message_wire.ConversationScope(
+                vendor="msteams",
+                account_id=bot_app_id,
+                conversation_id=conversation_id,
+                kind=message_wire.CONVERSATION_KIND_PRIVATE,
+            ),
+            content=[message_wire.MessageContentPart(text=message_wire.TextContent(text=text))],
+            vendor_extension=message_wire.VendorExtension(
+                vendor="msteams",
+                facts=[
+                    message_wire.VendorFact(name="tenant_id", value=tenant_id),
+                    message_wire.VendorFact(name="target_kind", value="owner_private"),
+                    message_wire.VendorFact(
+                        name="actor_aad_object_id",
+                        value=canonical_actor_id,
+                    ),
+                    message_wire.VendorFact(name="service_url", value=service_url),
+                ],
+            ),
+        )
+        return self._send_message_request(request, request_id=request_id)
+
+    def _send_message_request(self, request: Any, *, request_id: str) -> MessageEvidence:
+        """Invoke one validated channel or private message over the fixed connector API."""
+
+        from cyrene_exchange_product.integrations._generated.cyrene.message.connector.v1 import (
+            message_connector_pb2 as message_wire,
+        )
+
         try:
             response = self._client.invoke(
                 capability="message.connector.v1",

@@ -143,7 +143,17 @@ class IntegrationValidationError(IntegrationError):
     code = "INTEGRATION_INVALID"
 
 
-ProviderId = Literal["github", "wecom", "azure", "gcp", "hf", "runpod", "tailscale"]
+ProviderId = Literal[
+    "github",
+    "wecom",
+    "azure",
+    "azure_devops",
+    "gcp",
+    "hf",
+    "microsoft_graph",
+    "runpod",
+    "tailscale",
+]
 ConnectorAccessMode = Literal["actor_owned", "workspace_operator"]
 
 
@@ -176,13 +186,27 @@ class IntegrationConnection(ContractModel):
                 raise ValueError("GitHub connections require repositoryId and repositoryName")
         elif self.repository_id or self.repository_name:
             raise ValueError("non-GitHub connections cannot include repository fields")
-        if self.provider in {"azure", "gcp", "hf", "runpod", "tailscale"}:
+        if self.provider in {"azure", "azure_devops", "gcp", "hf", "runpod", "tailscale"}:
             if not self.binding_ref or not self.target_ref:
                 raise ValueError("cloud connections require configured bindingRef and targetRef")
         elif self.target_ref is not None:
             raise ValueError("targetRef is only valid for cloud resource connections")
         if self.provider == "wecom" and not self.binding_ref:
             raise ValueError("WeCom authorization connections require bindingRef")
+        if self.provider == "microsoft_graph" and (
+            not self.account_link_ref or not self.binding_ref or self.target_ref is not None
+        ):
+            raise ValueError(
+                "Microsoft Graph connections require an Account Center profile and host binding"
+            )
+        if self.provider == "microsoft_graph" and self.access_mode != "actor_owned":
+            raise ValueError("Microsoft Graph connections must remain actor owned")
+        if self.provider == "azure_devops" and (
+            not self.account_link_ref or self.access_mode != "actor_owned"
+        ):
+            raise ValueError(
+                "Azure DevOps connections must use one actor-owned Account Center profile"
+            )
         if self.access_mode == "workspace_operator" and self.provider not in {
             "github",
             "hf",
@@ -214,13 +238,21 @@ class CreateIntegrationConnection(ContractModel):
                 raise ValueError("GitHub connections require repositoryId and repositoryName")
         elif self.repository_id or self.repository_name:
             raise ValueError("non-GitHub connections cannot include repository fields")
-        if self.provider in {"azure", "gcp", "hf", "runpod", "tailscale"}:
+        if self.provider in {"azure", "azure_devops", "gcp", "hf", "runpod", "tailscale"}:
             if not self.binding_ref or not self.target_ref:
                 raise ValueError("cloud connections require configured bindingRef and targetRef")
         elif self.target_ref is not None:
             raise ValueError("targetRef is only valid for cloud resource connections")
         if self.provider == "wecom" and not self.binding_ref:
             raise ValueError("WeCom authorization connections require bindingRef")
+        if self.provider == "microsoft_graph" and (
+            not self.account_link_ref or not self.binding_ref or self.target_ref is not None
+        ):
+            raise ValueError(
+                "Microsoft Graph connections require an Account Center profile and host binding"
+            )
+        if self.provider == "azure_devops" and not self.account_link_ref:
+            raise ValueError("Azure DevOps connections require this actor's Account Center profile")
         return self
 
 

@@ -12,8 +12,14 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
+from cyrene_exchange_product.integrations.azure_devops import validate_authorized_source
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    is_valid_sharepoint_site_id,
+    validate_resource_id,
+    validate_sharepoint_list_id,
+)
 from cyrene_exchange_product.integrations.models import (
     CreateIntegrationConnection,
     IntegrationConnection,
@@ -23,7 +29,18 @@ from cyrene_exchange_product.integrations.models import (
 _ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$")
 _HUGGINGFACE_REPOSITORY_REF = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _RECIPIENT_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
-_PROVIDER_IDS = frozenset({"wecom", "azure", "gcp", "hf", "runpod", "tailscale"})
+_PROVIDER_IDS = frozenset(
+    {
+        "wecom",
+        "azure",
+        "azure_devops",
+        "gcp",
+        "hf",
+        "microsoft_graph",
+        "runpod",
+        "tailscale",
+    }
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -63,6 +80,20 @@ class CloudTargetAlias:
 
 
 @dataclass(frozen=True, slots=True)
+class AzureDevOpsAuthorizedSource:
+    """One provider-canonical ADO source row and its actor-owned AC profile ref."""
+
+    source_id: str
+    kind: str
+    project_id: str
+    project_name: str
+    profile_ref: str
+    pipeline_id: int | None = None
+    definition_id: int | None = None
+    definition_environment_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AuthorizationProviderProfile:
     """One fixed Plugin binding scoped to configured actors and resource aliases."""
 
@@ -85,6 +116,12 @@ class AuthorizationProviderProfile:
     account_scopes: Mapping[str, object] | None = None
     auth_mode: str | None = None
     access_mode: str = "actor_owned"
+    azure_devops_tenant_id: str | None = None
+    azure_devops_organization: str | None = None
+    authorized_sources: Mapping[str, AzureDevOpsAuthorizedSource] | None = None
+    microsoft_graph_plan_ids: tuple[str, ...] = ()
+    microsoft_graph_sharepoint_site_id: str | None = None
+    microsoft_graph_sharepoint_list_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +196,28 @@ class AuthorizationCloudProfileRegistry:
                     "WeCom authorization profile does not match the connection selector"
                 )
             return profile.display_name
+        if request.provider == "microsoft_graph":
+            if (
+                request.target_ref is not None
+                or profile.targets
+                or not profile.microsoft_graph_plan_ids
+                or not request.account_link_ref
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    "Microsoft Graph bindings require host-selected Planner plan IDs"
+                )
+            return "Microsoft Graph"
+        if request.provider == "azure_devops":
+            sources = profile.authorized_sources or {}
+            source = sources.get(request.target_ref or "")
+            if (
+                source is None
+                or request.account_link_ref != source.profile_ref
+                or profile.azure_devops_tenant_id is None
+                or profile.azure_devops_organization is None
+            ):
+                raise PermissionError("Azure DevOps source is outside host authorized_sources")
+            return source.project_name
         target = profile.targets.get(request.target_ref or "")
         if target is None:
             raise AuthorizationCloudConfigurationError(
@@ -260,9 +319,21 @@ class AuthorizationCloudProfileRegistry:
         if connection.organization_id != profile.organization_id:
             raise PermissionError("connection organization is outside the provider binding")
         target_ref: str | None = None
-        if connection.provider == "wecom":
+        if connection.provider in {"wecom", "microsoft_graph"}:
             if connection.target_ref is not None:
-                raise PermissionError("WeCom connection cannot select a cloud target")
+                raise PermissionError("provider connection cannot select a cloud target")
+            if connection.provider == "microsoft_graph" and profile.targets:
+                raise PermissionError(
+                    "Microsoft Graph binding cannot contain host resource targets"
+                )
+            if connection.provider == "microsoft_graph" and not profile.microsoft_graph_plan_ids:
+                raise PermissionError("Microsoft Graph binding has no selected host Planner plans")
+        elif connection.provider == "azure_devops":
+            sources = profile.authorized_sources or {}
+            source = sources.get(connection.target_ref or "")
+            if source is None or connection.account_link_ref != source.profile_ref:
+                raise PermissionError("Azure DevOps source/profile is outside authorized_sources")
+            target_ref = source.source_id
         else:
             target = profile.targets.get(connection.target_ref or "")
             if target is None:
@@ -312,9 +383,18 @@ class AuthorizationCloudProfileRegistry:
         )
         if context is None or context.context_ref not in profile.allowed_context_refs:
             raise PermissionError("connection owner has no configured live bearer context")
-        if connection.provider == "wecom":
+        if connection.provider in {"wecom", "microsoft_graph"}:
             if connection.target_ref is not None:
-                raise PermissionError("WeCom connection cannot select a cloud target")
+                raise PermissionError("provider connection cannot select a cloud target")
+            if connection.provider == "microsoft_graph" and profile.targets:
+                raise PermissionError(
+                    "Microsoft Graph binding cannot contain host resource targets"
+                )
+        elif connection.provider == "azure_devops":
+            sources = profile.authorized_sources or {}
+            source = sources.get(connection.target_ref or "")
+            if source is None or connection.account_link_ref != source.profile_ref:
+                raise PermissionError("Azure DevOps source/profile is outside authorized_sources")
         else:
             target = profile.targets.get(connection.target_ref or "")
             if target is None or (
@@ -582,6 +662,11 @@ def parse_authorization_cloud_settings(
                 "credentialSecretRef",
                 "accountScopes",
                 "authMode",
+                "plannerPlanIds",
+                "sharepointTargets",
+                "tenantId",
+                "organization",
+                "authorizedSources",
             },
             label=f"authorizationCloud.profiles.{profile_ref}",
         )
@@ -684,6 +769,30 @@ def parse_authorization_cloud_settings(
                 raise AuthorizationCloudConfigurationError(
                     "WeCom profiles require displayName and authorizationRef only"
                 )
+        elif provider == "microsoft_graph":
+            if (
+                targets
+                or display_name is not None
+                or authorization_ref is not None
+                or access_mode != "actor_owned"
+                or _text(item["callerWorkload"], "callerWorkload") != "microsoft-graph-provider"
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    "Microsoft Graph requires one actor-owned provider binding "
+                    "without resource targets"
+                )
+        elif provider == "azure_devops":
+            if (
+                targets
+                or display_name is not None
+                or authorization_ref is not None
+                or access_mode != "actor_owned"
+                or _text(item["callerWorkload"], "callerWorkload")
+                != "azure-devops-observation-provider"
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    "Azure DevOps requires an actor-owned fixed provider binding"
+                )
         elif not targets or display_name is not None or authorization_ref is not None:
             raise AuthorizationCloudConfigurationError(
                 "cloud profiles require target aliases and cannot select authorization refs"
@@ -698,15 +807,144 @@ def parse_authorization_cloud_settings(
             _parse_huggingface_scopes(item["accountScopes"]) if "accountScopes" in item else None
         )
         auth_mode = _text(item["authMode"], "authMode") if "authMode" in item else None
+        azure_devops_tenant_id: str | None = None
+        azure_devops_organization: str | None = None
+        authorized_sources: dict[str, AzureDevOpsAuthorizedSource] | None = None
+        microsoft_graph_plan_ids: tuple[str, ...] = ()
+        microsoft_graph_sharepoint_site_id: str | None = None
+        microsoft_graph_sharepoint_list_ids: tuple[str, ...] = ()
         if provider == "hf":
+            if "plannerPlanIds" in item or "sharepointTargets" in item:
+                raise AuthorizationCloudConfigurationError(
+                    "Microsoft Graph targets are valid only for Graph profiles"
+                )
             if credential_secret_ref is None or account_scopes is None:
                 raise AuthorizationCloudConfigurationError(
                     "HF profiles require a host secret reference and explicit Account Center scopes"
                 )
             if auth_mode not in {None, "fine_grained_token", "device_oauth"}:
                 raise AuthorizationCloudConfigurationError("HF authMode is unsupported")
+        elif provider == "azure_devops":
+            if "plannerPlanIds" in item or "sharepointTargets" in item:
+                raise AuthorizationCloudConfigurationError(
+                    "Microsoft Graph targets are valid only for Graph profiles"
+                )
+            if (
+                credential_secret_ref is not None
+                or account_scopes is not None
+                or auth_mode is not None
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    "Azure DevOps delegated profiles cannot contain credentials or auth modes"
+                )
+            try:
+                azure_devops_tenant_id = str(UUID(_text(item["tenantId"], "tenantId"))).lower()
+            except (KeyError, ValueError) as exc:
+                raise AuthorizationCloudConfigurationError(
+                    "Azure DevOps tenantId must be a UUID"
+                ) from exc
+            azure_devops_organization = _text(item.get("organization"), "organization")
+            raw_sources = item.get("authorizedSources", [])
+            if not isinstance(raw_sources, list):
+                raise AuthorizationCloudConfigurationError(
+                    "Azure DevOps authorizedSources must be an array"
+                )
+            authorized_sources = {}
+            source_profile_refs: set[str] = set()
+            for raw_source in raw_sources:
+                try:
+                    source = validate_authorized_source(
+                        raw_source,
+                        tenant_id=azure_devops_tenant_id,
+                        organization=azure_devops_organization,
+                    )
+                except ValueError as exc:
+                    raise AuthorizationCloudConfigurationError(
+                        "Azure DevOps authorizedSources contains an invalid source"
+                    ) from exc
+                source_id = str(source["source_id"])
+                source_profile_ref = str(source["profile_ref"])
+                if source_id in authorized_sources or source_profile_ref in source_profile_refs:
+                    raise AuthorizationCloudConfigurationError(
+                        "Azure DevOps authorizedSources contains a duplicate source or profile"
+                    )
+                source_profile_refs.add(source_profile_ref)
+                authorized_sources[source_id] = AzureDevOpsAuthorizedSource(
+                    source_id=source_id,
+                    kind=str(source["kind"]),
+                    project_id=str(source["project_id"]),
+                    project_name=str(source["project_name"]),
+                    profile_ref=source_profile_ref,
+                    pipeline_id=source.get("pipeline_id"),
+                    definition_id=source.get("definition_id"),
+                    definition_environment_id=source.get("definition_environment_id"),
+                )
+        elif provider == "microsoft_graph":
+            if (
+                credential_secret_ref is not None
+                or account_scopes is not None
+                or auth_mode is not None
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    "Microsoft Graph delegated profiles cannot contain host credentials "
+                    "or auth modes"
+                )
+            raw_plan_ids = item.get("plannerPlanIds", [])
+            if not isinstance(raw_plan_ids, list) or len(raw_plan_ids) > 100:
+                raise AuthorizationCloudConfigurationError(
+                    "Microsoft Graph plannerPlanIds must be an array of at most 100 IDs"
+                )
+            try:
+                microsoft_graph_plan_ids = tuple(
+                    validate_resource_id(value, "plannerPlanIds") for value in raw_plan_ids
+                )
+            except ValueError as exc:
+                raise AuthorizationCloudConfigurationError(
+                    "Microsoft Graph plannerPlanIds contains an invalid plan ID"
+                ) from exc
+            if len(microsoft_graph_plan_ids) != len(set(microsoft_graph_plan_ids)):
+                raise AuthorizationCloudConfigurationError(
+                    "Microsoft Graph plannerPlanIds contains duplicates"
+                )
+            raw_sharepoint_targets = item.get("sharepointTargets")
+            if raw_sharepoint_targets is not None:
+                sharepoint_targets = _object(
+                    raw_sharepoint_targets,
+                    required={"siteId", "listIds"},
+                    optional=set(),
+                    label=f"profile {profile_ref}.sharepointTargets",
+                )
+                list_ids = sharepoint_targets["listIds"]
+                if not isinstance(list_ids, list) or not 1 <= len(list_ids) <= 100:
+                    raise AuthorizationCloudConfigurationError(
+                        "Microsoft Graph SharePoint listIds must contain 1..100 IDs"
+                    )
+                try:
+                    raw_site_id = sharepoint_targets["siteId"]
+                    if not isinstance(raw_site_id, str) or not is_valid_sharepoint_site_id(
+                        raw_site_id
+                    ):
+                        raise ValueError("sharepointTargets.siteId is invalid")
+                    microsoft_graph_sharepoint_site_id = raw_site_id
+                    microsoft_graph_sharepoint_list_ids = tuple(
+                        validate_sharepoint_list_id(value) for value in list_ids
+                    )
+                except ValueError as exc:
+                    raise AuthorizationCloudConfigurationError(
+                        "Microsoft Graph SharePoint target contains an invalid ID"
+                    ) from exc
+                if len(microsoft_graph_sharepoint_list_ids) != len(
+                    set(microsoft_graph_sharepoint_list_ids)
+                ):
+                    raise AuthorizationCloudConfigurationError(
+                        "Microsoft Graph SharePoint listIds contains duplicates"
+                    )
         elif (
-            credential_secret_ref is not None or account_scopes is not None or auth_mode is not None
+            credential_secret_ref is not None
+            or account_scopes is not None
+            or auth_mode is not None
+            or "plannerPlanIds" in item
+            or "sharepointTargets" in item
         ):
             raise AuthorizationCloudConfigurationError(
                 "HF credential references, auth mode, and scopes are valid only for HF profiles"
@@ -731,6 +969,12 @@ def parse_authorization_cloud_settings(
             account_scopes=account_scopes,
             auth_mode=auth_mode,
             access_mode=access_mode,
+            azure_devops_tenant_id=azure_devops_tenant_id,
+            azure_devops_organization=azure_devops_organization,
+            authorized_sources=authorized_sources,
+            microsoft_graph_plan_ids=microsoft_graph_plan_ids,
+            microsoft_graph_sharepoint_site_id=microsoft_graph_sharepoint_site_id,
+            microsoft_graph_sharepoint_list_ids=microsoft_graph_sharepoint_list_ids,
         )
 
     email = _parse_email_profile(email_value, contexts)

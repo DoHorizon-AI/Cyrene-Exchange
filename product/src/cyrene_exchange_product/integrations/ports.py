@@ -70,6 +70,7 @@ class ProviderCredentialLeaseEvidence:
     target: dict[str, object]
     arguments_sha256: str
     expires_at: datetime
+    profile_scope_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +155,36 @@ class MessageEvidence:
     transport_request_id: str | None
     observed_at: datetime
     evidence: dict[str, object]
+
+
+class TeamsMessagePort(Protocol):
+    """Send one fixed Teams channel reply or allowlisted owner-private message."""
+
+    def send_reply(
+        self,
+        *,
+        bot_app_id: str,
+        tenant_id: str,
+        team_id: str,
+        channel_id: str,
+        conversation_id: str,
+        root_thread_id: str,
+        service_url: str,
+        text: str,
+        request_id: str,
+    ) -> MessageEvidence: ...
+
+    def send_private(
+        self,
+        *,
+        bot_app_id: str,
+        tenant_id: str,
+        actor_aad_object_id: str,
+        conversation_id: str,
+        service_url: str,
+        text: str,
+        request_id: str,
+    ) -> MessageEvidence: ...
 
 
 @dataclass(frozen=True, slots=True)

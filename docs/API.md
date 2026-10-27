@@ -59,6 +59,29 @@ through an actor binding. OAuth callback is GitHub's fixed GET callback with
 only `state` and `code`; Account Center resolves the private session by stored
 state digest.
 
+Microsoft Graph uses a separate Account Center delegated OAuth flow. The initial
+link requests `Tasks.Read` for the actor-selected Planner plan IDs. `Tasks.ReadWrite`
+is requested only through the explicit Planner-write action. SharePoint remains
+disabled until the actor selects one site/list set and completes its separate
+`Sites.Selected` consent. Graph profiles and connections are actor owned; Exchange
+rechecks the signed actor's Account Center profile and exact source scope for every
+operation, then passes only a one-use lease and scope digest to the provider.
+Exchange never receives or stores a Graph token.
+
+Owner-private Teams delivery stays on the internal
+`POST /internal/v1/teams/messages` route and the existing
+`msteams.message.reply` transport; it is not a model-visible tool or public
+Product operation. Its closed `owner_private` body binds the tenant, bot app,
+actor object ID, personal conversation ID, service URL, and text to a fresh
+Directory grant. Exchange requires the grant subject to match
+`actorAadObjectId` and the host
+`connectorHost.teamsMessages.personalActorSubjects` allowlist to include that
+actor. An omitted or empty allowlist disables personal delivery. Duplicate
+attempts return their durable receipt, and an unconfirmed send remains
+`uncertain` without an automatic resend. OpenAPI documents the internal request
+schema in components without adding a public path. The host actor list only
+allows a destination; every send still requires a fresh signed Directory grant.
+
 启用集成路由后，普通调用可由 Platform Authority 验证当前第一方 Bearer；Platform 通用
 Product 调用则必须携带其签发的执行凭据，并由 Exchange 通过注册的 mTLS workload 通道再次验证。
 两种方式都绑定当前 actor、workspace 和精确 operation；执行凭据还绑定实际 method、path、原始
@@ -68,10 +91,43 @@ notification binding 是群组资源；每位成员通过 actor binding 附加�
 范围最小化的 Platform delegation。OAuth callback 使用 GitHub 固定 GET 地址，仅接收 `state` 和
 `code`；Account Center 根据已存 state 摘要解析私有 session。
 
+Microsoft Graph 使用独立的 Account Center 委派 OAuth 流程。初次关联请求的 Planner plan ID 来自
+Exchange 固定 host binding；link 请求只选择 binding alias，不能提交或扩展 plan 范围。只有显式调用
+Planner 写权限 action 才请求 `Tasks.ReadWrite`。SharePoint 默认关闭；只有 host binding 固定配置了
+site/list（`sharepointTargets`），且 actor 通过仅接受 binding alias 的单独 `Sites.Selected` consent
+action 完成授权后才开放。Graph profile 与
+connection 均为 actor-owned；签名 actor 必须使用规范 Entra issuer 和 object ID，并与 Account Center
+`external_subject` 的 `tid:oid` 完全一致。每次操作前 Exchange 都会用签名 actor 重新读取 Account Center profile、
+核对精确 source scope，并且只向 Provider 传一次性 lease 和 scope digest。Exchange 不会接收或保存
+Graph token。
+
+Azure DevOps 使用独立的 Entra delegated OAuth profile，每个 Account Center profile 只绑定一个
+host `authorizedSources` source tuple。link 请求仅提供 `bindingRef` 和 `sourceId` alias；租户、组织、
+项目、source kind、pipeline/release 过滤 ID 均从 host profile 派生。Exchange 要求已签名 actor 的
+Entra tenant/object ID 与 Account Center profile 一致；每次操作都会重新核对 actor、source、操作、
+参数摘要和 profile scope digest。ADO token 只由 Account Center 和 Provider 服务端处理。
+
+Owner-private Teams delivery 仍使用内部
+`POST /internal/v1/teams/messages` 路由和现有 `msteams.message.reply` 传输；它不是模型可见工具，
+也不是公开 Product operation。封闭的 `owner_private` 请求体将 tenant、bot app、actor object ID、个人
+会话 ID、service URL 和文本绑定到新的 Directory grant。Exchange 要求 grant subject 与
+`actorAadObjectId` 一致，并要求 Host `connectorHost.teamsMessages.personalActorSubjects` allowlist
+包含该 actor。省略或配置空 allowlist 时，个人消息发送关闭。重复 attempt 返回持久回执；发送结果未确认时
+保持 `uncertain`，不会自动重发。OpenAPI components 记录该内部请求 schema，但不添加公开 path。
+Host actor 列表只允许个人发送目标；每次发送仍需要新的签名 Directory grant。
+
 | Operation | Purpose |
 | --- | --- |
 | `POST /api/v1/accounts/link-sessions` | Begin a GitHub or WeCom account link in Account Center; requires `Idempotency-Key` |
 | `GET /api/v1/accounts/github/callback?state=…&code=…` | Complete the fixed GitHub OAuth callback |
+| `POST /api/v1/accounts/provider-profiles/microsoft-graph/link-sessions` | Begin actor-owned Graph consent for host-fixed Planner plans using `bindingRef`; requires `Idempotency-Key` |
+| `GET /api/v1/accounts/microsoft-graph/callback?state=…&code=…` | Complete the fixed Microsoft Graph OAuth callback |
+| `POST /api/v1/accounts/provider-profiles/azure-devops/link-sessions` | Begin actor-owned Entra consent for one fixed host source using `bindingRef` and `sourceId`; requires `Idempotency-Key` |
+| `GET /api/v1/accounts/azure-devops/callback?state=…&code=…` | Complete the fixed Azure DevOps OAuth callback |
+| `POST /api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/enable-planner-write` | Explicitly request `Tasks.ReadWrite`; requires `Idempotency-Key` |
+| `POST /api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/select-sharepoint-target` | Select a host binding and start `Sites.Selected` consent for its fixed site/list allowlist; requires `Idempotency-Key` |
+| `GET /api/v1/accounts/microsoft-graph/scope-upgrade/callback?state=…&code=…` | Complete the stored Planner or SharePoint consent upgrade |
+| `GET /api/v1/accounts/provider-profiles` | List the verified actor's non-secret provider profiles and exact target scopes |
 | `POST /api/v1/accounts/link-sessions/wecom/confirm` | Confirm a WeCom link; requires `Idempotency-Key` |
 | `GET /api/v1/accounts/links` | List the verified actor's linked account metadata |
 | `POST /api/v1/accounts/links/{account_ref}/actions/unlink` | Unlink; requires `Idempotency-Key` |

@@ -26,6 +26,7 @@ from cyrene_exchange_product.integrations.connector_operations import (
     _validate_github_target,
     _without_cli_output,
     connector_binding_tools,
+    teams_personal_resource_ref,
     validate_computer_tool_schema,
 )
 from cyrene_exchange_product.integrations.connector_profiles import (
@@ -1654,6 +1655,126 @@ def test_teams_dispatcher_fails_closed_for_notification_route_and_owner() -> Non
             principal=wrong_owner,
             profile=notification,
             **request,
+        )
+
+
+def test_teams_private_dispatcher_binds_original_actor_and_personal_allowlist() -> None:
+    """A personal target is closed to the exact signed actor and host allowlist."""
+
+    tenant_id = "00000000-0000-4000-8000-000000000001"
+    actor_id = "11111111-1111-4111-8111-11111111111a"
+    other_actor_id = "22222222-2222-4222-8222-222222222222"
+    profile_value = {
+        "profileRef": "teams-private-host",
+        "connectionRef": "teams-private-connection",
+        "organizationId": "org-private",
+        "workspaceId": "workspace-private",
+        "tenantId": tenant_id,
+        "allowedTeamIds": ["team-private"],
+        "allowedChannelIds": [],
+        "botAppId": "bot-private",
+        "directPlugin": {
+            "bindingId": "teams-private-binding",
+            "connectionRef": "grpcs://teams-private:50051",
+            "transport": "local",
+        },
+        "expectedIssuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+        "personalActorSubjects": [actor_id],
+    }
+    settings = parse_connector_host_settings({"teamsMessages": profile_value})
+    profile = settings.teams_messages
+    assert profile is not None
+    assert profile.personal_actor_subjects == frozenset({actor_id})
+    dispatcher = ConnectorOperationDispatcher(
+        store=SimpleNamespace(),
+        accounts=SimpleNamespace(),
+        github=SimpleNamespace(),
+        authorization_cloud=None,
+        registry=None,
+    )
+    principal = IntegrationPrincipal(
+        issuer=profile.expected_issuer,
+        subject=actor_id,
+        organization_id=profile.organization_id,
+        workspace_id=profile.workspace_id,
+        allowed_operation_ids=frozenset({"msteams.message.reply"}),
+    )
+    conversation = {
+        "tenantId": tenant_id,
+        "botAppId": "bot-private",
+        "actorAadObjectId": actor_id,
+        "conversationId": "a:host-resolved-private-chat",
+        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+    }
+    arguments = {
+        "targetKind": "owner_private",
+        "conversation": conversation,
+        "text": "Private status update.",
+    }
+    resource_ref = teams_personal_resource_ref(conversation)
+    expected_resource_ref = (
+        "msteams-personal:" + hashlib.sha256(connector_canonical_json(conversation)).hexdigest()
+    )
+    assert resource_ref == expected_resource_ref
+
+    prepared = dispatcher.prepare_teams_reply(
+        principal=principal,
+        profile=profile,
+        provider_id="msteams",
+        profile_ref=profile.profile_ref,
+        operation_id="msteams.message.reply",
+        resource_ref=resource_ref,
+        arguments=arguments,
+        request_id="private-dispatch-1",
+    )
+
+    assert resource_ref.startswith("msteams-personal:")
+    assert prepared.arguments == arguments
+    assert prepared.target_projection == {"conversation": conversation}
+    assert prepared.operation_id == "msteams.message.reply"
+    assert prepared.tool_id == "msteams.message.reply"
+
+    wrong_actor_arguments = {
+        **arguments,
+        "conversation": {**conversation, "actorAadObjectId": other_actor_id},
+    }
+    with pytest.raises(PermissionError):
+        dispatcher.prepare_teams_reply(
+            principal=principal,
+            profile=profile,
+            provider_id="msteams",
+            profile_ref=profile.profile_ref,
+            operation_id="msteams.message.reply",
+            resource_ref=teams_personal_resource_ref(wrong_actor_arguments["conversation"]),
+            arguments=wrong_actor_arguments,
+            request_id="private-dispatch-actor-spoof",
+        )
+
+    with pytest.raises(ConnectorHostConfigurationError):
+        parse_connector_host_settings(
+            {
+                "teamsMessages": {
+                    **profile_value,
+                    "personalActorSubjects": [actor_id.upper()],
+                }
+            }
+        )
+
+    disabled_value = dict(profile_value)
+    disabled_value.pop("personalActorSubjects")
+    disabled = parse_connector_host_settings({"teamsMessages": disabled_value})
+    disabled_profile = disabled.teams_messages
+    assert disabled_profile is not None
+    with pytest.raises(PermissionError):
+        dispatcher.prepare_teams_reply(
+            principal=principal,
+            profile=disabled_profile,
+            provider_id="msteams",
+            profile_ref=disabled_profile.profile_ref,
+            operation_id="msteams.message.reply",
+            resource_ref=resource_ref,
+            arguments=arguments,
+            request_id="private-dispatch-disabled",
         )
 
 

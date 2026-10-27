@@ -16,13 +16,26 @@ import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 from cyrene_exchange_product.errors import ExchangeProductError
+from cyrene_exchange_product.integrations.azure_devops import (
+    ADO_OBSERVATION_OPERATIONS,
+)
+from cyrene_exchange_product.integrations.azure_devops import (
+    targets_for_operation as azure_devops_targets_for_operation,
+)
+from cyrene_exchange_product.integrations.azure_devops import (
+    validate_profile_identity as validate_azure_devops_profile_identity,
+)
+from cyrene_exchange_product.integrations.azure_devops import (
+    validate_profile_scope as validate_azure_devops_profile_scope,
+)
 from cyrene_exchange_product.integrations.connector_profiles import (
     ComputerRunnerProfile,
+    validate_teams_actor_aad_object_id,
     validate_teams_root_thread_id,
     validate_teams_service_url,
 )
@@ -30,6 +43,26 @@ from cyrene_exchange_product.integrations.connector_security import (
     ConnectorGrantClaims,
     connector_canonical_json,
     digest_arguments,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    GRAPH_OPERATIONS,
+    PLANNER_WRITE_OPERATIONS,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    lease_arguments_for_operation as microsoft_graph_lease_arguments,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    target_for_operation as microsoft_graph_target_for_operation,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    validate_profile_identity as validate_microsoft_graph_profile_identity,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    validate_scope_digest as validate_microsoft_graph_scope_digest,
+)
+from cyrene_exchange_product.integrations.microsoft_identity import (
+    MicrosoftActorMismatch,
+    microsoft_identity_for_principal,
 )
 from cyrene_exchange_product.integrations.models import (
     IntegrationConnection,
@@ -68,6 +101,10 @@ _TOOL_IDS_BY_PROVIDER: Mapping[str, Mapping[str, str]] = {
         "huggingface.repo.get": "huggingface.repo.get",
         "huggingface.file.download": "huggingface.file.download",
         "huggingface.file.upload": "huggingface.file.upload",
+    },
+    "microsoft_graph": {operation_id: operation_id for operation_id in sorted(GRAPH_OPERATIONS)},
+    "azure_devops": {
+        operation_id: operation_id for operation_id in sorted(ADO_OBSERVATION_OPERATIONS)
     },
     "azure": {
         "cloud.provider.health.read": "cloud_provider_health",
@@ -135,6 +172,8 @@ _MUTATING_OPERATIONS = frozenset(
         "computer.file.write",
         "github.vendor.cli.execute",
         "huggingface.file.upload",
+        "microsoft_graph.planner.task.create",
+        "microsoft_graph.planner.task.update",
         "cloud.resource.create",
         "cloud.resource.deploy",
         "cloud.resource.start",
@@ -289,12 +328,16 @@ class ConnectorOperationDispatcher:
         shared_match = current.access_mode == "workspace_operator"
         if not same_scope or not (owner_match or shared_match):
             raise PermissionError("connector connection owner does not match the signed actor")
+        if current.provider in {"microsoft_graph", "azure_devops"} and (
+            not owner_match or current.access_mode != "actor_owned"
+        ):
+            raise PermissionError("actor-owned provider connections cannot cross actor identity")
         canonical_provider = _canonical_provider(current.provider)
         if provider_id != canonical_provider:
             raise PermissionError("provider id does not match the persisted connection")
         expected_profile = (
             current.account_link_ref
-            if current.provider in {"github", "hf"}
+            if current.provider in {"github", "hf", "microsoft_graph", "azure_devops"}
             else current.binding_ref
         )
         if not expected_profile or profile_ref != expected_profile:
@@ -307,12 +350,26 @@ class ConnectorOperationDispatcher:
         elif current.provider != "runpod" and operation_id == "cloud.resource.restart":
             raise PermissionError("restart is supported only by RunPod profiles")
         selected = dict(arguments)
-        if current.provider not in {"github", "hf"} and selected.get("profile_ref") != profile_ref:
+        if (
+            current.provider not in {"github", "hf", "microsoft_graph", "azure_devops"}
+            and selected.get("profile_ref") != profile_ref
+        ):
             raise PermissionError("provider arguments do not bind the selected profile ref")
+        graph_scope: dict[str, Any] | None = None
+        azure_devops_scope: dict[str, Any] | None = None
+        azure_devops_binding_id: str | None = None
         if current.provider == "github":
             _validate_github_target(current, operation_id, selected)
         elif current.provider == "hf":
             self._validate_huggingface_target(current, operation_id, selected)
+        elif current.provider == "microsoft_graph":
+            graph_scope = self._microsoft_graph_profile_scope(principal, current, profile_ref)
+        elif current.provider == "azure_devops":
+            azure_devops_scope, azure_devops_binding_id = self._azure_devops_profile_scope(
+                principal,
+                current,
+                profile_ref,
+            )
         else:
             self._validate_cloud_target(principal, current, operation_id, selected)
         if operation_id in {
@@ -323,12 +380,29 @@ class ConnectorOperationDispatcher:
             if "target" in selected:
                 raise PermissionError("vendor CLI cannot select a model-supplied target")
             _reject_credential_export(selected)
-        target_projection = _resource_projection(
-            provider_id=canonical_provider,
-            profile_ref=profile_ref,
-            operation_id=operation_id,
-            arguments=selected,
-        )
+        target_projection: dict[str, object]
+        lease_target: dict[str, object] | None = None
+        if graph_scope is not None:
+            target_projection = microsoft_graph_target_for_operation(
+                operation_id,
+                selected,
+                graph_scope,
+            )
+        elif azure_devops_scope is not None and azure_devops_binding_id is not None:
+            target_projection, lease_target = azure_devops_targets_for_operation(
+                operation_id,
+                selected,
+                azure_devops_scope,
+                binding_id=azure_devops_binding_id,
+                selected_source_id=str(current.target_ref),
+            )
+        else:
+            target_projection = _resource_projection(
+                provider_id=canonical_provider,
+                profile_ref=profile_ref,
+                operation_id=operation_id,
+                arguments=selected,
+            )
         expected_resource_ref = _resource_ref(
             provider_id=canonical_provider,
             profile_ref=profile_ref,
@@ -337,16 +411,17 @@ class ConnectorOperationDispatcher:
         )
         if resource_ref != expected_resource_ref:
             raise PermissionError("resource ref does not match canonical provider arguments")
-        lease_target = (
-            _account_lease_target(
-                canonical_provider,
-                operation_id,
-                target_projection,
-                selected,
+        if azure_devops_scope is None:
+            lease_target = (
+                _account_lease_target(
+                    canonical_provider,
+                    operation_id,
+                    target_projection,
+                    selected,
+                )
+                if current.provider in {"github", "hf", "microsoft_graph"}
+                else None
             )
-            if current.provider in {"github", "hf"}
-            else None
-        )
         return PreparedConnectorOperation(
             connection=current,
             connection_ref=str(current.id),
@@ -365,6 +440,268 @@ class ConnectorOperationDispatcher:
             is_mutating=operation_id in _MUTATING_OPERATIONS,
         )
 
+    def _microsoft_graph_profile_scope(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        profile_ref: str,
+    ) -> dict[str, Any]:
+        """Read the current actor-owned Graph profile and classify auth state safely."""
+
+        host_profile = (
+            self._registry.settings.profiles.get(connection.binding_ref or "")
+            if self._registry is not None
+            else None
+        )
+        if (
+            host_profile is None
+            or host_profile.provider != "microsoft_graph"
+            or host_profile.access_mode != "actor_owned"
+            or not host_profile.microsoft_graph_plan_ids
+            or connection.target_ref is not None
+        ):
+            raise _connector_not_configured("microsoft_graph_host_plan_binding_missing")
+        try:
+            microsoft_identity_for_principal(principal)
+        except ValueError as exc:
+            raise PermissionError("Microsoft Graph requires the original Entra actor") from exc
+        response = self._accounts.list_provider_profiles(principal)
+        rows = response.get("profiles") if isinstance(response, Mapping) else None
+        if not isinstance(rows, list):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned invalid Microsoft Graph profile metadata.",
+                status=502,
+            )
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, Mapping)
+            and row.get("profile_ref") == profile_ref
+            and row.get("provider") == "microsoft_graph"
+        ]
+        if len(matches) != 1:
+            raise PermissionError("Microsoft Graph profile is outside the signed actor scope")
+        row = matches[0]
+        try:
+            scope = validate_microsoft_graph_profile_identity(
+                row,
+                profile_ref=profile_ref,
+                principal=principal,
+            )
+        except MicrosoftActorMismatch as exc:
+            raise PermissionError(
+                "Microsoft Graph profile belongs to a different Entra actor"
+            ) from exc
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned a mismatched Microsoft Graph identity or scope.",
+                status=502,
+            ) from exc
+        if tuple(scope["planner"]["plan_ids"]) != host_profile.microsoft_graph_plan_ids:
+            raise PermissionError(
+                "Microsoft Graph profile plan scope does not match the host binding"
+            )
+        if scope["sharepoint"]["enabled"] and (
+            scope["sharepoint"]["site_id"] != host_profile.microsoft_graph_sharepoint_site_id
+            or tuple(scope["sharepoint"]["list_ids"])
+            != host_profile.microsoft_graph_sharepoint_list_ids
+        ):
+            raise PermissionError(
+                "Microsoft Graph profile SharePoint scope does not match the host binding"
+            )
+        if row["expires_at"] <= int(datetime.now(UTC).timestamp()):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+                title="Microsoft Graph reauthorization required",
+                detail="The actor's delegated Graph access token has expired.",
+                status=409,
+                context={"reasonCode": "microsoft_graph_token_expired"},
+            )
+        auth_status = row.get("auth_status")
+        if auth_status in {"reauthorization_required", "revoked"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+                title="Microsoft Graph reauthorization required",
+                detail=(
+                    "Account Center reports that this actor's Microsoft Graph link needs consent."
+                ),
+                status=409,
+                context={"reasonCode": "microsoft_graph_reauthorization_required"},
+            )
+        if auth_status in {"unknown", "unavailable"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_UNAVAILABLE",
+                title="Microsoft Graph authorization is unavailable",
+                detail="Account Center could not confirm the current Microsoft Graph profile.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "microsoft_graph_profile_unavailable"},
+            )
+        if auth_status != "healthy":
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_NOT_READY",
+                title="Microsoft Graph authorization is not ready",
+                detail="Complete and verify Microsoft Graph consent before using this profile.",
+                status=409,
+                context={"reasonCode": "microsoft_graph_profile_not_healthy"},
+            )
+        return scope
+
+    def _azure_devops_profile_scope(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        profile_ref: str,
+    ) -> tuple[dict[str, Any], str]:
+        """Require one host-authorized ADO source and its actor-owned AC profile."""
+
+        if self._registry is None:
+            raise _connector_not_configured("azure_devops_source_configuration_missing")
+        host_profile = self._registry.settings.profiles.get(connection.binding_ref or "")
+        source = (
+            (host_profile.authorized_sources or {}).get(connection.target_ref or "")
+            if host_profile is not None
+            else None
+        )
+        if (
+            host_profile is None
+            or host_profile.provider != "azure_devops"
+            or host_profile.access_mode != "actor_owned"
+            or source is None
+            or source.source_id != connection.target_ref
+            or source.profile_ref != profile_ref
+            or connection.account_link_ref != profile_ref
+        ):
+            raise PermissionError("Azure DevOps source/profile is outside host authorized_sources")
+        try:
+            actor_tenant, _object_id, _subject = microsoft_identity_for_principal(principal)
+        except ValueError as exc:
+            raise PermissionError("Azure DevOps requires the original Entra actor") from exc
+        if actor_tenant != host_profile.azure_devops_tenant_id:
+            raise PermissionError(
+                "Azure DevOps source tenant differs from the original Entra actor"
+            )
+        response = self._accounts.list_provider_profiles(principal)
+        rows = response.get("profiles") if isinstance(response, Mapping) else None
+        if not isinstance(rows, list):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned invalid Azure DevOps profile metadata.",
+                status=502,
+            )
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, Mapping)
+            and row.get("provider") == "azure_devops"
+            and row.get("profile_ref") == profile_ref
+        ]
+        if len(matches) != 1:
+            raise PermissionError("Azure DevOps profile is outside the signed actor scope")
+        row = matches[0]
+        try:
+            validate_azure_devops_profile_identity(
+                row,
+                profile_ref=profile_ref,
+                principal=principal,
+            )
+        except MicrosoftActorMismatch as exc:
+            raise PermissionError(
+                "Azure DevOps profile belongs to a different Entra actor"
+            ) from exc
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned a mismatched Azure DevOps identity or OAuth scope.",
+                status=502,
+            ) from exc
+        if row["expires_at"] <= int(datetime.now(UTC).timestamp()):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+                title="Azure DevOps reauthorization required",
+                detail="The actor's delegated Azure DevOps token has expired.",
+                status=409,
+                context={"reasonCode": "azure_devops_token_expired"},
+            )
+        auth_status = row.get("auth_status")
+        if auth_status in {"reauthorization_required", "revoked"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+                title="Azure DevOps reauthorization required",
+                detail="Account Center reports that this actor's Entra link needs reauthorization.",
+                status=409,
+                context={"reasonCode": "azure_devops_reauthorization_required"},
+            )
+        if auth_status in {"unknown", "unavailable"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_UNAVAILABLE",
+                title="Azure DevOps authorization is unavailable",
+                detail="Account Center could not confirm the current Azure DevOps profile.",
+                status=503,
+                retryable=True,
+                context={"reasonCode": "azure_devops_profile_unavailable"},
+            )
+        if auth_status != "healthy":
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_NOT_READY",
+                title="Azure DevOps authorization is not ready",
+                detail="Complete and verify the actor-owned Entra consent before use.",
+                status=409,
+                context={"reasonCode": "azure_devops_profile_not_healthy"},
+            )
+        try:
+            scope = validate_azure_devops_profile_identity(
+                row,
+                profile_ref=profile_ref,
+                principal=principal,
+            )
+            host_scope = validate_azure_devops_profile_scope(
+                {
+                    "tenant_id": host_profile.azure_devops_tenant_id,
+                    "organization": host_profile.azure_devops_organization,
+                    "project_id": source.project_id,
+                    "source_id": source.source_id,
+                    "source_kind": source.kind,
+                    **(
+                        {"pipeline_id": source.pipeline_id}
+                        if source.pipeline_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"definition_id": source.definition_id}
+                        if source.definition_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"definition_environment_id": source.definition_environment_id}
+                        if source.definition_environment_id is not None
+                        else {}
+                    ),
+                }
+            )
+        except MicrosoftActorMismatch as exc:
+            raise PermissionError(
+                "Azure DevOps profile belongs to a different Entra actor"
+            ) from exc
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center ADO profile does not match its host source tuple.",
+                status=502,
+            ) from exc
+        if scope != host_scope:
+            raise PermissionError(
+                "Azure DevOps profile scope does not match host authorized_sources"
+            )
+        return scope, host_profile.endpoint.binding_id
+
     def prepare_teams_reply(
         self,
         *,
@@ -377,7 +714,7 @@ class ConnectorOperationDispatcher:
         arguments: Mapping[str, object],
         request_id: str,
     ) -> PreparedConnectorOperation:
-        """Validate one fixed Teams outbound message under the configured tenant/team."""
+        """Validate one fixed Teams channel or allowlisted owner-private send."""
 
         if (
             provider_id != "msteams"
@@ -391,54 +728,87 @@ class ConnectorOperationDispatcher:
         profile.authorize_principal(principal)
         principal.require(operation_id)
         selected = dict(arguments)
-        _exact_fields(selected, required={"conversation", "text"})
+        is_owner_private = selected.get("targetKind") == "owner_private"
+        _exact_fields(
+            selected,
+            required=(
+                {"targetKind", "conversation", "text"}
+                if is_owner_private
+                else {"conversation", "text"}
+            ),
+        )
         conversation = selected["conversation"]
         if not isinstance(conversation, Mapping):
             raise PermissionError("Teams conversation scope is invalid")
-        _exact_fields(
-            conversation,
-            required={
-                "tenantId",
-                "teamId",
-                "channelId",
-                "conversationId",
-                "rootThreadId",
-                "serviceUrl",
-            },
-        )
-        try:
-            profile.authorize_conversation(
+        if is_owner_private:
+            _exact_fields(
+                conversation,
+                required={
+                    "tenantId",
+                    "botAppId",
+                    "actorAadObjectId",
+                    "conversationId",
+                    "serviceUrl",
+                },
+            )
+            profile.authorize_personal_target(
+                principal_subject=principal.subject,
                 tenant_id=_text(conversation["tenantId"], "tenantId"),
-                team_id=_text(conversation["teamId"], "teamId"),
-                channel_id=_text(conversation["channelId"], "channelId"),
+                bot_app_id=_text(conversation["botAppId"], "botAppId"),
+                actor_aad_object_id=validate_teams_actor_aad_object_id(
+                    conversation["actorAadObjectId"]
+                ),
                 conversation_id=_text(conversation["conversationId"], "conversationId"),
-                root_thread_id=_text(conversation["rootThreadId"], "rootThreadId"),
                 service_url=_text(conversation["serviceUrl"], "serviceUrl"),
             )
-        except (ValueError, PermissionError) as exc:
-            raise PermissionError("Teams conversation is outside the configured allowlist") from exc
-        _text(conversation["conversationId"], "conversationId")
-        try:
-            validate_teams_root_thread_id(_text(conversation["rootThreadId"], "rootThreadId"))
-        except ValueError as exc:
-            raise PermissionError("Teams root activity id is not a channel message id") from exc
-        try:
-            validate_teams_service_url(
-                _text(conversation["serviceUrl"], "serviceUrl"),
-                tenant_id=_text(conversation["tenantId"], "tenantId"),
+            expected_resource = teams_personal_resource_ref(dict(conversation))
+        else:
+            _exact_fields(
+                conversation,
+                required={
+                    "tenantId",
+                    "teamId",
+                    "channelId",
+                    "conversationId",
+                    "rootThreadId",
+                    "serviceUrl",
+                },
             )
-        except ValueError as exc:
-            raise PermissionError(
-                "Teams service URL is outside the official route allowlist"
-            ) from exc
+            try:
+                profile.authorize_conversation(
+                    tenant_id=_text(conversation["tenantId"], "tenantId"),
+                    team_id=_text(conversation["teamId"], "teamId"),
+                    channel_id=_text(conversation["channelId"], "channelId"),
+                    conversation_id=_text(conversation["conversationId"], "conversationId"),
+                    root_thread_id=_text(conversation["rootThreadId"], "rootThreadId"),
+                    service_url=_text(conversation["serviceUrl"], "serviceUrl"),
+                )
+            except (ValueError, PermissionError) as exc:
+                raise PermissionError(
+                    "Teams conversation is outside the configured allowlist"
+                ) from exc
+            _text(conversation["conversationId"], "conversationId")
+            try:
+                validate_teams_root_thread_id(_text(conversation["rootThreadId"], "rootThreadId"))
+            except ValueError as exc:
+                raise PermissionError("Teams root activity id is not a channel message id") from exc
+            try:
+                validate_teams_service_url(
+                    _text(conversation["serviceUrl"], "serviceUrl"),
+                    tenant_id=_text(conversation["tenantId"], "tenantId"),
+                )
+            except ValueError as exc:
+                raise PermissionError(
+                    "Teams service URL is outside the official route allowlist"
+                ) from exc
+            expected_resource = teams_resource_ref(dict(conversation))
         text = _text(selected["text"], "text")
         if len(text) > 24_000:
-            raise ValueError("Teams reply exceeds the configured size limit")
+            raise ValueError("Teams message exceeds the configured size limit")
         selected["conversation"] = dict(conversation)
         projection: dict[str, object] = {"conversation": dict(conversation)}
-        expected_resource = teams_resource_ref(dict(conversation))
         if resource_ref != expected_resource:
-            raise PermissionError("Teams resource ref does not match the canonical thread")
+            raise PermissionError("Teams resource ref does not match the canonical target")
         return PreparedConnectorOperation(
             connection=None,
             connection_ref=profile.connection_ref,
@@ -562,7 +932,12 @@ class ConnectorOperationDispatcher:
                 tool_id=prepared.tool_id,
                 payload=prepared.arguments,
             )
-        elif prepared.provider_id in {"github", "huggingface"}:
+        elif prepared.provider_id in {
+            "github",
+            "huggingface",
+            "microsoft_graph",
+            "azure_devops",
+        }:
             if connection is None:
                 raise ValueError("provider connection is missing")
             if prepared.account_lease_target is None:
@@ -571,8 +946,13 @@ class ConnectorOperationDispatcher:
             payload_digest = digest_arguments(payload)
             if bytes.fromhex(payload_digest) != claims.arguments_digest_sha256:
                 raise PermissionError("provider payload digest differs from the Directory grant")
+            lease_digest = (
+                digest_arguments(microsoft_graph_lease_arguments(prepared.operation_id, payload))
+                if prepared.provider_id == "microsoft_graph"
+                else payload_digest
+            )
             connector_grant = (
-                _account_center_grant_proof(claims, arguments_sha256=payload_digest)
+                _account_center_grant_proof(claims, arguments_sha256=lease_digest)
                 if connection.access_mode == "workspace_operator"
                 else None
             )
@@ -581,7 +961,7 @@ class ConnectorOperationDispatcher:
                 profile_ref=prepared.profile_ref,
                 operation_id=prepared.operation_id,
                 target=prepared.account_lease_target,
-                arguments_sha256=payload_digest,
+                arguments_sha256=lease_digest,
                 connector_grant=connector_grant,
             )
             if (
@@ -601,6 +981,72 @@ class ConnectorOperationDispatcher:
                     profile_ref=prepared.profile_ref,
                     lease_ref=lease.lease_ref,
                     payload=payload,
+                )
+            elif prepared.provider_id == "microsoft_graph":
+                if self._authorization_cloud is None:
+                    raise _connector_not_configured("microsoft_graph_provider_not_configured")
+                try:
+                    scope_digest = validate_microsoft_graph_scope_digest(
+                        lease.profile_scope_sha256,
+                        required=True,
+                    )
+                except ValueError as exc:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                        title="Account Center response invalid",
+                        detail="Account Center returned an invalid Microsoft Graph scope digest.",
+                        status=502,
+                    ) from exc
+                if prepared.account_lease_target is None:
+                    raise ValueError("Microsoft Graph Account Center target is missing")
+                invocation_arguments = {
+                    "profile_ref": prepared.profile_ref,
+                    "lease_ref": lease.lease_ref,
+                    "target": dict(prepared.account_lease_target),
+                    "arguments_sha256": lease_digest,
+                    "profile_scope_sha256": scope_digest,
+                    "payload": payload,
+                }
+                result = self._authorization_cloud.invoke_connector_tool(
+                    principal,
+                    connection,
+                    operation_id=prepared.operation_id,
+                    tool_id=prepared.tool_id,
+                    arguments=invocation_arguments,
+                    request_id=prepared.request_id,
+                )
+            elif prepared.provider_id == "azure_devops":
+                if self._authorization_cloud is None:
+                    raise _connector_not_configured("azure_devops_provider_not_configured")
+                try:
+                    scope_digest = validate_microsoft_graph_scope_digest(
+                        lease.profile_scope_sha256,
+                        required=True,
+                    )
+                except ValueError as exc:
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                        title="Account Center response invalid",
+                        detail="Account Center returned an invalid Azure DevOps scope digest.",
+                        status=502,
+                    ) from exc
+                if prepared.account_lease_target is None:
+                    raise ValueError("Azure DevOps Account Center target is missing")
+                invocation_arguments = {
+                    "profile_ref": prepared.profile_ref,
+                    "lease_ref": lease.lease_ref,
+                    "target": dict(prepared.account_lease_target),
+                    "arguments_sha256": payload_digest,
+                    "profile_scope_sha256": scope_digest,
+                    "payload": payload,
+                }
+                result = self._authorization_cloud.invoke_connector_tool(
+                    principal,
+                    connection,
+                    operation_id=prepared.operation_id,
+                    tool_id=prepared.tool_id,
+                    arguments=invocation_arguments,
+                    request_id=prepared.request_id,
                 )
             else:
                 if self._authorization_cloud is None:
@@ -807,6 +1253,23 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
                 if operation_id.startswith("github.issue.")
                 else "github_repository"
             )
+        elif provider == "microsoft_graph":
+            projection = (
+                "microsoft_graph_plan"
+                if operation_id
+                in {
+                    "microsoft_graph.planner.plan.get",
+                    "microsoft_graph.planner.tasks.list",
+                }
+                else "microsoft_graph_task"
+                if operation_id in PLANNER_WRITE_OPERATIONS
+                or operation_id == "microsoft_graph.planner.task.get"
+                else "microsoft_graph_site"
+                if operation_id == "microsoft_graph.sharepoint.site.get"
+                else "microsoft_graph_list"
+            )
+        elif provider == "azure_devops":
+            projection = "azure_devops_source"
         elif provider == "computer":
             projection = (
                 "computer_workspace"
@@ -1006,6 +1469,15 @@ def teams_resource_ref(conversation: Mapping[str, object]) -> str:
     """Bind Teams output to the exact canonical tenant/team/channel/root thread."""
 
     return "sha256:" + hashlib.sha256(connector_canonical_json(dict(conversation))).hexdigest()
+
+
+def teams_personal_resource_ref(conversation: Mapping[str, object]) -> str:
+    """Bind a private send to its exact tenant, bot, actor, chat, and route tuple."""
+
+    return (
+        "msteams-personal:"
+        + hashlib.sha256(connector_canonical_json(dict(conversation))).hexdigest()
+    )
 
 
 def _fields(arguments: Mapping[str, object], names: set[str]) -> dict[str, object]:

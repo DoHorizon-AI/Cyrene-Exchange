@@ -177,3 +177,35 @@ def test_navigator_consumer_fixture_is_pinned_to_owner_operations() -> None:
     assert resource_responses["409"] == {"$ref": "#/components/responses/Problem"}
     problem_context = fixture["schemas"]["ProblemDetails"]["properties"]["context"]
     assert set(problem_context["properties"]) == {"connectionId", "authorizationRef"}
+
+
+def test_owner_private_teams_payload_is_closed_and_internal() -> None:
+    """The private message payload is documented without publishing an internal route."""
+
+    repository_root = Path(__file__).parents[2]
+    openapi_path = repository_root / "contracts/product/v1/openapi.yaml"
+    openapi, _ = read_from_filename(str(openapi_path))
+
+    assert "/internal/v1/teams/messages" not in openapi["paths"]
+    schemas = openapi["components"]["schemas"]
+    request = schemas["InternalTeamsPrivateMessageRequest"]
+    assert set(request["required"]) == {
+        "requestId",
+        "providerId",
+        "targetKind",
+        "conversation",
+        "text",
+    }
+    assert request["additionalProperties"] is False
+    assert request["properties"]["providerId"]["const"] == "msteams"
+    assert request["properties"]["targetKind"]["const"] == "owner_private"
+    conversation = schemas["InternalTeamsPrivateConversation"]
+    assert conversation["additionalProperties"] is False
+    assert set(conversation["required"]) == {
+        "tenantId",
+        "botAppId",
+        "actorAadObjectId",
+        "conversationId",
+        "serviceUrl",
+    }
+    assert conversation["properties"]["conversationId"]["maxLength"] == 512

@@ -30,6 +30,13 @@ from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
     DirectPluginEndpointConfig,
     EmailNotificationProfile,
 )
+from cyrene_exchange_product.integrations.azure_devops import (
+    ADO_OBSERVATION_OPERATIONS,
+    scope_for_authorized_source,
+)
+from cyrene_exchange_product.integrations.azure_devops import (
+    validate_profile_identity as validate_azure_devops_profile_identity,
+)
 from cyrene_exchange_product.integrations.clients import (
     PROVIDER_CAPABILITY,
     DirectInvoker,
@@ -46,6 +53,22 @@ from cyrene_exchange_product.integrations.connector_operations import (
 from cyrene_exchange_product.integrations.connector_security import (
     ConnectorGrantClaims,
     digest_arguments,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    GRAPH_OPERATIONS,
+    SHAREPOINT_READ_OPERATIONS,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    lease_arguments_for_operation as microsoft_graph_lease_arguments,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    validate_profile_identity as validate_microsoft_graph_profile_identity,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    validate_scope_digest as validate_microsoft_graph_scope_digest,
+)
+from cyrene_exchange_product.integrations.microsoft_identity import (
+    microsoft_identity_for_principal,
 )
 from cyrene_exchange_product.integrations.models import (
     AuthorizationCapabilityRecord,
@@ -549,7 +572,8 @@ class AuthorizationCloudDirectProvider:
         client = self._provider_clients.get(profile_ref)
         if (
             profile is None
-            or profile.provider not in {"hf", "azure", "gcp", "runpod"}
+            or profile.provider
+            not in {"hf", "microsoft_graph", "azure_devops", "azure", "gcp", "runpod"}
             or client is None
         ):
             raise ProviderObservationUnavailable("provider tool catalog binding is unavailable")
@@ -573,6 +597,10 @@ class AuthorizationCloudDirectProvider:
                 profile,
                 target_ref=target_ref,
             )
+        if profile.provider == "microsoft_graph":
+            return self._microsoft_graph_authorization_health(principal, connection, profile)
+        if profile.provider == "azure_devops":
+            return self._azure_devops_authorization_health(principal, connection, profile)
         if profile.provider in {"azure", "gcp", "runpod"}:
             return self._cloud_management_authorization_health(
                 principal,
@@ -638,6 +666,244 @@ class AuthorizationCloudDirectProvider:
                 )
                 for item in observed.capabilities
             ],
+        )
+
+    def _microsoft_graph_authorization_health(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        profile: AuthorizationProviderProfile,
+    ) -> AuthorizationHealthRecord:
+        """Project current Account Center Graph auth and per-operation scope facts."""
+
+        profile_ref = connection.account_link_ref
+        if self._account_center is None or not profile_ref:
+            raise ProviderObservationUnavailable("Microsoft Graph Account Center is unavailable")
+        response = self._account_center.list_provider_profiles(principal)
+        rows = response.get("profiles") if isinstance(response, Mapping) else None
+        matching = (
+            [
+                row
+                for row in rows
+                if isinstance(row, Mapping)
+                and row.get("provider") == "microsoft_graph"
+                and row.get("profile_ref") == profile_ref
+            ]
+            if isinstance(rows, list)
+            else []
+        )
+        if len(matching) != 1:
+            raise ProviderObservationUnavailable(
+                "Microsoft Graph Account Center profile is missing"
+            )
+        row = matching[0]
+        try:
+            scope = validate_microsoft_graph_profile_identity(
+                row,
+                profile_ref=profile_ref,
+                principal=principal,
+            )
+        except ValueError as exc:
+            raise ProviderObservationUnavailable(
+                "Microsoft Graph Account Center profile is invalid"
+            ) from exc
+        if tuple(scope["planner"]["plan_ids"]) != profile.microsoft_graph_plan_ids:
+            raise ProviderObservationUnavailable(
+                "Microsoft Graph Account Center plan scope differs from host configuration"
+            )
+        if scope["sharepoint"]["enabled"] and (
+            scope["sharepoint"]["site_id"] != profile.microsoft_graph_sharepoint_site_id
+            or tuple(scope["sharepoint"]["list_ids"]) != profile.microsoft_graph_sharepoint_list_ids
+        ):
+            raise ProviderObservationUnavailable(
+                "Microsoft Graph SharePoint scope differs from host configuration"
+            )
+        checked_at = datetime.now(UTC)
+        expires_at = datetime.fromtimestamp(row["expires_at"], UTC)
+        auth_status = row.get("auth_status")
+        if not isinstance(auth_status, str):
+            auth_status = "unknown"
+        account_state = {
+            "healthy": AuthorizationState.VALID,
+            "reauthorization_required": AuthorizationState.REAUTHORIZATION_REQUIRED,
+            "revoked": AuthorizationState.REAUTHORIZATION_REQUIRED,
+            "unavailable": AuthorizationState.UNAVAILABLE,
+            "unknown": AuthorizationState.UNKNOWN,
+        }.get(auth_status, AuthorizationState.UNKNOWN)
+        if expires_at <= checked_at:
+            account_state = AuthorizationState.REAUTHORIZATION_REQUIRED
+        planner = scope["planner"]
+        sharepoint = scope["sharepoint"]
+
+        def capability_state(enabled: bool) -> AuthorizationState:
+            if account_state != AuthorizationState.VALID:
+                return account_state
+            return AuthorizationState.VALID if enabled else AuthorizationState.PERMISSION_DENIED
+
+        capabilities = [
+            AuthorizationCapabilityRecord(
+                capability_id="microsoft_graph.planner.tasks.read",
+                state=capability_state(planner["tasks_read"]),
+                last_verified_at=checked_at if planner["tasks_read"] else None,
+                expires_at=expires_at,
+                reason_code=(None if planner["tasks_read"] else "planner_tasks_read_not_enabled"),
+            ),
+            AuthorizationCapabilityRecord(
+                capability_id="microsoft_graph.planner.tasks.write",
+                state=capability_state(planner["tasks_write"]),
+                last_verified_at=checked_at if planner["tasks_write"] else None,
+                expires_at=expires_at,
+                reason_code=(
+                    None if planner["tasks_write"] else "planner_tasks_write_consent_required"
+                ),
+            ),
+            AuthorizationCapabilityRecord(
+                capability_id="microsoft_graph.sharepoint.selected_metadata.read",
+                state=capability_state(sharepoint["enabled"]),
+                last_verified_at=checked_at if sharepoint["enabled"] else None,
+                expires_at=expires_at,
+                reason_code=(
+                    None if sharepoint["enabled"] else "sharepoint_selected_target_consent_required"
+                ),
+            ),
+        ]
+        generation = row.get("credential_revision", 0)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            generation = 0
+        return AuthorizationHealthRecord(
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            actor_issuer=connection.actor_issuer,
+            actor_subject=connection.actor_subject,
+            connection_id=connection.id,
+            authorization_ref=profile_ref,
+            reason_code=(
+                "microsoft_graph_reauthorization_required"
+                if account_state == AuthorizationState.REAUTHORIZATION_REQUIRED
+                else "microsoft_graph_profile_unavailable"
+                if account_state == AuthorizationState.UNAVAILABLE
+                else None
+            ),
+            login_state=LoginState.PRESENT,
+            authorization_state=account_state,
+            checked_at=checked_at,
+            expires_at=expires_at,
+            generation=generation,
+            capabilities=capabilities,
+        )
+
+    def _azure_devops_authorization_health(
+        self,
+        principal: IntegrationPrincipal,
+        connection: IntegrationConnection,
+        profile: AuthorizationProviderProfile,
+    ) -> AuthorizationHealthRecord:
+        """Report OAuth health while leaving actual project rights to ADO source calls."""
+
+        profile_ref = connection.account_link_ref
+        source = (profile.authorized_sources or {}).get(connection.target_ref or "")
+        if self._account_center is None or not profile_ref or source is None:
+            raise ProviderObservationUnavailable(
+                "Azure DevOps Account Center profile is unavailable"
+            )
+        response = self._account_center.list_provider_profiles(principal)
+        rows = response.get("profiles") if isinstance(response, Mapping) else None
+        matching = (
+            [
+                row
+                for row in rows
+                if isinstance(row, Mapping)
+                and row.get("provider") == "azure_devops"
+                and row.get("profile_ref") == profile_ref
+            ]
+            if isinstance(rows, list)
+            else []
+        )
+        if len(matching) != 1:
+            raise ProviderObservationUnavailable("Azure DevOps Account Center profile is missing")
+        row = matching[0]
+        try:
+            scope = validate_azure_devops_profile_identity(
+                row,
+                profile_ref=profile_ref,
+                principal=principal,
+            )
+            source_config = {
+                "source_id": source.source_id,
+                "kind": source.kind,
+                "project_id": source.project_id,
+                "project_name": source.project_name,
+                "profile_ref": source.profile_ref,
+                **({"pipeline_id": source.pipeline_id} if source.pipeline_id is not None else {}),
+                **(
+                    {"definition_id": source.definition_id}
+                    if source.definition_id is not None
+                    else {}
+                ),
+                **(
+                    {"definition_environment_id": source.definition_environment_id}
+                    if source.definition_environment_id is not None
+                    else {}
+                ),
+            }
+            expected_scope = scope_for_authorized_source(
+                tenant_id=str(profile.azure_devops_tenant_id),
+                organization=str(profile.azure_devops_organization),
+                source=source_config,
+            )
+        except ValueError as exc:
+            raise ProviderObservationUnavailable(
+                "Azure DevOps profile identity is invalid"
+            ) from exc
+        if scope != expected_scope:
+            raise ProviderObservationUnavailable(
+                "Azure DevOps profile scope differs from its source"
+            )
+        checked_at = datetime.now(UTC)
+        expires_at = datetime.fromtimestamp(row["expires_at"], UTC)
+        auth_status = row.get("auth_status")
+        if not isinstance(auth_status, str):
+            auth_status = "unknown"
+        account_state = {
+            "healthy": AuthorizationState.VALID,
+            "reauthorization_required": AuthorizationState.REAUTHORIZATION_REQUIRED,
+            "revoked": AuthorizationState.REAUTHORIZATION_REQUIRED,
+            "unavailable": AuthorizationState.UNAVAILABLE,
+            "unknown": AuthorizationState.UNKNOWN,
+        }.get(auth_status, AuthorizationState.UNKNOWN)
+        if expires_at <= checked_at:
+            account_state = AuthorizationState.REAUTHORIZATION_REQUIRED
+        generation = row.get("credential_revision", 0)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            generation = 0
+        reason_code = {
+            AuthorizationState.REAUTHORIZATION_REQUIRED: "azure_devops_reauthorization_required",
+            AuthorizationState.UNAVAILABLE: "azure_devops_profile_unavailable",
+            AuthorizationState.UNKNOWN: "azure_devops_profile_unknown",
+        }.get(account_state)
+        capabilities = [
+            AuthorizationCapabilityRecord(
+                capability_id=operation_id,
+                state=account_state,
+                expires_at=expires_at,
+                reason_code=reason_code,
+            )
+            for operation_id in sorted(ADO_OBSERVATION_OPERATIONS)
+        ]
+        return AuthorizationHealthRecord(
+            organization_id=connection.organization_id,
+            workspace_id=connection.workspace_id,
+            actor_issuer=connection.actor_issuer,
+            actor_subject=connection.actor_subject,
+            connection_id=connection.id,
+            authorization_ref=profile_ref,
+            reason_code=reason_code,
+            login_state=LoginState.PRESENT,
+            authorization_state=account_state,
+            checked_at=checked_at,
+            expires_at=expires_at,
+            generation=generation,
+            capabilities=capabilities,
         )
 
     def _cloud_management_authorization_health(
@@ -1094,7 +1360,14 @@ class AuthorizationCloudDirectProvider:
         current = self._store.current_connection_for_provider_call(connection.id)
         if current is None or current != connection or not current.enabled:
             raise PermissionError("connection changed before connector provider call")
-        if current.provider not in {"azure", "gcp", "hf", "runpod"}:
+        if current.provider not in {
+            "azure",
+            "azure_devops",
+            "gcp",
+            "hf",
+            "microsoft_graph",
+            "runpod",
+        }:
             raise PermissionError("connection provider has no cloud connector tool binding")
         profile, _target_ref = self._registry.profile_for_connection(
             principal,
@@ -1104,12 +1377,42 @@ class AuthorizationCloudDirectProvider:
         if profile.provider != current.provider:
             raise PermissionError("provider profile does not match the connection")
         expected_profile_ref = (
-            current.account_link_ref if current.provider == "hf" else current.binding_ref
+            current.account_link_ref
+            if current.provider in {"hf", "microsoft_graph", "azure_devops"}
+            else current.binding_ref
         )
         if arguments.get("profile_ref") != expected_profile_ref:
             raise PermissionError("provider profile argument does not match the connection")
         if current.provider == "hf":
             return _invoke_signed_huggingface_tool(
+                self._provider_clients.get(profile.profile_ref),
+                endpoint=profile.endpoint,
+                principal=principal,
+                profile=profile,
+                context_key=self._context_key(profile.context_key_ref),
+                tool_id=tool_id,
+                operation_id=operation_id,
+                arguments=arguments,
+                request_id=request_id,
+            )
+        if current.provider == "microsoft_graph":
+            if current.access_mode != "actor_owned":
+                raise PermissionError("Microsoft Graph account profile cannot be shared")
+            return _invoke_signed_microsoft_graph_tool(
+                self._provider_clients.get(profile.profile_ref),
+                endpoint=profile.endpoint,
+                principal=principal,
+                profile=profile,
+                context_key=self._context_key(profile.context_key_ref),
+                tool_id=tool_id,
+                operation_id=operation_id,
+                arguments=arguments,
+                request_id=request_id,
+            )
+        if current.provider == "azure_devops":
+            if current.access_mode != "actor_owned":
+                raise PermissionError("Azure DevOps account profile cannot be shared")
+            return _invoke_signed_azure_devops_tool(
                 self._provider_clients.get(profile.profile_ref),
                 endpoint=profile.endpoint,
                 principal=principal,
@@ -2006,6 +2309,366 @@ def _invoke_signed_huggingface_tool(
     if len(values) != 1:
         raise IntegrationToolCallUnavailable()
     return values[0]
+
+
+def _invoke_signed_microsoft_graph_tool(
+    client: DirectInvoker | None,
+    *,
+    endpoint: DirectPluginEndpointConfig,
+    principal: IntegrationPrincipal,
+    profile: AuthorizationProviderProfile,
+    context_key: bytes,
+    tool_id: str,
+    operation_id: str,
+    arguments: Mapping[str, object],
+    request_id: str,
+) -> dict[str, Any]:
+    """Send one Account Center lease envelope to the fixed Graph provider Plugin."""
+
+    payload = arguments.get("payload")
+    target = arguments.get("target")
+    profile_ref = arguments.get("profile_ref")
+    lease_ref = arguments.get("lease_ref")
+    arguments_sha256 = arguments.get("arguments_sha256")
+    raw_scope_sha256 = arguments.get("profile_scope_sha256")
+    try:
+        scope_sha256 = validate_microsoft_graph_scope_digest(raw_scope_sha256, required=True)
+        tenant_id, _object_id, _subject = microsoft_identity_for_principal(principal)
+    except ValueError as exc:
+        raise PermissionError("Microsoft Graph profile scope digest is invalid") from exc
+    if (
+        client is None
+        or operation_id not in GRAPH_OPERATIONS
+        or tool_id != operation_id
+        or profile.provider != "microsoft_graph"
+        or profile.caller_workload != "microsoft-graph-provider"
+        or len(context_key) != 32
+        or not request_id
+        or principal.issuer != profile.expected_issuer
+        or principal.organization_id != profile.organization_id
+        or principal.workspace_id != profile.workspace_id
+        or not isinstance(profile_ref, str)
+        or not profile_ref
+        or not isinstance(lease_ref, str)
+        or not lease_ref
+        or not isinstance(target, Mapping)
+        or target.get("tenant_id") != tenant_id
+        or (
+            operation_id.startswith("microsoft_graph.planner.")
+            and target.get("plan_id") not in profile.microsoft_graph_plan_ids
+        )
+        or (
+            operation_id in SHAREPOINT_READ_OPERATIONS
+            and (
+                target.get("site_id") != profile.microsoft_graph_sharepoint_site_id
+                or (
+                    "list_id" in target
+                    and target.get("list_id") not in profile.microsoft_graph_sharepoint_list_ids
+                )
+            )
+        )
+        or not isinstance(payload, Mapping)
+        or not isinstance(arguments_sha256, str)
+        or arguments_sha256
+        != digest_arguments(microsoft_graph_lease_arguments(operation_id, payload))
+        or not scope_sha256
+    ):
+        raise PermissionError("Microsoft Graph provider lease binding is incomplete")
+    signed_payload = {
+        "payload": dict(payload),
+        "profile_ref": profile_ref,
+        "lease_ref": lease_ref,
+        "target": dict(target),
+        "arguments_sha256": arguments_sha256,
+        "profile_scope_sha256": scope_sha256,
+    }
+    try:
+        from cyrene_account_center_contracts import sign_context
+
+        from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
+            tool_provider_pb2 as tool_wire,
+        )
+
+        trusted_context = sign_context(
+            method="call_tool",
+            payload=signed_payload,
+            caller_id=profile.caller_workload,
+            issuer=principal.issuer,
+            subject=principal.subject,
+            organization_id=principal.organization_id,
+            workspace_id=principal.workspace_id,
+            binding_id=endpoint.binding_id,
+            request_id=request_id,
+            operation_id=operation_id,
+            key=context_key,
+        )
+        envelope = {**signed_payload, "trusted_context": trusted_context.as_dict()}
+        request = tool_wire.CallToolRequest(
+            binding_id=endpoint.binding_id,
+            provider_tool_id=tool_id,
+            arguments_json=json.dumps(
+                envelope,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+        )
+    except Exception as exc:
+        raise ProviderObservationUnavailable("Microsoft Graph signed lease is invalid") from exc
+
+    try:
+        response = client.invoke(
+            capability=PROVIDER_CAPABILITY,
+            interface_version="1",
+            method="call_tool",
+            request=_direct_payload(
+                "type.cyrene.io/cyrene.tool.provider.v1.CallToolRequest",
+                request.SerializeToString(deterministic=True),
+            ),
+            deadline_seconds=10.0,
+            request_id=request_id,
+        )
+    except Exception as exc:
+        raise IntegrationToolCallUnavailable(retryable=True) from exc
+    if response.type_url != "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse":
+        raise IntegrationToolCallUnavailable()
+    try:
+        typed_response = tool_wire.CallToolResponse.FromString(response.value)
+    except Exception as exc:
+        raise IntegrationToolCallUnavailable() from exc
+    result_kind = typed_response.WhichOneof("result")
+    if result_kind == "error":
+        try:
+            code = tool_wire.ToolProviderErrorCode.Name(typed_response.error.code)
+        except ValueError:
+            code = "PROVIDER_UNAVAILABLE"
+        if code in {"AUTH_EXPIRED", "REFRESH_TOKEN_EXPIRED", "CONSENT_REVOKED"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+                title="Microsoft Graph reauthorization required",
+                detail="Account Center could not refresh this actor's delegated Graph consent.",
+                status=409,
+                context={"reasonCode": "microsoft_graph_reauthorization_required"},
+            )
+        _raise_provider_error(code, retryable=typed_response.error.retryable)
+    if result_kind != "outcome":
+        raise IntegrationToolCallUnavailable()
+    values: list[dict[str, Any]] = []
+    for part in typed_response.outcome.content:
+        if part.WhichOneof("content") != "json":
+            continue
+        try:
+            decoded = json.loads(part.json.json)
+        except json.JSONDecodeError as exc:
+            raise IntegrationToolCallUnavailable() from exc
+        if isinstance(decoded, Mapping):
+            values.append(dict(decoded))
+    if typed_response.outcome.is_error:
+        error = next(
+            (value.get("error") for value in values if isinstance(value.get("error"), Mapping)),
+            None,
+        )
+        if error is None or not isinstance(error.get("code"), str):
+            raise IntegrationToolCallUnavailable()
+        code = str(error["code"])
+        if code.upper() in {"AUTH_EXPIRED", "REFRESH_TOKEN_EXPIRED", "CONSENT_REVOKED"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
+                title="Microsoft Graph reauthorization required",
+                detail="Account Center could not refresh this actor's delegated Graph consent.",
+                status=409,
+                context={"reasonCode": "microsoft_graph_reauthorization_required"},
+            )
+        _raise_provider_error(
+            code,
+            retryable=error.get("retryable") is True,
+            unknown=(error.get("outcome") == "UNKNOWN" or error.get("state") == "UNKNOWN_RESULT"),
+        )
+    if len(values) != 1:
+        raise IntegrationToolCallUnavailable()
+    return values[0]
+
+
+def _invoke_signed_azure_devops_tool(
+    client: DirectInvoker | None,
+    *,
+    endpoint: DirectPluginEndpointConfig,
+    principal: IntegrationPrincipal,
+    profile: AuthorizationProviderProfile,
+    context_key: bytes,
+    tool_id: str,
+    operation_id: str,
+    arguments: Mapping[str, object],
+    request_id: str,
+) -> dict[str, Any]:
+    """Send one exact actor-bound Account Center lease to the ADO provider."""
+
+    payload = arguments.get("payload")
+    target = arguments.get("target")
+    profile_ref = arguments.get("profile_ref")
+    lease_ref = arguments.get("lease_ref")
+    arguments_sha256 = arguments.get("arguments_sha256")
+    try:
+        scope_sha256 = validate_microsoft_graph_scope_digest(
+            arguments.get("profile_scope_sha256"),
+            required=True,
+        )
+        tenant_id, _object_id, _subject = microsoft_identity_for_principal(principal)
+    except ValueError as exc:
+        raise PermissionError("Azure DevOps actor or profile scope binding is invalid") from exc
+    if (
+        client is None
+        or operation_id not in ADO_OBSERVATION_OPERATIONS
+        or tool_id != operation_id
+        or profile.provider != "azure_devops"
+        or profile.caller_workload != "azure-devops-observation-provider"
+        or profile.access_mode != "actor_owned"
+        or len(context_key) != 32
+        or not request_id
+        or principal.issuer != profile.expected_issuer
+        or principal.organization_id != profile.organization_id
+        or principal.workspace_id != profile.workspace_id
+        or not isinstance(profile_ref, str)
+        or not profile_ref
+        or not isinstance(lease_ref, str)
+        or not lease_ref
+        or not isinstance(target, Mapping)
+        or target.get("tenant_id") != tenant_id
+        or not isinstance(payload, Mapping)
+        or not isinstance(arguments_sha256, str)
+        or arguments_sha256 != digest_arguments(payload)
+        or not scope_sha256
+    ):
+        raise PermissionError("Azure DevOps provider lease binding is incomplete")
+    signed_payload = {
+        "payload": dict(payload),
+        "profile_ref": profile_ref,
+        "lease_ref": lease_ref,
+        "target": dict(target),
+        "arguments_sha256": arguments_sha256,
+        "profile_scope_sha256": scope_sha256,
+    }
+    try:
+        from cyrene_account_center_contracts import sign_context
+
+        from cyrene_exchange_product.integrations._generated.cyrene.tool.provider.v1 import (
+            tool_provider_pb2 as tool_wire,
+        )
+
+        trusted_context = sign_context(
+            method="call_tool",
+            payload=signed_payload,
+            caller_id=profile.caller_workload,
+            issuer=principal.issuer,
+            subject=principal.subject,
+            organization_id=principal.organization_id,
+            workspace_id=principal.workspace_id,
+            binding_id=endpoint.binding_id,
+            request_id=request_id,
+            operation_id=operation_id,
+            key=context_key,
+        )
+        envelope = {**signed_payload, "trusted_context": trusted_context.as_dict()}
+        request = tool_wire.CallToolRequest(
+            binding_id=endpoint.binding_id,
+            provider_tool_id=tool_id,
+            arguments_json=json.dumps(envelope, separators=(",", ":"), ensure_ascii=False),
+        )
+    except Exception as exc:
+        raise ProviderObservationUnavailable("Azure DevOps signed lease is invalid") from exc
+    try:
+        response = client.invoke(
+            capability=PROVIDER_CAPABILITY,
+            interface_version="1",
+            method="call_tool",
+            request=_direct_payload(
+                "type.cyrene.io/cyrene.tool.provider.v1.CallToolRequest",
+                request.SerializeToString(deterministic=True),
+            ),
+            deadline_seconds=10.0,
+            request_id=request_id,
+        )
+    except Exception as exc:
+        raise IntegrationToolCallUnavailable(retryable=True) from exc
+    if response.type_url != "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse":
+        raise IntegrationToolCallUnavailable()
+    try:
+        typed_response = tool_wire.CallToolResponse.FromString(response.value)
+    except Exception as exc:
+        raise IntegrationToolCallUnavailable() from exc
+    if typed_response.WhichOneof("result") != "outcome":
+        raise IntegrationToolCallUnavailable()
+    values: list[dict[str, Any]] = []
+    for part in typed_response.outcome.content:
+        if part.WhichOneof("content") != "json":
+            continue
+        try:
+            value = json.loads(part.json.json)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, Mapping):
+            values.append(dict(value))
+    if typed_response.outcome.is_error:
+        error = next(
+            (value.get("error") for value in values if isinstance(value.get("error"), Mapping)),
+            None,
+        )
+        if error is None or not isinstance(error.get("code"), str):
+            raise IntegrationToolCallUnavailable()
+        _raise_azure_devops_provider_error(
+            str(error["code"]),
+            retryable=error.get("retryable") is True,
+            unknown=error.get("outcome") == "UNKNOWN" or error.get("state") == "UNKNOWN_RESULT",
+        )
+    if len(values) != 1:
+        raise IntegrationToolCallUnavailable()
+    return values[0]
+
+
+def _raise_azure_devops_provider_error(
+    code: str,
+    *,
+    retryable: bool,
+    unknown: bool = False,
+) -> None:
+    """Preserve the ADO provider's auth, source, cursor, and availability classes."""
+
+    normalized = code.upper()
+    if unknown:
+        _raise_provider_error(code, retryable=retryable, unknown=True)
+    if normalized in {"AUTHENTICATION_DENIED", "SOURCE_SCOPE_DENIED", "PROFILE_SCOPE_MISMATCH"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+            title="Azure DevOps source is outside the authorized profile",
+            detail="The selected source or actor does not match its Account Center profile.",
+            status=403,
+            context={"reasonCode": normalized.lower()},
+        )
+    if normalized in {"AUTHORIZATION_DENIED", "PERMISSION_DENIED", "RESOURCE_SCOPE_MISMATCH"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PERMISSION_DENIED",
+            title="Azure DevOps permission denied",
+            detail="Azure DevOps denied access to the selected project or resource.",
+            status=403,
+            context={"reasonCode": normalized.lower()},
+        )
+    if normalized == "INVALID_CURSOR":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+            title="Azure DevOps page cursor is invalid",
+            detail="The supplied cursor is not valid for this authorized source.",
+            status=422,
+            context={"reasonCode": "invalid_cursor"},
+        )
+    if normalized == "AUTHORIZATION_UNAVAILABLE":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_PROVIDER_UNAVAILABLE",
+            title="Azure DevOps authorization is unavailable",
+            detail="The provider could not verify access to the selected source.",
+            status=503,
+            retryable=True,
+            context={"reasonCode": "authorization_unavailable"},
+        )
+    _raise_provider_error(code, retryable=retryable)
 
 
 def _sdk() -> Any:
