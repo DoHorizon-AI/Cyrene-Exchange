@@ -29,6 +29,7 @@ from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
     AuthorizationProviderProfile,
     DirectPluginEndpointConfig,
     EmailNotificationProfile,
+    validate_microsoft_graph_office_v2_scope,
 )
 from cyrene_exchange_product.integrations.azure_devops import (
     ADO_OBSERVATION_OPERATIONS,
@@ -57,6 +58,8 @@ from cyrene_exchange_product.integrations.connector_security import (
 from cyrene_exchange_product.integrations.microsoft_graph import (
     GRAPH_OPERATIONS,
     SHAREPOINT_READ_OPERATIONS,
+    SHAREPOINT_V2_READ_OPERATIONS,
+    profile_scope_metadata,
 )
 from cyrene_exchange_product.integrations.microsoft_graph import (
     lease_arguments_for_operation as microsoft_graph_lease_arguments,
@@ -707,19 +710,34 @@ class AuthorizationCloudDirectProvider:
             raise ProviderObservationUnavailable(
                 "Microsoft Graph Account Center profile is invalid"
             ) from exc
-        if tuple(scope["planner"]["plan_ids"]) != profile.microsoft_graph_plan_ids:
-            raise ProviderObservationUnavailable(
-                "Microsoft Graph Account Center plan scope differs from host configuration"
-            )
-        if scope["sharepoint"]["enabled"] and (
-            scope["sharepoint"]["site_id"] != profile.microsoft_graph_sharepoint_site_id
-            or tuple(scope["sharepoint"]["list_ids"]) != profile.microsoft_graph_sharepoint_list_ids
-        ):
-            raise ProviderObservationUnavailable(
-                "Microsoft Graph SharePoint scope differs from host configuration"
-            )
+        if getattr(profile, "microsoft_graph_office_v2", None) is not None:
+            try:
+                scope = validate_microsoft_graph_office_v2_scope(profile, scope, principal)
+            except (PermissionError, ValueError) as exc:
+                raise ProviderObservationUnavailable(
+                    "Microsoft Graph Office v2 scope differs from host configuration"
+                ) from exc
+        else:
+            if tuple(scope["planner"]["plan_ids"]) != profile.microsoft_graph_plan_ids:
+                raise ProviderObservationUnavailable(
+                    "Microsoft Graph Account Center plan scope differs from host configuration"
+                )
+            if scope["sharepoint"]["enabled"] and (
+                scope["sharepoint"]["site_id"] != profile.microsoft_graph_sharepoint_site_id
+                or tuple(scope["sharepoint"]["list_ids"])
+                != profile.microsoft_graph_sharepoint_list_ids
+            ):
+                raise ProviderObservationUnavailable(
+                    "Microsoft Graph SharePoint scope differs from host configuration"
+                )
         checked_at = datetime.now(UTC)
         expires_at = datetime.fromtimestamp(row["expires_at"], UTC)
+        refresh_expires_at = (
+            datetime.fromtimestamp(row["refresh_expires_at"], UTC)
+            if isinstance(row.get("refresh_expires_at"), int)
+            and not isinstance(row.get("refresh_expires_at"), bool)
+            else None
+        )
         auth_status = row.get("auth_status")
         if not isinstance(auth_status, str):
             auth_status = "unknown"
@@ -730,7 +748,7 @@ class AuthorizationCloudDirectProvider:
             "unavailable": AuthorizationState.UNAVAILABLE,
             "unknown": AuthorizationState.UNKNOWN,
         }.get(auth_status, AuthorizationState.UNKNOWN)
-        if expires_at <= checked_at:
+        if refresh_expires_at is not None and refresh_expires_at <= checked_at:
             account_state = AuthorizationState.REAUTHORIZATION_REQUIRED
         planner = scope["planner"]
         sharepoint = scope["sharepoint"]
@@ -767,6 +785,59 @@ class AuthorizationCloudDirectProvider:
                 ),
             ),
         ]
+        if scope.get("schema_version") == 2:
+            todo = scope["todo"]
+            calendar = scope["calendar"]
+            capabilities.extend(
+                [
+                    AuthorizationCapabilityRecord(
+                        capability_id="microsoft_graph.todo.tasks.read",
+                        state=capability_state(todo["tasks_read"]),
+                        last_verified_at=checked_at if todo["tasks_read"] else None,
+                        expires_at=expires_at,
+                        reason_code=(None if todo["tasks_read"] else "todo_tasks_read_not_enabled"),
+                    ),
+                    AuthorizationCapabilityRecord(
+                        capability_id="microsoft_graph.todo.tasks.write",
+                        state=capability_state(todo["tasks_write"]),
+                        last_verified_at=checked_at if todo["tasks_write"] else None,
+                        expires_at=expires_at,
+                        reason_code=(
+                            None if todo["tasks_write"] else "todo_tasks_write_not_enabled"
+                        ),
+                    ),
+                    AuthorizationCapabilityRecord(
+                        capability_id="microsoft_graph.calendar.events.read",
+                        state=capability_state(calendar["events_read"]),
+                        last_verified_at=checked_at if calendar["events_read"] else None,
+                        expires_at=expires_at,
+                        reason_code=(
+                            None if calendar["events_read"] else "calendar_events_read_not_enabled"
+                        ),
+                    ),
+                    AuthorizationCapabilityRecord(
+                        capability_id="microsoft_graph.calendar.events.write",
+                        state=capability_state(calendar["events_write"]),
+                        last_verified_at=checked_at if calendar["events_write"] else None,
+                        expires_at=expires_at,
+                        reason_code=(
+                            None
+                            if calendar["events_write"]
+                            else "calendar_events_write_not_enabled"
+                        ),
+                    ),
+                    AuthorizationCapabilityRecord(
+                        capability_id="microsoft_graph.calendar.freebusy.read",
+                        state=capability_state(calendar["freebusy_read"]),
+                        last_verified_at=checked_at if calendar["freebusy_read"] else None,
+                        expires_at=expires_at,
+                        reason_code=(
+                            None if calendar["freebusy_read"] else "calendar_freebusy_not_enabled"
+                        ),
+                    ),
+                ]
+            )
+        scope_metadata = profile_scope_metadata(row, scope)
         generation = row.get("credential_revision", 0)
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             generation = 0
@@ -775,6 +846,11 @@ class AuthorizationCloudDirectProvider:
             workspace_id=connection.workspace_id,
             actor_issuer=connection.actor_issuer,
             actor_subject=connection.actor_subject,
+            external_subject=(
+                str(row["external_subject"])
+                if isinstance(row.get("external_subject"), str)
+                else None
+            ),
             connection_id=connection.id,
             authorization_ref=profile_ref,
             reason_code=(
@@ -788,8 +864,15 @@ class AuthorizationCloudDirectProvider:
             authorization_state=account_state,
             checked_at=checked_at,
             expires_at=expires_at,
+            refresh_expires_at=refresh_expires_at,
             generation=generation,
             capabilities=capabilities,
+            scope_schema_version=scope_metadata["scope_schema_version"],
+            enabled_features=list(scope_metadata["enabled_features"]),
+            required_oauth_scopes=list(scope_metadata["required_oauth_scopes"]),
+            target_ref_count=int(scope_metadata["target_ref_count"]),
+            reauth_required=bool(scope_metadata["reauth_required"]),
+            reauth_reason_code=scope_metadata["reauth_reason_code"],
         )
 
     def _azure_devops_authorization_health(
@@ -2331,6 +2414,7 @@ def _invoke_signed_microsoft_graph_tool(
     lease_ref = arguments.get("lease_ref")
     arguments_sha256 = arguments.get("arguments_sha256")
     raw_scope_sha256 = arguments.get("profile_scope_sha256")
+    office_v2_profile = profile.microsoft_graph_office_v2
     try:
         scope_sha256 = validate_microsoft_graph_scope_digest(raw_scope_sha256, required=True)
         tenant_id, _object_id, _subject = microsoft_identity_for_principal(principal)
@@ -2355,15 +2439,25 @@ def _invoke_signed_microsoft_graph_tool(
         or target.get("tenant_id") != tenant_id
         or (
             operation_id.startswith("microsoft_graph.planner.")
+            and operation_id != "microsoft_graph.planner.plans.list"
+            and profile.microsoft_graph_plan_ids
             and target.get("plan_id") not in profile.microsoft_graph_plan_ids
         )
         or (
-            operation_id in SHAREPOINT_READ_OPERATIONS
+            operation_id in SHAREPOINT_READ_OPERATIONS | SHAREPOINT_V2_READ_OPERATIONS
             and (
                 target.get("site_id") != profile.microsoft_graph_sharepoint_site_id
                 or (
                     "list_id" in target
+                    and profile.microsoft_graph_sharepoint_list_ids
                     and target.get("list_id") not in profile.microsoft_graph_sharepoint_list_ids
+                )
+                or (
+                    "drive_id" in target
+                    and office_v2_profile is not None
+                    and office_v2_profile.targets["sharePointDriveIds"]
+                    and target.get("drive_id")
+                    not in office_v2_profile.targets["sharePointDriveIds"]
                 )
             )
         )

@@ -75,6 +75,7 @@ ACCOUNT_METHODS = {
     "poll_huggingface_renewal": "PollHuggingFaceRenewal",
     "begin_microsoft_graph_link": "BeginMicrosoftGraphLink",
     "complete_microsoft_graph_link": "CompleteMicrosoftGraphLink",
+    "update_microsoft_graph_v2_scope": "UpdateMicrosoftGraphV2Scope",
     "begin_microsoft_graph_scope_upgrade": "BeginMicrosoftGraphScopeUpgrade",
     "complete_microsoft_graph_scope_upgrade": "CompleteMicrosoftGraphScopeUpgrade",
     "begin_azure_devops_link": "BeginAzureDevOpsLink",
@@ -787,15 +788,40 @@ class AccountCenterClient:
         profile_ref: str,
         planner_plan_ids: list[str],
         idempotency_key: str,
+        office_v2_scope: Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
         """Begin one actor-owned delegated Graph link for exact Planner plans."""
 
+        payload: dict[str, object] = {
+            "profile_ref": profile_ref,
+            "idempotency_key": idempotency_key,
+        }
+        if office_v2_scope is not None:
+            payload["office_v2_scope"] = dict(office_v2_scope)
+        else:
+            payload["planner_plan_ids"] = list(planner_plan_ids)
+        return self._invoke_user("begin_microsoft_graph_link", principal, payload)
+
+    def update_microsoft_graph_v2_scope(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        workspace_id: str,
+        expected_credential_revision: int,
+        target_scope: Mapping[str, object],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """CAS-update only selected resource IDs on one same-actor v2 profile."""
+
         return self._invoke_user(
-            "begin_microsoft_graph_link",
+            "update_microsoft_graph_v2_scope",
             principal,
             {
                 "profile_ref": profile_ref,
-                "planner_plan_ids": list(planner_plan_ids),
+                "workspace_id": workspace_id,
+                "expected_credential_revision": expected_credential_revision,
+                "target_scope": dict(target_scope),
                 "idempotency_key": idempotency_key,
             },
         )
@@ -1130,6 +1156,7 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         "poll_huggingface_renewal": "PollHuggingFaceRenewalRequest",
         "begin_microsoft_graph_link": "BeginMicrosoftGraphLinkRequest",
         "complete_microsoft_graph_link": "CompleteMicrosoftGraphLinkRequest",
+        "update_microsoft_graph_v2_scope": "UpdateMicrosoftGraphV2ScopeRequest",
         "begin_microsoft_graph_scope_upgrade": "BeginMicrosoftGraphScopeUpgradeRequest",
         "complete_microsoft_graph_scope_upgrade": "CompleteMicrosoftGraphScopeUpgradeRequest",
         "begin_azure_devops_link": "BeginAzureDevOpsLinkRequest",
@@ -1151,6 +1178,7 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         raise ValueError("unsupported Account Center method")
     values = dict(payload)
     if method in {
+        "begin_microsoft_graph_link",
         "begin_microsoft_graph_scope_upgrade",
         "begin_azure_devops_link",
     }:
@@ -1184,6 +1212,7 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         values["resource"] = Resource(**dict(resource))
     serialized = asdict(dto_type(**values))
     if method in {
+        "begin_microsoft_graph_link",
         "begin_microsoft_graph_scope_upgrade",
         "begin_azure_devops_link",
     }:

@@ -37,11 +37,7 @@ def provision_connector_profiles(
     """Link verified connector profiles and persist scoped provider connections."""
 
     specification = _read_bootstrap_file(Path(bootstrap_file))
-    authority = services.connector_grant_authority
-    verifier = services.connector_grant_verifier
     registry = services.authorization_profile_registry
-    if authority is None or verifier is None:
-        raise _bootstrap_error("connector_bootstrap_not_configured")
 
     actor = _object(
         specification["actor"],
@@ -135,60 +131,12 @@ def provision_connector_profiles(
         for repository in repositories
     }
 
-    # This exact supported connector grant is only a fresh Directory role proof
-    # for the privileged local bootstrap. It is not reused for profile-link calls.
     proof_connection_id = next(iter(github_connection_ids.values()))
-    grant_arguments: dict[str, object] = {}
-    grant_operation = "github.repository.list"
-    grant_request_id = str(uuid4())
-    grant_resource_ref = _resource_ref(
-        provider_id="github",
-        profile_ref=github_profile_ref,
-        operation_id=grant_operation,
-        target={"profile_ref": github_profile_ref},
-    )
-    arguments_digest = bytes.fromhex(digest_arguments(grant_arguments))
-    grant_bytes = authority.authorize_connector_operation(
-        workspace_id=workspace_id,
-        principal_issuer=issuer,
-        principal_subject=subject,
-        connection_ref=str(proof_connection_id),
-        provider_id="github",
-        profile_ref=github_profile_ref,
-        operation_id=grant_operation,
-        resource_ref=grant_resource_ref,
-        arguments_digest_sha256=arguments_digest,
-        request_id=grant_request_id,
-    )
-    expected = {
-        "request_id": grant_request_id,
-        "organization_id": organization_id,
-        "workspace_id": workspace_id,
-        "principal_issuer": issuer,
-        "principal_subject": subject,
-        "connection_ref": str(proof_connection_id),
-        "provider_id": "github",
-        "profile_ref": github_profile_ref,
-        "operation_id": grant_operation,
-        "resource_ref": grant_resource_ref,
-        "arguments_digest_sha256": arguments_digest,
-    }
-    verifier.validate_authority_response(grant_bytes, expected=expected)
-    claims = verifier.consume(grant_bytes, expected=expected)
-    principal = IntegrationPrincipal(
-        issuer=claims.principal_issuer,
-        subject=claims.principal_subject,
-        organization_id=claims.organization_id,
-        workspace_id=claims.workspace_id,
-        allowed_operation_ids=frozenset(
-            {"navigator.connector.operator.v1", "integrationCreateConnection"}
-        ),
-    )
-
-    _validate_host_actor_scope(
-        principal,
-        services=services,
+    principal = authorize_connector_operator(
+        services,
         specification=specification,
+        proof_profile_ref=github_profile_ref,
+        proof_connection_ref=str(proof_connection_id),
     )
     _authorize_cloud_profile_targets(cloud_entries, principal, registry)
     if plan_only:
@@ -696,6 +644,82 @@ def _provision_cloud_connections(
             }
         )
     return result
+
+
+def authorize_connector_operator(
+    services: Any,
+    *,
+    specification: Mapping[str, Any],
+    proof_profile_ref: str,
+    proof_connection_ref: str,
+) -> IntegrationPrincipal:
+    """Verify one configured actor through the same fresh Directory proof as bootstrap.
+
+    The GitHub read operation is used only as the existing connector-operator
+    role proof. This helper never calls the provider or reuses the proof as a
+    profile-link or resource authorization. 中文：复用启动流程的实时目录角色校验。
+    """
+
+    authority = services.connector_grant_authority
+    verifier = services.connector_grant_verifier
+    if authority is None or verifier is None:
+        raise _bootstrap_error("connector_bootstrap_not_configured")
+    actor = _object(
+        specification.get("actor"),
+        required={"issuer", "subject", "organizationId", "workspaceId"},
+        label="bootstrap actor",
+    )
+    issuer = _text(actor["issuer"], "actor issuer")
+    subject = _text(actor["subject"], "actor subject")
+    organization_id = _text(actor["organizationId"], "actor organizationId")
+    workspace_id = _text(actor["workspaceId"], "actor workspaceId")
+    request_id = str(uuid4())
+    operation_id = "github.repository.list"
+    resource_ref = _resource_ref(
+        provider_id="github",
+        profile_ref=proof_profile_ref,
+        operation_id=operation_id,
+        target={"profile_ref": proof_profile_ref},
+    )
+    arguments_digest = bytes.fromhex(digest_arguments({}))
+    grant_bytes = authority.authorize_connector_operation(
+        workspace_id=workspace_id,
+        principal_issuer=issuer,
+        principal_subject=subject,
+        connection_ref=proof_connection_ref,
+        provider_id="github",
+        profile_ref=proof_profile_ref,
+        operation_id=operation_id,
+        resource_ref=resource_ref,
+        arguments_digest_sha256=arguments_digest,
+        request_id=request_id,
+    )
+    expected = {
+        "request_id": request_id,
+        "organization_id": organization_id,
+        "workspace_id": workspace_id,
+        "principal_issuer": issuer,
+        "principal_subject": subject,
+        "connection_ref": proof_connection_ref,
+        "provider_id": "github",
+        "profile_ref": proof_profile_ref,
+        "operation_id": operation_id,
+        "resource_ref": resource_ref,
+        "arguments_digest_sha256": arguments_digest,
+    }
+    verifier.validate_authority_response(grant_bytes, expected=expected)
+    claims = verifier.consume(grant_bytes, expected=expected)
+    principal = IntegrationPrincipal(
+        issuer=claims.principal_issuer,
+        subject=claims.principal_subject,
+        organization_id=claims.organization_id,
+        workspace_id=claims.workspace_id,
+        allowed_operation_ids=frozenset(
+            {"navigator.connector.operator.v1", "integrationCreateConnection"}
+        ),
+    )
+    _validate_host_actor_scope(principal, services=services, specification=specification)
+    return principal
 
 
 def _read_bootstrap_file(path: Path) -> dict[str, Any]:

@@ -21,6 +21,9 @@ from typing import Any
 from uuid import UUID
 
 from cyrene_exchange_product.errors import ExchangeProductError
+from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
+    validate_microsoft_graph_office_v2_scope,
+)
 from cyrene_exchange_product.integrations.azure_devops import (
     ADO_OBSERVATION_OPERATIONS,
 )
@@ -45,6 +48,7 @@ from cyrene_exchange_product.integrations.connector_security import (
     digest_arguments,
 )
 from cyrene_exchange_product.integrations.microsoft_graph import (
+    GRAPH_MUTATING_OPERATIONS,
     GRAPH_OPERATIONS,
     PLANNER_WRITE_OPERATIONS,
 )
@@ -159,31 +163,32 @@ _TOOL_IDS_BY_PROVIDER: Mapping[str, Mapping[str, str]] = {
         "computer.directory.list": "computer.directory.list",
     },
 }
-_MUTATING_OPERATIONS = frozenset(
-    {
-        "github.issue.comment.create",
-        "github.issue.state.update",
-        "github.branch.create",
-        "github.branch.delete",
-        "github.file.commit",
-        "github.pull_request.draft.create",
-        "github.actions.rerun_failed",
-        "computer.command.execute",
-        "computer.file.write",
-        "github.vendor.cli.execute",
-        "huggingface.file.upload",
-        "microsoft_graph.planner.task.create",
-        "microsoft_graph.planner.task.update",
-        "cloud.resource.create",
-        "cloud.resource.deploy",
-        "cloud.resource.start",
-        "cloud.resource.stop",
-        "cloud.resource.restart",
-        "cloud.resource.update",
-        "cloud.resource.delete",
-        "cloud.operation.cancel",
-        "cloud.vendor.cli.execute",
-    }
+_MUTATING_OPERATIONS = (
+    frozenset(
+        {
+            "github.issue.comment.create",
+            "github.issue.state.update",
+            "github.branch.create",
+            "github.branch.delete",
+            "github.file.commit",
+            "github.pull_request.draft.create",
+            "github.actions.rerun_failed",
+            "computer.command.execute",
+            "computer.file.write",
+            "github.vendor.cli.execute",
+            "huggingface.file.upload",
+            "cloud.resource.create",
+            "cloud.resource.deploy",
+            "cloud.resource.start",
+            "cloud.resource.stop",
+            "cloud.resource.restart",
+            "cloud.resource.update",
+            "cloud.resource.delete",
+            "cloud.operation.cancel",
+            "cloud.vendor.cli.execute",
+        }
+    )
+    | GRAPH_MUTATING_OPERATIONS
 )
 _CLI_SECRET_WORDS = frozenset(
     {"access-token", "api-key", "auth-token", "password", "secret", "token"}
@@ -453,11 +458,12 @@ class ConnectorOperationDispatcher:
             if self._registry is not None
             else None
         )
+        office_v2 = getattr(host_profile, "microsoft_graph_office_v2", None)
         if (
             host_profile is None
             or host_profile.provider != "microsoft_graph"
             or host_profile.access_mode != "actor_owned"
-            or not host_profile.microsoft_graph_plan_ids
+            or (not host_profile.microsoft_graph_plan_ids and office_v2 is None)
             or connection.target_ref is not None
         ):
             raise _connector_not_configured("microsoft_graph_host_plan_binding_missing")
@@ -501,28 +507,37 @@ class ConnectorOperationDispatcher:
                 detail="Account Center returned a mismatched Microsoft Graph identity or scope.",
                 status=502,
             ) from exc
-        if tuple(scope["planner"]["plan_ids"]) != host_profile.microsoft_graph_plan_ids:
-            raise PermissionError(
-                "Microsoft Graph profile plan scope does not match the host binding"
-            )
-        if scope["sharepoint"]["enabled"] and (
-            scope["sharepoint"]["site_id"] != host_profile.microsoft_graph_sharepoint_site_id
-            or tuple(scope["sharepoint"]["list_ids"])
-            != host_profile.microsoft_graph_sharepoint_list_ids
-        ):
-            raise PermissionError(
-                "Microsoft Graph profile SharePoint scope does not match the host binding"
-            )
-        if row["expires_at"] <= int(datetime.now(UTC).timestamp()):
-            raise ExchangeProductError(
-                code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
-                title="Microsoft Graph reauthorization required",
-                detail="The actor's delegated Graph access token has expired.",
-                status=409,
-                context={"reasonCode": "microsoft_graph_token_expired"},
-            )
+        if office_v2 is not None:
+            try:
+                scope = validate_microsoft_graph_office_v2_scope(
+                    host_profile,
+                    scope,
+                    principal,
+                )
+            except (PermissionError, ValueError) as exc:
+                raise PermissionError(
+                    "Microsoft Graph profile scope differs from the v2 host binding"
+                ) from exc
+        else:
+            if tuple(scope["planner"]["plan_ids"]) != host_profile.microsoft_graph_plan_ids:
+                raise PermissionError(
+                    "Microsoft Graph profile plan scope does not match the host binding"
+                )
+            if scope["sharepoint"]["enabled"] and (
+                scope["sharepoint"]["site_id"] != host_profile.microsoft_graph_sharepoint_site_id
+                or tuple(scope["sharepoint"]["list_ids"])
+                != host_profile.microsoft_graph_sharepoint_list_ids
+            ):
+                raise PermissionError(
+                    "Microsoft Graph profile SharePoint scope does not match the host binding"
+                )
         auth_status = row.get("auth_status")
-        if auth_status in {"reauthorization_required", "revoked"}:
+        refresh_expires_at = row.get("refresh_expires_at")
+        if auth_status in {"reauthorization_required", "revoked"} or (
+            isinstance(refresh_expires_at, int)
+            and not isinstance(refresh_expires_at, bool)
+            and refresh_expires_at <= int(datetime.now(UTC).timestamp())
+        ):
             raise ExchangeProductError(
                 code="EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED",
                 title="Microsoft Graph reauthorization required",
@@ -1259,6 +1274,7 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
                 if operation_id
                 in {
                     "microsoft_graph.planner.plan.get",
+                    "microsoft_graph.planner.plans.list",
                     "microsoft_graph.planner.tasks.list",
                 }
                 else "microsoft_graph_task"
@@ -1266,7 +1282,23 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
                 or operation_id == "microsoft_graph.planner.task.get"
                 else "microsoft_graph_site"
                 if operation_id == "microsoft_graph.sharepoint.site.get"
+                else "microsoft_graph_drive"
+                if operation_id == "microsoft_graph.sharepoint.drives.list"
+                else "microsoft_graph_drive_item"
+                if operation_id == "microsoft_graph.sharepoint.drive.items.list"
                 else "microsoft_graph_list"
+                if operation_id.startswith("microsoft_graph.sharepoint.list.")
+                else "microsoft_graph_todo_list"
+                if operation_id == "microsoft_graph.todo.lists.list"
+                else "microsoft_graph_todo_task"
+                if operation_id.startswith("microsoft_graph.todo.task")
+                or operation_id == "microsoft_graph.todo.tasks.list"
+                else "microsoft_graph_calendar"
+                if operation_id == "microsoft_graph.calendar.calendars.list"
+                else "microsoft_graph_event"
+                if operation_id.startswith("microsoft_graph.calendar.event")
+                or operation_id == "microsoft_graph.calendar.events.list"
+                else "microsoft_graph_freebusy"
             )
         elif provider == "azure_devops":
             projection = "azure_devops_source"
@@ -1441,6 +1473,57 @@ def _account_lease_target(
 ) -> dict[str, object]:
     """Return the Account Center-specific profile target for one one-use lease."""
 
+    if provider_id == "microsoft_graph":
+        graph_fields = {
+            "microsoft_graph.planner.plan.get": ("tenant_id", "plan_id"),
+            "microsoft_graph.planner.plans.list": ("tenant_id",),
+            "microsoft_graph.planner.tasks.list": ("tenant_id", "plan_id"),
+            "microsoft_graph.planner.task.get": ("tenant_id", "plan_id", "task_id"),
+            "microsoft_graph.planner.task.create": ("tenant_id", "plan_id", "bucket_id"),
+            "microsoft_graph.planner.task.update": ("tenant_id", "plan_id", "task_id"),
+            "microsoft_graph.sharepoint.site.get": ("tenant_id", "site_id"),
+            "microsoft_graph.sharepoint.list.get": ("tenant_id", "site_id", "list_id"),
+            "microsoft_graph.sharepoint.list.items.delta": (
+                "tenant_id",
+                "site_id",
+                "list_id",
+            ),
+            "microsoft_graph.todo.lists.list": ("tenant_id",),
+            "microsoft_graph.todo.tasks.list": ("tenant_id", "task_list_id"),
+            "microsoft_graph.todo.task.get": ("tenant_id", "task_list_id", "task_id"),
+            "microsoft_graph.todo.task.create": ("tenant_id", "task_list_id"),
+            "microsoft_graph.todo.task.update": ("tenant_id", "task_list_id", "task_id"),
+            "microsoft_graph.todo.task.delete": ("tenant_id", "task_list_id", "task_id"),
+            "microsoft_graph.calendar.calendars.list": ("tenant_id",),
+            "microsoft_graph.calendar.events.list": ("tenant_id", "calendar_id"),
+            "microsoft_graph.calendar.event.get": ("tenant_id", "calendar_id", "event_id"),
+            "microsoft_graph.calendar.event.create": (
+                "tenant_id",
+                "calendar_id",
+                "transaction_id",
+            ),
+            "microsoft_graph.calendar.event.update": (
+                "tenant_id",
+                "calendar_id",
+                "event_id",
+            ),
+            "microsoft_graph.calendar.event.delete": (
+                "tenant_id",
+                "calendar_id",
+                "event_id",
+            ),
+            "microsoft_graph.calendar.freebusy.get": ("tenant_id", "schedule_ids"),
+            "microsoft_graph.sharepoint.drives.list": ("tenant_id", "site_id"),
+            "microsoft_graph.sharepoint.drive.items.list": (
+                "tenant_id",
+                "site_id",
+                "drive_id",
+            ),
+        }
+        fields = graph_fields.get(operation_id)
+        if fields is None or any(field not in resource_projection for field in fields):
+            raise ValueError("Microsoft Graph Account Center lease target is incomplete")
+        return {field: resource_projection[field] for field in fields}
     if provider_id == "github" and operation_id == "github.repository.list":
         return {}
     hf_list_targets = {
