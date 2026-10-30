@@ -618,6 +618,7 @@ class AuthorizationHealthRecord(ContractModel):
     workspace_id: str
     actor_issuer: str
     actor_subject: str
+    external_subject: str | None = Field(default=None, max_length=1200)
     connection_id: UUID
     authorization_ref: str | None = Field(default=None, max_length=300)
     reason_code: str | None = Field(default=None, max_length=200)
@@ -625,8 +626,15 @@ class AuthorizationHealthRecord(ContractModel):
     authorization_state: AuthorizationState
     checked_at: datetime
     expires_at: datetime | None = None
+    refresh_expires_at: datetime | None = None
     generation: int = Field(ge=0)
     capabilities: list[AuthorizationCapabilityRecord] = Field(default_factory=list)
+    scope_schema_version: int | None = Field(default=None, ge=1, le=100)
+    enabled_features: list[str] = Field(default_factory=list)
+    required_oauth_scopes: list[str] = Field(default_factory=list)
+    target_ref_count: int = Field(default=0, ge=0)
+    reauth_required: bool = False
+    reauth_reason_code: str | None = Field(default=None, max_length=200)
 
 
 class RenewalSessionRecord(ContractModel):

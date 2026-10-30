@@ -20,12 +20,19 @@ from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations.clients import IntegrationAccountCenterPort
 from cyrene_exchange_product.integrations.connector_operations import (
     ConnectorOperationDispatcher,
+    _account_lease_target,
     _resource_ref,
 )
 from cyrene_exchange_product.integrations.connector_security import digest_arguments
 from cyrene_exchange_product.integrations.microsoft_graph import (
+    GRAPH_OPERATIONS,
     lease_arguments_for_operation,
+    profile_scope_metadata,
+    public_profile_scope,
+    required_graph_permissions,
+    required_oauth_scopes,
     target_for_operation,
+    validate_profile_identity,
     validate_profile_scope,
 )
 from cyrene_exchange_product.integrations.models import (
@@ -40,9 +47,15 @@ OTHER_OBJECT_ID = "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa"
 PROFILE_REF = "66666666-7777-4888-8999-aaaaaaaaaaaa"
 CONNECTION_ID = UUID("99999999-aaaa-4bbb-8ccc-dddddddddddd")
 WORKSPACE_ID = "graph-workspace"
+V2_WORKSPACE_ID = "33333333-4444-4555-8666-777777777777"
 ORGANIZATION_ID = "graph-organization"
 ISSUER = f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
 PLAN_ID = "xqQg5FS2LkCp935s-FIFm2QAFkHM"
+OFFICE_V2_SITE_ID = (
+    "contoso.sharepoint.com,22222222-3333-4444-8555-666666666666,"
+    "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+)
+OFFICE_V2_LIST_ID = "dddddddd-eeee-4fff-8000-111111111111"
 
 
 def _profile_scope(
@@ -70,11 +83,52 @@ def _profile_scope(
     }
 
 
+def _office_v2_scope() -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "tenant_id": TENANT_ID,
+        "workspace_id": V2_WORKSPACE_ID,
+        "planner": {"plan_ids": [], "tasks_read": True, "tasks_write": True},
+        "sharepoint": {
+            "enabled": True,
+            "site_id": OFFICE_V2_SITE_ID,
+            "list_ids": [],
+            "drive_ids": [],
+            "metadata_read": True,
+            "content_read": False,
+        },
+        "todo": {
+            "enabled": True,
+            "task_list_ids": [],
+            "tasks_read": True,
+            "tasks_write": True,
+        },
+        "calendar": {
+            "enabled": True,
+            "calendar_ids": [],
+            "events_read": True,
+            "events_write": True,
+            "freebusy_read": False,
+            "freebusy_subjects": [],
+            "attendees_write": False,
+        },
+        "mail": {
+            "enabled": False,
+            "folder_ids": [],
+            "metadata_read": False,
+            "body_read": False,
+            "drafts_write": False,
+            "send_enabled": False,
+        },
+    }
+
+
 def _account_profile(
     *,
     auth_status: str = "healthy",
     scope: dict[str, object] | None = None,
     expires_at: int | None = None,
+    refresh_expires_at: int | None = None,
 ) -> dict[str, object]:
     subject = f"{TENANT_ID}:{OBJECT_ID}"
     selected_scope = scope or _profile_scope()
@@ -92,6 +146,7 @@ def _account_profile(
         "auth_mode": "delegated_oauth",
         "access_mode": "actor_owned",
         "expires_at": expires_at or int((datetime.now(UTC) + timedelta(hours=1)).timestamp()),
+        "refresh_expires_at": refresh_expires_at,
         "oauth_scopes": oauth_scopes,
         "target_scope": selected_scope,
     }
@@ -259,6 +314,408 @@ def test_graph_profile_scope_is_exact_and_planner_write_requires_separate_consen
             sharepoint_scope,
         )
     assert other_list.value.context["reasonCode"] == "microsoft_graph_list_scope_mismatch"
+
+
+def test_office_v2_discovery_is_limited_to_safe_selected_account_metadata() -> None:
+    scope = validate_profile_scope(_office_v2_scope())
+    site_id = str(scope["sharepoint"]["site_id"])
+
+    assert target_for_operation("microsoft_graph.planner.plans.list", {}, scope) == {
+        "tenant_id": TENANT_ID
+    }
+    assert target_for_operation("microsoft_graph.todo.lists.list", {}, scope) == {
+        "tenant_id": TENANT_ID,
+        "task_list_ids": [],
+    }
+    assert target_for_operation("microsoft_graph.calendar.calendars.list", {}, scope) == {
+        "tenant_id": TENANT_ID,
+        "calendar_ids": [],
+    }
+    assert target_for_operation(
+        "microsoft_graph.sharepoint.drives.list",
+        {"site_id": site_id},
+        scope,
+    ) == {"tenant_id": TENANT_ID, "site_id": site_id, "drive_ids": []}
+    assert required_graph_permissions(scope) == (
+        "Calendars.ReadWrite",
+        "Sites.Selected",
+        "Tasks.ReadWrite",
+        "User.Read",
+    )
+    assert required_oauth_scopes(scope) == (
+        "Calendars.ReadWrite",
+        "Sites.Selected",
+        "Tasks.ReadWrite",
+        "User.Read",
+        "offline_access",
+    )
+
+    with pytest.raises(ExchangeProductError) as outside_list:
+        target_for_operation(
+            "microsoft_graph.todo.tasks.list",
+            {"task_list_id": "list-not-yet-selected"},
+            scope,
+        )
+    assert outside_list.value.context["reasonCode"] == "microsoft_graph_todo_list_scope_mismatch"
+    with pytest.raises(ExchangeProductError) as mail_denied:
+        target_for_operation("microsoft_graph.mail.message.send", {"message_id": "m1"}, scope)
+    assert mail_denied.value.context["reasonCode"] == "microsoft_graph_operation_not_allowlisted"
+
+
+def test_office_v2_selected_targets_gate_writes_and_bind_their_lease_digest() -> None:
+    scope = _office_v2_scope()
+    scope["todo"] = {
+        "enabled": True,
+        "task_list_ids": ["AAMkList-opaque=="],
+        "tasks_read": True,
+        "tasks_write": True,
+    }
+    scope["calendar"] = {
+        **scope["calendar"],
+        "calendar_ids": ["AAMkCalendar-opaque=="],
+    }
+    scope["sharepoint"] = {
+        **scope["sharepoint"],
+        "drive_ids": ["b!drive-opaque=="],
+    }
+    normalized = validate_profile_scope(scope)
+    todo_args = {"task_list_id": "AAMkList-opaque==", "title": "Prepare review"}
+    todo_target = target_for_operation("microsoft_graph.todo.task.create", todo_args, normalized)
+    assert todo_target == {"tenant_id": TENANT_ID, "task_list_id": "AAMkList-opaque=="}
+    assert lease_arguments_for_operation("microsoft_graph.todo.task.create", todo_args) == {
+        "title": "Prepare review"
+    }
+
+    event_args = {
+        "calendar_id": "AAMkCalendar-opaque==",
+        "subject": "Design review",
+        "start_date_time": "2026-11-02T10:00:00-05:00",
+        "end_date_time": "2026-11-02T10:30:00-05:00",
+        "transaction_id": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+    }
+    event_target = target_for_operation(
+        "microsoft_graph.calendar.event.create", event_args, normalized
+    )
+    assert event_target == {
+        "tenant_id": TENANT_ID,
+        "calendar_id": "AAMkCalendar-opaque==",
+        "transaction_id": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+    }
+    assert lease_arguments_for_operation("microsoft_graph.calendar.event.create", event_args) == {
+        "subject": "Design review",
+        "start_date_time": "2026-11-02T10:00:00-05:00",
+        "end_date_time": "2026-11-02T10:30:00-05:00",
+    }
+    with pytest.raises(ValueError, match="arguments do not match"):
+        target_for_operation(
+            "microsoft_graph.calendar.event.create",
+            {**event_args, "attendees": ["coworker@example.com"]},
+            normalized,
+        )
+
+    sharepoint_target = target_for_operation(
+        "microsoft_graph.sharepoint.drive.items.list",
+        {"site_id": normalized["sharepoint"]["site_id"], "drive_id": "b!drive-opaque=="},
+        normalized,
+    )
+    assert sharepoint_target["drive_id"] == "b!drive-opaque=="
+
+
+def test_all_graph_operations_project_exact_account_center_lease_targets() -> None:
+    scope = _office_v2_scope()
+    scope["planner"]["plan_ids"] = [PLAN_ID]
+    scope["sharepoint"]["list_ids"] = [OFFICE_V2_LIST_ID]
+    scope["sharepoint"]["drive_ids"] = ["b!drive-opaque=="]
+    scope["todo"]["task_list_ids"] = ["AAMkList-opaque=="]
+    scope["calendar"].update(
+        {
+            "calendar_ids": ["AAMkCalendar-opaque=="],
+            "freebusy_read": True,
+            "freebusy_subjects": ["Person@DoHorizon.com"],
+        }
+    )
+    site_id = scope["sharepoint"]["site_id"]
+    list_id = OFFICE_V2_LIST_ID
+    task_list_id = "AAMkList-opaque=="
+    calendar_id = "AAMkCalendar-opaque=="
+    transaction_id = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    event_window = {
+        "start_date_time": "2026-11-02T10:00:00-05:00",
+        "end_date_time": "2026-11-02T10:30:00-05:00",
+    }
+    cases = {
+        "microsoft_graph.planner.plan.get": (
+            {"plan_id": PLAN_ID},
+            {"tenant_id": TENANT_ID, "plan_id": PLAN_ID},
+        ),
+        "microsoft_graph.planner.plans.list": (
+            {"page_size": 10},
+            {"tenant_id": TENANT_ID},
+        ),
+        "microsoft_graph.planner.tasks.list": (
+            {"plan_id": PLAN_ID, "page_size": 10},
+            {"tenant_id": TENANT_ID, "plan_id": PLAN_ID},
+        ),
+        "microsoft_graph.planner.task.get": (
+            {"plan_id": PLAN_ID, "task_id": "task_A2b"},
+            {"tenant_id": TENANT_ID, "plan_id": PLAN_ID, "task_id": "task_A2b"},
+        ),
+        "microsoft_graph.planner.task.create": (
+            {"plan_id": PLAN_ID, "bucket_id": "bucket_936w-A2b", "title": "Review"},
+            {"tenant_id": TENANT_ID, "plan_id": PLAN_ID, "bucket_id": "bucket_936w-A2b"},
+        ),
+        "microsoft_graph.planner.task.update": (
+            {
+                "plan_id": PLAN_ID,
+                "task_id": "task_A2b",
+                "if_match": "etag-1",
+                "changes": {"title": "Updated"},
+            },
+            {"tenant_id": TENANT_ID, "plan_id": PLAN_ID, "task_id": "task_A2b"},
+        ),
+        "microsoft_graph.sharepoint.site.get": (
+            {"site_id": site_id},
+            {"tenant_id": TENANT_ID, "site_id": site_id},
+        ),
+        "microsoft_graph.sharepoint.list.get": (
+            {"site_id": site_id, "list_id": list_id},
+            {"tenant_id": TENANT_ID, "site_id": site_id, "list_id": list_id},
+        ),
+        "microsoft_graph.sharepoint.list.items.delta": (
+            {"site_id": site_id, "list_id": list_id, "page_size": 10},
+            {"tenant_id": TENANT_ID, "site_id": site_id, "list_id": list_id},
+        ),
+        "microsoft_graph.todo.lists.list": (
+            {"page_size": 10},
+            {"tenant_id": TENANT_ID},
+        ),
+        "microsoft_graph.todo.tasks.list": (
+            {"task_list_id": task_list_id, "page_size": 10},
+            {"tenant_id": TENANT_ID, "task_list_id": task_list_id},
+        ),
+        "microsoft_graph.todo.task.get": (
+            {"task_list_id": task_list_id, "task_id": "AAMkTask-opaque=="},
+            {"tenant_id": TENANT_ID, "task_list_id": task_list_id, "task_id": "AAMkTask-opaque=="},
+        ),
+        "microsoft_graph.todo.task.create": (
+            {"task_list_id": task_list_id, "title": "Prepare review"},
+            {"tenant_id": TENANT_ID, "task_list_id": task_list_id},
+        ),
+        "microsoft_graph.todo.task.update": (
+            {
+                "task_list_id": task_list_id,
+                "task_id": "AAMkTask-opaque==",
+                "if_match": "etag-1",
+                "changes": {"title": "Updated"},
+            },
+            {"tenant_id": TENANT_ID, "task_list_id": task_list_id, "task_id": "AAMkTask-opaque=="},
+        ),
+        "microsoft_graph.todo.task.delete": (
+            {
+                "task_list_id": task_list_id,
+                "task_id": "AAMkTask-opaque==",
+                "if_match": "etag-1",
+            },
+            {"tenant_id": TENANT_ID, "task_list_id": task_list_id, "task_id": "AAMkTask-opaque=="},
+        ),
+        "microsoft_graph.calendar.calendars.list": (
+            {"page_size": 10},
+            {"tenant_id": TENANT_ID},
+        ),
+        "microsoft_graph.calendar.events.list": (
+            {"calendar_id": calendar_id, **event_window, "page_size": 10},
+            {"tenant_id": TENANT_ID, "calendar_id": calendar_id},
+        ),
+        "microsoft_graph.calendar.event.get": (
+            {"calendar_id": calendar_id, "event_id": "AAMkEvent-opaque=="},
+            {"tenant_id": TENANT_ID, "calendar_id": calendar_id, "event_id": "AAMkEvent-opaque=="},
+        ),
+        "microsoft_graph.calendar.event.create": (
+            {
+                "calendar_id": calendar_id,
+                "subject": "Design review",
+                **event_window,
+                "transaction_id": transaction_id,
+            },
+            {
+                "tenant_id": TENANT_ID,
+                "calendar_id": calendar_id,
+                "transaction_id": transaction_id,
+            },
+        ),
+        "microsoft_graph.calendar.event.update": (
+            {
+                "calendar_id": calendar_id,
+                "event_id": "AAMkEvent-opaque==",
+                "if_match": "etag-1",
+                "changes": {"subject": "Updated"},
+            },
+            {"tenant_id": TENANT_ID, "calendar_id": calendar_id, "event_id": "AAMkEvent-opaque=="},
+        ),
+        "microsoft_graph.calendar.event.delete": (
+            {
+                "calendar_id": calendar_id,
+                "event_id": "AAMkEvent-opaque==",
+                "if_match": "etag-1",
+            },
+            {"tenant_id": TENANT_ID, "calendar_id": calendar_id, "event_id": "AAMkEvent-opaque=="},
+        ),
+        "microsoft_graph.calendar.freebusy.get": (
+            {
+                "schedules": ["PERSON@DOHORIZON.COM"],
+                "start_date_time": "2026-11-02T10:00:00-05:00",
+                "end_date_time": "2026-11-02T10:30:00-05:00",
+                "interval_minutes": 15,
+            },
+            {"tenant_id": TENANT_ID, "schedule_ids": ["person@dohorizon.com"]},
+        ),
+        "microsoft_graph.sharepoint.drives.list": (
+            {"site_id": site_id, "page_size": 10},
+            {"tenant_id": TENANT_ID, "site_id": site_id},
+        ),
+        "microsoft_graph.sharepoint.drive.items.list": (
+            {
+                "site_id": site_id,
+                "drive_id": "b!drive-opaque==",
+                "parent_item_id": "folder!opaque==",
+                "page_size": 10,
+            },
+            {"tenant_id": TENANT_ID, "site_id": site_id, "drive_id": "b!drive-opaque=="},
+        ),
+    }
+
+    assert set(cases) == GRAPH_OPERATIONS
+    for operation_id, (arguments, expected_lease_target) in cases.items():
+        resource_projection = target_for_operation(operation_id, arguments, scope)
+        assert set(expected_lease_target) <= set(resource_projection)
+        resource_ref = _resource_ref(
+            provider_id="microsoft_graph",
+            profile_ref=PROFILE_REF,
+            operation_id=operation_id,
+            target=resource_projection,
+        )
+        assert resource_ref.startswith("sha256:")
+        lease_target = _account_lease_target(
+            "microsoft_graph",
+            operation_id,
+            resource_projection,
+            arguments,
+        )
+        assert lease_target == expected_lease_target, operation_id
+
+    assert cases["microsoft_graph.todo.lists.list"][1] == {"tenant_id": TENANT_ID}
+    assert cases["microsoft_graph.calendar.calendars.list"][1] == {"tenant_id": TENANT_ID}
+    assert cases["microsoft_graph.sharepoint.drives.list"][1] == {
+        "tenant_id": TENANT_ID,
+        "site_id": site_id,
+    }
+    assert target_for_operation(
+        "microsoft_graph.todo.lists.list",
+        cases["microsoft_graph.todo.lists.list"][0],
+        scope,
+    ) == {"tenant_id": TENANT_ID, "task_list_ids": [task_list_id]}
+    assert target_for_operation(
+        "microsoft_graph.calendar.calendars.list",
+        cases["microsoft_graph.calendar.calendars.list"][0],
+        scope,
+    ) == {"tenant_id": TENANT_ID, "calendar_ids": [calendar_id]}
+    assert target_for_operation(
+        "microsoft_graph.sharepoint.drives.list",
+        cases["microsoft_graph.sharepoint.drives.list"][0],
+        scope,
+    ) == {
+        "tenant_id": TENANT_ID,
+        "site_id": site_id,
+        "drive_ids": ["b!drive-opaque=="],
+    }
+    drive_arguments = cases["microsoft_graph.sharepoint.drive.items.list"][0]
+    assert (
+        target_for_operation(
+            "microsoft_graph.sharepoint.drive.items.list",
+            drive_arguments,
+            scope,
+        )["parent_item_id"]
+        == "folder!opaque=="
+    )
+    assert (
+        lease_arguments_for_operation(
+            "microsoft_graph.sharepoint.drive.items.list",
+            drive_arguments,
+        )["parent_item_id"]
+        == "folder!opaque=="
+    )
+
+
+def test_office_v2_identity_is_pinned_to_tenant_owner_and_workspace() -> None:
+    scope = _office_v2_scope()
+    profile = {
+        "profile_ref": PROFILE_REF,
+        "provider": "microsoft_graph",
+        "identity_ref": f"{TENANT_ID}:{OBJECT_ID}",
+        "external_subject": f"{TENANT_ID}:{OBJECT_ID}",
+        "auth_status": "healthy",
+        "auth_mode": "delegated_oauth",
+        "access_mode": "actor_owned",
+        "expires_at": int((datetime.now(UTC) + timedelta(hours=1)).timestamp()),
+        "refresh_expires_at": None,
+        "oauth_scopes": list(required_graph_permissions(scope)),
+        "target_scope": scope,
+    }
+    principal = IntegrationPrincipal(
+        issuer=ISSUER,
+        subject=OBJECT_ID,
+        organization_id=ORGANIZATION_ID,
+        workspace_id=V2_WORKSPACE_ID,
+        allowed_operation_ids=frozenset({"microsoft_graph.todo.lists.list"}),
+    )
+    validated = validate_profile_scope(scope)
+    assert public_profile_scope(validated)["workspaceId"] == V2_WORKSPACE_ID
+    assert validate_profile_identity(profile, profile_ref=PROFILE_REF, principal=principal)
+    metadata = profile_scope_metadata(profile, validated)
+    assert metadata["scope_schema_version"] == 2
+    assert metadata["refresh_expires_at"] is None
+    assert metadata["reauth_required"] is False
+
+    wrong_workspace = IntegrationPrincipal(
+        issuer=ISSUER,
+        subject=OBJECT_ID,
+        organization_id=ORGANIZATION_ID,
+        workspace_id="44444444-5555-4666-8777-888888888888",
+        allowed_operation_ids=frozenset({"microsoft_graph.todo.lists.list"}),
+    )
+    with pytest.raises(ValueError, match="another workspace"):
+        validate_profile_identity(profile, profile_ref=PROFILE_REF, principal=wrong_workspace)
+
+    profile["oauth_scopes"] = [
+        "User.Read",
+        "Mail.Send",
+        "Tasks.ReadWrite",
+        "Sites.Selected",
+        "Calendars.ReadWrite",
+    ]
+    with pytest.raises(ValueError, match="OAuth scopes"):
+        validate_profile_identity(profile, profile_ref=PROFILE_REF, principal=principal)
+
+
+def test_office_v2_profile_never_accepts_mail_body_reads() -> None:
+    scope = _office_v2_scope()
+    scope["mail"]["body_read"] = True
+
+    with pytest.raises(ValueError, match="Mail body reads are disabled"):
+        validate_profile_scope(scope)
+
+
+def test_office_v2_write_scope_covers_read_on_other_enabled_task_feature() -> None:
+    scope = _office_v2_scope()
+    scope["planner"]["tasks_write"] = False
+    scope["todo"]["tasks_write"] = True
+
+    assert set(required_graph_permissions(scope)) == {
+        "User.Read",
+        "Tasks.ReadWrite",
+        "Sites.Selected",
+        "Calendars.ReadWrite",
+    }
 
 
 @pytest.mark.parametrize(
@@ -595,12 +1052,42 @@ def test_graph_reauthorization_state_is_a_conflict_before_lease_creation() -> No
     assert accounts.lease_requests == []
 
 
-def test_graph_expired_profile_is_reauthorization_required_before_lease_creation() -> None:
+def test_graph_expired_access_token_remains_usable_when_account_center_can_refresh() -> None:
     operation_id = "microsoft_graph.planner.tasks.list"
     principal = _principal(operation_id=operation_id)
     expired_at = int((datetime.now(UTC) - timedelta(minutes=1)).timestamp())
     connection, accounts, _provider, dispatcher = _dispatcher(
         _account_profile(expires_at=expired_at)
+    )
+    arguments: dict[str, object] = {"plan_id": PLAN_ID}
+    target = target_for_operation(operation_id, arguments, _profile_scope())
+
+    prepared = dispatcher.prepare_connection_operation(
+        principal=principal,
+        connection=connection,
+        provider_id="microsoft_graph",
+        profile_ref=PROFILE_REF,
+        operation_id=operation_id,
+        resource_ref=_resource_ref(
+            provider_id="microsoft_graph",
+            profile_ref=PROFILE_REF,
+            operation_id=operation_id,
+            target=target,
+        ),
+        arguments=arguments,
+        request_id="request-graph-expired-access-refreshable",
+    )
+
+    assert prepared.operation_id == operation_id
+    assert accounts.lease_requests == []
+
+
+def test_graph_expired_refresh_token_requires_reauthorization_before_lease() -> None:
+    operation_id = "microsoft_graph.planner.tasks.list"
+    principal = _principal(operation_id=operation_id)
+    expired_refresh = int((datetime.now(UTC) - timedelta(minutes=1)).timestamp())
+    connection, accounts, _provider, dispatcher = _dispatcher(
+        _account_profile(refresh_expires_at=expired_refresh)
     )
     arguments: dict[str, object] = {"plan_id": PLAN_ID}
     target = target_for_operation(operation_id, arguments, _profile_scope())
@@ -619,11 +1106,11 @@ def test_graph_expired_profile_is_reauthorization_required_before_lease_creation
                 target=target,
             ),
             arguments=arguments,
-            request_id="request-graph-expired-profile",
+            request_id="request-graph-expired-refresh",
         )
 
     assert expired.value.code == "EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED"
-    assert expired.value.context["reasonCode"] == "microsoft_graph_token_expired"
+    assert expired.value.context["reasonCode"] == "microsoft_graph_reauthorization_required"
     assert accounts.lease_requests == []
 
 

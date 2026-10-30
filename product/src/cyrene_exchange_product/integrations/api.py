@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from functools import partial
 from math import floor
 from typing import Annotated, Any, Literal, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Header, Query, Request
@@ -37,6 +37,9 @@ from pydantic import (
 from pydantic.alias_generators import to_camel
 
 from cyrene_exchange_product.errors import ExchangeProductError
+from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
+    microsoft_graph_office_v2_scope,
+)
 from cyrene_exchange_product.integrations.azure_devops import (
     public_profile_scope as azure_devops_public_profile_scope,
 )
@@ -60,6 +63,12 @@ from cyrene_exchange_product.integrations.connector_security import (
     digest_arguments,
     navigator_hmac_body_limit,
     parse_signed_json_object,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    OFFICE_V2_REDIRECT_URI,
+)
+from cyrene_exchange_product.integrations.microsoft_graph import (
+    profile_scope_metadata as microsoft_graph_profile_scope_metadata,
 )
 from cyrene_exchange_product.integrations.microsoft_graph import (
     public_profile_scope as microsoft_graph_public_profile_scope,
@@ -609,6 +618,7 @@ class AuthorizationHealthResponse(_HttpResponseModel):
 
     connection_id: str = Field(alias="connectionId")
     provider: ProviderId
+    external_subject: str | None = Field(default=None, alias="externalSubject")
     authorization_ref: str | None = Field(default=None, alias="authorizationRef")
     login_state: Literal["PRESENT", "MISSING", "UNKNOWN", "UNAVAILABLE"] = Field(alias="loginState")
     authorization_state: Literal[
@@ -616,9 +626,16 @@ class AuthorizationHealthResponse(_HttpResponseModel):
     ] = Field(alias="authorizationState")
     checked_at: datetime | None = Field(default=None, alias="checkedAt")
     expires_at: datetime | None = Field(default=None, alias="expiresAt")
+    refresh_expires_at: datetime | None = Field(default=None, alias="refreshExpiresAt")
     generation: int = Field(ge=0)
     capabilities: list[AuthorizationCapabilityResponse]
     reason_code: str | None = Field(default=None, alias="reasonCode")
+    scope_schema_version: int | None = Field(default=None, alias="scopeSchemaVersion")
+    enabled_features: list[str] = Field(default_factory=list, alias="enabledFeatures")
+    required_oauth_scopes: list[str] = Field(default_factory=list, alias="requiredOAuthScopes")
+    target_ref_count: int = Field(default=0, ge=0, alias="targetRefCount")
+    reauth_required: bool = Field(default=False, alias="reauthRequired")
+    reauth_reason_code: str | None = Field(default=None, alias="reauthReasonCode")
 
 
 class AuthorizationHealthSnapshotConnectionResponse(_HttpResponseModel):
@@ -628,15 +645,23 @@ class AuthorizationHealthSnapshotConnectionResponse(_HttpResponseModel):
 
     connection_id: UUID = Field(alias="connectionId")
     provider: ProviderId
+    external_subject: str | None = Field(default=None, alias="externalSubject")
     login_state: Literal["PRESENT", "MISSING", "UNKNOWN", "UNAVAILABLE"] = Field(alias="loginState")
     authorization_state: Literal[
         "VALID", "REAUTHORIZATION_REQUIRED", "PERMISSION_DENIED", "UNKNOWN", "UNAVAILABLE"
     ] = Field(alias="authorizationState")
     checked_at: datetime | None = Field(default=None, alias="checkedAt")
     expires_at: datetime | None = Field(default=None, alias="expiresAt")
+    refresh_expires_at: datetime | None = Field(default=None, alias="refreshExpiresAt")
     generation: int = Field(ge=0)
     capabilities: list[AuthorizationCapabilityResponse] = Field(max_length=100)
     reason_code: str | None = Field(default=None, alias="reasonCode")
+    scope_schema_version: int | None = Field(default=None, alias="scopeSchemaVersion")
+    enabled_features: list[str] = Field(default_factory=list, alias="enabledFeatures")
+    required_oauth_scopes: list[str] = Field(default_factory=list, alias="requiredOAuthScopes")
+    target_ref_count: int = Field(default=0, ge=0, alias="targetRefCount")
+    reauth_required: bool = Field(default=False, alias="reauthRequired")
+    reauth_reason_code: str | None = Field(default=None, alias="reauthReasonCode")
 
 
 class AuthorizationHealthSnapshotResponse(_HttpResponseModel):
@@ -1899,7 +1924,12 @@ def _azure_devops_profile_for_actor(
     return row, scope
 
 
-def _microsoft_graph_oauth_session_response(result: Mapping[str, Any]) -> dict[str, Any]:
+def _microsoft_graph_oauth_session_response(
+    result: Mapping[str, Any],
+    *,
+    profile_ref: str | None = None,
+    expected_redirect_uri: str | None = None,
+) -> dict[str, Any]:
     """Project one Account Center Graph OAuth session after URL and expiry checks."""
 
     session_ref = result.get("link_session_ref")
@@ -1930,6 +1960,7 @@ def _microsoft_graph_oauth_session_response(result: Mapping[str, Any]) -> dict[s
             r"/(?:common|organizations|[0-9a-fA-F-]{36})/oauth2/v2\.0/authorize",
             parsed.path,
         )
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
         valid_tenant = path_parts[1]
         if valid_tenant not in {"common", "organizations"}:
             UUID(valid_tenant)
@@ -1957,8 +1988,25 @@ def _microsoft_graph_oauth_session_response(result: Mapping[str, Any]) -> dict[s
             detail="Account Center returned a Microsoft authorization URL outside the fixed route.",
             status=502,
         )
+    if expected_redirect_uri is not None:
+        redirect_values = [value for key, value in query_pairs if key == "redirect_uri"]
+        response_modes = [value for key, value in query_pairs if key == "response_mode"]
+        if (
+            redirect_values != [expected_redirect_uri]
+            or len(response_modes) > 1
+            or (response_modes and response_modes[0] != "query")
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail=(
+                    "Account Center returned a Microsoft authorization URL outside the fixed route."
+                ),
+                status=502,
+            )
     return {
         "linkSessionRef": session_ref,
+        **({"profileRef": profile_ref} if profile_ref is not None else {}),
         "authorizationUrl": authorization_url,
         "expiresAt": _http_utc_timestamp(datetime.fromtimestamp(expires_at, UTC)),
     }
@@ -1977,6 +2025,8 @@ def _linked_provider_profile_response(
     auth_status = result.get("auth_status")
     external_subject = result.get("external_subject")
     expires_at = result.get("expires_at")
+    refresh_expires_at = result.get("refresh_expires_at")
+    credential_revision = result.get("credential_revision")
     auth_mode = result.get("auth_mode")
     access_mode = result.get("access_mode", "actor_owned")
     if (
@@ -1999,6 +2049,22 @@ def _linked_provider_profile_response(
         or (
             expires_at is not None
             and (isinstance(expires_at, bool) or not isinstance(expires_at, int))
+        )
+        or (
+            refresh_expires_at is not None
+            and (
+                isinstance(refresh_expires_at, bool)
+                or not isinstance(refresh_expires_at, int)
+                or refresh_expires_at <= 0
+            )
+        )
+        or (
+            credential_revision is not None
+            and (
+                isinstance(credential_revision, bool)
+                or not isinstance(credential_revision, int)
+                or credential_revision < 0
+            )
         )
         or not isinstance(access_mode, str)
         or access_mode not in {"actor_owned", "workspace_operator"}
@@ -2054,6 +2120,24 @@ def _linked_provider_profile_response(
                 status=502,
             ) from exc
         projection["targetScope"] = microsoft_graph_public_profile_scope(scope)
+        metadata = microsoft_graph_profile_scope_metadata(result, scope)
+        projection.update(
+            {
+                "scopeSchemaVersion": metadata["scope_schema_version"],
+                "enabledFeatures": metadata["enabled_features"],
+                "requiredOAuthScopes": metadata["required_oauth_scopes"],
+                "targetRefCount": metadata["target_ref_count"],
+                "credentialExpiresAt": projection["expiresAt"],
+                "refreshExpiresAt": (
+                    _http_utc_timestamp(datetime.fromtimestamp(refresh_expires_at, UTC))
+                    if refresh_expires_at is not None
+                    else None
+                ),
+                "reauthRequired": metadata["reauth_required"],
+                "reauthReasonCode": metadata["reauth_reason_code"],
+                "credentialRevision": credential_revision,
+            }
+        )
     elif expected_provider == "azure_devops":
         if auth_status != "healthy" or access_mode != "actor_owned":
             raise ExchangeProductError(
@@ -2457,17 +2541,29 @@ def create_router(services: IntegrationServices) -> APIRouter:
         host_profile = (
             registry.settings.profiles.get(body.binding_ref) if registry is not None else None
         )
+        office_v2_scope = None
+        if host_profile is not None and host_profile.microsoft_graph_office_v2 is not None:
+            try:
+                office_v2_scope = microsoft_graph_office_v2_scope(host_profile, actor)
+            except (PermissionError, ValueError) as exc:
+                raise ExchangeProductError(
+                    code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_UNAVAILABLE",
+                    title="Microsoft Graph provider is not configured",
+                    detail="The fixed Graph v2 owner and Workspace scope is invalid.",
+                    status=503,
+                    retryable=True,
+                ) from exc
         if (
             host_profile is None
             or host_profile.provider != "microsoft_graph"
             or host_profile.access_mode != "actor_owned"
-            or not host_profile.microsoft_graph_plan_ids
+            or (not host_profile.microsoft_graph_plan_ids and office_v2_scope is None)
             or not registry.principal_allowed_for_profile(actor, host_profile)
         ):
             raise ExchangeProductError(
                 code="EXCHANGE_CONNECTOR_PROVIDER_CONFIGURATION_UNAVAILABLE",
                 title="Microsoft Graph provider is not configured",
-                detail="Select a fixed Graph binding with host-authorized Planner plan IDs.",
+                detail="Select a fixed actor-owned Microsoft Graph v1 or v2 binding.",
                 status=503,
                 retryable=True,
             )
@@ -2475,10 +2571,19 @@ def create_router(services: IntegrationServices) -> APIRouter:
         result = services.accounts.begin_microsoft_graph_link(
             actor,
             profile_ref=profile_ref,
-            planner_plan_ids=list(host_profile.microsoft_graph_plan_ids),
+            planner_plan_ids=(
+                list(office_v2_scope["planner"]["plan_ids"])
+                if office_v2_scope is not None
+                else list(host_profile.microsoft_graph_plan_ids)
+            ),
             idempotency_key=idempotency_key,
+            office_v2_scope=office_v2_scope,
         )
-        return _microsoft_graph_oauth_session_response(result)
+        return _microsoft_graph_oauth_session_response(
+            result,
+            profile_ref=profile_ref,
+            expected_redirect_uri=(OFFICE_V2_REDIRECT_URI if office_v2_scope is not None else None),
+        )
 
     @router.post(
         "/api/v1/accounts/provider-profiles/azure-devops/link-sessions",
@@ -2741,6 +2846,8 @@ def create_router(services: IntegrationServices) -> APIRouter:
     async def list_provider_profiles(
         request: Request,
         workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        provider_filter: str | None = Query(default=None, alias="provider"),
+        profile_ref_filter: str | None = Query(default=None, alias="profileRef"),
     ) -> dict[str, Any]:
         actor = await principal(
             request,
@@ -2748,6 +2855,27 @@ def create_router(services: IntegrationServices) -> APIRouter:
             operation_id="navigator.connector.operator.v1",
         )
         require(actor, "navigator.connector.operator.v1")
+        if provider_filter is not None and provider_filter not in {
+            "huggingface",
+            "microsoft_graph",
+            "azure_devops",
+        }:
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                title="Provider selector is invalid",
+                detail="Select a supported provider profile type.",
+                status=422,
+            )
+        if profile_ref_filter is not None and (
+            not isinstance(profile_ref_filter, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,299}", profile_ref_filter)
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                title="Profile selector is invalid",
+                detail="Select one opaque provider profile reference.",
+                status=422,
+            )
         result = services.accounts.list_provider_profiles(actor)
         profiles = result.get("profiles") if isinstance(result, Mapping) else None
         if not isinstance(profiles, list):
@@ -2768,6 +2896,10 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 )
             profile_ref = item.get("profile_ref")
             provider = item.get("provider")
+            if provider_filter is not None and provider != provider_filter:
+                continue
+            if profile_ref_filter is not None and profile_ref != profile_ref_filter:
+                continue
             identity_ref = item.get("identity_ref")
             auth_status = item.get("auth_status")
             auth_mode = item.get("auth_mode")
@@ -2822,6 +2954,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         principal=actor,
                     )
                     target_scope = microsoft_graph_public_profile_scope(graph_scope)
+                    scope_metadata = microsoft_graph_profile_scope_metadata(item, graph_scope)
                 except ValueError as exc:
                     raise ExchangeProductError(
                         code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
@@ -2876,6 +3009,33 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         else None
                     ),
                     **({"authMode": auth_mode} if isinstance(auth_mode, str) else {}),
+                    **(
+                        {
+                            "scopeSchemaVersion": scope_metadata["scope_schema_version"],
+                            "enabledFeatures": scope_metadata["enabled_features"],
+                            "requiredOAuthScopes": scope_metadata["required_oauth_scopes"],
+                            "targetRefCount": scope_metadata["target_ref_count"],
+                            "credentialExpiresAt": (
+                                _http_utc_timestamp(datetime.fromtimestamp(item["expires_at"], UTC))
+                                if isinstance(item.get("expires_at"), int)
+                                and not isinstance(item.get("expires_at"), bool)
+                                else None
+                            ),
+                            "refreshExpiresAt": (
+                                _http_utc_timestamp(
+                                    datetime.fromtimestamp(item["refresh_expires_at"], UTC)
+                                )
+                                if isinstance(item.get("refresh_expires_at"), int)
+                                and not isinstance(item.get("refresh_expires_at"), bool)
+                                else None
+                            ),
+                            "reauthRequired": scope_metadata["reauth_required"],
+                            "reauthReasonCode": scope_metadata["reauth_reason_code"],
+                            "credentialRevision": item.get("credential_revision"),
+                        }
+                        if provider == "microsoft_graph"
+                        else {}
+                    ),
                 }
             )
         return {"profiles": projected}
@@ -4174,28 +4334,44 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 "connectionId": str(connection.id),
                 "provider": connection.provider,
                 "authorizationRef": None,
+                "externalSubject": None,
                 "loginState": LoginState.UNKNOWN.value,
                 "authorizationState": AuthorizationState.UNKNOWN.value,
                 "checkedAt": None,
                 "expiresAt": None,
+                "refreshExpiresAt": None,
                 "generation": 0,
                 "capabilities": [],
                 "reasonCode": "not_observed",
+                "scopeSchemaVersion": None,
+                "enabledFeatures": [],
+                "requiredOAuthScopes": [],
+                "targetRefCount": 0,
+                "reauthRequired": False,
+                "reauthReasonCode": None,
             }
         return {
             "connectionId": str(connection.id),
             "provider": connection.provider,
             "authorizationRef": health.authorization_ref,
+            "externalSubject": health.external_subject,
             "loginState": health.login_state.value,
             "authorizationState": health.authorization_state.value,
             "checkedAt": health.checked_at,
             "expiresAt": health.expires_at,
+            "refreshExpiresAt": health.refresh_expires_at,
             "generation": health.generation,
             "capabilities": [
                 capability.model_dump(mode="python", by_alias=True)
                 for capability in health.capabilities
             ],
             "reasonCode": health.reason_code,
+            "scopeSchemaVersion": health.scope_schema_version,
+            "enabledFeatures": health.enabled_features,
+            "requiredOAuthScopes": health.required_oauth_scopes,
+            "targetRefCount": health.target_ref_count,
+            "reauthRequired": health.reauth_required,
+            "reauthReasonCode": health.reauth_reason_code,
         }
 
     @router.post(
@@ -4288,9 +4464,17 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         "authorizationState": AuthorizationState.UNKNOWN.value,
                         "checkedAt": None,
                         "expiresAt": None,
+                        "refreshExpiresAt": None,
                         "generation": 0,
                         "capabilities": [],
                         "reasonCode": "not_observed",
+                        "externalSubject": None,
+                        "scopeSchemaVersion": None,
+                        "enabledFeatures": [],
+                        "requiredOAuthScopes": [],
+                        "targetRefCount": 0,
+                        "reauthRequired": False,
+                        "reauthReasonCode": None,
                     }
                 )
                 continue
@@ -4299,10 +4483,12 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 {
                     "connectionId": connection.id,
                     "provider": connection.provider,
+                    "externalSubject": health.external_subject,
                     "loginState": health.login_state.value,
                     "authorizationState": health.authorization_state.value,
                     "checkedAt": health.checked_at,
                     "expiresAt": health.expires_at,
+                    "refreshExpiresAt": health.refresh_expires_at,
                     "generation": health.generation,
                     "capabilities": [
                         {
@@ -4315,6 +4501,12 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         for capability in health.capabilities
                     ],
                     "reasonCode": _safe_health_reason_code(health.reason_code),
+                    "scopeSchemaVersion": health.scope_schema_version,
+                    "enabledFeatures": health.enabled_features,
+                    "requiredOAuthScopes": health.required_oauth_scopes,
+                    "targetRefCount": health.target_ref_count,
+                    "reauthRequired": health.reauth_required,
+                    "reauthReasonCode": _safe_health_reason_code(health.reauth_reason_code),
                 }
             )
         return {"connections": snapshots}

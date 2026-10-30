@@ -631,6 +631,7 @@ def _integration_connector_export_data(
         row.provider in {"azure", "gcp", "runpod"} for row in connections
     )
     account_profiles: dict[tuple[str, str], dict[str, Any]] = {}
+    account_profile_graph_scopes: dict[tuple[str, str], dict[str, Any]] = {}
     account_profile_identity_refs: dict[tuple[str, str], str] = {}
     seen_account_profile_refs: set[str] = set()
     account_profile_principal: IntegrationPrincipal | None = None
@@ -680,15 +681,18 @@ def _integration_connector_export_data(
                 raise SystemExit("Account Center returned invalid cloud identity metadata")
             if provider == "microsoft_graph":
                 from cyrene_exchange_product.integrations.microsoft_graph import (
+                    profile_scope_metadata,
                     validate_profile_identity,
                 )
 
                 try:
-                    validate_profile_identity(
+                    graph_scope = validate_profile_identity(
                         row,
                         profile_ref=profile_ref,
                         principal=account_profile_principal,
                     )
+                    graph_metadata = profile_scope_metadata(row, graph_scope)
+                    account_profile_graph_scopes[(profile_ref, str(provider))] = graph_scope
                 except ValueError as exc:
                     raise SystemExit(
                         "Account Center returned invalid Microsoft Graph identity metadata"
@@ -727,6 +731,21 @@ def _integration_connector_export_data(
                 "targetScope": safe_scope,
                 **({"authMode": auth_mode} if isinstance(auth_mode, str) else {}),
                 **({"credentialRevision": revision} if revision is not None else {}),
+                **(
+                    {
+                        "externalSubject": str(row["external_subject"]),
+                        "scopeSchemaVersion": graph_metadata["scope_schema_version"],
+                        "enabledFeatures": graph_metadata["enabled_features"],
+                        "requiredOAuthScopes": graph_metadata["required_oauth_scopes"],
+                        "targetRefCount": graph_metadata["target_ref_count"],
+                        "credentialExpiresAt": row.get("expires_at"),
+                        "refreshExpiresAt": row.get("refresh_expires_at"),
+                        "reauthRequired": graph_metadata["reauth_required"],
+                        "reauthReasonCode": graph_metadata["reauth_reason_code"],
+                    }
+                    if provider == "microsoft_graph"
+                    else {}
+                ),
             }
 
     bindings: list[dict[str, Any]] = []
@@ -828,23 +847,47 @@ def _integration_connector_export_data(
                     host_profile is None
                     or host_profile.provider != "microsoft_graph"
                     or host_profile.access_mode != "actor_owned"
-                    or not host_profile.microsoft_graph_plan_ids
+                    or (
+                        not host_profile.microsoft_graph_plan_ids
+                        and host_profile.microsoft_graph_office_v2 is None
+                    )
                     or connection.target_ref is not None
                 ):
                     raise SystemExit("Microsoft Graph host binding does not match the connection")
-                if (
+                if host_profile.microsoft_graph_office_v2 is not None:
+                    from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
+                        validate_microsoft_graph_office_v2_scope,
+                    )
+
+                    v2_graph_scope = account_profile_graph_scopes.get(
+                        (str(profile_ref), "microsoft_graph")
+                    )
+                    if v2_graph_scope is None or account_profile_principal is None:
+                        raise SystemExit("Microsoft Graph v2 scope readback is unavailable")
+                    try:
+                        validate_microsoft_graph_office_v2_scope(
+                            host_profile,
+                            v2_graph_scope,
+                            account_profile_principal,
+                        )
+                    except (PermissionError, ValueError) as exc:
+                        raise SystemExit(
+                            "Microsoft Graph Account Center scope differs from host config"
+                        ) from exc
+                elif (
                     tuple(account_profile["targetScope"]["planner"]["planIds"])
                     != host_profile.microsoft_graph_plan_ids
                 ):
                     raise SystemExit("Microsoft Graph Account Center plans differ from host config")
-                sharepoint_scope = account_profile["targetScope"]["sharepoint"]
-                if sharepoint_scope["enabled"] and (
-                    sharepoint_scope["siteId"] != host_profile.microsoft_graph_sharepoint_site_id
-                    or tuple(sharepoint_scope["listIds"])
+                elif account_profile["targetScope"]["sharepoint"]["enabled"] and (
+                    account_profile["targetScope"]["sharepoint"]["siteId"]
+                    != host_profile.microsoft_graph_sharepoint_site_id
+                    or tuple(account_profile["targetScope"]["sharepoint"]["listIds"])
                     != host_profile.microsoft_graph_sharepoint_list_ids
                 ):
                     raise SystemExit("Microsoft Graph SharePoint scope differs from host config")
-                connection_target_scope = account_profile["targetScope"]
+                # The complete resource scope remains on the Account Center profile record.
+                connection_target_scope = None
             else:
                 if account_profile is None:
                     raise SystemExit("Azure DevOps Account Center profile readback is unavailable")
@@ -1013,24 +1056,85 @@ def _integration_connector_export_data(
                 selected_ids = set()
                 for tool_id, mapping in expected.items():
                     operation_id = str(mapping["operationId"])
-                    if mapping.get("mutating") is False:
+                    mutating = mapping.get("mutating") is True
+                    if scope.get("schemaVersion") != 2:
                         sharepoint_read = (
-                            operation_id.startswith("microsoft_graph.sharepoint.")
+                            not mutating
+                            and operation_id
+                            in {
+                                "microsoft_graph.sharepoint.site.get",
+                                "microsoft_graph.sharepoint.list.get",
+                                "microsoft_graph.sharepoint.list.items.delta",
+                            }
                             and sharepoint["enabled"]
                         )
-                        planner_read = (
-                            operation_id.startswith("microsoft_graph.planner.")
-                            and planner["tasksRead"]
-                            and planner["planIds"]
+                        planner_operation = operation_id.startswith("microsoft_graph.planner.")
+                        planner_targeted = bool(planner["planIds"])
+                        planner_enabled = (
+                            planner_operation
+                            and planner_targeted
+                            and (planner["tasksWrite"] if mutating else planner["tasksRead"])
                         )
-                        if sharepoint_read or planner_read:
+                        if sharepoint_read or planner_enabled:
                             selected_ids.add(tool_id)
-                    elif (
-                        mapping.get("mutating") is True
-                        and operation_id.startswith("microsoft_graph.planner.")
-                        and planner["tasksWrite"]
-                        and planner["planIds"]
-                    ):
+                        continue
+
+                    todo = scope["todo"]
+                    calendar = scope["calendar"]
+                    planner_operation = operation_id.startswith("microsoft_graph.planner.")
+                    planner_discovery = operation_id == "microsoft_graph.planner.plans.list"
+                    planner_targeted = planner_discovery or bool(planner["planIds"])
+                    planner_enabled = (
+                        planner_operation
+                        and planner_targeted
+                        and (planner["tasksWrite"] if mutating else planner["tasksRead"])
+                    )
+                    todo_discovery = operation_id == "microsoft_graph.todo.lists.list"
+                    todo_targeted = todo_discovery or bool(todo["taskListIds"])
+                    todo_enabled = (
+                        operation_id.startswith("microsoft_graph.todo.")
+                        and todo["enabled"]
+                        and todo_targeted
+                        and (todo["tasksWrite"] if mutating else todo["tasksRead"])
+                    )
+                    calendar_discovery = operation_id == "microsoft_graph.calendar.calendars.list"
+                    calendar_freebusy = operation_id == "microsoft_graph.calendar.freebusy.get"
+                    calendar_targeted = calendar_discovery or (
+                        bool(calendar["calendarIds"])
+                        if not calendar_freebusy
+                        else bool(calendar["freebusySubjects"])
+                    )
+                    calendar_enabled = (
+                        operation_id.startswith("microsoft_graph.calendar.")
+                        and calendar["enabled"]
+                        and calendar_targeted
+                        and (
+                            calendar["eventsWrite"]
+                            if mutating
+                            else calendar["freebusyRead"]
+                            if calendar_freebusy
+                            else calendar["eventsRead"]
+                        )
+                    )
+                    sharepoint_discovery = operation_id == "microsoft_graph.sharepoint.drives.list"
+                    sharepoint_targeted = sharepoint_discovery or bool(sharepoint["driveIds"])
+                    sharepoint_v2_enabled = (
+                        operation_id.startswith("microsoft_graph.sharepoint.")
+                        and not mutating
+                        and sharepoint["enabled"]
+                        and sharepoint["metadataRead"]
+                        and (
+                            sharepoint_targeted
+                            if operation_id
+                            in {
+                                "microsoft_graph.sharepoint.drives.list",
+                                "microsoft_graph.sharepoint.drive.items.list",
+                            }
+                            else operation_id == "microsoft_graph.sharepoint.site.get"
+                            or bool(sharepoint["listIds"])
+                        )
+                    )
+                    if planner_enabled or todo_enabled or calendar_enabled or sharepoint_v2_enabled:
                         selected_ids.add(tool_id)
         elif provider_id == "azure_devops":
             if account_profile is None or account_profile["authStatus"] != "healthy":
@@ -1057,8 +1161,8 @@ def _integration_connector_export_data(
         selected_catalog_is_read_only = bool(selected_ids) and selected_ids <= read_ids
         for tool_id in sorted(selected_ids):
             mapping = expected[tool_id]
-            mutating = mapping.get("mutating")
-            if not isinstance(mutating, bool):
+            operation_mutating = mapping.get("mutating")
+            if not isinstance(operation_mutating, bool):
                 raise SystemExit("Exchange connector operation map has invalid mutability")
             binding_tools.append(mapping)
             if include_live_catalog:
@@ -1068,7 +1172,7 @@ def _integration_connector_export_data(
                         "id": definition.tool_id,
                         "name": definition.name,
                         "description": definition.description,
-                        "readOnly": not mutating,
+                        "readOnly": not operation_mutating,
                         "inputSchema": definition.input_schema,
                     }
                 )
@@ -1167,15 +1271,15 @@ def _integration_connector_export_data(
                     tool_id=tool_id,
                     input_schema=definition.input_schema,
                 )
-                mutating = mapping.get("mutating")
-                if not isinstance(mutating, bool):
+                computer_mutating = mapping.get("mutating")
+                if not isinstance(computer_mutating, bool):
                     raise SystemExit("computer runner operation map has invalid mutability")
                 tools.append(
                     {
                         "id": definition.tool_id,
                         "name": definition.name,
                         "description": definition.description,
-                        "readOnly": not mutating,
+                        "readOnly": not computer_mutating,
                         "inputSchema": definition.input_schema,
                     }
                 )
@@ -1378,6 +1482,50 @@ def _integration_connector_bootstrap(arguments: argparse.Namespace) -> int:
     finally:
         services.close()
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def _integration_office_setup(arguments: argparse.Namespace) -> int:
+    """Run one fixed Office setup action with sensitive input read only from stdin."""
+
+    from cyrene_exchange_product.integrations.cli import build_production_services
+    from cyrene_exchange_product.integrations.office_setup import (
+        OfficeSetupError,
+        _read_request_stdin,
+        execute_office_setup,
+    )
+
+    try:
+        request_payload = _read_request_stdin(sys.stdin)
+        services = build_production_services(arguments.integration_database)
+        try:
+            result = execute_office_setup(
+                services,
+                action=arguments.office_setup_action,
+                private_config=arguments.private_config,
+                request_payload=request_payload,
+            )
+        finally:
+            services.close()
+    except OfficeSetupError as exc:
+        print(
+            json.dumps(
+                {"state": exc.state, "reasonCode": exc.reason_code},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 2
+    except Exception:
+        print(
+            json.dumps(
+                {"state": "FAILED", "reasonCode": "office_setup_unavailable"},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 2
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return 0
 
 
@@ -1782,6 +1930,18 @@ def parser() -> argparse.ArgumentParser:
             "or saving connections"
         ),
     )
+    office_setup = integration_commands.add_parser(
+        "office-setup",
+        help="Run one private, owner-bound Microsoft Graph Office setup action",
+    )
+    office_setup_actions = office_setup.add_subparsers(
+        dest="office_setup_action",
+        required=True,
+    )
+    for action_name in ("begin", "complete", "status", "discover", "select-targets"):
+        action = office_setup_actions.add_parser(action_name)
+        action.add_argument("--integration-database", type=Path, required=True)
+        action.add_argument("--private-config", type=Path, required=True)
     return value
 
 
@@ -1808,6 +1968,8 @@ def run(argv: list[str] | None = None) -> int:
             return _integration_connector_readiness(arguments)
         if arguments.integration_command == "bootstrap-connectors":
             return _integration_connector_bootstrap(arguments)
+        if arguments.integration_command == "office-setup":
+            return _integration_office_setup(arguments)
         if arguments.integration_command.startswith("authorization-cloud"):
             return _integration_authorization_cloud(
                 arguments,

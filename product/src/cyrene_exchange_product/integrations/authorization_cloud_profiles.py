@@ -17,9 +17,11 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from cyrene_exchange_product.integrations.azure_devops import validate_authorized_source
 from cyrene_exchange_product.integrations.microsoft_graph import (
     is_valid_sharepoint_site_id,
+    validate_profile_scope,
     validate_resource_id,
     validate_sharepoint_list_id,
 )
+from cyrene_exchange_product.integrations.microsoft_identity import microsoft_identity_for_principal
 from cyrene_exchange_product.integrations.models import (
     CreateIntegrationConnection,
     IntegrationConnection,
@@ -29,6 +31,29 @@ from cyrene_exchange_product.integrations.models import (
 _ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$")
 _HUGGINGFACE_REPOSITORY_REF = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _RECIPIENT_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_OFFICE_V2_FEATURES = frozenset(
+    {
+        "plannerEnabled",
+        "todoEnabled",
+        "calendarEnabled",
+        "mailMetadataEnabled",
+        "mailDraftsEnabled",
+        "mailSendEnabled",
+        "sharePointDriveMetadataEnabled",
+    }
+)
+_OFFICE_V2_TARGETS = frozenset(
+    {
+        "plannerPlanIds",
+        "sharePointSiteIds",
+        "sharePointListIds",
+        "sharePointDriveIds",
+        "toDoTaskListIds",
+        "calendarIds",
+        "mailFolderIds",
+        "freebusySubjects",
+    }
+)
 _PROVIDER_IDS = frozenset(
     {
         "wecom",
@@ -94,6 +119,16 @@ class AzureDevOpsAuthorizedSource:
 
 
 @dataclass(frozen=True, slots=True)
+class MicrosoftGraphOfficeV2Profile:
+    """Fixed tenant, workspace, feature gates, and candidate resource targets."""
+
+    tenant_id: str
+    workspace_id: str
+    enabled_features: Mapping[str, bool]
+    targets: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True, slots=True)
 class AuthorizationProviderProfile:
     """One fixed Plugin binding scoped to configured actors and resource aliases."""
 
@@ -122,6 +157,7 @@ class AuthorizationProviderProfile:
     microsoft_graph_plan_ids: tuple[str, ...] = ()
     microsoft_graph_sharepoint_site_id: str | None = None
     microsoft_graph_sharepoint_list_ids: tuple[str, ...] = ()
+    microsoft_graph_office_v2: MicrosoftGraphOfficeV2Profile | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,11 +236,14 @@ class AuthorizationCloudProfileRegistry:
             if (
                 request.target_ref is not None
                 or profile.targets
-                or not profile.microsoft_graph_plan_ids
+                or (
+                    not profile.microsoft_graph_plan_ids
+                    and profile.microsoft_graph_office_v2 is None
+                )
                 or not request.account_link_ref
             ):
                 raise AuthorizationCloudConfigurationError(
-                    "Microsoft Graph bindings require host-selected Planner plan IDs"
+                    "Microsoft Graph bindings require a fixed v1 or v2 host profile"
                 )
             return "Microsoft Graph"
         if request.provider == "azure_devops":
@@ -326,8 +365,12 @@ class AuthorizationCloudProfileRegistry:
                 raise PermissionError(
                     "Microsoft Graph binding cannot contain host resource targets"
                 )
-            if connection.provider == "microsoft_graph" and not profile.microsoft_graph_plan_ids:
-                raise PermissionError("Microsoft Graph binding has no selected host Planner plans")
+            if (
+                connection.provider == "microsoft_graph"
+                and not profile.microsoft_graph_plan_ids
+                and profile.microsoft_graph_office_v2 is None
+            ):
+                raise PermissionError("Microsoft Graph binding has no fixed host scope")
         elif connection.provider == "azure_devops":
             sources = profile.authorized_sources or {}
             source = sources.get(connection.target_ref or "")
@@ -667,6 +710,7 @@ def parse_authorization_cloud_settings(
                 "tenantId",
                 "organization",
                 "authorizedSources",
+                "officeV2",
             },
             label=f"authorizationCloud.profiles.{profile_ref}",
         )
@@ -813,8 +857,9 @@ def parse_authorization_cloud_settings(
         microsoft_graph_plan_ids: tuple[str, ...] = ()
         microsoft_graph_sharepoint_site_id: str | None = None
         microsoft_graph_sharepoint_list_ids: tuple[str, ...] = ()
+        microsoft_graph_office_v2: MicrosoftGraphOfficeV2Profile | None = None
         if provider == "hf":
-            if "plannerPlanIds" in item or "sharepointTargets" in item:
+            if "plannerPlanIds" in item or "sharepointTargets" in item or "officeV2" in item:
                 raise AuthorizationCloudConfigurationError(
                     "Microsoft Graph targets are valid only for Graph profiles"
                 )
@@ -825,7 +870,7 @@ def parse_authorization_cloud_settings(
             if auth_mode not in {None, "fine_grained_token", "device_oauth"}:
                 raise AuthorizationCloudConfigurationError("HF authMode is unsupported")
         elif provider == "azure_devops":
-            if "plannerPlanIds" in item or "sharepointTargets" in item:
+            if "plannerPlanIds" in item or "sharepointTargets" in item or "officeV2" in item:
                 raise AuthorizationCloudConfigurationError(
                     "Microsoft Graph targets are valid only for Graph profiles"
                 )
@@ -889,7 +934,28 @@ def parse_authorization_cloud_settings(
                     "Microsoft Graph delegated profiles cannot contain host credentials "
                     "or auth modes"
                 )
-            raw_plan_ids = item.get("plannerPlanIds", [])
+            raw_office_v2 = item.get("officeV2")
+            if raw_office_v2 is not None:
+                if "plannerPlanIds" in item or "sharepointTargets" in item:
+                    raise AuthorizationCloudConfigurationError(
+                        "Microsoft Graph officeV2 cannot be combined with legacy target fields"
+                    )
+                microsoft_graph_office_v2 = _parse_microsoft_graph_office_v2(
+                    raw_office_v2,
+                    expected_issuer=expected_issuer,
+                    expected_workspace_id=workspace_id,
+                )
+                microsoft_graph_plan_ids = microsoft_graph_office_v2.targets["plannerPlanIds"]
+                sharepoint_sites = microsoft_graph_office_v2.targets["sharePointSiteIds"]
+                microsoft_graph_sharepoint_site_id = (
+                    sharepoint_sites[0] if sharepoint_sites else None
+                )
+                microsoft_graph_sharepoint_list_ids = microsoft_graph_office_v2.targets[
+                    "sharePointListIds"
+                ]
+                raw_plan_ids = list(microsoft_graph_plan_ids)
+            else:
+                raw_plan_ids = item.get("plannerPlanIds", [])
             if not isinstance(raw_plan_ids, list) or len(raw_plan_ids) > 100:
                 raise AuthorizationCloudConfigurationError(
                     "Microsoft Graph plannerPlanIds must be an array of at most 100 IDs"
@@ -907,7 +973,7 @@ def parse_authorization_cloud_settings(
                     "Microsoft Graph plannerPlanIds contains duplicates"
                 )
             raw_sharepoint_targets = item.get("sharepointTargets")
-            if raw_sharepoint_targets is not None:
+            if raw_office_v2 is None and raw_sharepoint_targets is not None:
                 sharepoint_targets = _object(
                     raw_sharepoint_targets,
                     required={"siteId", "listIds"},
@@ -945,6 +1011,7 @@ def parse_authorization_cloud_settings(
             or auth_mode is not None
             or "plannerPlanIds" in item
             or "sharepointTargets" in item
+            or "officeV2" in item
         ):
             raise AuthorizationCloudConfigurationError(
                 "HF credential references, auth mode, and scopes are valid only for HF profiles"
@@ -975,6 +1042,7 @@ def parse_authorization_cloud_settings(
             microsoft_graph_plan_ids=microsoft_graph_plan_ids,
             microsoft_graph_sharepoint_site_id=microsoft_graph_sharepoint_site_id,
             microsoft_graph_sharepoint_list_ids=microsoft_graph_sharepoint_list_ids,
+            microsoft_graph_office_v2=microsoft_graph_office_v2,
         )
 
     email = _parse_email_profile(email_value, contexts)
@@ -984,6 +1052,306 @@ def parse_authorization_cloud_settings(
         profiles=profiles,
         email=email,
     )
+
+
+def _parse_microsoft_graph_office_v2(
+    value: object,
+    *,
+    expected_issuer: str,
+    expected_workspace_id: str,
+) -> MicrosoftGraphOfficeV2Profile:
+    """Parse one exact owner/workspace Graph v2 policy copied from host config."""
+
+    office = _object(
+        value,
+        required={"schemaVersion", "tenantId", "workspaceId", "enabledFeatures", "targets"},
+        optional=set(),
+        label="Microsoft Graph officeV2",
+    )
+    version = office["schemaVersion"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != 2:
+        raise AuthorizationCloudConfigurationError("Microsoft Graph officeV2 version is invalid")
+    try:
+        tenant_id = str(UUID(_text(office["tenantId"], "officeV2 tenantId"))).lower()
+        workspace_id = str(UUID(_text(office["workspaceId"], "officeV2 workspaceId"))).lower()
+        expected_workspace = str(UUID(expected_workspace_id)).lower()
+    except (ValueError, TypeError) as exc:
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph officeV2 tenant/workspace must be UUIDs"
+        ) from exc
+    issuer_match = re.fullmatch(
+        r"https://login\.microsoftonline\.com/([0-9a-fA-F-]{36})/v2\.0",
+        expected_issuer,
+    )
+    try:
+        issuer_tenant_id = (
+            str(UUID(issuer_match.group(1))).lower() if issuer_match is not None else None
+        )
+    except ValueError as exc:
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph officeV2 expectedIssuer is invalid"
+        ) from exc
+    if issuer_tenant_id != tenant_id or workspace_id != expected_workspace:
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph officeV2 tenant/workspace differs from its owner binding"
+        )
+
+    features_value = office["enabledFeatures"]
+    if not isinstance(features_value, Mapping) or set(features_value) != _OFFICE_V2_FEATURES:
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph officeV2 features have an unsupported shape"
+        )
+    if any(type(flag) is not bool for flag in features_value.values()):
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph officeV2 feature flags must be booleans"
+        )
+    features = {key: bool(value) for key, value in features_value.items()}
+    if any(
+        features[name] for name in ("mailMetadataEnabled", "mailDraftsEnabled", "mailSendEnabled")
+    ):
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph mail access is deferred for this Exchange delivery"
+        )
+
+    targets_value = office["targets"]
+    if not isinstance(targets_value, Mapping) or set(targets_value) != _OFFICE_V2_TARGETS:
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph officeV2 targets have an unsupported shape"
+        )
+    targets: dict[str, tuple[str, ...]] = {}
+    for name, raw_values in targets_value.items():
+        if not isinstance(raw_values, list) or len(raw_values) > 100:
+            raise AuthorizationCloudConfigurationError(
+                f"Microsoft Graph officeV2 {name} must be a bounded array"
+            )
+        parsed: list[str] = []
+        for item in raw_values:
+            if (
+                not isinstance(item, str)
+                or not item
+                or item.strip() != item
+                or len(item) > 256
+                or "*" in item
+                or any(ord(character) < 0x20 or ord(character) == 0x7F for character in item)
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    f"Microsoft Graph officeV2 {name} contains an invalid target"
+                )
+            if name == "freebusySubjects":
+                if re.fullmatch(r"[^\s@]+@[^\s@]+", item) is None:
+                    raise AuthorizationCloudConfigurationError(
+                        "Microsoft Graph officeV2 freebusySubjects must be exact email/UPN values"
+                    )
+                item = item.casefold()
+            parsed.append(item)
+        if len(parsed) != len(set(parsed)):
+            raise AuthorizationCloudConfigurationError(
+                f"Microsoft Graph officeV2 {name} contains duplicates"
+            )
+        targets[name] = tuple(parsed)
+
+    planner_ids = targets["plannerPlanIds"]
+    try:
+        for item in planner_ids:
+            validate_resource_id(item, "officeV2 plannerPlanIds")
+    except ValueError as exc:
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph officeV2 Planner target is invalid"
+        ) from exc
+    for item in targets["sharePointSiteIds"]:
+        if not is_valid_sharepoint_site_id(item):
+            raise AuthorizationCloudConfigurationError(
+                "Microsoft Graph officeV2 SharePoint site ID is invalid"
+            )
+    try:
+        for item in targets["sharePointListIds"]:
+            validate_sharepoint_list_id(item)
+    except ValueError as exc:
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph officeV2 SharePoint list target is invalid"
+        ) from exc
+
+    sharepoint_enabled = features["sharePointDriveMetadataEnabled"]
+    if sharepoint_enabled:
+        if len(targets["sharePointSiteIds"]) != 1:
+            raise AuthorizationCloudConfigurationError(
+                "Microsoft Graph v2 supports one fixed SharePoint site per profile"
+            )
+    elif any(
+        targets[name] for name in ("sharePointSiteIds", "sharePointListIds", "sharePointDriveIds")
+    ):
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph SharePoint targets require its feature flag"
+        )
+    if not features["todoEnabled"] and targets["toDoTaskListIds"]:
+        raise AuthorizationCloudConfigurationError("To Do targets require its feature flag")
+    if not features["plannerEnabled"] and targets["plannerPlanIds"]:
+        raise AuthorizationCloudConfigurationError("Planner targets require its feature flag")
+    if not features["calendarEnabled"] and any(
+        targets[name] for name in ("calendarIds", "freebusySubjects")
+    ):
+        raise AuthorizationCloudConfigurationError("Calendar targets require its feature flag")
+    if targets["mailFolderIds"]:
+        raise AuthorizationCloudConfigurationError("Mail targets are deferred for this release")
+
+    return MicrosoftGraphOfficeV2Profile(
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+        enabled_features=features,
+        targets=targets,
+    )
+
+
+def microsoft_graph_office_v2_scope(
+    profile: AuthorizationProviderProfile,
+    principal: IntegrationPrincipal,
+) -> dict[str, Any]:
+    """Build the initial Account Center v2 scope from fixed host policy and actor pins."""
+
+    office = profile.microsoft_graph_office_v2
+    if (
+        profile.provider != "microsoft_graph"
+        or profile.access_mode != "actor_owned"
+        or office is None
+    ):
+        raise PermissionError("Microsoft Graph Office v2 host profile is unavailable")
+    tenant_id, _object_id, _external_subject = microsoft_identity_for_principal(principal)
+    if (
+        tenant_id != office.tenant_id
+        or principal.workspace_id != office.workspace_id
+        or profile.expected_issuer != principal.issuer
+        or profile.organization_id != principal.organization_id
+        or profile.workspace_id != principal.workspace_id
+    ):
+        raise PermissionError("Microsoft Graph Office v2 binding is outside the verified actor")
+
+    features = office.enabled_features
+    targets = office.targets
+    sharepoint_enabled = features["sharePointDriveMetadataEnabled"]
+    site_ids = targets["sharePointSiteIds"]
+    scope = {
+        "schema_version": 2,
+        "tenant_id": office.tenant_id,
+        "workspace_id": office.workspace_id,
+        "planner": {
+            "plan_ids": list(targets["plannerPlanIds"]),
+            "tasks_read": features["plannerEnabled"],
+            "tasks_write": features["plannerEnabled"],
+        },
+        "sharepoint": {
+            "enabled": sharepoint_enabled,
+            "site_id": site_ids[0] if sharepoint_enabled else None,
+            "list_ids": list(targets["sharePointListIds"]) if sharepoint_enabled else [],
+            "drive_ids": list(targets["sharePointDriveIds"]) if sharepoint_enabled else [],
+            "metadata_read": sharepoint_enabled,
+            "content_read": False,
+        },
+        "todo": {
+            "enabled": features["todoEnabled"],
+            "task_list_ids": list(targets["toDoTaskListIds"]),
+            "tasks_read": features["todoEnabled"],
+            "tasks_write": features["todoEnabled"],
+        },
+        "calendar": {
+            "enabled": features["calendarEnabled"],
+            "calendar_ids": list(targets["calendarIds"]),
+            "events_read": features["calendarEnabled"],
+            "events_write": features["calendarEnabled"],
+            "freebusy_read": bool(targets["freebusySubjects"]),
+            "freebusy_subjects": list(targets["freebusySubjects"]),
+            "attendees_write": False,
+        },
+        "mail": {
+            "enabled": False,
+            "folder_ids": [],
+            "metadata_read": False,
+            "body_read": False,
+            "drafts_write": False,
+            "send_enabled": False,
+        },
+    }
+    return validate_profile_scope(scope)
+
+
+def validate_microsoft_graph_office_v2_scope(
+    profile: AuthorizationProviderProfile,
+    scope_value: object,
+    principal: IntegrationPrincipal,
+) -> dict[str, Any]:
+    """Bind an Account Center v2 scope to the exact host flags and actor Workspace."""
+
+    office = profile.microsoft_graph_office_v2
+    if profile.provider != "microsoft_graph" or office is None:
+        raise PermissionError("Microsoft Graph Office v2 host scope is unavailable")
+    tenant_id, _object_id, _external_subject = microsoft_identity_for_principal(principal)
+    if (
+        tenant_id != office.tenant_id
+        or principal.workspace_id != office.workspace_id
+        or profile.expected_issuer != principal.issuer
+        or profile.organization_id != principal.organization_id
+        or profile.workspace_id != principal.workspace_id
+    ):
+        raise PermissionError("Microsoft Graph Office v2 binding is outside the verified actor")
+    scope = validate_profile_scope(scope_value)
+    if (
+        scope.get("schema_version") != 2
+        or scope["tenant_id"] != office.tenant_id
+        or scope["workspace_id"] != office.workspace_id
+    ):
+        raise PermissionError("Microsoft Graph profile Workspace scope differs from host policy")
+
+    features = office.enabled_features
+    targets = office.targets
+    planner = scope["planner"]
+    sharepoint = scope["sharepoint"]
+    todo = scope["todo"]
+    calendar = scope["calendar"]
+    if todo["enabled"] and not features["todoEnabled"]:
+        raise PermissionError("Microsoft Graph To Do is disabled by host policy")
+    if planner["tasks_read"] and not features["plannerEnabled"]:
+        raise PermissionError("Microsoft Graph Planner is disabled by host policy")
+    if sharepoint["enabled"] and not features["sharePointDriveMetadataEnabled"]:
+        raise PermissionError(
+            "Microsoft Graph SharePoint drive metadata is disabled by host policy"
+        )
+    if calendar["enabled"] and not features["calendarEnabled"]:
+        raise PermissionError("Microsoft Graph Calendar is disabled by host policy")
+    if calendar["attendees_write"]:
+        raise PermissionError(
+            "Microsoft Graph Calendar attendee writes are disabled in this release"
+        )
+    if any(scope["mail"].values()):
+        raise PermissionError("Microsoft Graph Mail is deferred for this release")
+    if sharepoint["enabled"]:
+        if sharepoint["site_id"] != office.targets["sharePointSiteIds"][0]:
+            raise PermissionError("Microsoft Graph SharePoint site is outside host policy")
+        _require_host_subset(
+            sharepoint["list_ids"], targets["sharePointListIds"], "SharePoint list"
+        )
+        _require_host_subset(
+            sharepoint["drive_ids"], targets["sharePointDriveIds"], "SharePoint drive"
+        )
+    if todo["enabled"]:
+        _require_host_subset(todo["task_list_ids"], targets["toDoTaskListIds"], "To Do list")
+    if calendar["enabled"]:
+        _require_host_subset(calendar["calendar_ids"], targets["calendarIds"], "Calendar")
+        _require_host_subset(
+            calendar["freebusy_subjects"], targets["freebusySubjects"], "free/busy subject"
+        )
+    if planner["plan_ids"]:
+        _require_host_subset(planner["plan_ids"], targets["plannerPlanIds"], "Planner plan")
+    return scope
+
+
+def _require_host_subset(
+    selected: tuple[str, ...] | list[str],
+    host_allowlist: tuple[str, ...],
+    label: str,
+) -> None:
+    """Constrain a non-empty host allowlist while permitting owner discovery when empty."""
+
+    if host_allowlist and not set(selected) <= set(host_allowlist):
+        raise PermissionError(f"Microsoft Graph {label} target is outside host policy")
 
 
 def _parse_huggingface_scopes(value: object) -> Mapping[str, object]:

@@ -39,6 +39,12 @@ CALLBACK_KEY = b"c" * 32
 GRAPH_KEY = b"g" * 32
 ADO_KEY = b"a" * 32
 GRAPH_PROFILE_REF = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+GRAPH_V2_WORKSPACE_ID = "33333333-4444-4555-8666-777777777777"
+GRAPH_V2_LIST_ID = "dddddddd-eeee-4fff-8000-111111111111"
+GRAPH_V2_TASK_LIST_ID = "AAMkList-opaque=="
+GRAPH_V2_CALENDAR_ID = "AAMkCalendar-opaque=="
+GRAPH_V2_DRIVE_ID = "b!drive-opaque=="
+GRAPH_V2_FREEBUSY_SUBJECT = "li.1@dohorizon.com"
 ADO_PROFILE_REF = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
 CONNECTION_ID = UUID("99999999-aaaa-4bbb-8ccc-dddddddddddd")
 GRAPH_PLAN_ID = "plan_A2b_935s-FIFm2QAFkHM"
@@ -48,12 +54,13 @@ GRAPH_SITE_ID = (
     "contoso.sharepoint.com,22222222-3333-4444-8555-666666666666,"
     "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
 )
+GRAPH_V2_SITE_ID = GRAPH_SITE_ID
 GRAPH_LIST_ID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
 ADO_ORGANIZATION = "contoso"
 ADO_PROJECT_ID = "22222222-3333-4444-8555-666666666666"
 ADO_SOURCE_ID = "pipeline-source-a"
 ADO_PIPELINE_ID = 31
-CALLBACK_URI = "https://account.example.test/oauth/entra/callback"
+CALLBACK_URI = "http://localhost:52191/oauth/callback"
 AZURE_DEVOPS_RESOURCE_SCOPE = "https://app.vssps.visualstudio.com/.default"
 
 
@@ -102,6 +109,30 @@ def plugin_modules() -> SimpleNamespace:
         pytest.fail(f"Plugins checkout is missing required source paths: {missing}")
     for path in reversed(paths):
         sys.path.insert(0, str(path))
+
+    # Other tests may have imported the installed SDK during pytest collection.
+    # Remove only those cached modules that did not come from this exact
+    # checkout so this gate cannot accidentally mix installed and source code.
+    source_roots = tuple(path.resolve() for path in paths)
+    source_packages = (
+        "cyrene_account_center_contracts",
+        "cyrene_plugin_runtime",
+        "account_center",
+        "microsoft_graph_provider",
+        "azure_devops_observation_provider",
+    )
+    for module_name, module in tuple(sys.modules.items()):
+        if not any(
+            module_name == package or module_name.startswith(f"{package}.")
+            for package in source_packages
+        ):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            continue
+        resolved_module_path = Path(module_file).resolve()
+        if not any(resolved_module_path.is_relative_to(root) for root in source_roots):
+            del sys.modules[module_name]
 
     contracts = importlib.import_module("cyrene_account_center_contracts")
     contracts_path = Path(contracts.__file__).resolve()
@@ -756,7 +787,12 @@ class _AccountCenterDirectInvoker:
         return self.payload_type(type_url=result.type_url, value=result.value)
 
 
-def _principal(*, subject: str = OBJECT_ID, operations: set[str]) -> Any:
+def _principal(
+    *,
+    subject: str = OBJECT_ID,
+    workspace_id: str = WORKSPACE_ID,
+    operations: set[str],
+) -> Any:
     principal_type = importlib.import_module(
         "cyrene_exchange_product.integrations.models"
     ).IntegrationPrincipal
@@ -764,7 +800,7 @@ def _principal(*, subject: str = OBJECT_ID, operations: set[str]) -> Any:
         issuer=ISSUER,
         subject=subject,
         organization_id=ORGANIZATION_ID,
-        workspace_id=WORKSPACE_ID,
+        workspace_id=workspace_id,
         allowed_operation_ids=frozenset(operations),
     )
 
@@ -1068,6 +1104,331 @@ def test_exchange_graph_dispatch_reaches_provider_and_consumes_exact_account_lea
         )
     assert plugin_modules.contracts.payload_sha256(scope) == last_lease.profile_scope_sha256
     assert len(spine.graph_http.calls) == before_replay_http
+
+
+def _office_v2_operation_arguments() -> dict[str, dict[str, Any]]:
+    """Build a valid payload for every fixed Graph operation."""
+
+    event_window = {
+        "start_date_time": "2026-11-02T10:00:00-05:00",
+        "end_date_time": "2026-11-02T10:30:00-05:00",
+    }
+    from cyrene_exchange_product.integrations.microsoft_graph import GRAPH_OPERATIONS
+
+    values: dict[str, dict[str, Any]] = {}
+    for operation_id in sorted(GRAPH_OPERATIONS):
+        if operation_id == "microsoft_graph.planner.plan.get":
+            arguments = {"plan_id": GRAPH_PLAN_ID}
+        elif operation_id == "microsoft_graph.planner.plans.list":
+            arguments = {"page_size": 10}
+        elif operation_id == "microsoft_graph.planner.tasks.list":
+            arguments = {"plan_id": GRAPH_PLAN_ID, "page_size": 10}
+        elif operation_id == "microsoft_graph.planner.task.get":
+            arguments = {"plan_id": GRAPH_PLAN_ID, "task_id": GRAPH_TASK_ID}
+        elif operation_id == "microsoft_graph.planner.task.create":
+            arguments = {
+                "plan_id": GRAPH_PLAN_ID,
+                "bucket_id": GRAPH_BUCKET_ID,
+                "title": "Office v2 task",
+            }
+        elif operation_id == "microsoft_graph.planner.task.update":
+            arguments = {
+                "plan_id": GRAPH_PLAN_ID,
+                "task_id": GRAPH_TASK_ID,
+                "if_match": 'W/"synthetic-etag-1"',
+                "changes": {"title": "Updated office v2 task"},
+            }
+        elif operation_id == "microsoft_graph.sharepoint.site.get":
+            arguments = {"site_id": GRAPH_V2_SITE_ID}
+        elif operation_id in {
+            "microsoft_graph.sharepoint.list.get",
+            "microsoft_graph.sharepoint.list.items.delta",
+        }:
+            arguments = {"site_id": GRAPH_V2_SITE_ID, "list_id": GRAPH_V2_LIST_ID}
+            if operation_id.endswith("items.delta"):
+                arguments["page_size"] = 10
+        elif operation_id == "microsoft_graph.todo.lists.list":
+            arguments = {"page_size": 10}
+        elif operation_id == "microsoft_graph.todo.tasks.list":
+            arguments = {"task_list_id": GRAPH_V2_TASK_LIST_ID, "page_size": 10}
+        elif operation_id == "microsoft_graph.todo.task.get":
+            arguments = {
+                "task_list_id": GRAPH_V2_TASK_LIST_ID,
+                "task_id": "AAMkTask-opaque==",
+            }
+        elif operation_id == "microsoft_graph.todo.task.create":
+            arguments = {"task_list_id": GRAPH_V2_TASK_LIST_ID, "title": "To Do v2 task"}
+        elif operation_id == "microsoft_graph.todo.task.update":
+            arguments = {
+                "task_list_id": GRAPH_V2_TASK_LIST_ID,
+                "task_id": "AAMkTask-opaque==",
+                "if_match": 'W/"synthetic-etag-1"',
+                "changes": {"title": "Updated To Do task"},
+            }
+        elif operation_id == "microsoft_graph.todo.task.delete":
+            arguments = {
+                "task_list_id": GRAPH_V2_TASK_LIST_ID,
+                "task_id": "AAMkTask-opaque==",
+                "if_match": 'W/"synthetic-etag-1"',
+            }
+        elif operation_id == "microsoft_graph.calendar.calendars.list":
+            arguments = {"page_size": 10}
+        elif operation_id == "microsoft_graph.calendar.events.list":
+            arguments = {"calendar_id": GRAPH_V2_CALENDAR_ID, **event_window, "page_size": 10}
+        elif operation_id == "microsoft_graph.calendar.event.get":
+            arguments = {
+                "calendar_id": GRAPH_V2_CALENDAR_ID,
+                "event_id": "AAMkEvent-opaque==",
+            }
+        elif operation_id == "microsoft_graph.calendar.event.create":
+            arguments = {
+                "calendar_id": GRAPH_V2_CALENDAR_ID,
+                "subject": "Office v2 event",
+                **event_window,
+                "transaction_id": "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa",
+            }
+        elif operation_id == "microsoft_graph.calendar.event.update":
+            arguments = {
+                "calendar_id": GRAPH_V2_CALENDAR_ID,
+                "event_id": "AAMkEvent-opaque==",
+                "if_match": 'W/"synthetic-etag-1"',
+                "changes": {"subject": "Updated office v2 event"},
+            }
+        elif operation_id == "microsoft_graph.calendar.event.delete":
+            arguments = {
+                "calendar_id": GRAPH_V2_CALENDAR_ID,
+                "event_id": "AAMkEvent-opaque==",
+                "if_match": 'W/"synthetic-etag-1"',
+            }
+        elif operation_id == "microsoft_graph.calendar.freebusy.get":
+            arguments = {
+                "schedules": [GRAPH_V2_FREEBUSY_SUBJECT.upper()],
+                "start_date_time": "2026-11-02T10:00:00-05:00",
+                "end_date_time": "2026-11-02T10:30:00-05:00",
+                "interval_minutes": 15,
+            }
+        elif operation_id == "microsoft_graph.sharepoint.drives.list":
+            arguments = {"site_id": GRAPH_V2_SITE_ID, "page_size": 10}
+        elif operation_id == "microsoft_graph.sharepoint.drive.items.list":
+            arguments = {
+                "site_id": GRAPH_V2_SITE_ID,
+                "drive_id": GRAPH_V2_DRIVE_ID,
+                "parent_item_id": "folder!opaque==",
+                "page_size": 10,
+            }
+        else:
+            raise AssertionError(f"No Graph fixture arguments for {operation_id}")
+        values[operation_id] = arguments
+    return values
+
+
+def test_exchange_account_center_and_provider_agree_on_all_office_v2_targets(
+    tmp_path: Path,
+    plugin_modules: SimpleNamespace,
+) -> None:
+    """Use the installed SDK, real Account Center leases, and Provider target projection."""
+
+    from cyrene_exchange_product.integrations.connector_operations import (
+        _resource_ref,
+    )
+    from cyrene_exchange_product.integrations.connector_security import digest_arguments
+    from cyrene_exchange_product.integrations.microsoft_graph import (
+        GRAPH_OPERATIONS,
+        lease_arguments_for_operation,
+        target_for_operation,
+    )
+
+    features = {
+        "plannerEnabled": True,
+        "todoEnabled": True,
+        "calendarEnabled": True,
+        "mailMetadataEnabled": False,
+        "mailDraftsEnabled": False,
+        "mailSendEnabled": False,
+        "sharePointDriveMetadataEnabled": True,
+    }
+    office_scope_host = SimpleNamespace(
+        tenant_id=TENANT_ID,
+        workspace_id=GRAPH_V2_WORKSPACE_ID,
+        enabled_features=features,
+        targets={
+            "plannerPlanIds": (),
+            "sharePointSiteIds": (GRAPH_V2_SITE_ID,),
+            "sharePointListIds": (),
+            "sharePointDriveIds": (),
+            "toDoTaskListIds": (),
+            "calendarIds": (),
+            "mailFolderIds": (),
+            "freebusySubjects": (GRAPH_V2_FREEBUSY_SUBJECT,),
+        },
+    )
+    host_profile = SimpleNamespace(
+        profile_ref=GRAPH_BINDING_ID,
+        provider="microsoft_graph",
+        access_mode="actor_owned",
+        expected_issuer=ISSUER,
+        organization_id=ORGANIZATION_ID,
+        workspace_id=GRAPH_V2_WORKSPACE_ID,
+        microsoft_graph_plan_ids=(),
+        microsoft_graph_sharepoint_site_id=GRAPH_V2_SITE_ID,
+        microsoft_graph_sharepoint_list_ids=(),
+        microsoft_graph_office_v2=office_scope_host,
+    )
+    spine = _make_spine(tmp_path, plugin_modules)
+    principal = _principal(
+        workspace_id=GRAPH_V2_WORKSPACE_ID,
+        operations=set(GRAPH_OPERATIONS),
+    )
+    initial_scope = importlib.import_module(
+        "cyrene_exchange_product.integrations.authorization_cloud_profiles"
+    ).microsoft_graph_office_v2_scope(host_profile, principal)
+    session = spine.account_client.begin_microsoft_graph_link(
+        principal,
+        profile_ref=GRAPH_PROFILE_REF,
+        planner_plan_ids=[],
+        idempotency_key="office-v2-initial-link",
+        office_v2_scope=initial_scope,
+    )
+    state = parse_qs(urlparse(session["authorization_url"]).query)["state"][0]
+    spine.account_client.complete_microsoft_graph_link(
+        principal,
+        state=state,
+        code="synthetic-office-v2-code",
+    )
+    profile_rows = spine.account_client.list_provider_profiles(principal)["profiles"]
+    profile = next(row for row in profile_rows if row["profile_ref"] == GRAPH_PROFILE_REF)
+    assert profile["credential_revision"] == 0
+    assert profile["target_scope"] == initial_scope
+    assert "Mail.Send" not in profile["oauth_scopes"]
+
+    connection = importlib.import_module(
+        "cyrene_exchange_product.integrations.models"
+    ).IntegrationConnection(
+        id=CONNECTION_ID,
+        organization_id=ORGANIZATION_ID,
+        workspace_id=GRAPH_V2_WORKSPACE_ID,
+        actor_issuer=ISSUER,
+        actor_subject=OBJECT_ID,
+        account_link_ref=GRAPH_PROFILE_REF,
+        provider="microsoft_graph",
+        binding_ref=GRAPH_BINDING_ID,
+        target_ref=None,
+        display_name="Office v2 profile",
+        access_mode="actor_owned",
+    )
+    spine.graph_dispatcher._store = _ConnectionStore(connection)
+    spine.graph_dispatcher._registry.settings.profiles[GRAPH_BINDING_ID] = host_profile
+
+    def create_and_compare_lease(
+        operation_id: str,
+        arguments: Mapping[str, Any],
+        index: int,
+    ) -> None:
+        """Exercise Exchange projection, Account Center exact targets, and Provider target."""
+
+        current_profile = next(
+            row
+            for row in spine.account_client.list_provider_profiles(principal)["profiles"]
+            if row["profile_ref"] == GRAPH_PROFILE_REF
+        )
+        scope = current_profile["target_scope"]
+        projection = target_for_operation(operation_id, arguments, scope)
+        resource_ref = _resource_ref(
+            provider_id="microsoft_graph",
+            profile_ref=GRAPH_PROFILE_REF,
+            operation_id=operation_id,
+            target=projection,
+        )
+        prepared = spine.graph_dispatcher.prepare_connection_operation(
+            principal=principal,
+            connection=connection,
+            provider_id="microsoft_graph",
+            profile_ref=GRAPH_PROFILE_REF,
+            operation_id=operation_id,
+            resource_ref=resource_ref,
+            arguments=arguments,
+            request_id=f"office-v2-target-{index}",
+        )
+        exchange_arguments = lease_arguments_for_operation(operation_id, arguments)
+        provider_arguments = plugin_modules.graph_plugin._arguments_for_lease(
+            operation_id,
+            arguments,
+        )
+        assert provider_arguments == exchange_arguments, operation_id
+        provider_target = plugin_modules.graph_plugin._target(scope, operation_id, arguments)
+        assert provider_target == prepared.account_lease_target, operation_id
+        provider_profile = plugin_modules.contracts.ProviderProfile(
+            profile_ref=GRAPH_PROFILE_REF,
+            provider="microsoft_graph",
+            identity_ref=current_profile["identity_ref"],
+            target_scope=scope,
+            auth_status=current_profile["auth_status"],
+            auth_mode=current_profile["auth_mode"],
+            oauth_scopes=current_profile["oauth_scopes"],
+            access_mode=current_profile["access_mode"],
+            external_subject=current_profile["external_subject"],
+            expires_at=current_profile["expires_at"],
+            refresh_expires_at=current_profile["refresh_expires_at"],
+            credential_revision=current_profile["credential_revision"],
+            scope_schema_version=current_profile["scope_schema_version"],
+            reauth_required=current_profile["reauth_required"],
+        )
+        plugin_modules.graph_plugin._authorize_profile(
+            scope,
+            operation_id,
+            arguments,
+            provider_profile,
+            settings=spine.graph_provider._require_settings(),
+            expected_external_subject=f"{TENANT_ID}:{OBJECT_ID}",
+            expected_workspace_id=GRAPH_V2_WORKSPACE_ID,
+        )
+        lease = spine.account_port.create_provider_credential_lease(
+            principal,
+            profile_ref=GRAPH_PROFILE_REF,
+            operation_id=operation_id,
+            target=prepared.account_lease_target,
+            arguments_sha256=digest_arguments(exchange_arguments),
+        )
+        assert lease.target == provider_target
+        assert lease.arguments_sha256 == digest_arguments(provider_arguments)
+        row = spine._lease_row(lease.lease_ref)
+        assert json.loads(row["target_json"]) == provider_target
+        assert row["arguments_sha256"] == digest_arguments(provider_arguments)
+        assert row["redeemed_at"] is None
+
+    operation_arguments = _office_v2_operation_arguments()
+    assert set(operation_arguments) == GRAPH_OPERATIONS
+    for index, operation_id in enumerate(
+        (
+            "microsoft_graph.planner.plans.list",
+            "microsoft_graph.todo.lists.list",
+            "microsoft_graph.calendar.calendars.list",
+            "microsoft_graph.sharepoint.drives.list",
+        )
+    ):
+        create_and_compare_lease(operation_id, operation_arguments[operation_id], index)
+
+    selected_scope = json.loads(json.dumps(initial_scope))
+    selected_scope["planner"]["plan_ids"] = [GRAPH_PLAN_ID]
+    selected_scope["sharepoint"]["list_ids"] = [GRAPH_V2_LIST_ID]
+    selected_scope["sharepoint"]["drive_ids"] = [GRAPH_V2_DRIVE_ID]
+    selected_scope["todo"]["task_list_ids"] = [GRAPH_V2_TASK_LIST_ID]
+    selected_scope["calendar"]["calendar_ids"] = [GRAPH_V2_CALENDAR_ID]
+    selected_scope = plugin_modules.account_center._safe_microsoft_graph_profile_scope(
+        selected_scope
+    )
+    updated = spine.account_client.update_microsoft_graph_v2_scope(
+        principal,
+        profile_ref=GRAPH_PROFILE_REF,
+        workspace_id=GRAPH_V2_WORKSPACE_ID,
+        expected_credential_revision=0,
+        target_scope=selected_scope,
+        idempotency_key="office-v2-target-cas",
+    )
+    assert updated["credential_revision"] == 1
+    assert updated["target_scope"] == selected_scope
+    for index, (operation_id, arguments) in enumerate(operation_arguments.items(), start=10):
+        create_and_compare_lease(operation_id, arguments, index)
 
 
 def test_exchange_ado_poll_binds_scope_digest_and_unlink_revokes_pending_lease(
