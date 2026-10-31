@@ -457,36 +457,57 @@ def test_mail_send_unknown_result_is_preserved_for_durable_receipt_mapping() -> 
         "folder_id": "drafts",
         "message_id": "AAMkDraft-opaque==",
     }
-    client = _DirectClient(
+    arguments = {
+        "payload": payload,
+        "profile_ref": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+        "lease_ref": "77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+        "target": target,
+        "arguments_sha256": digest_arguments(
+            lease_arguments_for_operation(operation_id, payload)
+        ),
+        "profile_scope_sha256": "a" * 64,
+    }
+
+    def invoke(result: dict[str, Any]) -> dict[str, Any]:
+        return _invoke_signed_microsoft_graph_tool(
+            _DirectClient(result),
+            endpoint=SimpleNamespace(binding_id="graph-provider-binding"),
+            principal=principal,
+            profile=profile,
+            context_key=_KEY,
+            tool_id=operation_id,
+            operation_id=operation_id,
+            arguments=arguments,
+            request_id="office-mail-send-unknown",
+        )
+
+    result = invoke(
         {
             "status": "UNKNOWN",
             "message_id": "AAMkDraft-opaque==",
             "reconciliation": "Read the selected mailbox metadata before another send attempt.",
         }
     )
-    result = _invoke_signed_microsoft_graph_tool(
-        client,
-        endpoint=SimpleNamespace(binding_id="graph-provider-binding"),
-        principal=principal,
-        profile=profile,
-        context_key=_KEY,
-        tool_id=operation_id,
-        operation_id=operation_id,
-        arguments={
-            "payload": payload,
-            "profile_ref": "66666666-7777-4888-8999-aaaaaaaaaaaa",
-            "lease_ref": "77777777-8888-4999-8aaa-bbbbbbbbbbbb",
-            "target": target,
-            "arguments_sha256": digest_arguments(
-                lease_arguments_for_operation(operation_id, payload)
-            ),
-            "profile_scope_sha256": "a" * 64,
-        },
-        request_id="office-mail-send-unknown",
-    )
     assert result["status"] == "UNKNOWN"
     assert result["message_id"] == "AAMkDraft-opaque=="
     assert "reconciliation" in result
+    for malformed in (
+        {
+            "status": "ACCEPTED",
+            "message_id": "AAMkDraft-opaque==",
+            "error": {"code": "unexpected"},
+        },
+        {"status": "ACCEPTED", "message_id": "AAMkOtherDraft=="},
+        {
+            "status": "ACCEPTED",
+            "message_id": "AAMkDraft-opaque==",
+            "message": {"bodyPreview": "private text"},
+        },
+    ):
+        with pytest.raises(ExchangeProductError) as unknown:
+            invoke(malformed)
+        assert unknown.value.code == "EXCHANGE_CONNECTOR_OUTCOME_UNKNOWN"
+        assert unknown.value.context["resultState"] == "UNKNOWN_RESULT"
 
 
 def test_graph_mail_mutation_transport_loss_is_unknown_while_reads_remain_retryable() -> None:

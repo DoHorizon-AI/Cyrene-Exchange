@@ -2597,6 +2597,15 @@ def _invoke_signed_microsoft_graph_tool(
             _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
         raise IntegrationToolCallUnavailable()
     result = values[0]
+    if operation_id.startswith("microsoft_graph.mail.") and (
+        "error" in result
+        or "isError" in result
+        or "is_error" in result
+        or _contains_forbidden_mail_content(result)
+    ):
+        if operation_id in GRAPH_MUTATING_OPERATIONS:
+            _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
+        raise IntegrationToolCallUnavailable()
     if operation_id in GRAPH_MUTATING_OPERATIONS:
         expected_status = (
             "ACCEPTED"
@@ -2610,7 +2619,66 @@ def _invoke_signed_microsoft_graph_tool(
             "UNKNOWN",
         }:
             _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
+        if operation_id.startswith("microsoft_graph.mail.") and not _valid_mail_mutation_result(
+            operation_id,
+            result,
+            target,
+        ):
+            _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
     return result
+
+
+def _contains_forbidden_mail_content(value: object) -> bool:
+    """Reject bodies and attachments if a provider ever violates metadata-only Mail reads."""
+
+    forbidden = {"body", "bodypreview", "body_preview", "bodytext", "body_text", "attachments"}
+    if isinstance(value, Mapping):
+        return any(
+            str(key).replace("_", "").casefold() in forbidden
+            or _contains_forbidden_mail_content(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_forbidden_mail_content(item) for item in value)
+    return False
+
+
+def _valid_mail_mutation_result(
+    operation_id: str,
+    result: Mapping[str, Any],
+    target: object,
+) -> bool:
+    """Require the fixed confirmation/uncertainty shape for Mail writes."""
+
+    if not isinstance(target, Mapping):
+        return False
+    status = result.get("status")
+    if status not in {"CONFIRMED", "ACCEPTED", "UNKNOWN"}:
+        return False
+    target_message_id = target.get("message_id")
+    if status == "UNKNOWN":
+        if not isinstance(result.get("reconciliation"), str) or not result["reconciliation"]:
+            return False
+        if operation_id == "microsoft_graph.mail.draft.create":
+            return "message" in result and result.get("message") is None
+        return isinstance(target_message_id, str) and result.get("message_id") == target_message_id
+    if operation_id == "microsoft_graph.mail.message.send":
+        return status == "ACCEPTED" and result.get("message_id") == target_message_id
+    if status != "CONFIRMED":
+        return False
+    if operation_id == "microsoft_graph.mail.draft.delete":
+        return result.get("message_id") == target_message_id
+    message = result.get("message")
+    if not isinstance(message, Mapping):
+        return False
+    if operation_id == "microsoft_graph.mail.draft.create":
+        return isinstance(message.get("message_id"), str) and message.get("is_draft") is True
+    return (
+        operation_id == "microsoft_graph.mail.draft.update"
+        and isinstance(target_message_id, str)
+        and message.get("message_id") == target_message_id
+        and message.get("is_draft") is True
+    )
 
 
 def _invoke_signed_azure_devops_tool(
