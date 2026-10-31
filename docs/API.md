@@ -75,8 +75,11 @@ ID. If an existing
 profile lacks an explicitly enabled Mail scope, status reports
 `mailAuthorizationState=REAUTHORIZATION_REQUIRED`; status does not start consent.
 The loopback setup bridge starts the existing Account Center scope-upgrade flow only
-after an explicit user action. Reads return metadata only, without body, preview, or
-attachments. Send accepts only a selected existing draft, and a Graph `202` is
+after an explicit user action. Its target-selection request is a patch: omitted
+categories retain the current selection, and an explicit empty array clears only
+that category; selection cannot change feature flags or OAuth scopes. Reads return
+metadata only, without body, preview, or attachments. Send accepts only a selected
+existing draft, and a Graph `202` is
 reported as `ACCEPTED`, not as delivered. Ambiguous post-dispatch mutations become
 `UNKNOWN_RESULT` and are not retried automatically.
 
@@ -114,8 +117,9 @@ Mail feature 仅由固定 host profile 显式启用。Metadata 读取使用 `Mai
 发送增加 `Mail.Send`，并且总会预检查当前用户 Drafts 文件夹中的既有草稿。Send-only grant 不能枚举 Drafts，只能接收精确的既有
 draft ID。既有关联缺少显式启用的 Mail scope 时，状态
 返回 `mailAuthorizationState=REAUTHORIZATION_REQUIRED`；status 不会自行启动授权。loopback setup bridge 仅在用户显式
-操作后启动 Account Center 现有 scope-upgrade 流程。读取只返回 metadata，不含正文、预览或附件。Send 仅接受已选择的
-既有草稿；Graph `202` 返回 `ACCEPTED`，不表示已送达。派发后结果不明的 mutation 记录为 `UNKNOWN_RESULT`，不会自动重试。
+操作后启动 Account Center 现有 scope-upgrade 流程。Target selection 是 patch：遗漏类别保留原选择，显式空数组只清空该类别；
+选择操作不能修改 feature flag 或 OAuth scope。读取只返回 metadata，不含正文、预览或附件。Send 仅接受已选择的既有草稿；
+Graph `202` 返回 `ACCEPTED`，不表示已送达。派发后结果不明的 mutation 记录为 `UNKNOWN_RESULT`，不会自动重试。
 
 Azure DevOps 使用独立的 Entra delegated OAuth profile，每个 Account Center profile 只绑定一个
 host `authorizedSources` source tuple。link 请求仅提供 `bindingRef` 和 `sourceId` alias；租户、组织、

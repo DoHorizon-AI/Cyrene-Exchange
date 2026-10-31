@@ -585,6 +585,7 @@ def _profile_snapshot(
         "externalSubject": str(profile.get("external_subject")),
         "scopeSchemaVersion": meta["scope_schema_version"],
         "targetScope": public_profile_scope(scope),
+        "selectedTargets": _selected_target_ids(scope),
         "requiredOAuthScopes": list(meta["required_oauth_scopes"]),
         "enabledFeatures": enabled_features,
         "targetRefCount": int(meta["target_ref_count"]),
@@ -623,6 +624,20 @@ def _mail_authorization_state(
     return "READY"
 
 
+def _selected_target_ids(scope: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Expose only the current validated target selections, without profile credentials."""
+
+    return {
+        "plannerPlanIds": list(scope["planner"]["plan_ids"]),
+        "sharePointListIds": list(scope["sharepoint"]["list_ids"]),
+        "sharePointDriveIds": list(scope["sharepoint"]["drive_ids"]),
+        "toDoTaskListIds": list(scope["todo"]["task_list_ids"]),
+        "calendarIds": list(scope["calendar"]["calendar_ids"]),
+        "freebusySubjects": list(scope["calendar"]["freebusy_subjects"]),
+        "mailFolderIds": list(scope["mail"]["folder_ids"]),
+    }
+
+
 def _not_linked_snapshot(
     host_profile: Any,
     profile_ref: str,
@@ -641,6 +656,15 @@ def _not_linked_snapshot(
         "externalSubject": None,
         "scopeSchemaVersion": 2,
         "targetScope": None,
+        "selectedTargets": {
+            "plannerPlanIds": [],
+            "sharePointListIds": [],
+            "sharePointDriveIds": [],
+            "toDoTaskListIds": [],
+            "calendarIds": [],
+            "freebusySubjects": [],
+            "mailFolderIds": [],
+        },
         "requiredOAuthScopes": list(
             required_oauth_scopes(microsoft_graph_office_v2_scope(host_profile, principal))
         ),
@@ -787,12 +811,12 @@ def _select_targets(
         )
     if current_revision != expected_revision:
         return _profile_snapshot(profile_ref, profile, host_profile=host_profile, state="CONFLICT")
-    selected = _target_selection(payload["targets"])
+    requested_targets = _target_selection(payload["targets"])
     old_scope = validate_profile_scope(profile.get("target_scope"))
     if old_scope.get("schema_version") != 2:
         raise OfficeSetupError("office_graph_v2_scope_required")
-    if old_scope["calendar"]["freebusy_read"] and not selected["freebusySubjects"]:
-        raise OfficeSetupError("office_graph_target_selection_invalid")
+    selected = _selected_target_ids(old_scope)
+    selected.update(requested_targets)
 
     discovery_map = {
         "plannerPlanIds": ("planner_plans", "plan_id"),
@@ -803,6 +827,8 @@ def _select_targets(
         "freebusySubjects": ("freebusy_subjects", "freebusy_subject"),
     }
     for target_name, (resource_type, resource_id_field) in discovery_map.items():
+        if target_name not in requested_targets:
+            continue
         chosen = selected[target_name]
         if not chosen:
             continue
@@ -849,6 +875,7 @@ def _select_targets(
             **old_scope["calendar"],
             "calendar_ids": selected["calendarIds"],
             "freebusy_subjects": selected["freebusySubjects"],
+            "freebusy_read": bool(selected["freebusySubjects"]),
         },
         "mail": {**old_scope["mail"], "folder_ids": selected["mailFolderIds"]},
     }
@@ -1137,13 +1164,15 @@ def _discovery_item(resource_type: str, value: object) -> dict[str, str]:
 
 
 def _target_selection(value: object) -> dict[str, list[str]]:
-    """Validate the exact resource-ID selection shape; permission flags are absent."""
+    """Validate a non-empty patch of resource-ID selections; flags are absent."""
 
     item = _object(
-        value, required=set(_TARGET_FIELDS), optional=set(), label="Office target selection"
+        value, required=set(), optional=set(_TARGET_FIELDS), label="Office target selection"
     )
+    if not item:
+        raise OfficeSetupError("office_graph_target_selection_invalid")
     selected: dict[str, list[str]] = {}
-    for field in sorted(_TARGET_FIELDS):
+    for field in sorted(item):
         raw = item[field]
         maximum = 100
         if not isinstance(raw, list) or len(raw) > maximum:

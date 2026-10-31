@@ -191,11 +191,14 @@ def test_target_selection_is_exact_and_rejects_duplicates() -> None:
         "freebusySubjects": [],
     }
     assert _target_selection(selection)["toDoTaskListIds"] == ["AAMk-list"]
+    assert _target_selection({"mailFolderIds": []}) == {"mailFolderIds": []}
 
     with pytest.raises(OfficeSetupError, match="office_graph_target_selection_duplicate"):
         _target_selection({**selection, "toDoTaskListIds": ["AAMk-list", "AAMk-list"]})
     with pytest.raises(OfficeSetupError, match="office_graph_target_selection_invalid"):
         _target_selection({**selection, "calendarIds": ["*"]})
+    with pytest.raises(OfficeSetupError, match="office_graph_target_selection_invalid"):
+        _target_selection({})
 
 
 def test_discovery_projection_never_returns_urls_or_content() -> None:
@@ -277,6 +280,7 @@ def test_profile_snapshot_exposes_health_and_scope_without_credentials() -> None
     assert snapshot["credentialRevision"] == 4
     assert snapshot["reauthRequired"] is False
     assert snapshot["mailAuthorizationState"] == "DISABLED"
+    assert snapshot["selectedTargets"]["mailFolderIds"] == []
     assert "access_token" not in snapshot and "refresh_token" not in snapshot
     assert "never-project-this" not in json.dumps(snapshot)
 
@@ -609,6 +613,16 @@ def test_synthetic_office_setup_begin_complete_discover_cas_status_chain(
     )
     assert unlinked["state"] == "NOT_LINKED"
     assert unlinked["targetScope"] is None
+    assert set(unlinked["selectedTargets"]) == {
+        "plannerPlanIds",
+        "sharePointListIds",
+        "sharePointDriveIds",
+        "toDoTaskListIds",
+        "calendarIds",
+        "freebusySubjects",
+        "mailFolderIds",
+    }
+    assert unlinked["selectedTargets"]["mailFolderIds"] == []
     assert unlinked["enabledFeatures"]["mailSendEnabled"] is False
 
     begun = execute_office_setup(
@@ -791,11 +805,11 @@ def test_mail_upgrade_is_explicit_host_derived_and_keeps_old_profile_until_compl
         ):
             assert profile_ref == PROFILE_REF
             assert workspace_id == WORKSPACE_ID
-            assert expected_credential_revision == 5
+            assert expected_credential_revision == profile["credential_revision"]
             assert idempotency_key.startswith("office-targets:")
             calls.append(("select-targets", {"revision": expected_credential_revision}))
             profile["target_scope"] = target_scope
-            profile["credential_revision"] = 6
+            profile["credential_revision"] = expected_credential_revision + 1
             return profile
 
     services = SimpleNamespace(accounts=FakeAccounts(), callback_principal=principal)
@@ -877,21 +891,32 @@ def test_mail_upgrade_is_explicit_host_derived_and_keeps_old_profile_until_compl
         private_config=config_path,
         request_payload={
             "expectedCredentialRevision": 5,
-            "targets": {
-                "plannerPlanIds": [],
-                "sharePointListIds": [],
-                "sharePointDriveIds": [],
-                "toDoTaskListIds": [],
-                "calendarIds": [],
-                "mailFolderIds": ["AAMkInbox-opaque=="],
-                "freebusySubjects": ["person@dohorizon.com"],
-            },
+            "targets": {"mailFolderIds": ["AAMkInbox-opaque=="]},
         },
     )
     assert selected["state"] == "UPDATED"
     assert selected["selectedCounts"]["mailFolders"] == 1
+    assert selected["selectedTargets"]["mailFolderIds"] == ["AAMkInbox-opaque=="]
+    assert selected["selectedTargets"]["freebusySubjects"] == ["person@dohorizon.com"]
+    assert selected["credentialRevision"] == 6
+
+    cleared = execute_office_setup(
+        services,
+        action="select-targets",
+        private_config=config_path,
+        request_payload={
+            "expectedCredentialRevision": 6,
+            "targets": {"mailFolderIds": []},
+        },
+    )
+    assert cleared["state"] == "UPDATED"
+    assert cleared["selectedCounts"]["mailFolders"] == 0
+    assert cleared["selectedTargets"]["mailFolderIds"] == []
+    assert cleared["selectedTargets"]["freebusySubjects"] == ["person@dohorizon.com"]
+    assert cleared["credentialRevision"] == 7
     assert [name for name, _ in calls] == [
         "begin-upgrade",
         "complete-upgrade",
+        "select-targets",
         "select-targets",
     ]
