@@ -34,6 +34,7 @@ from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
 from cyrene_exchange_product.integrations.authorization_cloud_provider import (
     AuthorizationCloudDirectProvider,
     PlatformCurrentAuthorizationContextResolver,
+    _invoke_signed_microsoft_graph_tool,
 )
 from cyrene_exchange_product.integrations.connector_operations import _account_center_grant_proof
 from cyrene_exchange_product.integrations.connector_security import digest_arguments
@@ -344,6 +345,82 @@ class _DirectClient:
             "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse",
             response.SerializeToString(deterministic=True),
         )
+
+
+def test_microsoft_graph_signed_context_uses_exchange_caller_and_keeps_provider_workload() -> None:
+    from cyrene_exchange_product.integrations.microsoft_graph import (
+        lease_arguments_for_operation,
+    )
+
+    tenant_id = "11111111-2222-4333-8444-555555555555"
+    object_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+    operation_id = "microsoft_graph.todo.lists.list"
+    principal = IntegrationPrincipal(
+        issuer=issuer,
+        subject=object_id,
+        organization_id="office-org",
+        workspace_id="office-workspace",
+        allowed_operation_ids=frozenset({operation_id}),
+    )
+    profile = SimpleNamespace(
+        provider="microsoft_graph",
+        caller_workload="microsoft-graph-provider",
+        access_mode="actor_owned",
+        expected_issuer=issuer,
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        microsoft_graph_plan_ids=(),
+        microsoft_graph_sharepoint_site_id=None,
+        microsoft_graph_sharepoint_list_ids=(),
+        microsoft_graph_office_v2=None,
+    )
+    payload = {"page_size": 10}
+    arguments = {
+        "payload": payload,
+        "profile_ref": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+        "lease_ref": "77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+        "target": {"tenant_id": tenant_id},
+        "arguments_sha256": digest_arguments(lease_arguments_for_operation(operation_id, payload)),
+        "profile_scope_sha256": "a" * 64,
+    }
+    client = _DirectClient({"items": []})
+
+    result = _invoke_signed_microsoft_graph_tool(
+        client,
+        endpoint=SimpleNamespace(binding_id="graph-provider-binding"),
+        principal=principal,
+        profile=profile,
+        context_key=_KEY,
+        tool_id=operation_id,
+        operation_id=operation_id,
+        arguments=arguments,
+        request_id="office-graph-discovery-1",
+    )
+
+    assert result == {"items": []}
+    assert profile.caller_workload == "microsoft-graph-provider"
+    request = client.requests[0]
+    envelope = json.loads(request.arguments_json)
+    signed_payload = {
+        key: envelope[key]
+        for key in (
+            "payload",
+            "profile_ref",
+            "lease_ref",
+            "target",
+            "arguments_sha256",
+            "profile_scope_sha256",
+        )
+    }
+    assert envelope["trusted_context"]["caller_id"] == "exchange-service"
+    assert verify_account_center_context(
+        method="call_tool",
+        payload=signed_payload,
+        context=envelope["trusted_context"],
+        keys={"exchange-service": _KEY},
+        expected_caller_id="exchange-service",
+    )
 
 
 class _StaticContexts:
