@@ -16,6 +16,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -851,8 +852,22 @@ class AccountCenterClient:
         idempotency_key: str,
         site_id: str | None = None,
         list_ids: list[str] | None = None,
+        mail_features: Mapping[str, bool] | None = None,
     ) -> dict[str, Any]:
-        """Begin one fixed Planner-write or selected-SharePoint consent upgrade."""
+        """Begin one fixed Graph permission upgrade using a closed feature contract."""
+
+        if mail_features is not None:
+            if (
+                permission != "mail"
+                or set(mail_features) != {"metadata_read", "drafts_write", "send"}
+                or any(type(flag) is not bool for flag in mail_features.values())
+                or not any(mail_features.values())
+            ):
+                raise ValueError("Microsoft Graph mail scope-upgrade features are invalid")
+        elif permission == "mail":
+            raise ValueError("Microsoft Graph mail scope-upgrade features are required")
+        elif permission not in {"planner_tasks_write", "sharepoint_selected"}:
+            raise ValueError("Microsoft Graph scope-upgrade permission is not supported")
 
         payload: dict[str, object] = {
             "profile_ref": profile_ref,
@@ -863,6 +878,8 @@ class AccountCenterClient:
             payload["site_id"] = site_id
         if list_ids is not None:
             payload["list_ids"] = list(list_ids)
+        if mail_features is not None:
+            payload["mail_features"] = dict(mail_features)
         return self._invoke_user("begin_microsoft_graph_scope_upgrade", principal, payload)
 
     def complete_microsoft_graph_scope_upgrade(
@@ -1196,6 +1213,45 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
                 retryable=True,
                 context={"reasonCode": "account_center_connector_grant_contract_missing"},
             )
+    if method == "begin_microsoft_graph_scope_upgrade" and "mail_features" in values:
+        dto_fields = getattr(dto_type, "__dataclass_fields__", {})
+        if "mail_features" not in dto_fields:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_MAIL_SCOPE_UPGRADE_UNAVAILABLE",
+                title="Microsoft Graph Mail authorization is unavailable",
+                detail=(
+                    "The pinned Account Center contract does not support the fixed Mail "
+                    "scope-upgrade request."
+                ),
+                status=503,
+                retryable=False,
+                context={"reasonCode": "account_center_mail_scope_upgrade_contract_missing"},
+            )
+        mail_features_type = getattr(account_contracts, "MicrosoftGraphMailFeatures", None)
+        permission_type = getattr(account_contracts, "MicrosoftGraphPermissionUpgrade", None)
+        raw_mail_features = values["mail_features"]
+        if (
+            mail_features_type is None
+            or permission_type is None
+            or not isinstance(raw_mail_features, Mapping)
+            or set(raw_mail_features) != {"metadata_read", "drafts_write", "send"}
+            or any(type(flag) is not bool for flag in raw_mail_features.values())
+            or not any(raw_mail_features.values())
+            or not hasattr(permission_type, "MAIL")
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_MAIL_SCOPE_UPGRADE_UNAVAILABLE",
+                title="Microsoft Graph Mail authorization is unavailable",
+                detail=(
+                    "The pinned Account Center contract lacks the fixed Mail feature DTO "
+                    "or permission."
+                ),
+                status=503,
+                retryable=False,
+                context={"reasonCode": "account_center_mail_scope_upgrade_contract_invalid"},
+            )
+        values["permission"] = permission_type.MAIL
+        values["mail_features"] = mail_features_type(**dict(raw_mail_features))
     if method == "link_huggingface_profile" and "auth_mode" in values:
         dto_fields = getattr(dto_type, "__dataclass_fields__", {})
         if "auth_mode" not in dto_fields:
@@ -1211,6 +1267,8 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
             raise ValueError("Account Center resource must be a typed resource object")
         values["resource"] = Resource(**dict(resource))
     serialized = asdict(dto_type(**values))
+    if isinstance(serialized.get("permission"), Enum):
+        serialized["permission"] = serialized["permission"].value
     if method in {
         "begin_microsoft_graph_link",
         "begin_microsoft_graph_scope_upgrade",
@@ -3393,6 +3451,17 @@ def _raise_provider_error(
             status=422,
             context={"reasonCode": normalized.lower()},
         )
+    if normalized in {"RATE_LIMITED", "THROTTLED", "TOO_MANY_REQUESTS"}:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_RATE_LIMITED",
+            title="Provider rate limit reached",
+            detail=(
+                "The provider rejected this request before accepting the operation; retry later."
+            ),
+            status=429,
+            retryable=True,
+            context={"reasonCode": "provider_rate_limited"},
+        )
     if normalized in {"RESOURCE_NOT_FOUND", "PROFILE_NOT_FOUND"}:
         raise ExchangeProductError(
             code="EXCHANGE_CONNECTOR_RESOURCE_NOT_FOUND",
@@ -3400,6 +3469,30 @@ def _raise_provider_error(
             detail="The configured provider did not find the selected resource or profile.",
             status=404,
             context={"reasonCode": normalized.lower()},
+        )
+    if normalized == "GRAPH_RESOURCE_NOT_FOUND":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_RESOURCE_NOT_FOUND",
+            title="Mail draft not found",
+            detail="Microsoft Graph did not find the selected draft in the user's Drafts folder.",
+            status=404,
+            context={"reasonCode": "mail_draft_not_found"},
+        )
+    if normalized == "MESSAGE_NOT_DRAFT":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_OPERATION_REJECTED",
+            title="A current draft is required",
+            detail="The selected message is no longer a draft in the user's Drafts folder.",
+            status=409,
+            context={"reasonCode": "mail_message_not_draft"},
+        )
+    if normalized == "CONCURRENCY_CONFLICT":
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_RESOURCE_CONFLICT",
+            title="Provider resource changed",
+            detail="The selected resource changed since it was read; refresh it before updating.",
+            status=409,
+            context={"reasonCode": "resource_concurrency_conflict"},
         )
     raise ExchangeProductError(
         code="EXCHANGE_CONNECTOR_PROVIDER_UNAVAILABLE",

@@ -3076,7 +3076,7 @@ components:
           minLength: 1
           maxLength: 300
       title: BeginMicrosoftGraphLinkBody
-      description: Select a host binding with fixed Planner plan IDs for delegated Tasks.Read consent.
+      description: Select a host binding with fixed Office features and targets for actor-owned delegated Microsoft Graph consent.
     BeginAzureDevOpsLinkBody:
       type: object
       additionalProperties: false
@@ -3107,6 +3107,12 @@ components:
       title: SelectMicrosoftGraphSharePointScopeBody
       description: Select a host binding whose site/list allowlist is fixed for Sites.Selected consent.
     MicrosoftGraphProfileScope:
+      oneOf:
+      - $ref: '#/components/schemas/MicrosoftGraphProfileScopeV1'
+      - $ref: '#/components/schemas/MicrosoftGraphOfficeV2ProfileScope'
+      title: MicrosoftGraphProfileScope
+      description: Exact non-secret legacy or Office v2 scope returned by the actor-owned Account Center profile.
+    MicrosoftGraphProfileScopeV1:
       type: object
       additionalProperties: false
       required:
@@ -3161,8 +3167,176 @@ components:
                 type: string
                 format: uuid
                 pattern: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
-      title: MicrosoftGraphProfileScope
-      description: Exact non-secret scope returned by the actor-owned Account Center profile.
+      title: MicrosoftGraphProfileScopeV1
+      description: Legacy non-secret Microsoft Graph Planner and SharePoint scope.
+    MicrosoftGraphOfficeV2ProfileScope:
+      type: object
+      additionalProperties: false
+      required:
+      - schemaVersion
+      - tenantId
+      - workspaceId
+      - planner
+      - sharepoint
+      - todo
+      - calendar
+      - mail
+      properties:
+        schemaVersion:
+          type: integer
+          const: 2
+        tenantId:
+          type: string
+          format: uuid
+        workspaceId:
+          type: string
+          format: uuid
+        planner:
+          type: object
+          additionalProperties: false
+          required:
+          - planIds
+          - tasksRead
+          - tasksWrite
+          properties:
+            planIds:
+              type: array
+              maxItems: 100
+              uniqueItems: true
+              items:
+                type: string
+                pattern: ^[A-Za-z0-9_-]{1,128}$
+            tasksRead:
+              type: boolean
+            tasksWrite:
+              type: boolean
+        sharepoint:
+          type: object
+          additionalProperties: false
+          required:
+          - enabled
+          - siteId
+          - listIds
+          - driveIds
+          - metadataRead
+          - contentRead
+          properties:
+            enabled:
+              type: boolean
+            siteId:
+              anyOf:
+              - type: string
+                pattern: ^[A-Za-z0-9.-]{1,255},[0-9a-fA-F-]{36},[0-9a-fA-F-]{36}$
+              - type: 'null'
+            listIds:
+              type: array
+              maxItems: 100
+              uniqueItems: true
+              items:
+                type: string
+                format: uuid
+            driveIds:
+              type: array
+              maxItems: 100
+              uniqueItems: true
+              items:
+                type: string
+                pattern: ^[A-Za-z0-9._!~+=-]{1,512}$
+            metadataRead:
+              type: boolean
+            contentRead:
+              type: boolean
+              const: false
+        todo:
+          type: object
+          additionalProperties: false
+          required:
+          - enabled
+          - taskListIds
+          - tasksRead
+          - tasksWrite
+          properties:
+            enabled:
+              type: boolean
+            taskListIds:
+              type: array
+              maxItems: 100
+              uniqueItems: true
+              items:
+                type: string
+                pattern: ^[A-Za-z0-9._!~+=-]{1,512}$
+            tasksRead:
+              type: boolean
+            tasksWrite:
+              type: boolean
+        calendar:
+          type: object
+          additionalProperties: false
+          required:
+          - enabled
+          - calendarIds
+          - eventsRead
+          - eventsWrite
+          - freebusyRead
+          - freebusySubjects
+          - attendeesWrite
+          properties:
+            enabled:
+              type: boolean
+            calendarIds:
+              type: array
+              maxItems: 100
+              uniqueItems: true
+              items:
+                type: string
+                pattern: ^[A-Za-z0-9._!~+=-]{1,512}$
+            eventsRead:
+              type: boolean
+            eventsWrite:
+              type: boolean
+            freebusyRead:
+              type: boolean
+            freebusySubjects:
+              type: array
+              maxItems: 100
+              uniqueItems: true
+              items:
+                type: string
+                format: email
+            attendeesWrite:
+              type: boolean
+              const: false
+        mail:
+          type: object
+          additionalProperties: false
+          required:
+          - enabled
+          - folderIds
+          - metadataRead
+          - bodyRead
+          - draftsWrite
+          - sendEnabled
+          properties:
+            enabled:
+              type: boolean
+            folderIds:
+              type: array
+              maxItems: 100
+              uniqueItems: true
+              items:
+                type: string
+                pattern: ^[A-Za-z0-9._!~+=-]{1,512}$
+            metadataRead:
+              type: boolean
+            bodyRead:
+              type: boolean
+              const: false
+            draftsWrite:
+              type: boolean
+            sendEnabled:
+              type: boolean
+      title: MicrosoftGraphOfficeV2ProfileScope
+      description: Exact non-secret Office v2 scope, including explicit Mail metadata, draft, and send capabilities.
     AzureDevOpsProfileScope:
       type: object
       additionalProperties: false

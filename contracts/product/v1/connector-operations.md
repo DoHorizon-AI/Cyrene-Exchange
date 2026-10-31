@@ -84,10 +84,51 @@ Planner reads require the initial delegated `Tasks.Read` consent. `Tasks.ReadWri
 is requested only by the explicit Planner-write consent action; until Account
 Center reports that consent, task create/update operations are denied. SharePoint
 operations remain absent until the host binding selects one exact site/list set
-and the actor completes separate `Sites.Selected` consent. Tenant-wide task write, Mail, Calendar,
-plan enumeration, arbitrary SharePoint fields, and arbitrary Graph URLs are not
-part of this operation map. The provider constrains task updates to the fixed
-field allowlist and requires the current eTag as `if_match`.
+and the actor completes separate `Sites.Selected` consent. Planner plan enumeration
+and arbitrary Graph URLs are not part of this operation map. The provider constrains
+task updates to the fixed field allowlist and requires the current eTag as `if_match`.
+
+Mail capabilities are opt-in host flags. Initial linking requests only configured
+features; an already linked profile missing an opted-in Mail scope reports
+`REAUTHORIZATION_REQUIRED` and uses the existing explicit Account Center scope-upgrade
+flow. Status never starts consent. `Mail.ReadBasic` covers metadata reads and the
+Drafts preflight for send-only profiles; listing and writing Drafts require the
+drafts feature and `Mail.ReadWrite`. Send-only can send only a caller-supplied exact
+draft ID and cannot enumerate Drafts. Send adds `Mail.Send`; Drafts plus send need
+only `Mail.ReadWrite` and `Mail.Send`.
+Mail folder IDs are selected from the fixed `mail.folders.list` discovery result.
+The provider reads message metadata only; it never returns `body`, `bodyPreview`, or
+attachments. Draft body text is accepted only as an explicit create/update input.
+
+| Operation ID | Access | Target projection |
+| --- | --- | --- |
+| `microsoft_graph.mail.folders.list` | Read | `tenant_id` |
+| `microsoft_graph.mail.messages.list` | Read | `tenant_id`, `folder_id` |
+| `microsoft_graph.mail.message.get` | Read | `tenant_id`, `folder_id`, `message_id` |
+| `microsoft_graph.mail.drafts.list` | Read | `tenant_id`, fixed `folder_id=drafts` |
+| `microsoft_graph.mail.draft.create` | Write | `tenant_id`, fixed `folder_id=drafts` |
+| `microsoft_graph.mail.draft.update` | Write | `tenant_id`, fixed `folder_id=drafts`, `message_id` |
+| `microsoft_graph.mail.draft.delete` | Write | `tenant_id`, fixed `folder_id=drafts`, `message_id` |
+| `microsoft_graph.mail.message.send` | Write | `tenant_id`, fixed `folder_id=drafts`, `message_id` |
+
+The closed payloads are: folder/draft list `{page_size?, page_cursor?}`; message list
+`{folder_id, page_size?, page_cursor?}`; message get `{folder_id, message_id}`;
+draft create `{subject, body_text, to_recipients?, cc_recipients?}`; draft update
+`{message_id, if_match, changes}` where `changes` is a non-empty subset of
+`subject`, `body_text`, `to_recipients`, and `cc_recipients`; draft delete
+`{message_id, if_match}`; and send `{message_id}`. Page size is bounded to 1–100,
+and provider cursors are opaque and profile/target bound. Folder and message IDs
+are exact opaque resource selectors; they are bound in the AC lease target and
+excluded from its argument digest, while all other payload values remain covered.
+
+Draft update/delete use the returned eTag as `if_match`. Create/update accept only
+plain-text body input and bounded exact email-address recipient lists. Every draft
+mutation and send first verifies that the exact current-user message belongs to
+the Drafts folder and still has `isDraft=true`; send cannot target an arbitrary
+folder or non-draft message. A Graph `202` is returned as `status=ACCEPTED`, which
+confirms provider acceptance but not delivery. A transport loss or malformed
+post-dispatch mutation response is recorded as `UNKNOWN_RESULT` and is never
+automatically retried; typed preflight rejections remain definite failures.
 
 ## Azure DevOps observation operations
 
@@ -215,9 +256,39 @@ Exchange 不会接收或保存 Graph access/refresh token。Provider 兑换一�
 
 Planner 读取要求初次委派 `Tasks.Read` consent。只有显式执行 Planner 写权限 consent action 时才申请
 `Tasks.ReadWrite`；Account Center 确认前，create/update 均会拒绝。SharePoint 操作默认不可用；host binding
-固定 site/list 且 actor 单独完成 `Sites.Selected` consent 后才开放。该操作表不包含 tenant-wide task write、Mail、
-Calendar、plan 枚举、任意 SharePoint 字段或任意 Graph URL。Provider 将 task update 限制为固定字段，
-并要求以当前 eTag 作为 `if_match` 前置条件。
+固定 site/list 且 actor 单独完成 `Sites.Selected` consent 后才开放。plan 枚举和任意 Graph URL 不在此操作表中。
+Provider 将 task update 限制为固定字段，并要求以当前 eTag 作为 `if_match` 前置条件。
+
+Mail capability 由 host 显式 opt-in。初次关联仅请求配置的 feature；已关联 profile 缺少新启用的 Mail scope 时，状态
+报告 `REAUTHORIZATION_REQUIRED`，并使用 Account Center 现有 scope-upgrade 流程；status 不会启动授权。
+仅 metadata 使用 `Mail.ReadBasic`；draft 写入使用 `Mail.ReadWrite`；发送增加 `Mail.Send`，send-only 另需
+`Mail.ReadBasic` 用于 Drafts 前置检查。Drafts 列表和写入都要求 drafts feature 与 `Mail.ReadWrite`；send-only 只能发送调用方已知
+的精确 draft ID，不能枚举 Drafts。Drafts+send 只需 `Mail.ReadWrite` 和 `Mail.Send`。Mail folder ID 必须从
+固定 `mail.folders.list` 发现结果中选择。Provider 只读取消息 metadata，不返回 `body`、`bodyPreview` 或附件；正文仅能作为
+显式 draft create/update 输入。
+
+| Operation ID | 权限 | Target 投影 |
+| --- | --- | --- |
+| `microsoft_graph.mail.folders.list` | 读取 | `tenant_id` |
+| `microsoft_graph.mail.messages.list` | 读取 | `tenant_id`、`folder_id` |
+| `microsoft_graph.mail.message.get` | 读取 | `tenant_id`、`folder_id`、`message_id` |
+| `microsoft_graph.mail.drafts.list` | 读取 | `tenant_id`、固定 `folder_id=drafts` |
+| `microsoft_graph.mail.draft.create` | 写入 | `tenant_id`、固定 `folder_id=drafts` |
+| `microsoft_graph.mail.draft.update` | 写入 | `tenant_id`、固定 `folder_id=drafts`、`message_id` |
+| `microsoft_graph.mail.draft.delete` | 写入 | `tenant_id`、固定 `folder_id=drafts`、`message_id` |
+| `microsoft_graph.mail.message.send` | 写入 | `tenant_id`、固定 `folder_id=drafts`、`message_id` |
+
+闭合输入分别为：folder/draft list `{page_size?, page_cursor?}`；message list
+`{folder_id, page_size?, page_cursor?}`；message get `{folder_id, message_id}`；draft create
+`{subject, body_text, to_recipients?, cc_recipients?}`；draft update
+`{message_id, if_match, changes}`，其中 `changes` 是 `subject`、`body_text`、`to_recipients`、
+`cc_recipients` 的非空子集；draft delete `{message_id, if_match}`；send `{message_id}`。
+`page_size` 限于 1–100，Provider cursor 不透明并绑定 profile/target。Folder 与 message ID 是精确 opaque
+selector，会绑定到 AC lease target 并从 argument digest 排除；其余输入均包含在 digest 中。
+
+Draft update/delete 必须将返回的 eTag 作为 `if_match`。所有 draft mutation 与 send 都先确认当前用户的 message 属于 Drafts 且
+`isDraft=true`；发送不接受任意 folder 或非草稿。Graph `202` 返回 `status=ACCEPTED`，只表示 Provider 已接受，不代表已送达。
+派发后的传输中断或格式错误响应会记录为 `UNKNOWN_RESULT`，绝不自动重试；有明确类型的前置检查拒绝仍是确定失败。
 
 ## Azure DevOps observation 操作
 

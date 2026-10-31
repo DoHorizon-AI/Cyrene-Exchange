@@ -22,6 +22,7 @@ from cyrene_exchange_product.integrations.connector_operations import (
     ConnectorOperationDispatcher,
     _account_lease_target,
     _resource_ref,
+    connector_binding_tools,
 )
 from cyrene_exchange_product.integrations.connector_security import digest_arguments
 from cyrene_exchange_product.integrations.microsoft_graph import (
@@ -137,6 +138,13 @@ def _account_profile(
         oauth_scopes.append("Tasks.ReadWrite")
     if selected_scope["sharepoint"]["enabled"]:
         oauth_scopes.append("Sites.Selected")
+    mail = selected_scope.get("mail", {})
+    if mail.get("drafts_write"):
+        oauth_scopes.append("Mail.ReadWrite")
+    elif mail.get("metadata_read") or mail.get("send_enabled"):
+        oauth_scopes.append("Mail.ReadBasic")
+    if mail.get("send_enabled"):
+        oauth_scopes.append("Mail.Send")
     return {
         "profile_ref": PROFILE_REF,
         "provider": "microsoft_graph",
@@ -359,7 +367,7 @@ def test_office_v2_discovery_is_limited_to_safe_selected_account_metadata() -> N
     assert outside_list.value.context["reasonCode"] == "microsoft_graph_todo_list_scope_mismatch"
     with pytest.raises(ExchangeProductError) as mail_denied:
         target_for_operation("microsoft_graph.mail.message.send", {"message_id": "m1"}, scope)
-    assert mail_denied.value.context["reasonCode"] == "microsoft_graph_operation_not_allowlisted"
+    assert mail_denied.value.context["reasonCode"] == "mail_feature_not_enabled"
 
 
 def test_office_v2_selected_targets_gate_writes_and_bind_their_lease_digest() -> None:
@@ -434,6 +442,14 @@ def test_all_graph_operations_project_exact_account_center_lease_targets() -> No
             "freebusy_subjects": ["Person@DoHorizon.com"],
         }
     )
+    scope["mail"] = {
+        "enabled": True,
+        "folder_ids": ["AAMkMailFolder-opaque=="],
+        "metadata_read": True,
+        "body_read": False,
+        "drafts_write": True,
+        "send_enabled": True,
+    }
     site_id = scope["sharepoint"]["site_id"]
     list_id = OFFICE_V2_LIST_ID
     task_list_id = "AAMkList-opaque=="
@@ -582,6 +598,58 @@ def test_all_graph_operations_project_exact_account_center_lease_targets() -> No
             },
             {"tenant_id": TENANT_ID, "site_id": site_id, "drive_id": "b!drive-opaque=="},
         ),
+        "microsoft_graph.mail.folders.list": (
+            {"page_size": 10},
+            {"tenant_id": TENANT_ID},
+        ),
+        "microsoft_graph.mail.messages.list": (
+            {"folder_id": "AAMkMailFolder-opaque==", "page_size": 10},
+            {"tenant_id": TENANT_ID, "folder_id": "AAMkMailFolder-opaque=="},
+        ),
+        "microsoft_graph.mail.message.get": (
+            {"folder_id": "AAMkMailFolder-opaque==", "message_id": "AAMkMessage-opaque=="},
+            {
+                "tenant_id": TENANT_ID,
+                "folder_id": "AAMkMailFolder-opaque==",
+                "message_id": "AAMkMessage-opaque==",
+            },
+        ),
+        "microsoft_graph.mail.drafts.list": (
+            {"page_size": 10},
+            {"tenant_id": TENANT_ID, "folder_id": "drafts"},
+        ),
+        "microsoft_graph.mail.draft.create": (
+            {"subject": "Review", "body_text": "Plain text", "to_recipients": ["a@b.test"]},
+            {"tenant_id": TENANT_ID, "folder_id": "drafts"},
+        ),
+        "microsoft_graph.mail.draft.update": (
+            {
+                "message_id": "AAMkMessage-opaque==",
+                "if_match": 'W/"etag-1"',
+                "changes": {"subject": "Updated"},
+            },
+            {
+                "tenant_id": TENANT_ID,
+                "folder_id": "drafts",
+                "message_id": "AAMkMessage-opaque==",
+            },
+        ),
+        "microsoft_graph.mail.draft.delete": (
+            {"message_id": "AAMkMessage-opaque==", "if_match": 'W/"etag-1"'},
+            {
+                "tenant_id": TENANT_ID,
+                "folder_id": "drafts",
+                "message_id": "AAMkMessage-opaque==",
+            },
+        ),
+        "microsoft_graph.mail.message.send": (
+            {"message_id": "AAMkMessage-opaque=="},
+            {
+                "tenant_id": TENANT_ID,
+                "folder_id": "drafts",
+                "message_id": "AAMkMessage-opaque==",
+            },
+        ),
     }
 
     assert set(cases) == GRAPH_OPERATIONS
@@ -646,6 +714,48 @@ def test_all_graph_operations_project_exact_account_center_lease_targets() -> No
     )
 
 
+def test_mail_operations_are_published_with_closed_resource_projections() -> None:
+    mail_tools = {
+        item["operationId"]: item
+        for item in connector_binding_tools("microsoft_graph")
+        if str(item["operationId"]).startswith("microsoft_graph.mail.")
+    }
+    assert set(mail_tools) == {
+        "microsoft_graph.mail.folders.list",
+        "microsoft_graph.mail.messages.list",
+        "microsoft_graph.mail.message.get",
+        "microsoft_graph.mail.drafts.list",
+        "microsoft_graph.mail.draft.create",
+        "microsoft_graph.mail.draft.update",
+        "microsoft_graph.mail.draft.delete",
+        "microsoft_graph.mail.message.send",
+    }
+    assert mail_tools["microsoft_graph.mail.folders.list"]["resourceProjection"] == (
+        "microsoft_graph_mail_folder"
+    )
+    assert mail_tools["microsoft_graph.mail.messages.list"]["resourceProjection"] == (
+        "microsoft_graph_mail_message"
+    )
+    for operation_id in {
+        "microsoft_graph.mail.drafts.list",
+        "microsoft_graph.mail.draft.create",
+        "microsoft_graph.mail.draft.update",
+        "microsoft_graph.mail.draft.delete",
+        "microsoft_graph.mail.message.send",
+    }:
+        assert mail_tools[operation_id]["resourceProjection"] == "microsoft_graph_mail_draft"
+    assert mail_tools["microsoft_graph.mail.message.get"]["resourceProjection"] == (
+        "microsoft_graph_mail_message"
+    )
+    for operation_id in {
+        "microsoft_graph.mail.draft.create",
+        "microsoft_graph.mail.draft.update",
+        "microsoft_graph.mail.draft.delete",
+        "microsoft_graph.mail.message.send",
+    }:
+        assert mail_tools[operation_id]["mutating"] is True
+
+
 def test_office_v2_identity_is_pinned_to_tenant_owner_and_workspace() -> None:
     scope = _office_v2_scope()
     profile = {
@@ -703,6 +813,167 @@ def test_office_v2_profile_never_accepts_mail_body_reads() -> None:
 
     with pytest.raises(ValueError, match="Mail body reads are disabled"):
         validate_profile_scope(scope)
+
+
+def test_office_v2_profile_can_discover_mail_folders_before_selection() -> None:
+    scope = _office_v2_scope()
+    scope["mail"] = {
+        "enabled": True,
+        "folder_ids": [],
+        "metadata_read": True,
+        "body_read": False,
+        "drafts_write": False,
+        "send_enabled": False,
+    }
+    assert target_for_operation("microsoft_graph.mail.folders.list", {}, scope) == {
+        "tenant_id": TENANT_ID
+    }
+    assert "Mail.ReadBasic" in required_graph_permissions(scope)
+
+
+def test_mail_permissions_are_minimal_and_draft_targets_are_fixed() -> None:
+    send_only = _office_v2_scope()
+    send_only["mail"] = {
+        "enabled": True,
+        "folder_ids": [],
+        "metadata_read": False,
+        "body_read": False,
+        "drafts_write": False,
+        "send_enabled": True,
+    }
+    assert set(required_graph_permissions(send_only)) == {
+        "User.Read",
+        "Tasks.ReadWrite",
+        "Sites.Selected",
+        "Calendars.ReadWrite",
+        "Mail.ReadBasic",
+        "Mail.Send",
+    }
+    with pytest.raises(ExchangeProductError) as send_only_list_denied:
+        target_for_operation("microsoft_graph.mail.drafts.list", {}, send_only)
+    assert (
+        send_only_list_denied.value.context["reasonCode"] == "mail_draft_metadata_consent_required"
+    )
+    assert target_for_operation(
+        "microsoft_graph.mail.message.send", {"message_id": "AAMkDraft-opaque=="}, send_only
+    ) == {
+        "tenant_id": TENANT_ID,
+        "folder_id": "drafts",
+        "message_id": "AAMkDraft-opaque==",
+    }
+    with pytest.raises(ExchangeProductError) as denied:
+        metadata_only = {
+            **send_only,
+            "mail": {
+                "enabled": True,
+                "folder_ids": [],
+                "metadata_read": True,
+                "body_read": False,
+                "drafts_write": False,
+                "send_enabled": False,
+            },
+        }
+        target_for_operation(
+            "microsoft_graph.mail.drafts.list",
+            {},
+            metadata_only,
+        )
+    assert denied.value.context["reasonCode"] == "mail_draft_metadata_consent_required"
+
+    drafts = _office_v2_scope()
+    drafts["mail"] = {
+        "enabled": True,
+        "folder_ids": [],
+        "metadata_read": False,
+        "body_read": False,
+        "drafts_write": True,
+        "send_enabled": True,
+    }
+    assert set(required_graph_permissions(drafts)) >= {"Mail.ReadWrite", "Mail.Send"}
+    assert "Mail.ReadBasic" not in required_graph_permissions(drafts)
+    assert target_for_operation("microsoft_graph.mail.drafts.list", {}, drafts) == {
+        "tenant_id": TENANT_ID,
+        "folder_id": "drafts",
+    }
+
+
+def test_mail_arguments_are_closed_and_do_not_allow_body_reads_or_arbitrary_recipients() -> None:
+    scope = _office_v2_scope()
+    scope["mail"] = {
+        "enabled": True,
+        "folder_ids": ["AAMkMailFolder-opaque=="],
+        "metadata_read": True,
+        "body_read": False,
+        "drafts_write": True,
+        "send_enabled": True,
+    }
+    with pytest.raises(ValueError):
+        target_for_operation(
+            "microsoft_graph.mail.message.get",
+            {"folder_id": "AAMkMailFolder-opaque==", "message_id": "m1", "body": True},
+            scope,
+        )
+    with pytest.raises(ValueError):
+        target_for_operation(
+            "microsoft_graph.mail.draft.create",
+            {"subject": "Review", "body_text": "text", "to_recipients": ["x <a@b.test>"]},
+            scope,
+        )
+    with pytest.raises(ExchangeProductError) as outside:
+        target_for_operation(
+            "microsoft_graph.mail.messages.list",
+            {"folder_id": "AAMkOtherFolder=="},
+            scope,
+        )
+    assert outside.value.context["reasonCode"] == "microsoft_graph_mail_folder_scope_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "args", "expected"),
+    [
+        ("microsoft_graph.mail.folders.list", {"page_size": 10}, {"page_size": 10}),
+        (
+            "microsoft_graph.mail.messages.list",
+            {"folder_id": "f1", "page_size": 10},
+            {"page_size": 10},
+        ),
+        ("microsoft_graph.mail.message.get", {"folder_id": "f1", "message_id": "m1"}, {}),
+        ("microsoft_graph.mail.drafts.list", {"page_size": 10}, {"page_size": 10}),
+        (
+            "microsoft_graph.mail.draft.create",
+            {"subject": "S", "body_text": "body"},
+            {"subject": "S", "body_text": "body"},
+        ),
+        (
+            "microsoft_graph.mail.draft.update",
+            {"message_id": "m1", "if_match": 'W/"e"', "changes": {"subject": "S"}},
+            {"if_match": 'W/"e"', "changes": {"subject": "S"}},
+        ),
+        (
+            "microsoft_graph.mail.draft.delete",
+            {"message_id": "m1", "if_match": 'W/"e"'},
+            {"if_match": 'W/"e"'},
+        ),
+        ("microsoft_graph.mail.message.send", {"message_id": "m1"}, {}),
+    ],
+)
+def test_mail_lease_digest_binds_payload_except_exact_targets(
+    operation_id: str, args: dict[str, object], expected: dict[str, object]
+) -> None:
+    projected = lease_arguments_for_operation(operation_id, args)
+    assert projected == expected
+    changed_target = dict(args)
+    for key in set(args) - set(expected):
+        changed_target[key] = f"changed-{key}"
+    assert digest_arguments(lease_arguments_for_operation(operation_id, changed_target)) == (
+        digest_arguments(expected)
+    )
+    if expected:
+        first = next(iter(expected))
+        changed_payload = {**args, first: "changed-nontarget"}
+        assert digest_arguments(lease_arguments_for_operation(operation_id, changed_payload)) != (
+            digest_arguments(projected)
+        )
 
 
 def test_office_v2_write_scope_covers_read_on_other_enabled_task_feature() -> None:

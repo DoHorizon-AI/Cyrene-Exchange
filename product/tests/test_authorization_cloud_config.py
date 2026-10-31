@@ -297,6 +297,7 @@ def test_microsoft_profiles_use_fixed_host_plan_and_source_allowlists(tmp_path: 
     configuration, _ = _config(tmp_path)
     cloud = configuration["authorizationCloud"]
     tenant_id = "11111111-2222-4333-8444-555555555555"
+    office_workspace_id = "33333333-4444-4555-8666-777777777777"
     oid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
     cloud["currentAuthority"]["contexts"].append(
@@ -305,7 +306,7 @@ def test_microsoft_profiles_use_fixed_host_plan_and_source_allowlists(tmp_path: 
             "issuer": issuer,
             "subject": oid,
             "organizationId": "org-a",
-            "workspaceId": "workspace-a",
+            "workspaceId": office_workspace_id,
             "bearerTokenEnvRef": "bearers/actor-a",
         }
     )
@@ -319,7 +320,7 @@ def test_microsoft_profiles_use_fixed_host_plan_and_source_allowlists(tmp_path: 
         "expectedIssuer": issuer,
         "contextKeyRef": "keys/azure",
         "organizationId": "org-a",
-        "workspaceId": "workspace-a",
+        "workspaceId": office_workspace_id,
         "allowedContextRefs": ["entra-actor"],
         "accessMode": "actor_owned",
     }
@@ -334,6 +335,40 @@ def test_microsoft_profiles_use_fixed_host_plan_and_source_allowlists(tmp_path: 
                 "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
             ),
             "listIds": ["bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"],
+        },
+    }
+    cloud["profiles"]["graph-office-v2"] = {
+        **common,
+        "directPlugin": {
+            "bindingId": "microsoft-office-v2-binding",
+            "connectionRef": "grpc://127.0.0.1:5512",
+            "transport": "local",
+        },
+        "provider": "microsoft_graph",
+        "callerWorkload": "microsoft-graph-provider",
+        "officeV2": {
+            "schemaVersion": 2,
+            "tenantId": tenant_id,
+            "workspaceId": office_workspace_id,
+            "enabledFeatures": {
+                "plannerEnabled": False,
+                "todoEnabled": False,
+                "calendarEnabled": False,
+                "mailMetadataEnabled": True,
+                "mailDraftsEnabled": False,
+                "mailSendEnabled": False,
+                "sharePointDriveMetadataEnabled": False,
+            },
+            "targets": {
+                "plannerPlanIds": [],
+                "sharePointSiteIds": [],
+                "sharePointListIds": [],
+                "sharePointDriveIds": [],
+                "toDoTaskListIds": [],
+                "calendarIds": [],
+                "mailFolderIds": [],
+                "freebusySubjects": [],
+            },
         },
     }
     cloud["profiles"]["ado-pipeline"] = {
@@ -365,6 +400,25 @@ def test_microsoft_profiles_use_fixed_host_plan_and_source_allowlists(tmp_path: 
     )
     assert settings.profiles["graph-planner"].microsoft_graph_sharepoint_list_ids == (
         "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+    )
+    office_v2 = settings.profiles["graph-office-v2"].microsoft_graph_office_v2
+    assert office_v2 is not None
+    assert office_v2.enabled_features["mailMetadataEnabled"] is True
+    assert office_v2.targets["mailFolderIds"] == ()
+    schema = json.loads(
+        (
+            Path(__file__).parents[1] / "examples/authorization-cloud-configuration.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(schema)
+    Draft202012Validator(schema).validate(
+        {
+            "authorizationCloud": {
+                "currentAuthority": cloud["currentAuthority"],
+                "profiles": {"graph-office-v2": cloud["profiles"]["graph-office-v2"]},
+            },
+            "emailNotifications": configuration["emailNotifications"],
+        }
     )
     ado_source = settings.profiles["ado-pipeline"].authorized_sources["pipeline-source-a"]
     assert ado_source.profile_ref == "66666666-7777-4888-8999-aaaaaaaaaaaa"
@@ -402,7 +456,6 @@ def test_microsoft_host_allowlist_defaults_empty_and_rejects_duplicate_plan_ids(
             cloud,
             email_value=configuration["emailNotifications"],
         )
-
     cloud["profiles"]["graph-disabled"].pop("plannerPlanIds")
     cloud["profiles"]["graph-disabled"]["sharepointTargets"] = {
         "siteId": (
@@ -412,6 +465,72 @@ def test_microsoft_host_allowlist_defaults_empty_and_rejects_duplicate_plan_ids(
         "listIds": ["not-a-uuid"],
     }
     with pytest.raises(AuthorizationCloudConfigurationError, match="invalid ID"):
+        parse_authorization_cloud_settings(
+            cloud,
+            email_value=configuration["emailNotifications"],
+        )
+
+
+def test_microsoft_office_mail_folder_targets_require_explicit_metadata_feature(
+    tmp_path: Path,
+) -> None:
+    configuration, _ = _config(tmp_path)
+    cloud = configuration["authorizationCloud"]
+    tenant_id = "11111111-2222-4333-8444-555555555555"
+    office_workspace_id = "33333333-4444-4555-8666-777777777777"
+    cloud["currentAuthority"]["contexts"].append(
+        {
+            "contextRef": "entra-actor",
+            "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+            "subject": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "organizationId": "org-a",
+            "workspaceId": office_workspace_id,
+            "bearerTokenEnvRef": "bearers/actor-a",
+        }
+    )
+    cloud["profiles"]["graph-office-v2"] = {
+        "provider": "microsoft_graph",
+        "directPlugin": {
+            "bindingId": "microsoft-office-v2-binding",
+            "connectionRef": "grpc://127.0.0.1:5512",
+            "transport": "local",
+        },
+        "callerWorkload": "microsoft-graph-provider",
+        "audience": "microsoft-provider",
+        "expectedIssuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+        "contextKeyRef": "keys/azure",
+        "organizationId": "org-a",
+        "workspaceId": office_workspace_id,
+        "allowedContextRefs": ["entra-actor"],
+        "accessMode": "actor_owned",
+        "officeV2": {
+            "schemaVersion": 2,
+            "tenantId": tenant_id,
+            "workspaceId": office_workspace_id,
+            "enabledFeatures": {
+                "plannerEnabled": False,
+                "todoEnabled": False,
+                "calendarEnabled": False,
+                "mailMetadataEnabled": False,
+                "mailDraftsEnabled": False,
+                "mailSendEnabled": False,
+                "sharePointDriveMetadataEnabled": False,
+            },
+            "targets": {
+                "plannerPlanIds": [],
+                "sharePointSiteIds": [],
+                "sharePointListIds": [],
+                "sharePointDriveIds": [],
+                "toDoTaskListIds": [],
+                "calendarIds": [],
+                "mailFolderIds": ["AAMkFolder-opaque=="],
+                "freebusySubjects": [],
+            },
+        },
+    }
+    with pytest.raises(
+        AuthorizationCloudConfigurationError, match="folder targets require metadata"
+    ):
         parse_authorization_cloud_settings(
             cloud,
             email_value=configuration["emailNotifications"],

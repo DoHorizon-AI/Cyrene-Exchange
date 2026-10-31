@@ -13,10 +13,12 @@ from cyrene_exchange_product.integrations import store as store_module
 from cyrene_exchange_product.integrations.api import (
     ConnectorOperationBody,
     TeamsMessageBody,
+    _connector_exception_result,
     _connector_operation_response,
     _connector_replay_response,
     _teams_resource_ref,
 )
+from cyrene_exchange_product.integrations.clients import _raise_provider_error
 from cyrene_exchange_product.integrations.connector_operations import (
     ConnectorOperationDispatcher,
     _account_lease_target,
@@ -1259,6 +1261,15 @@ def test_provider_business_states_do_not_masquerade_as_tool_lifecycle() -> None:
         )["outcome"]
         == "uncertain"
     )
+    accepted_send = _connector_operation_response(
+        "mail-send-accepted",
+        {"status": "ACCEPTED", "message_id": "AAMkDraft-opaque=="},
+        is_mutating=True,
+        operation_id="microsoft_graph.mail.message.send",
+    )
+    assert accepted_send["outcome"] == "verified"
+    accepted_result = json.loads(accepted_send["result"]["content"][0]["text"])
+    assert accepted_result == {"status": "ACCEPTED", "message_id": "AAMkDraft-opaque=="}
     assert (
         _connector_operation_response(
             "write-no-state", {"resource_ref": "pod-1"}, is_mutating=True
@@ -1303,6 +1314,31 @@ def test_provider_business_states_do_not_masquerade_as_tool_lifecycle() -> None:
         )["outcome"]
         == "uncertain"
     )
+
+
+def test_typed_connector_refusal_is_definite_but_mutating_5xx_is_unknown() -> None:
+    refusal = ExchangeProductError(
+        code="EXCHANGE_CONNECTOR_OPERATION_REJECTED",
+        title="Draft precondition failed",
+        detail="The selected message is no longer a draft.",
+        status=409,
+    )
+    assert _connector_exception_result(refusal, is_mutating=True)["state"] == "FAILED"
+
+    ambiguous = ExchangeProductError(
+        code="EXCHANGE_CONNECTOR_OUTCOME_UNKNOWN",
+        title="Provider operation outcome is unknown",
+        detail="The provider did not confirm the result.",
+        status=502,
+    )
+    assert _connector_exception_result(ambiguous, is_mutating=True)["state"] == "UNKNOWN_RESULT"
+    assert _connector_exception_result(ambiguous, is_mutating=False)["state"] == "FAILED"
+
+    with pytest.raises(ExchangeProductError) as throttled:
+        _raise_provider_error("RATE_LIMITED", retryable=True)
+    assert throttled.value.status == 429
+    assert throttled.value.retryable is True
+    assert _connector_exception_result(throttled.value, is_mutating=True)["state"] == "FAILED"
 
 
 def test_provider_response_rejects_camelcase_secrets_and_suppresses_nested_cli_output() -> None:

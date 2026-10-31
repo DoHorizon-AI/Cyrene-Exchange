@@ -33,6 +33,7 @@ from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
 )
 from cyrene_exchange_product.integrations.authorization_cloud_provider import (
     AuthorizationCloudDirectProvider,
+    IntegrationToolCallUnavailable,
     PlatformCurrentAuthorizationContextResolver,
     _invoke_signed_microsoft_graph_tool,
 )
@@ -421,6 +422,186 @@ def test_microsoft_graph_signed_context_uses_exchange_caller_and_keeps_provider_
         keys={"exchange-service": _KEY},
         expected_caller_id="exchange-service",
     )
+
+
+def test_mail_send_unknown_result_is_preserved_for_durable_receipt_mapping() -> None:
+    from cyrene_exchange_product.integrations.microsoft_graph import (
+        lease_arguments_for_operation,
+    )
+
+    tenant_id = "11111111-2222-4333-8444-555555555555"
+    object_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+    operation_id = "microsoft_graph.mail.message.send"
+    principal = IntegrationPrincipal(
+        issuer=issuer,
+        subject=object_id,
+        organization_id="office-org",
+        workspace_id="office-workspace",
+        allowed_operation_ids=frozenset({operation_id}),
+    )
+    profile = SimpleNamespace(
+        provider="microsoft_graph",
+        caller_workload="microsoft-graph-provider",
+        expected_issuer=issuer,
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        microsoft_graph_plan_ids=(),
+        microsoft_graph_sharepoint_site_id=None,
+        microsoft_graph_sharepoint_list_ids=(),
+        microsoft_graph_office_v2=None,
+    )
+    payload = {"message_id": "AAMkDraft-opaque=="}
+    target = {
+        "tenant_id": tenant_id,
+        "folder_id": "drafts",
+        "message_id": "AAMkDraft-opaque==",
+    }
+    arguments = {
+        "payload": payload,
+        "profile_ref": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+        "lease_ref": "77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+        "target": target,
+        "arguments_sha256": digest_arguments(lease_arguments_for_operation(operation_id, payload)),
+        "profile_scope_sha256": "a" * 64,
+    }
+
+    def invoke(result: dict[str, Any]) -> dict[str, Any]:
+        return _invoke_signed_microsoft_graph_tool(
+            _DirectClient(result),
+            endpoint=SimpleNamespace(binding_id="graph-provider-binding"),
+            principal=principal,
+            profile=profile,
+            context_key=_KEY,
+            tool_id=operation_id,
+            operation_id=operation_id,
+            arguments=arguments,
+            request_id="office-mail-send-unknown",
+        )
+
+    result = invoke(
+        {
+            "status": "UNKNOWN",
+            "message_id": "AAMkDraft-opaque==",
+            "reconciliation": "Read the selected mailbox metadata before another send attempt.",
+        }
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["message_id"] == "AAMkDraft-opaque=="
+    assert "reconciliation" in result
+    for malformed in (
+        {
+            "status": "ACCEPTED",
+            "message_id": "AAMkDraft-opaque==",
+            "error": {"code": "unexpected"},
+        },
+        {"status": "ACCEPTED", "message_id": "AAMkOtherDraft=="},
+        {
+            "status": "ACCEPTED",
+            "message_id": "AAMkDraft-opaque==",
+            "message": {"bodyPreview": "private text"},
+        },
+    ):
+        with pytest.raises(ExchangeProductError) as unknown:
+            invoke(malformed)
+        assert unknown.value.code == "EXCHANGE_CONNECTOR_OUTCOME_UNKNOWN"
+        assert unknown.value.context["resultState"] == "UNKNOWN_RESULT"
+
+
+def test_graph_mail_mutation_transport_loss_is_unknown_while_reads_remain_retryable() -> None:
+    from cyrene_exchange_product.integrations.microsoft_graph import (
+        lease_arguments_for_operation,
+    )
+
+    tenant_id = "11111111-2222-4333-8444-555555555555"
+    object_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+    principal = IntegrationPrincipal(
+        issuer=issuer,
+        subject=object_id,
+        organization_id="office-org",
+        workspace_id="office-workspace",
+        allowed_operation_ids=frozenset(),
+    )
+    profile = SimpleNamespace(
+        provider="microsoft_graph",
+        caller_workload="microsoft-graph-provider",
+        access_mode="actor_owned",
+        expected_issuer=issuer,
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        microsoft_graph_plan_ids=(),
+        microsoft_graph_sharepoint_site_id=None,
+        microsoft_graph_sharepoint_list_ids=(),
+        microsoft_graph_office_v2=None,
+    )
+
+    class LostReplyClient:
+        def invoke(self, **_kwargs):
+            raise TimeoutError("simulated post-dispatch response loss")
+
+    def invoke(
+        operation_id: str,
+        payload: dict[str, object],
+        target: dict[str, object],
+        client: Any | None = None,
+    ) -> None:
+        _invoke_signed_microsoft_graph_tool(
+            client or LostReplyClient(),
+            endpoint=SimpleNamespace(binding_id="graph-provider-binding"),
+            principal=principal,
+            profile=profile,
+            context_key=_KEY,
+            tool_id=operation_id,
+            operation_id=operation_id,
+            arguments={
+                "payload": payload,
+                "profile_ref": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+                "lease_ref": "77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+                "target": target,
+                "arguments_sha256": digest_arguments(
+                    lease_arguments_for_operation(operation_id, payload)
+                ),
+                "profile_scope_sha256": "a" * 64,
+            },
+            request_id="mail-mutation-transport-loss",
+        )
+
+    with pytest.raises(ExchangeProductError) as unknown:
+        invoke(
+            "microsoft_graph.mail.message.send",
+            {"message_id": "AAMkDraft-opaque=="},
+            {
+                "tenant_id": tenant_id,
+                "folder_id": "drafts",
+                "message_id": "AAMkDraft-opaque==",
+            },
+        )
+    assert unknown.value.code == "EXCHANGE_CONNECTOR_OUTCOME_UNKNOWN"
+    assert unknown.value.context["resultState"] == "UNKNOWN_RESULT"
+    assert unknown.value.retryable is False
+
+    class InvalidReplyClient:
+        def invoke(self, **_kwargs):
+            return DirectPayload("type.invalid/response", b"not-a-provider-response")
+
+    with pytest.raises(ExchangeProductError) as malformed:
+        invoke(
+            "microsoft_graph.mail.draft.delete",
+            {"message_id": "AAMkDraft-opaque==", "if_match": 'W/"etag"'},
+            {
+                "tenant_id": tenant_id,
+                "folder_id": "drafts",
+                "message_id": "AAMkDraft-opaque==",
+            },
+            InvalidReplyClient(),
+        )
+    assert malformed.value.code == "EXCHANGE_CONNECTOR_OUTCOME_UNKNOWN"
+    assert malformed.value.context["resultState"] == "UNKNOWN_RESULT"
+
+    with pytest.raises(IntegrationToolCallUnavailable) as read_failure:
+        invoke("microsoft_graph.mail.folders.list", {"page_size": 10}, {"tenant_id": tenant_id})
+    assert read_failure.value.retryable is True
 
 
 class _StaticContexts:

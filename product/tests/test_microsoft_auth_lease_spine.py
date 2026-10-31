@@ -44,6 +44,7 @@ GRAPH_V2_LIST_ID = "dddddddd-eeee-4fff-8000-111111111111"
 GRAPH_V2_TASK_LIST_ID = "AAMkList-opaque=="
 GRAPH_V2_CALENDAR_ID = "AAMkCalendar-opaque=="
 GRAPH_V2_DRIVE_ID = "b!drive-opaque=="
+GRAPH_V2_MAIL_FOLDER_ID = "AAMkFolder-opaque=="
 GRAPH_V2_FREEBUSY_SUBJECT = "li.1@dohorizon.com"
 ADO_PROFILE_REF = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
 CONNECTION_ID = UUID("99999999-aaaa-4bbb-8ccc-dddddddddddd")
@@ -1216,6 +1217,36 @@ def _office_v2_operation_arguments() -> dict[str, dict[str, Any]]:
                 "parent_item_id": "folder!opaque==",
                 "page_size": 10,
             }
+        elif operation_id == "microsoft_graph.mail.folders.list":
+            arguments = {"page_size": 10}
+        elif operation_id == "microsoft_graph.mail.messages.list":
+            arguments = {"folder_id": GRAPH_V2_MAIL_FOLDER_ID, "page_size": 10}
+        elif operation_id == "microsoft_graph.mail.message.get":
+            arguments = {
+                "folder_id": GRAPH_V2_MAIL_FOLDER_ID,
+                "message_id": "AAMkMessage-opaque==",
+            }
+        elif operation_id == "microsoft_graph.mail.drafts.list":
+            arguments = {"page_size": 10}
+        elif operation_id == "microsoft_graph.mail.draft.create":
+            arguments = {
+                "subject": "Office draft",
+                "body_text": "Synthetic body",
+                "to_recipients": ["owner@example.test"],
+            }
+        elif operation_id == "microsoft_graph.mail.draft.update":
+            arguments = {
+                "message_id": "AAMkDraft-opaque==",
+                "if_match": 'W/"synthetic-etag-1"',
+                "changes": {"subject": "Updated synthetic draft"},
+            }
+        elif operation_id == "microsoft_graph.mail.draft.delete":
+            arguments = {
+                "message_id": "AAMkDraft-opaque==",
+                "if_match": 'W/"synthetic-etag-1"',
+            }
+        elif operation_id == "microsoft_graph.mail.message.send":
+            arguments = {"message_id": "AAMkDraft-opaque=="}
         else:
             raise AssertionError(f"No Graph fixture arguments for {operation_id}")
         values[operation_id] = arguments
@@ -1242,9 +1273,9 @@ def test_exchange_account_center_and_provider_agree_on_all_office_v2_targets(
         "plannerEnabled": True,
         "todoEnabled": True,
         "calendarEnabled": True,
-        "mailMetadataEnabled": False,
-        "mailDraftsEnabled": False,
-        "mailSendEnabled": False,
+        "mailMetadataEnabled": True,
+        "mailDraftsEnabled": True,
+        "mailSendEnabled": True,
         "sharePointDriveMetadataEnabled": True,
     }
     office_scope_host = SimpleNamespace(
@@ -1299,7 +1330,8 @@ def test_exchange_account_center_and_provider_agree_on_all_office_v2_targets(
     profile = next(row for row in profile_rows if row["profile_ref"] == GRAPH_PROFILE_REF)
     assert profile["credential_revision"] == 0
     assert profile["target_scope"] == initial_scope
-    assert "Mail.Send" not in profile["oauth_scopes"]
+    assert "Mail.Send" in profile["oauth_scopes"]
+    assert "Mail.ReadWrite" in profile["oauth_scopes"]
 
     connection = importlib.import_module(
         "cyrene_exchange_product.integrations.models"
@@ -1414,6 +1446,7 @@ def test_exchange_account_center_and_provider_agree_on_all_office_v2_targets(
     selected_scope["sharepoint"]["drive_ids"] = [GRAPH_V2_DRIVE_ID]
     selected_scope["todo"]["task_list_ids"] = [GRAPH_V2_TASK_LIST_ID]
     selected_scope["calendar"]["calendar_ids"] = [GRAPH_V2_CALENDAR_ID]
+    selected_scope["mail"]["folder_ids"] = [GRAPH_V2_MAIL_FOLDER_ID]
     selected_scope = plugin_modules.account_center._safe_microsoft_graph_profile_scope(
         selected_scope
     )
