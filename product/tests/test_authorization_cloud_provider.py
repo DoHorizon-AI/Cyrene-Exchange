@@ -462,9 +462,7 @@ def test_mail_send_unknown_result_is_preserved_for_durable_receipt_mapping() -> 
         "profile_ref": "66666666-7777-4888-8999-aaaaaaaaaaaa",
         "lease_ref": "77777777-8888-4999-8aaa-bbbbbbbbbbbb",
         "target": target,
-        "arguments_sha256": digest_arguments(
-            lease_arguments_for_operation(operation_id, payload)
-        ),
+        "arguments_sha256": digest_arguments(lease_arguments_for_operation(operation_id, payload)),
         "profile_scope_sha256": "a" * 64,
     }
 

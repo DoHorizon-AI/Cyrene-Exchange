@@ -406,8 +406,9 @@ def test_microsoft_profiles_use_fixed_host_plan_and_source_allowlists(tmp_path: 
     assert office_v2.enabled_features["mailMetadataEnabled"] is True
     assert office_v2.targets["mailFolderIds"] == ()
     schema = json.loads(
-        (Path(__file__).parents[1] / "examples/authorization-cloud-configuration.schema.json")
-        .read_text(encoding="utf-8")
+        (
+            Path(__file__).parents[1] / "examples/authorization-cloud-configuration.schema.json"
+        ).read_text(encoding="utf-8")
     )
     Draft202012Validator.check_schema(schema)
     Draft202012Validator(schema).validate(

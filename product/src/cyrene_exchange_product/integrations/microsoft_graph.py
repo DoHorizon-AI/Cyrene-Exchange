@@ -1382,8 +1382,7 @@ def _validate_mail_body(value: object) -> None:
         not isinstance(value, str)
         or len(value) > 65_536
         or any(
-            (ord(character) < 0x20 and character not in "\t\n\r")
-            or ord(character) == 0x7F
+            (ord(character) < 0x20 and character not in "\t\n\r") or ord(character) == 0x7F
             for character in value
         )
     ):

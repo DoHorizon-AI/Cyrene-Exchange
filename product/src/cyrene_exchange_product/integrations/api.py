@@ -1506,9 +1506,7 @@ def _connector_operation_response(
     if is_mutating and unknown_mutation_state:
         outcome = "uncertain"
     elif (
-        is_mutating
-        and operation_id == "microsoft_graph.mail.message.send"
-        and state == "ACCEPTED"
+        is_mutating and operation_id == "microsoft_graph.mail.message.send" and state == "ACCEPTED"
     ):
         # Graph's 202 confirms provider acceptance only; the nested result keeps
         # `status=ACCEPTED` and does not claim mailbox delivery.

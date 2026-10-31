@@ -852,8 +852,7 @@ def test_mail_permissions_are_minimal_and_draft_targets_are_fixed() -> None:
     with pytest.raises(ExchangeProductError) as send_only_list_denied:
         target_for_operation("microsoft_graph.mail.drafts.list", {}, send_only)
     assert (
-        send_only_list_denied.value.context["reasonCode"]
-        == "mail_draft_metadata_consent_required"
+        send_only_list_denied.value.context["reasonCode"] == "mail_draft_metadata_consent_required"
     )
     assert target_for_operation(
         "microsoft_graph.mail.message.send", {"message_id": "AAMkDraft-opaque=="}, send_only

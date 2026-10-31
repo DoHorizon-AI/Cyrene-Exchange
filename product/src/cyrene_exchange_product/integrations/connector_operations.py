@@ -1303,13 +1303,15 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
                 else "microsoft_graph_mail_folder"
                 if operation_id == "microsoft_graph.mail.folders.list"
                 else "microsoft_graph_mail_message"
-                if operation_id in {
+                if operation_id
+                in {
                     "microsoft_graph.mail.messages.list",
                     "microsoft_graph.mail.message.get",
                 }
                 else "microsoft_graph_mail_draft"
                 if operation_id.startswith("microsoft_graph.mail.draft.")
-                or operation_id in {
+                or operation_id
+                in {
                     "microsoft_graph.mail.drafts.list",
                     "microsoft_graph.mail.message.send",
                 }
