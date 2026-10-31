@@ -849,9 +849,12 @@ def test_mail_permissions_are_minimal_and_draft_targets_are_fixed() -> None:
         "Mail.ReadBasic",
         "Mail.Send",
     }
-    assert target_for_operation(
-        "microsoft_graph.mail.drafts.list", {}, send_only
-    ) == {"tenant_id": TENANT_ID, "folder_id": "drafts"}
+    with pytest.raises(ExchangeProductError) as send_only_list_denied:
+        target_for_operation("microsoft_graph.mail.drafts.list", {}, send_only)
+    assert (
+        send_only_list_denied.value.context["reasonCode"]
+        == "mail_draft_metadata_consent_required"
+    )
     assert target_for_operation(
         "microsoft_graph.mail.message.send", {"message_id": "AAMkDraft-opaque=="}, send_only
     ) == {
@@ -889,6 +892,10 @@ def test_mail_permissions_are_minimal_and_draft_targets_are_fixed() -> None:
     }
     assert set(required_graph_permissions(drafts)) >= {"Mail.ReadWrite", "Mail.Send"}
     assert "Mail.ReadBasic" not in required_graph_permissions(drafts)
+    assert target_for_operation("microsoft_graph.mail.drafts.list", {}, drafts) == {
+        "tenant_id": TENANT_ID,
+        "folder_id": "drafts",
+    }
 
 
 def test_mail_arguments_are_closed_and_do_not_allow_body_reads_or_arbitrary_recipients() -> None:

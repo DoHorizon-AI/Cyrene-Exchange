@@ -92,8 +92,10 @@ Mail capabilities are opt-in host flags. Initial linking requests only configure
 features; an already linked profile missing an opted-in Mail scope reports
 `REAUTHORIZATION_REQUIRED` and uses the existing explicit Account Center scope-upgrade
 flow. Status never starts consent. `Mail.ReadBasic` covers metadata reads and the
-Drafts preflight for send-only profiles; draft writes use `Mail.ReadWrite`, and send
-adds `Mail.Send`. Drafts plus send need only `Mail.ReadWrite` and `Mail.Send`.
+Drafts preflight for send-only profiles; listing and writing Drafts require the
+drafts feature and `Mail.ReadWrite`. Send-only can send only a caller-supplied exact
+draft ID and cannot enumerate Drafts. Send adds `Mail.Send`; Drafts plus send need
+only `Mail.ReadWrite` and `Mail.Send`.
 Mail folder IDs are selected from the fixed `mail.folders.list` discovery result.
 The provider reads message metadata only; it never returns `body`, `bodyPreview`, or
 attachments. Draft body text is accepted only as an explicit create/update input.
@@ -260,7 +262,8 @@ Provider 将 task update 限制为固定字段，并要求以当前 eTag 作为 
 Mail capability 由 host 显式 opt-in。初次关联仅请求配置的 feature；已关联 profile 缺少新启用的 Mail scope 时，状态
 报告 `REAUTHORIZATION_REQUIRED`，并使用 Account Center 现有 scope-upgrade 流程；status 不会启动授权。
 仅 metadata 使用 `Mail.ReadBasic`；draft 写入使用 `Mail.ReadWrite`；发送增加 `Mail.Send`，send-only 另需
-`Mail.ReadBasic` 用于 Drafts 前置检查。Drafts+send 只需 `Mail.ReadWrite` 和 `Mail.Send`。Mail folder ID 必须从
+`Mail.ReadBasic` 用于 Drafts 前置检查。Drafts 列表和写入都要求 drafts feature 与 `Mail.ReadWrite`；send-only 只能发送调用方已知
+的精确 draft ID，不能枚举 Drafts。Drafts+send 只需 `Mail.ReadWrite` 和 `Mail.Send`。Mail folder ID 必须从
 固定 `mail.folders.list` 发现结果中选择。Provider 只读取消息 metadata，不返回 `body`、`bodyPreview` 或附件；正文仅能作为
 显式 draft create/update 输入。
 

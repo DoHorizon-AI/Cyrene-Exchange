@@ -874,10 +874,10 @@ def target_for_operation(
                 )
             return mail_target
         if operation_id in MAIL_DRAFT_READ_OPERATIONS:
-            if not (mail["drafts_write"] or mail["send_enabled"]):
+            if not mail["drafts_write"]:
                 raise _permission_denied(
                     "mail_draft_metadata_consent_required",
-                    "Mail metadata consent is required to list drafts",
+                    "Mail draft consent is required to list Drafts",
                 )
             return {"tenant_id": tenant_id, "folder_id": "drafts"}
         if operation_id in MAIL_DRAFT_WRITE_OPERATIONS:

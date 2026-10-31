@@ -68,8 +68,10 @@ SharePoint remains disabled until the actor selects one fixed site/list set and
 completes `Sites.Selected` consent.
 
 Mail features are enabled only by the fixed host profile. Metadata reads use
-`Mail.ReadBasic`; draft writes use `Mail.ReadWrite`; sending adds `Mail.Send` and
-always preflights an existing message in the user's Drafts folder. If an existing
+`Mail.ReadBasic`; listing and writing Drafts use `Mail.ReadWrite`; sending adds
+`Mail.Send` and always preflights an existing message in the user's Drafts folder.
+A send-only grant cannot enumerate Drafts and accepts only an exact existing draft
+ID. If an existing
 profile lacks an explicitly enabled Mail scope, status reports
 `mailAuthorizationState=REAUTHORIZATION_REQUIRED`; status does not start consent.
 The loopback setup bridge starts the existing Account Center scope-upgrade flow only
@@ -108,8 +110,9 @@ actor 必须使用规范 Entra issuer 和 object ID，并与 Account Center `ext
 显式执行 Planner 写权限 consent 后开放。SharePoint 默认关闭；host binding 固定 site/list 且 actor 单独完成
 `Sites.Selected` consent 后才开放。
 
-Mail feature 仅由固定 host profile 显式启用。Metadata 读取使用 `Mail.ReadBasic`，草稿写入使用 `Mail.ReadWrite`，
-发送增加 `Mail.Send`，并且总会预检查当前用户 Drafts 文件夹中的既有草稿。既有关联缺少显式启用的 Mail scope 时，状态
+Mail feature 仅由固定 host profile 显式启用。Metadata 读取使用 `Mail.ReadBasic`，Drafts 列表和写入使用 `Mail.ReadWrite`，
+发送增加 `Mail.Send`，并且总会预检查当前用户 Drafts 文件夹中的既有草稿。Send-only grant 不能枚举 Drafts，只能接收精确的既有
+draft ID。既有关联缺少显式启用的 Mail scope 时，状态
 返回 `mailAuthorizationState=REAUTHORIZATION_REQUIRED`；status 不会自行启动授权。loopback setup bridge 仅在用户显式
 操作后启动 Account Center 现有 scope-upgrade 流程。读取只返回 metadata，不含正文、预览或附件。Send 仅接受已选择的
 既有草稿；Graph `202` 返回 `ACCEPTED`，不表示已送达。派发后结果不明的 mutation 记录为 `UNKNOWN_RESULT`，不会自动重试。
