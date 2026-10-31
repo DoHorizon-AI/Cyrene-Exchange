@@ -669,7 +669,8 @@ def _not_linked_snapshot(
             required_oauth_scopes(microsoft_graph_office_v2_scope(host_profile, principal))
         ),
         "enabledFeatures": dict(features),
-        "targetRefCount": sum(len(values) for values in office.targets.values()),
+        # Host allowlist targets are not selected profile references before linking.
+        "targetRefCount": 0,
         "selectedCounts": {"mailFolders": len(office.targets["mailFolderIds"])},
         "credentialExpiresAt": None,
         "refreshExpiresAt": None,

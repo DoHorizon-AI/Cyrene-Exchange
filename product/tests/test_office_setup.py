@@ -613,6 +613,7 @@ def test_synthetic_office_setup_begin_complete_discover_cas_status_chain(
     )
     assert unlinked["state"] == "NOT_LINKED"
     assert unlinked["targetScope"] is None
+    assert host_profile.microsoft_graph_office_v2.targets["sharePointSiteIds"] == (SITE_ID,)
     assert set(unlinked["selectedTargets"]) == {
         "plannerPlanIds",
         "sharePointListIds",
@@ -622,6 +623,8 @@ def test_synthetic_office_setup_begin_complete_discover_cas_status_chain(
         "freebusySubjects",
         "mailFolderIds",
     }
+    assert sum(len(target_ids) for target_ids in unlinked["selectedTargets"].values()) == 0
+    assert unlinked["targetRefCount"] == 0
     assert unlinked["selectedTargets"]["mailFolderIds"] == []
     assert unlinked["enabledFeatures"]["mailSendEnabled"] is False
 
