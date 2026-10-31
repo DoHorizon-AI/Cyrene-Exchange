@@ -885,6 +885,16 @@ def test_mail_upgrade_is_explicit_host_derived_and_keeps_old_profile_until_compl
     assert discovered["items"] == [
         {"id": "AAMkInbox-opaque==", "displayName": "Inbox", "kind": "mail_folder"}
     ]
+    with pytest.raises(OfficeSetupError, match="office_graph_target_selection_invalid"):
+        execute_office_setup(
+            services,
+            action="select-targets",
+            private_config=config_path,
+            request_payload={
+                "expectedCredentialRevision": 5,
+                "targets": {"freebusySubjects": []},
+            },
+        )
     selected = execute_office_setup(
         services,
         action="select-targets",

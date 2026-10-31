@@ -817,6 +817,12 @@ def _select_targets(
         raise OfficeSetupError("office_graph_v2_scope_required")
     selected = _selected_target_ids(old_scope)
     selected.update(requested_targets)
+    if (
+        old_scope["calendar"]["freebusy_read"]
+        and "freebusySubjects" in requested_targets
+        and not requested_targets["freebusySubjects"]
+    ):
+        raise OfficeSetupError("office_graph_target_selection_invalid")
 
     discovery_map = {
         "plannerPlanIds": ("planner_plans", "plan_id"),
@@ -875,7 +881,6 @@ def _select_targets(
             **old_scope["calendar"],
             "calendar_ids": selected["calendarIds"],
             "freebusy_subjects": selected["freebusySubjects"],
-            "freebusy_read": bool(selected["freebusySubjects"]),
         },
         "mail": {**old_scope["mail"], "folder_ids": selected["mailFolderIds"]},
     }
