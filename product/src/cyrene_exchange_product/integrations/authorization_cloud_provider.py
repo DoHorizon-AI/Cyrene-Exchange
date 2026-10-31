@@ -90,6 +90,8 @@ from cyrene_exchange_product.integrations.models import (
 )
 from cyrene_exchange_product.integrations.store import IntegrationStore
 
+EXCHANGE_SERVICE_CALLER_ID = "exchange-service"
+
 
 class PlatformCurrentAuthorizationContextResolver:
     """Reverify bearer or one-use Directory proof before every worker call."""
@@ -2486,7 +2488,7 @@ def _invoke_signed_microsoft_graph_tool(
         trusted_context = sign_context(
             method="call_tool",
             payload=signed_payload,
-            caller_id=profile.caller_workload,
+            caller_id=EXCHANGE_SERVICE_CALLER_ID,
             issuer=principal.issuer,
             subject=principal.subject,
             organization_id=principal.organization_id,
