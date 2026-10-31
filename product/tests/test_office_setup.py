@@ -34,6 +34,7 @@ from cyrene_exchange_product.integrations.models import IntegrationPrincipal
 from cyrene_exchange_product.integrations.office_setup import (
     OfficeSetupError,
     _discovery_item,
+    _not_linked_snapshot,
     _operator_config,
     _profile_snapshot,
     _target_selection,
@@ -147,6 +148,23 @@ def _principal() -> IntegrationPrincipal:
         workspace_id=WORKSPACE_ID,
         allowed_operation_ids=frozenset(),
     )
+
+
+def test_not_linked_snapshot_counts_no_host_allowlist_targets() -> None:
+    host_profile = _office_host_profile()
+    office = host_profile.microsoft_graph_office_v2
+    office.enabled_features["mailMetadataEnabled"] = True
+    office.targets["mailFolderIds"] = ("allowed-mail-folder",)
+    assert office.targets["sharePointSiteIds"] == (SITE_ID,)
+
+    snapshot = _not_linked_snapshot(host_profile, PROFILE_REF, _principal())
+
+    assert snapshot["state"] == "NOT_LINKED"
+    assert snapshot["selectedTargets"]["sharePointListIds"] == []
+    assert snapshot["selectedTargets"]["mailFolderIds"] == []
+    assert sum(len(target_ids) for target_ids in snapshot["selectedTargets"].values()) == 0
+    assert snapshot["targetRefCount"] == 0
+    assert snapshot["selectedCounts"] == {"mailFolders": 0}
 
 
 def test_operator_config_requires_current_user_private_exact_file(tmp_path) -> None:

@@ -671,7 +671,7 @@ def _not_linked_snapshot(
         "enabledFeatures": dict(features),
         # Host allowlist targets are not selected profile references before linking.
         "targetRefCount": 0,
-        "selectedCounts": {"mailFolders": len(office.targets["mailFolderIds"])},
+        "selectedCounts": {"mailFolders": 0},
         "credentialExpiresAt": None,
         "refreshExpiresAt": None,
         "credentialRevision": None,
