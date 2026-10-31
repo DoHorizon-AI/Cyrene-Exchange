@@ -1106,13 +1106,6 @@ def _parse_microsoft_graph_office_v2(
             "Microsoft Graph officeV2 feature flags must be booleans"
         )
     features = {key: bool(value) for key, value in features_value.items()}
-    if any(
-        features[name] for name in ("mailMetadataEnabled", "mailDraftsEnabled", "mailSendEnabled")
-    ):
-        raise AuthorizationCloudConfigurationError(
-            "Microsoft Graph mail access is deferred for this Exchange delivery"
-        )
-
     targets_value = office["targets"]
     if not isinstance(targets_value, Mapping) or set(targets_value) != _OFFICE_V2_TARGETS:
         raise AuthorizationCloudConfigurationError(
@@ -1191,8 +1184,10 @@ def _parse_microsoft_graph_office_v2(
         targets[name] for name in ("calendarIds", "freebusySubjects")
     ):
         raise AuthorizationCloudConfigurationError("Calendar targets require its feature flag")
-    if targets["mailFolderIds"]:
-        raise AuthorizationCloudConfigurationError("Mail targets are deferred for this release")
+    if targets["mailFolderIds"] and not features["mailMetadataEnabled"]:
+        raise AuthorizationCloudConfigurationError(
+            "Microsoft Graph mail folder targets require metadata access"
+        )
 
     return MicrosoftGraphOfficeV2Profile(
         tenant_id=tenant_id,
@@ -1262,12 +1257,15 @@ def microsoft_graph_office_v2_scope(
             "attendees_write": False,
         },
         "mail": {
-            "enabled": False,
-            "folder_ids": [],
-            "metadata_read": False,
+            "enabled": any(
+                features[name]
+                for name in ("mailMetadataEnabled", "mailDraftsEnabled", "mailSendEnabled")
+            ),
+            "folder_ids": list(targets["mailFolderIds"]),
+            "metadata_read": features["mailMetadataEnabled"],
             "body_read": False,
-            "drafts_write": False,
-            "send_enabled": False,
+            "drafts_write": features["mailDraftsEnabled"],
+            "send_enabled": features["mailSendEnabled"],
         },
     }
     return validate_profile_scope(scope)
@@ -1320,8 +1318,16 @@ def validate_microsoft_graph_office_v2_scope(
         raise PermissionError(
             "Microsoft Graph Calendar attendee writes are disabled in this release"
         )
-    if any(scope["mail"].values()):
-        raise PermissionError("Microsoft Graph Mail is deferred for this release")
+    mail = scope["mail"]
+    mail_feature_map = {
+        "metadata_read": "mailMetadataEnabled",
+        "drafts_write": "mailDraftsEnabled",
+        "send_enabled": "mailSendEnabled",
+    }
+    for scope_flag, host_flag in mail_feature_map.items():
+        if mail[scope_flag] and not features[host_flag]:
+            raise PermissionError("Microsoft Graph Mail feature is disabled by host policy")
+    _require_host_subset(mail["folder_ids"], targets["mailFolderIds"], "Mail folder")
     if sharepoint["enabled"]:
         if sharepoint["site_id"] != office.targets["sharePointSiteIds"][0]:
             raise PermissionError("Microsoft Graph SharePoint site is outside host policy")

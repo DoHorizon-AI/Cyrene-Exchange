@@ -46,7 +46,14 @@ from cyrene_exchange_product.integrations.models import (
 _MAX_PRIVATE_CONFIG_BYTES = 64 * 1024
 _MAX_REQUEST_BYTES = 32 * 1024
 _RESOURCE_TYPES = frozenset(
-    {"planner_plans", "todo_lists", "sharepoint_drives", "calendars", "freebusy_subjects"}
+    {
+        "planner_plans",
+        "todo_lists",
+        "sharepoint_drives",
+        "calendars",
+        "mail_folders",
+        "freebusy_subjects",
+    }
 )
 _TARGET_FIELDS = frozenset(
     {
@@ -55,6 +62,7 @@ _TARGET_FIELDS = frozenset(
         "sharePointDriveIds",
         "toDoTaskListIds",
         "calendarIds",
+        "mailFolderIds",
         "freebusySubjects",
     }
 )
@@ -63,6 +71,7 @@ _RESOURCE_OPERATIONS = {
     "todo_lists": "microsoft_graph.todo.lists.list",
     "sharepoint_drives": "microsoft_graph.sharepoint.drives.list",
     "calendars": "microsoft_graph.calendar.calendars.list",
+    "mail_folders": "microsoft_graph.mail.folders.list",
 }
 
 
@@ -89,7 +98,15 @@ def execute_office_setup(
     ``complete`` and are passed directly to Account Center. 中文：身份和凭据均由服务端固定。
     """
 
-    if action not in {"begin", "complete", "status", "discover", "select-targets"}:
+    if action not in {
+        "begin",
+        "complete",
+        "begin-mail-scope-upgrade",
+        "complete-scope-upgrade",
+        "status",
+        "discover",
+        "select-targets",
+    }:
         raise OfficeSetupError("office_setup_action_invalid")
     config = _operator_config(Path(private_config))
     payload = _request_object({} if request_payload is None else request_payload)
@@ -97,6 +114,14 @@ def execute_office_setup(
 
     if action == "begin":
         return _begin_link(
+            services,
+            principal=principal,
+            host_profile=host_profile,
+            profile_ref=profile_ref,
+            payload=payload,
+        )
+    if action == "begin-mail-scope-upgrade":
+        return _begin_mail_scope_upgrade(
             services,
             principal=principal,
             host_profile=host_profile,
@@ -111,17 +136,25 @@ def execute_office_setup(
             profile_ref=profile_ref,
             payload=payload,
         )
+    if action == "complete-scope-upgrade":
+        return _complete_mail_scope_upgrade(
+            services,
+            principal=principal,
+            host_profile=host_profile,
+            profile_ref=profile_ref,
+            payload=payload,
+        )
     profile = _read_profile(services, principal, host_profile, profile_ref)
     if action == "status":
         if profile is None:
             return _not_linked_snapshot(host_profile, profile_ref, principal)
-        snapshot = _profile_snapshot(profile_ref, profile)
+        snapshot = _profile_snapshot(profile_ref, profile, host_profile=host_profile)
         if snapshot["authStatus"] == "healthy" and not snapshot["reauthRequired"]:
             _ensure_connection(services, principal, host_profile, profile_ref)
         return snapshot
     if profile is None:
         raise OfficeSetupError("office_graph_profile_not_linked", state="AUTHORIZATION_REQUIRED")
-    snapshot = _profile_snapshot(profile_ref, profile)
+    snapshot = _profile_snapshot(profile_ref, profile, host_profile=host_profile)
     if snapshot["authStatus"] != "healthy" or snapshot["reauthRequired"]:
         raise OfficeSetupError(
             "office_graph_authorization_required",
@@ -219,7 +252,7 @@ def _begin_link(
             and not profile_scope_metadata(existing, existing_scope)["reauth_required"]
         ):
             _ensure_connection(services, principal, host_profile, profile_ref)
-            return _profile_snapshot(profile_ref, existing)
+            return _profile_snapshot(profile_ref, existing, host_profile=host_profile)
     raw_request_id = payload.get("requestId")
     request_id = (
         _uuid_text(raw_request_id, "requestId") if raw_request_id is not None else str(uuid4())
@@ -240,7 +273,71 @@ def _begin_link(
         )
     except Exception as exc:
         raise OfficeSetupError("office_graph_link_start_failed") from exc
-    return {"state": "AUTHORIZATION_REQUIRED", "provider": "microsoft_graph", **session}
+    return {
+        "state": "AUTHORIZATION_REQUIRED",
+        "provider": "microsoft_graph",
+        "flowKind": "link",
+        **session,
+    }
+
+
+def _begin_mail_scope_upgrade(
+    services: Any,
+    *,
+    principal: IntegrationPrincipal,
+    host_profile: Any,
+    profile_ref: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Explicitly request one host-derived Mail scope upgrade for an existing profile."""
+
+    _exact_fields(payload, required=set(), optional={"requestId"})
+    office_scope = microsoft_graph_office_v2_scope(host_profile, principal)
+    mail = office_scope["mail"]
+    mail_features = {
+        "metadata_read": mail["metadata_read"],
+        "drafts_write": mail["drafts_write"],
+        "send": mail["send_enabled"],
+    }
+    if not any(mail_features.values()):
+        raise OfficeSetupError("office_graph_mail_upgrade_not_configured")
+    existing = _read_profile(services, principal, host_profile, profile_ref)
+    if existing is None:
+        raise OfficeSetupError("office_graph_profile_not_linked", state="AUTHORIZATION_REQUIRED")
+    existing_scope = validate_profile_scope(existing.get("target_scope"))
+    existing_meta = profile_scope_metadata(existing, existing_scope)
+    if existing.get("auth_status") != "healthy" or existing_meta["reauth_required"]:
+        raise OfficeSetupError(
+            "office_graph_authorization_required", state="AUTHORIZATION_REQUIRED"
+        )
+    if _mail_authorization_state(host_profile, existing_scope, existing) == "READY":
+        _ensure_connection(services, principal, host_profile, profile_ref)
+        return _profile_snapshot(profile_ref, existing, host_profile=host_profile)
+    raw_request_id = payload.get("requestId")
+    request_id = (
+        _uuid_text(raw_request_id, "requestId") if raw_request_id is not None else str(uuid4())
+    )
+    try:
+        result = services.accounts.begin_microsoft_graph_scope_upgrade(
+            principal,
+            profile_ref=profile_ref,
+            permission="mail",
+            mail_features=mail_features,
+            idempotency_key=f"office-graph-mail-upgrade:{profile_ref}:{request_id}",
+        )
+        session = _microsoft_graph_oauth_session_response(
+            result,
+            profile_ref=profile_ref,
+            expected_redirect_uri=OFFICE_V2_REDIRECT_URI,
+        )
+    except Exception as exc:
+        raise OfficeSetupError("office_graph_mail_upgrade_start_failed") from exc
+    return {
+        "state": "AUTHORIZATION_REQUIRED",
+        "provider": "microsoft_graph",
+        "flowKind": "scope_upgrade",
+        **session,
+    }
 
 
 def _complete_link(
@@ -292,7 +389,68 @@ def _complete_link(
     ):
         raise OfficeSetupError("office_graph_authorization_not_healthy")
     _ensure_connection(services, principal, host_profile, profile_ref)
-    return {"state": "LINKED", **_profile_snapshot(profile_ref, profile)}
+    return {
+        "state": "LINKED",
+        **_profile_snapshot(profile_ref, profile, host_profile=host_profile),
+    }
+
+
+def _complete_mail_scope_upgrade(
+    services: Any,
+    *,
+    principal: IntegrationPrincipal,
+    host_profile: Any,
+    profile_ref: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Complete only an OAuth scope-upgrade flow chosen from server-side pending state."""
+
+    _exact_fields(payload, required={"state", "code"}, optional=set())
+    state = _bounded_text(payload["state"], "state", minimum=32, maximum=512)
+    code = _bounded_text(payload["code"], "code", minimum=1, maximum=4096)
+    callback_principal = getattr(services, "callback_principal", None)
+    if not isinstance(callback_principal, IntegrationPrincipal):
+        raise OfficeSetupError("office_graph_callback_service_unavailable")
+    try:
+        result = services.accounts.complete_microsoft_graph_scope_upgrade(
+            callback_principal,
+            state=state,
+            code=code,
+        )
+        profile = _validate_graph_profile(
+            result,
+            principal=principal,
+            host_profile=host_profile,
+            profile_ref=profile_ref,
+        )
+        scope = validate_profile_scope(profile.get("target_scope"))
+        if _mail_authorization_state(host_profile, scope, profile) != "READY":
+            raise OfficeSetupError("office_graph_mail_upgrade_not_effective")
+    except Exception as exc:
+        # A lost response is reconciled once; never replay the authorization code.
+        try:
+            readback_profile = _read_profile(services, principal, host_profile, profile_ref)
+        except Exception as read_error:
+            raise OfficeSetupError(
+                "office_graph_completion_unknown", state="UNKNOWN"
+            ) from read_error
+        if (
+            readback_profile is None
+            or readback_profile.get("auth_status") != "healthy"
+            or _mail_authorization_state(
+                host_profile,
+                validate_profile_scope(readback_profile.get("target_scope")),
+                readback_profile,
+            )
+            != "READY"
+        ):
+            raise OfficeSetupError("office_graph_completion_unknown", state="UNKNOWN") from exc
+        profile = readback_profile
+    _ensure_connection(services, principal, host_profile, profile_ref)
+    return {
+        "state": "LINKED",
+        **_profile_snapshot(profile_ref, profile, host_profile=host_profile),
+    }
 
 
 def _read_profile(
@@ -399,6 +557,7 @@ def _profile_snapshot(
     profile_ref: str,
     profile: Mapping[str, Any],
     *,
+    host_profile: Any,
     state: str = "LINKED",
 ) -> dict[str, Any]:
     """Return only safe profile status and bounded scope metadata to the loopback UI."""
@@ -412,9 +571,9 @@ def _profile_snapshot(
         "plannerEnabled": bool(scope["planner"]["tasks_read"]),
         "todoEnabled": bool(scope["todo"]["enabled"]),
         "calendarEnabled": bool(scope["calendar"]["enabled"]),
-        "mailMetadataEnabled": False,
-        "mailDraftsEnabled": False,
-        "mailSendEnabled": False,
+        "mailMetadataEnabled": bool(scope["mail"]["metadata_read"]),
+        "mailDraftsEnabled": bool(scope["mail"]["drafts_write"]),
+        "mailSendEnabled": bool(scope["mail"]["send_enabled"]),
         "sharePointDriveMetadataEnabled": bool(scope["sharepoint"]["enabled"]),
     }
     return {
@@ -429,12 +588,39 @@ def _profile_snapshot(
         "requiredOAuthScopes": list(meta["required_oauth_scopes"]),
         "enabledFeatures": enabled_features,
         "targetRefCount": int(meta["target_ref_count"]),
+        "selectedCounts": {"mailFolders": len(scope["mail"]["folder_ids"])},
         "credentialExpiresAt": _epoch_text(expires_at),
         "refreshExpiresAt": _epoch_text(refresh_expires_at),
         "credentialRevision": revision,
         "reauthRequired": bool(meta["reauth_required"]),
         "reauthReasonCode": meta["reauth_reason_code"],
+        "mailAuthorizationState": _mail_authorization_state(host_profile, scope, profile),
     }
+
+
+def _mail_authorization_state(
+    host_profile: Any,
+    scope: Mapping[str, Any],
+    profile: Mapping[str, Any],
+) -> str:
+    """Project mail-only readiness without turning an upgrade need into link failure."""
+
+    requested = host_profile.microsoft_graph_office_v2.enabled_features
+    required = {
+        "metadata_read": bool(requested["mailMetadataEnabled"]),
+        "drafts_write": bool(requested["mailDraftsEnabled"]),
+        "send_enabled": bool(requested["mailSendEnabled"]),
+    }
+    if not any(required.values()):
+        return "DISABLED"
+    mail = scope["mail"]
+    if (
+        profile.get("auth_status") != "healthy"
+        or profile_scope_metadata(profile, scope)["reauth_required"]
+        or any(flag and not mail[name] for name, flag in required.items())
+    ):
+        return "REAUTHORIZATION_REQUIRED"
+    return "READY"
 
 
 def _not_linked_snapshot(
@@ -460,11 +646,20 @@ def _not_linked_snapshot(
         ),
         "enabledFeatures": dict(features),
         "targetRefCount": sum(len(values) for values in office.targets.values()),
+        "selectedCounts": {"mailFolders": len(office.targets["mailFolderIds"])},
         "credentialExpiresAt": None,
         "refreshExpiresAt": None,
         "credentialRevision": None,
         "reauthRequired": False,
         "reauthReasonCode": None,
+        "mailAuthorizationState": (
+            "REAUTHORIZATION_REQUIRED"
+            if any(
+                features[name]
+                for name in ("mailMetadataEnabled", "mailDraftsEnabled", "mailSendEnabled")
+            )
+            else "DISABLED"
+        ),
     }
 
 
@@ -591,7 +786,7 @@ def _select_targets(
             state="AUTHORIZATION_REQUIRED",
         )
     if current_revision != expected_revision:
-        return _profile_snapshot(profile_ref, profile, state="CONFLICT")
+        return _profile_snapshot(profile_ref, profile, host_profile=host_profile, state="CONFLICT")
     selected = _target_selection(payload["targets"])
     old_scope = validate_profile_scope(profile.get("target_scope"))
     if old_scope.get("schema_version") != 2:
@@ -603,6 +798,7 @@ def _select_targets(
         "plannerPlanIds": ("planner_plans", "plan_id"),
         "toDoTaskListIds": ("todo_lists", "task_list_id"),
         "calendarIds": ("calendars", "calendar_id"),
+        "mailFolderIds": ("mail_folders", "folder_id"),
         "sharePointDriveIds": ("sharepoint_drives", "drive_id"),
         "freebusySubjects": ("freebusy_subjects", "freebusy_subject"),
     }
@@ -654,6 +850,7 @@ def _select_targets(
             "calendar_ids": selected["calendarIds"],
             "freebusy_subjects": selected["freebusySubjects"],
         },
+        "mail": {**old_scope["mail"], "folder_ids": selected["mailFolderIds"]},
     }
     new_scope = validate_profile_scope(new_scope)
     if new_scope["sharepoint"]["site_id"] != old_scope["sharepoint"]["site_id"]:
@@ -680,7 +877,9 @@ def _select_targets(
         if current is not None and _same_target_scope(current.get("target_scope"), new_scope):
             current_revision = current.get("credential_revision")
             if current_revision == expected_revision + 1:
-                return _profile_snapshot(profile_ref, current, state="UPDATED")
+                return _profile_snapshot(
+                    profile_ref, current, host_profile=host_profile, state="UPDATED"
+                )
         raise OfficeSetupError("office_graph_target_update_unknown", state="UNKNOWN") from exc
     current = _read_profile(services, principal, host_profile, profile_ref)
     if current is None:
@@ -689,7 +888,7 @@ def _select_targets(
         raise OfficeSetupError("office_graph_target_update_unknown", state="UNKNOWN")
     if not _same_target_scope(current.get("target_scope"), new_scope):
         raise OfficeSetupError("office_graph_target_update_readback_mismatch", state="UNKNOWN")
-    return _profile_snapshot(profile_ref, current, state="UPDATED")
+    return _profile_snapshot(profile_ref, current, host_profile=host_profile, state="UPDATED")
 
 
 def _discover_all_ids(
@@ -912,6 +1111,7 @@ def _discovery_item(resource_type: str, value: object) -> dict[str, str]:
         "todo_lists": ("task_list_id", "display_name", "todo_list"),
         "sharepoint_drives": ("drive_id", "name", "sharepoint_drive"),
         "calendars": ("calendar_id", "name", "calendar"),
+        "mail_folders": ("folder_id", "display_name", "mail_folder"),
         "freebusy_subjects": ("freebusy_subject", "display_name", "person"),
     }
     fields = identifiers.get(resource_type)
@@ -973,6 +1173,7 @@ def _host_allowlist(host_profile: Any, resource_type: str) -> set[str]:
         "todo_lists": "toDoTaskListIds",
         "sharepoint_drives": "sharePointDriveIds",
         "calendars": "calendarIds",
+        "mail_folders": "mailFolderIds",
         "freebusy_subjects": "freebusySubjects",
     }.get(resource_type)
     return set(office.targets[field]) if field is not None else set()

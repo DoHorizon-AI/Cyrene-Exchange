@@ -94,6 +94,29 @@ CALENDAR_WRITE_OPERATIONS = frozenset(
         "microsoft_graph.calendar.event.delete",
     }
 )
+MAIL_FOLDER_READ_OPERATIONS = frozenset({"microsoft_graph.mail.folders.list"})
+MAIL_MESSAGE_READ_OPERATIONS = frozenset(
+    {
+        "microsoft_graph.mail.messages.list",
+        "microsoft_graph.mail.message.get",
+    }
+)
+MAIL_DRAFT_READ_OPERATIONS = frozenset({"microsoft_graph.mail.drafts.list"})
+MAIL_DRAFT_WRITE_OPERATIONS = frozenset(
+    {
+        "microsoft_graph.mail.draft.create",
+        "microsoft_graph.mail.draft.update",
+        "microsoft_graph.mail.draft.delete",
+        "microsoft_graph.mail.message.send",
+    }
+)
+MAIL_OPERATIONS = (
+    MAIL_FOLDER_READ_OPERATIONS
+    | MAIL_MESSAGE_READ_OPERATIONS
+    | MAIL_DRAFT_READ_OPERATIONS
+    | MAIL_DRAFT_WRITE_OPERATIONS
+)
+MAIL_MUTATING_OPERATIONS = MAIL_DRAFT_WRITE_OPERATIONS
 SHAREPOINT_V2_READ_OPERATIONS = frozenset(
     {
         "microsoft_graph.sharepoint.drives.list",
@@ -106,6 +129,7 @@ V2_GRAPH_OPERATIONS = (
     | TODO_WRITE_OPERATIONS
     | CALENDAR_READ_OPERATIONS
     | CALENDAR_WRITE_OPERATIONS
+    | MAIL_OPERATIONS
     | SHAREPOINT_V2_READ_OPERATIONS
 )
 GRAPH_OPERATIONS = (
@@ -116,10 +140,14 @@ GRAPH_OPERATIONS = (
     | TODO_WRITE_OPERATIONS
     | CALENDAR_READ_OPERATIONS
     | CALENDAR_WRITE_OPERATIONS
+    | MAIL_OPERATIONS
     | SHAREPOINT_V2_READ_OPERATIONS
 )
 GRAPH_MUTATING_OPERATIONS = (
-    PLANNER_WRITE_OPERATIONS | TODO_WRITE_OPERATIONS | CALENDAR_WRITE_OPERATIONS
+    PLANNER_WRITE_OPERATIONS
+    | TODO_WRITE_OPERATIONS
+    | CALENDAR_WRITE_OPERATIONS
+    | MAIL_MUTATING_OPERATIONS
 )
 
 
@@ -402,8 +430,8 @@ def _validate_mail_scope(value: object) -> dict[str, Any]:
     if flags["enabled"]:
         if not any(flags[name] for name in ("metadata_read", "drafts_write", "send_enabled")):
             raise ValueError("Account Center returned an enabled Mail profile without a capability")
-        if flags["metadata_read"] and not folder_ids:
-            raise ValueError("Account Center returned Mail metadata without selected folders")
+        if folder_ids and not flags["metadata_read"]:
+            raise ValueError("Account Center returned Mail folder targets without metadata access")
     elif folder_ids or any(
         flags[name] for name in ("metadata_read", "drafts_write", "send_enabled")
     ):
@@ -455,6 +483,15 @@ def required_graph_permissions(profile_scope: Mapping[str, Any]) -> tuple[str, .
         required.add("Calendars.ReadWrite")
     elif calendar["events_read"] or calendar["freebusy_read"]:
         required.add("Calendars.ReadBasic")
+    mail = scope["mail"]
+    if mail["drafts_write"]:
+        required.add("Mail.ReadWrite")
+    elif mail["metadata_read"] or mail["send_enabled"]:
+        # Sending an existing draft requires a metadata preflight. ReadBasic is
+        # the narrowest delegated permission when draft writes are not enabled.
+        required.add("Mail.ReadBasic")
+    if mail["send_enabled"]:
+        required.add("Mail.Send")
     return tuple(sorted(required))
 
 
@@ -620,7 +657,12 @@ def profile_scope_metadata(
             enabled_features.append("sharepoint_drive_metadata")
             target_ref_count += len(sharepoint["list_ids"]) + len(sharepoint["drive_ids"])
         if mail["enabled"]:
-            enabled_features.append("mail_deferred")
+            if mail["metadata_read"]:
+                enabled_features.append("mail_metadata")
+            if mail["drafts_write"]:
+                enabled_features.append("mail_drafts")
+            if mail["send_enabled"]:
+                enabled_features.append("mail_send")
             target_ref_count += len(mail["folder_ids"])
     elif sharepoint["enabled"]:
         enabled_features.append("sharepoint_selected_metadata_read")
@@ -801,6 +843,63 @@ def target_for_operation(
                 )
         return target
 
+    if scope.get("schema_version") == 2 and operation_id in MAIL_OPERATIONS:
+        mail = scope["mail"]
+        if not mail["enabled"]:
+            raise _permission_denied("mail_feature_not_enabled", "Mail access is disabled")
+        _validate_mail_arguments(operation_id, arguments)
+        if operation_id == "microsoft_graph.mail.folders.list":
+            if not mail["metadata_read"]:
+                raise _permission_denied(
+                    "mail_metadata_read_consent_required",
+                    "Mail metadata consent is required to discover folders",
+                )
+            return {"tenant_id": tenant_id}
+        if operation_id in MAIL_MESSAGE_READ_OPERATIONS:
+            if not mail["metadata_read"]:
+                raise _permission_denied(
+                    "mail_metadata_read_consent_required",
+                    "Mail metadata consent is required",
+                )
+            folder_id = _opaque_resource_id(arguments.get("folder_id"), "folder_id")
+            if folder_id not in mail["folder_ids"]:
+                raise _scope_forbidden(
+                    "microsoft_graph_mail_folder_scope_mismatch",
+                    "Mail folder is outside the linked profile scope",
+                )
+            mail_target: dict[str, object] = {"tenant_id": tenant_id, "folder_id": folder_id}
+            if operation_id == "microsoft_graph.mail.message.get":
+                mail_target["message_id"] = _opaque_resource_id(
+                    arguments.get("message_id"), "message_id"
+                )
+            return mail_target
+        if operation_id in MAIL_DRAFT_READ_OPERATIONS:
+            if not (mail["drafts_write"] or mail["send_enabled"]):
+                raise _permission_denied(
+                    "mail_draft_metadata_consent_required",
+                    "Mail metadata consent is required to list drafts",
+                )
+            return {"tenant_id": tenant_id, "folder_id": "drafts"}
+        if operation_id in MAIL_DRAFT_WRITE_OPERATIONS:
+            if operation_id == "microsoft_graph.mail.message.send":
+                if not mail["send_enabled"]:
+                    raise _permission_denied(
+                        "mail_send_consent_required", "Mail send consent is required"
+                    )
+                # The delegated permission derivation includes Mail.ReadBasic
+                # for send-only profiles so the provider can preflight Drafts.
+            elif not mail["drafts_write"]:
+                raise _permission_denied(
+                    "mail_draft_write_consent_required", "Mail draft write consent is required"
+                )
+            mail_target = {"tenant_id": tenant_id, "folder_id": "drafts"}
+            if operation_id != "microsoft_graph.mail.draft.create":
+                mail_target["message_id"] = _opaque_resource_id(
+                    arguments.get("message_id"), "message_id"
+                )
+            return mail_target
+        raise _permission_denied("mail_operation_not_enabled", "Mail operation is disabled")
+
     sharepoint = scope["sharepoint"]
     is_v2 = scope.get("schema_version") == 2
     if not sharepoint["enabled"] or (is_v2 and not sharepoint["metadata_read"]):
@@ -916,6 +1015,14 @@ def lease_arguments_for_operation(
             "site_id",
             "drive_id",
         },
+        "microsoft_graph.mail.folders.list": set(),
+        "microsoft_graph.mail.messages.list": {"folder_id"},
+        "microsoft_graph.mail.message.get": {"folder_id", "message_id"},
+        "microsoft_graph.mail.drafts.list": set(),
+        "microsoft_graph.mail.draft.create": set(),
+        "microsoft_graph.mail.draft.update": {"message_id"},
+        "microsoft_graph.mail.draft.delete": {"message_id"},
+        "microsoft_graph.mail.message.send": {"message_id"},
     }.get(operation_id)
     if excluded is None or not isinstance(arguments, Mapping):
         raise ValueError("Microsoft Graph operation is outside the fixed lease digest map")
@@ -1193,6 +1300,94 @@ def _validate_calendar_arguments(operation_id: str, arguments: Mapping[str, obje
     elif operation_id == "microsoft_graph.calendar.event.delete":
         _exact_fields(arguments, required={"calendar_id", "event_id", "if_match"})
         _bounded_text(arguments["if_match"], "if_match", maximum=512)
+
+
+def _validate_mail_arguments(operation_id: str, arguments: Mapping[str, object]) -> None:
+    """Validate fixed Mail metadata and draft inputs without accepting arbitrary Graph paths."""
+
+    if operation_id in {
+        "microsoft_graph.mail.folders.list",
+        "microsoft_graph.mail.drafts.list",
+    }:
+        _exact_fields(arguments, required=set(), optional={"page_size", "page_cursor"})
+        _validate_page_options(arguments)
+    elif operation_id == "microsoft_graph.mail.messages.list":
+        _exact_fields(
+            arguments,
+            required={"folder_id"},
+            optional={"page_size", "page_cursor"},
+        )
+        _opaque_resource_id(arguments["folder_id"], "folder_id")
+        _validate_page_options(arguments)
+    elif operation_id == "microsoft_graph.mail.message.get":
+        _exact_fields(arguments, required={"folder_id", "message_id"})
+        _opaque_resource_id(arguments["folder_id"], "folder_id")
+        _opaque_resource_id(arguments["message_id"], "message_id")
+    elif operation_id == "microsoft_graph.mail.draft.create":
+        _exact_fields(
+            arguments,
+            required={"subject", "body_text"},
+            optional={"to_recipients", "cc_recipients"},
+        )
+        _bounded_text(arguments["subject"], "subject", maximum=255)
+        _validate_mail_body(arguments["body_text"])
+        for field in ("to_recipients", "cc_recipients"):
+            if field in arguments:
+                _validate_mail_recipients(arguments[field], field)
+    elif operation_id == "microsoft_graph.mail.draft.update":
+        _exact_fields(arguments, required={"message_id", "if_match", "changes"})
+        _opaque_resource_id(arguments["message_id"], "message_id")
+        _bounded_text(arguments["if_match"], "if_match", maximum=512)
+        changes = arguments["changes"]
+        allowed = {"subject", "body_text", "to_recipients", "cc_recipients"}
+        if not isinstance(changes, Mapping) or not changes or set(changes) - allowed:
+            raise ValueError("changes contains an unsupported Mail draft field")
+        if "subject" in changes:
+            _bounded_text(changes["subject"], "subject", maximum=255)
+        if "body_text" in changes:
+            _validate_mail_body(changes["body_text"])
+        for field in ("to_recipients", "cc_recipients"):
+            if field in changes:
+                _validate_mail_recipients(changes[field], field)
+    elif operation_id == "microsoft_graph.mail.draft.delete":
+        _exact_fields(arguments, required={"message_id", "if_match"})
+        _opaque_resource_id(arguments["message_id"], "message_id")
+        _bounded_text(arguments["if_match"], "if_match", maximum=512)
+    elif operation_id == "microsoft_graph.mail.message.send":
+        _exact_fields(arguments, required={"message_id"})
+        _opaque_resource_id(arguments["message_id"], "message_id")
+    else:
+        raise ValueError("Microsoft Graph Mail operation is outside the fixed argument schema")
+
+
+def _validate_mail_recipients(value: object, label: str) -> None:
+    """Accept only a bounded list of exact email addresses for draft recipient fields."""
+
+    if not isinstance(value, list) or not 1 <= len(value) <= 50:
+        raise ValueError(f"{label} must be a bounded list of email addresses")
+    for address in value:
+        if (
+            not isinstance(address, str)
+            or not 3 <= len(address) <= 320
+            or address.strip() != address
+            or re.fullmatch(r"[^\s<>@]+@[^\s<>@]+", address) is None
+        ):
+            raise ValueError(f"{label} contains an invalid email address")
+
+
+def _validate_mail_body(value: object) -> None:
+    """Accept bounded plain text, preserving newlines while rejecting controls."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) > 65_536
+        or any(
+            (ord(character) < 0x20 and character not in "\t\n\r")
+            or ord(character) == 0x7F
+            for character in value
+        )
+    ):
+        raise ValueError("body_text is outside the fixed Microsoft Graph schema")
 
 
 def _validate_subjects(value: object) -> list[str]:

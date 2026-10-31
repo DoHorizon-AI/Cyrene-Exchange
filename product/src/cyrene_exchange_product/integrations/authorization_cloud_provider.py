@@ -56,6 +56,7 @@ from cyrene_exchange_product.integrations.connector_security import (
     digest_arguments,
 )
 from cyrene_exchange_product.integrations.microsoft_graph import (
+    GRAPH_MUTATING_OPERATIONS,
     GRAPH_OPERATIONS,
     SHAREPOINT_READ_OPERATIONS,
     SHAREPOINT_V2_READ_OPERATIONS,
@@ -2524,12 +2525,18 @@ def _invoke_signed_microsoft_graph_tool(
             request_id=request_id,
         )
     except Exception as exc:
+        if operation_id in GRAPH_MUTATING_OPERATIONS:
+            _raise_provider_error("PROVIDER_OUTCOME_UNKNOWN", retryable=False, unknown=True)
         raise IntegrationToolCallUnavailable(retryable=True) from exc
     if response.type_url != "type.cyrene.io/cyrene.tool.provider.v1.CallToolResponse":
+        if operation_id in GRAPH_MUTATING_OPERATIONS:
+            _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
         raise IntegrationToolCallUnavailable()
     try:
         typed_response = tool_wire.CallToolResponse.FromString(response.value)
     except Exception as exc:
+        if operation_id in GRAPH_MUTATING_OPERATIONS:
+            _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
         raise IntegrationToolCallUnavailable() from exc
     result_kind = typed_response.WhichOneof("result")
     if result_kind == "error":
@@ -2547,6 +2554,8 @@ def _invoke_signed_microsoft_graph_tool(
             )
         _raise_provider_error(code, retryable=typed_response.error.retryable)
     if result_kind != "outcome":
+        if operation_id in GRAPH_MUTATING_OPERATIONS:
+            _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
         raise IntegrationToolCallUnavailable()
     values: list[dict[str, Any]] = []
     for part in typed_response.outcome.content:
@@ -2555,6 +2564,8 @@ def _invoke_signed_microsoft_graph_tool(
         try:
             decoded = json.loads(part.json.json)
         except json.JSONDecodeError as exc:
+            if operation_id in GRAPH_MUTATING_OPERATIONS:
+                _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
             raise IntegrationToolCallUnavailable() from exc
         if isinstance(decoded, Mapping):
             values.append(dict(decoded))
@@ -2564,6 +2575,8 @@ def _invoke_signed_microsoft_graph_tool(
             None,
         )
         if error is None or not isinstance(error.get("code"), str):
+            if operation_id in GRAPH_MUTATING_OPERATIONS:
+                _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
             raise IntegrationToolCallUnavailable()
         code = str(error["code"])
         if code.upper() in {"AUTH_EXPIRED", "REFRESH_TOKEN_EXPIRED", "CONSENT_REVOKED"}:
@@ -2580,8 +2593,24 @@ def _invoke_signed_microsoft_graph_tool(
             unknown=(error.get("outcome") == "UNKNOWN" or error.get("state") == "UNKNOWN_RESULT"),
         )
     if len(values) != 1:
+        if operation_id in GRAPH_MUTATING_OPERATIONS:
+            _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
         raise IntegrationToolCallUnavailable()
-    return values[0]
+    result = values[0]
+    if operation_id in GRAPH_MUTATING_OPERATIONS:
+        expected_status = (
+            "ACCEPTED"
+            if operation_id == "microsoft_graph.mail.message.send"
+            else "CONFIRMED"
+            if operation_id.startswith("microsoft_graph.mail.")
+            else None
+        )
+        if expected_status is not None and result.get("status") not in {
+            expected_status,
+            "UNKNOWN",
+        }:
+            _raise_provider_error("PROVIDER_RESPONSE_INVALID", retryable=False, unknown=True)
+    return result
 
 
 def _invoke_signed_azure_devops_tool(

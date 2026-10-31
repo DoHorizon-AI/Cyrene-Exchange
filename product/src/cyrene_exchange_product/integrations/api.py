@@ -1484,6 +1484,7 @@ def _connector_operation_response(
     result: Mapping[str, Any],
     *,
     is_mutating: bool = False,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     """Project provider business state into the stable Navigator invocation envelope."""
 
@@ -1504,6 +1505,14 @@ def _connector_operation_response(
     } or remote_state_value in {"UNKNOWN", "UNKNOWN_RESULT", "UNVERIFIED"}
     if is_mutating and unknown_mutation_state:
         outcome = "uncertain"
+    elif (
+        is_mutating
+        and operation_id == "microsoft_graph.mail.message.send"
+        and state == "ACCEPTED"
+    ):
+        # Graph's 202 confirms provider acceptance only; the nested result keeps
+        # `status=ACCEPTED` and does not claim mailbox delivery.
+        outcome = "verified"
     elif state == "COMMAND_FAILED" and remote_state_value in {"", "NOT_APPLICABLE"}:
         outcome = "failed"
     elif is_mutating and state in {"PENDING", "RUNNING", "SUBMITTED", "ACCEPTED"}:
@@ -1555,6 +1564,20 @@ def _connector_envelope_sha256(
         "argumentsDigestSha256": arguments_sha256,
     }
     return hashlib.sha256(connector_canonical_json(envelope)).hexdigest()
+
+
+def _connector_exception_result(
+    error: ExchangeProductError,
+    *,
+    is_mutating: bool,
+) -> dict[str, Any]:
+    """Keep typed 4xx provider refusals definite; preserve uncertainty for 5xx writes."""
+
+    unknown_mutation = is_mutating and error.status >= 500
+    return {
+        "state": "UNKNOWN_RESULT" if unknown_mutation else "FAILED",
+        "error": {"code": error.code, "retryable": error.retryable},
+    }
 
 
 def _connector_replay_response(
@@ -3789,10 +3812,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 claims=claims,
             )
         except ExchangeProductError as exc:
-            result = {
-                "state": "UNKNOWN_RESULT" if prepared.is_mutating else "FAILED",
-                "error": {"code": exc.code, "retryable": exc.retryable},
-            }
+            result = _connector_exception_result(exc, is_mutating=prepared.is_mutating)
         except Exception:
             result = {
                 "state": "UNKNOWN_RESULT" if prepared.is_mutating else "FAILED",
@@ -3802,6 +3822,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             claims.request_id,
             result,
             is_mutating=prepared.is_mutating,
+            operation_id=prepared.operation_id,
         )
         outcome = response["outcome"]
         receipt_state = {

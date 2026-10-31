@@ -59,14 +59,24 @@ through an actor binding. OAuth callback is GitHub's fixed GET callback with
 only `state` and `code`; Account Center resolves the private session by stored
 state digest.
 
-Microsoft Graph uses a separate Account Center delegated OAuth flow. The initial
-link requests `Tasks.Read` for the actor-selected Planner plan IDs. `Tasks.ReadWrite`
-is requested only through the explicit Planner-write action. SharePoint remains
-disabled until the actor selects one site/list set and completes its separate
-`Sites.Selected` consent. Graph profiles and connections are actor owned; Exchange
-rechecks the signed actor's Account Center profile and exact source scope for every
-operation, then passes only a one-use lease and scope digest to the provider.
-Exchange never receives or stores a Graph token.
+Microsoft Graph uses a separate Account Center delegated OAuth flow. Graph profiles
+and connections are actor owned; Exchange rechecks the signed actor's Account Center
+profile and exact source scope for every operation, then passes only a one-use lease
+and scope digest to the provider. Exchange never receives or stores a Graph token.
+Planner reads use `Tasks.Read`; writes require the explicit Planner-write consent.
+SharePoint remains disabled until the actor selects one fixed site/list set and
+completes `Sites.Selected` consent.
+
+Mail features are enabled only by the fixed host profile. Metadata reads use
+`Mail.ReadBasic`; draft writes use `Mail.ReadWrite`; sending adds `Mail.Send` and
+always preflights an existing message in the user's Drafts folder. If an existing
+profile lacks an explicitly enabled Mail scope, status reports
+`mailAuthorizationState=REAUTHORIZATION_REQUIRED`; status does not start consent.
+The loopback setup bridge starts the existing Account Center scope-upgrade flow only
+after an explicit user action. Reads return metadata only, without body, preview, or
+attachments. Send accepts only a selected existing draft, and a Graph `202` is
+reported as `ACCEPTED`, not as delivered. Ambiguous post-dispatch mutations become
+`UNKNOWN_RESULT` and are not retried automatically.
 
 Owner-private Teams delivery stays on the internal
 `POST /internal/v1/teams/messages` route and the existing
@@ -91,15 +101,18 @@ notification binding 是群组资源；每位成员通过 actor binding 附加�
 范围最小化的 Platform delegation。OAuth callback 使用 GitHub 固定 GET 地址，仅接收 `state` 和
 `code`；Account Center 根据已存 state 摘要解析私有 session。
 
-Microsoft Graph 使用独立的 Account Center 委派 OAuth 流程。初次关联请求的 Planner plan ID 来自
-Exchange 固定 host binding；link 请求只选择 binding alias，不能提交或扩展 plan 范围。只有显式调用
-Planner 写权限 action 才请求 `Tasks.ReadWrite`。SharePoint 默认关闭；只有 host binding 固定配置了
-site/list（`sharepointTargets`），且 actor 通过仅接受 binding alias 的单独 `Sites.Selected` consent
-action 完成授权后才开放。Graph profile 与
-connection 均为 actor-owned；签名 actor 必须使用规范 Entra issuer 和 object ID，并与 Account Center
-`external_subject` 的 `tid:oid` 完全一致。每次操作前 Exchange 都会用签名 actor 重新读取 Account Center profile、
-核对精确 source scope，并且只向 Provider 传一次性 lease 和 scope digest。Exchange 不会接收或保存
-Graph token。
+Microsoft Graph 使用独立的 Account Center 委派 OAuth 流程。Graph profile 与 connection 均为 actor-owned；签名
+actor 必须使用规范 Entra issuer 和 object ID，并与 Account Center `external_subject` 的 `tid:oid` 完全一致。
+每次操作前 Exchange 都会用签名 actor 重新读取 Account Center profile、核对精确 source scope，并且只向 Provider
+传一次性 lease 和 scope digest。Exchange 不会接收或保存 Graph token。Planner 初始读取使用 `Tasks.Read`；写入只在
+显式执行 Planner 写权限 consent 后开放。SharePoint 默认关闭；host binding 固定 site/list 且 actor 单独完成
+`Sites.Selected` consent 后才开放。
+
+Mail feature 仅由固定 host profile 显式启用。Metadata 读取使用 `Mail.ReadBasic`，草稿写入使用 `Mail.ReadWrite`，
+发送增加 `Mail.Send`，并且总会预检查当前用户 Drafts 文件夹中的既有草稿。既有关联缺少显式启用的 Mail scope 时，状态
+返回 `mailAuthorizationState=REAUTHORIZATION_REQUIRED`；status 不会自行启动授权。loopback setup bridge 仅在用户显式
+操作后启动 Account Center 现有 scope-upgrade 流程。读取只返回 metadata，不含正文、预览或附件。Send 仅接受已选择的
+既有草稿；Graph `202` 返回 `ACCEPTED`，不表示已送达。派发后结果不明的 mutation 记录为 `UNKNOWN_RESULT`，不会自动重试。
 
 Azure DevOps 使用独立的 Entra delegated OAuth profile，每个 Account Center profile 只绑定一个
 host `authorizedSources` source tuple。link 请求仅提供 `bindingRef` 和 `sourceId` alias；租户、组织、
@@ -126,7 +139,7 @@ Host actor 列表只允许个人发送目标；每次发送仍需要新的签名
 | `GET /api/v1/accounts/azure-devops/callback?state=…&code=…` | Complete the fixed Azure DevOps OAuth callback |
 | `POST /api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/enable-planner-write` | Explicitly request `Tasks.ReadWrite`; requires `Idempotency-Key` |
 | `POST /api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/select-sharepoint-target` | Select a host binding and start `Sites.Selected` consent for its fixed site/list allowlist; requires `Idempotency-Key` |
-| `GET /api/v1/accounts/microsoft-graph/scope-upgrade/callback?state=…&code=…` | Complete the stored Planner or SharePoint consent upgrade |
+| `GET /api/v1/accounts/microsoft-graph/scope-upgrade/callback?state=…&code=…` | Complete the stored Planner, SharePoint, or Mail consent upgrade |
 | `GET /api/v1/accounts/provider-profiles` | List the verified actor's non-secret provider profiles and exact target scopes |
 | `POST /api/v1/accounts/link-sessions/wecom/confirm` | Confirm a WeCom link; requires `Idempotency-Key` |
 | `GET /api/v1/accounts/links` | List the verified actor's linked account metadata |

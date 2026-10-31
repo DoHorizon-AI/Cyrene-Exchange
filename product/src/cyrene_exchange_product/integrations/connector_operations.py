@@ -1299,6 +1299,21 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
                 if operation_id.startswith("microsoft_graph.calendar.event")
                 or operation_id == "microsoft_graph.calendar.events.list"
                 else "microsoft_graph_freebusy"
+                if operation_id == "microsoft_graph.calendar.freebusy.get"
+                else "microsoft_graph_mail_folder"
+                if operation_id == "microsoft_graph.mail.folders.list"
+                else "microsoft_graph_mail_message"
+                if operation_id in {
+                    "microsoft_graph.mail.messages.list",
+                    "microsoft_graph.mail.message.get",
+                }
+                else "microsoft_graph_mail_draft"
+                if operation_id.startswith("microsoft_graph.mail.draft.")
+                or operation_id in {
+                    "microsoft_graph.mail.drafts.list",
+                    "microsoft_graph.mail.message.send",
+                }
+                else "microsoft_graph_freebusy"
             )
         elif provider == "azure_devops":
             projection = "azure_devops_source"
@@ -1519,6 +1534,14 @@ def _account_lease_target(
                 "site_id",
                 "drive_id",
             ),
+            "microsoft_graph.mail.folders.list": ("tenant_id",),
+            "microsoft_graph.mail.messages.list": ("tenant_id", "folder_id"),
+            "microsoft_graph.mail.message.get": ("tenant_id", "folder_id", "message_id"),
+            "microsoft_graph.mail.drafts.list": ("tenant_id", "folder_id"),
+            "microsoft_graph.mail.draft.create": ("tenant_id", "folder_id"),
+            "microsoft_graph.mail.draft.update": ("tenant_id", "folder_id", "message_id"),
+            "microsoft_graph.mail.draft.delete": ("tenant_id", "folder_id", "message_id"),
+            "microsoft_graph.mail.message.send": ("tenant_id", "folder_id", "message_id"),
         }
         fields = graph_fields.get(operation_id)
         if fields is None or any(field not in resource_projection for field in fields):
