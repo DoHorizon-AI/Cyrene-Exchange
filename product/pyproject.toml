@@ -12,11 +12,24 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
   "cyrene-exchange",
+  "cryptography==48.0.1",
   "fastapi==0.141.1",
+  "grpcio==1.62.3",
   "httpx==0.28.1",
   "pydantic==2.13.5",
+  "protobuf==4.25.9",
   "uvicorn==0.52.4",
+  "rfc8785==0.1.4",
 ]
+
+[project.optional-dependencies]
+integrations = [
+  "cyrene-account-center-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@f5681bf294eac8e35c73214d71aad3c568686ee8#subdirectory=sdk/python/cyrene_account_center_contracts",
+  "cyrene-integration-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@1da8f0abb4f1fd76f5a2921e33cf8a6c3ae81a11#subdirectory=sdk/python/cyrene_integration_contracts",
+]
+
+[project.scripts]
+cyrene-exchange = "cyrene_exchange_product.cli:main"
 
 [project.urls]
 Repository = "https://github.com/DoHorizon-AI/Cyrene-Exchange"
@@ -26,6 +39,7 @@ Issues = "https://github.com/DoHorizon-AI/Cyrene-Exchange/issues"
 dev = [
   "httpx==0.28.1",
   "jsonschema==4.26.0",
+  "grpcio-tools==1.62.3",
   "mypy==2.3.1",
   "openapi-spec-validator==0.9.0",
   "pytest==9.1.1",
@@ -38,6 +52,9 @@ cyrene-exchange = {path = "..", editable = true}
 [tool.hatch.build.targets.wheel]
 packages = ["src/cyrene_exchange_product"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
 testpaths = ["tests"]
@@ -48,6 +65,7 @@ filterwarnings = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["src/cyrene_exchange_product/integrations/_generated/**"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -57,7 +75,17 @@ ignore = ["RUF002"]
 python_version = "3.12"
 strict = true
 files = ["src/cyrene_exchange_product"]
+exclude = ["^src/cyrene_exchange_product/integrations/_generated/"]
 
 [[tool.mypy.overrides]]
 module = ["cyrene_exchange.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+  "cyrene_exchange_product.integrations._generated.*",
+  "google.protobuf.*",
+  "grpc.*",
+]
+follow_imports = "skip"
 ignore_missing_imports = true
