@@ -339,7 +339,7 @@ requires-dist = [
     { name = "cryptography", specifier = "==48.0.1" },
     { name = "cyrene-account-center-contracts", marker = "extra == 'integrations'", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_account_center_contracts&rev=f5681bf294eac8e35c73214d71aad3c568686ee8" },
     { name = "cyrene-exchange", editable = "../" },
-    { name = "cyrene-integration-contracts", marker = "extra == 'integrations'", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=1da8f0abb4f1fd76f5a2921e33cf8a6c3ae81a11" },
+    { name = "cyrene-integration-contracts", marker = "extra == 'integrations'", git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=f96b28c3e10233526f78b1355b302732a7aa1b31" },
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "grpcio", specifier = "==1.62.3" },
     { name = "httpx", specifier = "==0.28.1" },
@@ -364,7 +364,7 @@ dev = [
 [[package]]
 name = "cyrene-integration-contracts"
 version = "0.1.0"
-source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=1da8f0abb4f1fd76f5a2921e33cf8a6c3ae81a11#1da8f0abb4f1fd76f5a2921e33cf8a6c3ae81a11" }
+source = { git = "https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git?subdirectory=sdk%2Fpython%2Fcyrene_integration_contracts&rev=f96b28c3e10233526f78b1355b302732a7aa1b31#f96b28c3e10233526f78b1355b302732a7aa1b31" }
 dependencies = [
     { name = "jsonschema" },
 ]
