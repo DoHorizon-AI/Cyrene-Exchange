@@ -60,6 +60,7 @@ DEFAULT_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS = 50.0
 MAX_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS = 120.0
 DEFAULT_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS = 50.0
 MAX_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS = 120.0
+DEFAULT_TEAMS_MESSAGE_RPC_DEADLINE_SECONDS = 45.0
 ACCOUNT_METHODS = {
     "begin_link": "BeginLink",
     "complete_github_link": "CompleteGitHubLink",
@@ -2249,7 +2250,12 @@ class WeComMessageClient:
 class TeamsMessageClient:
     """Send one grant-bound Teams reply or private message through its Plugin."""
 
-    def __init__(self, client: DirectInvoker, *, deadline_seconds: float = 10.0) -> None:
+    def __init__(
+        self,
+        client: DirectInvoker,
+        *,
+        deadline_seconds: float = DEFAULT_TEAMS_MESSAGE_RPC_DEADLINE_SECONDS,
+    ) -> None:
         if deadline_seconds <= 0:
             raise ValueError("deadline_seconds must be positive")
         self._client = client
@@ -2451,6 +2457,16 @@ class TeamsMessageClient:
                 detail="The Teams provider denied this configured channel operation.",
                 status=403,
                 context={"reasonCode": "permission_denied"},
+            )
+        if (
+            result.status == message_wire.DELIVERY_STATUS_ACCEPTED
+            and not result.vendor_message_id.strip()
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_TEAMS_PROVIDER_RESPONSE_INVALID",
+                title="Teams connector response invalid",
+                detail="The Teams connector accepted the message without a vendor message ID.",
+                status=502,
             )
         evidence: dict[str, object] = {
             "status": message_wire.DeliveryStatus.Name(result.status),
