@@ -95,6 +95,7 @@ GITHUB_TOOL_IDS = frozenset(
         "github.branches.list",
         "github.pull_requests.list",
         "github.pull_request.get",
+        "github.commits.compare",
         "github.actions.runs.list",
         "github.issues.search",
         "github.actions.jobs.list",
