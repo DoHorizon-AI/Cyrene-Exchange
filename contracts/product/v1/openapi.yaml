@@ -927,6 +927,52 @@ paths:
       security:
       - IntegrationBearer: []
       - ProductExecutionCredential: []
+  /api/v1/accounts/people/links/actions/revoke:
+    post:
+      summary: Revoke Person Links
+      description: Dissolve every active verified link one person has to one provider, through the same path the owner's own unlink uses. A GitHub token is revoked at the provider. Shared workspace-operator profiles are never dissolved; they are counted in skippedShared. Requires the connector operator role.
+      operationId: accountRevokePersonLinks
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokePersonLinksBody'
+      responses:
+        '200':
+          description: The per-link outcomes. Nothing to dissolve is a success with unlinked 0.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountRevokePersonLinksResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
   /api/v1/accounts/provider-profiles/microsoft-graph/link-sessions:
     post:
       summary: Begin Microsoft Graph Link
@@ -3713,6 +3759,61 @@ components:
             $ref: '#/components/schemas/AccountPerson'
         truncated:
           type: boolean
+    RevokePersonLinksBody:
+      type: object
+      additionalProperties: false
+      required:
+      - subject
+      - provider
+      properties:
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 256
+        provider:
+          type: string
+          pattern: ^(github|huggingface|azure_devops|wecom|qq|bilibili|azure|gcp|runpod|microsoft_graph)$
+    AccountRevokePersonLinksResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - subject
+      - provider
+      - unlinked
+      - skippedShared
+      - results
+      properties:
+        subject:
+          type: string
+        provider:
+          type: string
+        unlinked:
+          type: integer
+          minimum: 0
+        skippedShared:
+          type: integer
+          minimum: 0
+          description: Shared workspace-operator profiles that were left in place.
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+            - kind
+            - status
+            properties:
+              kind:
+                type: string
+                enum:
+                - account
+                - profile
+              status:
+                type: string
+                enum:
+                - unlinked
+                - revocation_unknown
+                - revocation_failed
     BeginMicrosoftGraphLinkBody:
       type: object
       additionalProperties: false

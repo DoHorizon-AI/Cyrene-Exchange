@@ -418,6 +418,17 @@ class RetractAccountHandleBody(IntegrationRequestBody):
     handle: str = Field(min_length=1, max_length=254)
 
 
+class RevokePersonLinksBody(IntegrationRequestBody):
+    """One person and one provider whose verified links are dissolved."""
+
+    subject: str = Field(min_length=1, max_length=256)
+    provider: str = Field(
+        pattern=(
+            "^(github|huggingface|azure_devops|wecom|qq|bilibili|azure|gcp|runpod|microsoft_graph)$"
+        )
+    )
+
+
 class GitHubInstallationRepositoryBody(IntegrationRequestBody):
     """One selected repository in a verified GitHub App installation."""
 
@@ -1480,6 +1491,29 @@ def _retract_handle_response(result: Any) -> dict[str, Any]:
         "personRef": result["person_ref"],
         "provider": result["provider"],
         "handle": result["handle"],
+    }
+
+
+def _revoke_links_response(result: Any) -> dict[str, Any]:
+    """Project the per-link outcomes of dissolving a person's links."""
+
+    if (
+        not isinstance(result, Mapping)
+        or any(key not in result for key in ("subject", "provider", "unlinked", "skipped_shared"))
+        or not isinstance(result.get("results"), list)
+    ):
+        raise _invalid_people_response()
+    results: list[dict[str, Any]] = []
+    for item in result["results"]:
+        if not isinstance(item, Mapping) or "kind" not in item or "status" not in item:
+            raise _invalid_people_response()
+        results.append({"kind": item["kind"], "status": item["status"]})
+    return {
+        "subject": result["subject"],
+        "provider": result["provider"],
+        "unlinked": result["unlinked"],
+        "skippedShared": result["skipped_shared"],
+        "results": results,
     }
 
 
@@ -3042,6 +3076,31 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 actor,
                 provider=body.provider,
                 handle=body.handle,
+                idempotency_key=idempotency_key,
+            )
+        )
+
+    @router.post(
+        "/api/v1/accounts/people/links/actions/revoke",
+        operation_id="accountRevokePersonLinks",
+    )
+    async def revoke_person_links(
+        body: RevokePersonLinksBody,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        """Dissolve one person's verified links to one provider on their behalf."""
+
+        actor = await principal(
+            request, workspace_id, operation_id="navigator.connector.operator.v1"
+        )
+        require(actor, "navigator.connector.operator.v1")
+        return _revoke_links_response(
+            services.accounts.revoke_person_links(
+                actor,
+                subject=body.subject,
+                provider=body.provider,
                 idempotency_key=idempotency_key,
             )
         )

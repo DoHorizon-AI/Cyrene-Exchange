@@ -199,6 +199,16 @@ class _People:
             "truncated": False,
         }
         self.declare_error: Exception | None = None
+        self.revoke_result: Any = {
+            "subject": "user-43",
+            "provider": "github",
+            "unlinked": 2,
+            "skipped_shared": 1,
+            "results": [
+                {"kind": "account", "status": "revocation_unknown"},
+                {"kind": "profile", "status": "unlinked"},
+            ],
+        }
 
     def find_people(self, principal: IntegrationPrincipal, **kwargs: Any) -> Any:
         self.calls.append(("find_people", kwargs))
@@ -225,6 +235,10 @@ class _People:
             "provider": kwargs["provider"],
             "handle": kwargs["handle"],
         }
+
+    def revoke_person_links(self, principal: IntegrationPrincipal, **kwargs: Any) -> Any:
+        self.calls.append(("revoke_person_links", kwargs))
+        return self.revoke_result
 
 
 class _Nothing:
@@ -433,3 +447,86 @@ def test_routes_surface_account_center_refusals_and_reject_malformed_responses(
 
     assert conflict.status_code == 409
     assert (malformed.status_code, incomplete.status_code) == (502, 502)
+
+
+def test_revoke_person_links_client_payload_is_exact() -> None:
+    transport = _Transport(_reply("RevokePersonLinks", {"unlinked": 0}))
+
+    _client(transport).revoke_person_links(
+        _principal(OPERATOR), subject="user-43", provider="github", idempotency_key="revoke-1"
+    )
+
+    assert transport.calls[0]["method"] == "revoke_person_links"
+    assert transport.payload(0) == {
+        "subject": "user-43",
+        "provider": "github",
+        "idempotency_key": "revoke-1",
+    }
+
+
+def test_revoke_person_links_route_is_operator_gated_and_projects_per_link_outcomes(
+    tmp_path: Path,
+) -> None:
+    app, people = _app(tmp_path, _principal(OPERATOR))
+    url = "/api/v1/accounts/people/links/actions/revoke?workspaceId=workspace-1"
+    with TestClient(app) as client:
+        revoked = client.post(
+            url,
+            headers={**_AUTH, "Idempotency-Key": "revoke-1"},
+            json={"subject": "user-43", "provider": "github"},
+        )
+        missing_key = client.post(url, headers=_AUTH, json={"subject": "u", "provider": "github"})
+        injected = client.post(
+            url,
+            headers={**_AUTH, "Idempotency-Key": "revoke-2"},
+            json={"subject": "u", "provider": "github", "roles": ["admin"]},
+        )
+        bad_provider = client.post(
+            url,
+            headers={**_AUTH, "Idempotency-Key": "revoke-3"},
+            json={"subject": "u", "provider": "gitlab"},
+        )
+
+    assert revoked.status_code == 200
+    assert revoked.json() == {
+        "subject": "user-43",
+        "provider": "github",
+        "unlinked": 2,
+        "skippedShared": 1,
+        "results": [
+            {"kind": "account", "status": "revocation_unknown"},
+            {"kind": "profile", "status": "unlinked"},
+        ],
+    }
+    assert (missing_key.status_code, injected.status_code, bad_provider.status_code) == (
+        422,
+        422,
+        422,
+    )
+    assert people.calls == [
+        (
+            "revoke_person_links",
+            {"subject": "user-43", "provider": "github", "idempotency_key": "revoke-1"},
+        )
+    ]
+
+
+def test_revoke_person_links_rejects_a_non_operator_and_a_malformed_response(
+    tmp_path: Path,
+) -> None:
+    url = "/api/v1/accounts/people/links/actions/revoke?workspaceId=workspace-1"
+    body = {"subject": "user-43", "provider": "github"}
+    headers = {**_AUTH, "Idempotency-Key": "revoke-1"}
+
+    app, people = _app(tmp_path, _principal("accountListLinks"))
+    with TestClient(app) as client:
+        denied = client.post(url, headers=headers, json=body)
+    assert denied.status_code == 403
+    assert people.calls == []
+
+    (tmp_path / "second").mkdir()
+    app, people = _app(tmp_path / "second", _principal(OPERATOR))
+    people.revoke_result = {"subject": "user-43", "provider": "github"}
+    with TestClient(app) as client:
+        malformed = client.post(url, headers=headers, json=body)
+    assert malformed.status_code == 502

@@ -91,8 +91,11 @@ ACCOUNT_METHODS = {
     "declare_account_handle": "DeclareAccountHandle",
     "retract_account_handle": "RetractAccountHandle",
     "find_people": "FindPeople",
+    "revoke_person_links": "RevokePersonLinks",
 }
-PEOPLE_METHODS = frozenset({"declare_account_handle", "retract_account_handle", "find_people"})
+PEOPLE_METHODS = frozenset(
+    {"declare_account_handle", "retract_account_handle", "find_people", "revoke_person_links"}
+)
 GITHUB_TOOL_IDS = frozenset(
     {
         "github.repository.list",
@@ -1094,6 +1097,22 @@ class AccountCenterClient:
             },
         )
 
+    def revoke_person_links(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        subject: str,
+        provider: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Dissolve one person's verified links to one provider on their behalf."""
+
+        return self._invoke_user(
+            "revoke_person_links",
+            principal,
+            {"subject": subject, "provider": provider, "idempotency_key": idempotency_key},
+        )
+
     def _invoke_user(
         self,
         method: str,
@@ -1265,6 +1284,7 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         "declare_account_handle": "DeclareAccountHandleRequest",
         "retract_account_handle": "RetractAccountHandleRequest",
         "find_people": "FindPeopleRequest",
+        "revoke_person_links": "RevokePersonLinksRequest",
     }
     if method in dynamic_types:
         dto_type = getattr(account_contracts, dynamic_types[method], None)
