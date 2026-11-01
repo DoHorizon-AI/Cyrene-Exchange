@@ -61,6 +61,7 @@ DEFAULT_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS = 50.0
 MAX_GITHUB_APP_INSTALLATION_DEADLINE_SECONDS = 120.0
 DEFAULT_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS = 50.0
 MAX_GITHUB_PROVIDER_RPC_DEADLINE_SECONDS = 120.0
+DEFAULT_TEAMS_MESSAGE_RPC_DEADLINE_SECONDS = 45.0
 ACCOUNT_METHODS = {
     "begin_link": "BeginLink",
     "complete_github_link": "CompleteGitHubLink",
@@ -88,7 +89,14 @@ ACCOUNT_METHODS = {
     "redeem_credential_lease": "RedeemCredentialLease",
     "unlink_provider_profile": "UnlinkProviderProfile",
     "resolve_linked_sender": "ResolveLinkedSender",
+    "declare_account_handle": "DeclareAccountHandle",
+    "retract_account_handle": "RetractAccountHandle",
+    "find_people": "FindPeople",
+    "revoke_person_links": "RevokePersonLinks",
 }
+PEOPLE_METHODS = frozenset(
+    {"declare_account_handle", "retract_account_handle", "find_people", "revoke_person_links"}
+)
 GITHUB_TOOL_IDS = frozenset(
     {
         "github.repository.list",
@@ -1050,6 +1058,92 @@ class AccountCenterClient:
             {"profile_ref": profile_ref, "idempotency_key": idempotency_key},
         )
 
+    def declare_account_handle(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        provider: str,
+        handle: str,
+        subject: str | None,
+        mail: str | None,
+        display_name: str | None,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Declare one platform account for a person; the handle carries no credential."""
+
+        return self._invoke_user(
+            "declare_account_handle",
+            principal,
+            {
+                "provider": provider,
+                "handle": handle,
+                "subject": subject,
+                "mail": mail,
+                "display_name": display_name,
+                "idempotency_key": idempotency_key,
+            },
+        )
+
+    def retract_account_handle(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        provider: str,
+        handle: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Retire one declared platform account so it can be declared again later."""
+
+        return self._invoke_user(
+            "retract_account_handle",
+            principal,
+            {"provider": provider, "handle": handle, "idempotency_key": idempotency_key},
+        )
+
+    def find_people(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        workspace_id: str | None,
+        subject: str | None = None,
+        mail: str | None = None,
+        provider: str | None = None,
+        handle: str | None = None,
+        name: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Find people by account, identity, or name; every filter is optional."""
+
+        return self._invoke_user(
+            "find_people",
+            principal,
+            {
+                "workspace_id": workspace_id,
+                "subject": subject,
+                "mail": mail,
+                "provider": provider,
+                "handle": handle,
+                "name": name,
+                "limit": limit,
+            },
+        )
+
+    def revoke_person_links(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        subject: str,
+        provider: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Dissolve one person's verified links to one provider on their behalf."""
+
+        return self._invoke_user(
+            "revoke_person_links",
+            principal,
+            {"subject": subject, "provider": provider, "idempotency_key": idempotency_key},
+        )
+
     def _invoke_user(
         self,
         method: str,
@@ -1123,6 +1217,10 @@ class AccountCenterClient:
                     status=409,
                     context={"reasonCode": "account_center_connector_grant_replayed"},
                 ) from exc
+            if method in PEOPLE_METHODS and domain_code == "PERMISSION_DENIED":
+                mapped = _people_error(provider_reason)
+                if mapped is not None:
+                    raise mapped from exc
             if domain_code == "PERMISSION_DENIED":
                 raise ExchangeProductError(
                     code="EXCHANGE_ACCOUNT_CENTER_AUTHORIZATION_DENIED",
@@ -1214,6 +1312,10 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         "list_provider_profiles": "ListProviderProfilesRequest",
         "create_provider_credential_lease": "CreateProviderCredentialLeaseRequest",
         "unlink_provider_profile": "UnlinkProviderProfileRequest",
+        "declare_account_handle": "DeclareAccountHandleRequest",
+        "retract_account_handle": "RetractAccountHandleRequest",
+        "find_people": "FindPeopleRequest",
+        "revoke_person_links": "RevokePersonLinksRequest",
     }
     if method in dynamic_types:
         dto_type = getattr(account_contracts, dynamic_types[method], None)
@@ -1307,6 +1409,14 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
         "begin_azure_devops_link",
     }:
         serialized = {key: value for key, value in serialized.items() if value is not None}
+    if method in {"declare_account_handle", "find_people"}:
+        # Optional fields are omitted rather than sent as null; only the
+        # workspace selector may be null (an organization-level workspace).
+        serialized = {
+            key: value
+            for key, value in serialized.items()
+            if value is not None or key == "workspace_id"
+        }
     return serialized
 
 
@@ -1347,6 +1457,36 @@ def _owned_provider_profiles(
             ) from exc
         result.append(profile)
     return tuple(result)
+
+
+def _people_error(reason: str) -> ExchangeProductError | None:
+    """Map the people directory's domain refusals to precise HTTP statuses."""
+
+    if reason in {"handle_owned", "person_conflict"}:
+        return ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_HANDLE_CONFLICT",
+            title="Account handle conflict",
+            detail="The account or the person conflicts with an existing directory record.",
+            status=409,
+            context={"reasonCode": f"account_center_{reason}"},
+        )
+    if reason == "handle_not_found":
+        return ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_HANDLE_NOT_FOUND",
+            title="Account handle not found",
+            detail="No active declared account matches this provider and handle.",
+            status=404,
+            context={"reasonCode": "account_center_handle_not_found"},
+        )
+    if reason in {"invalid_request", "result_too_large"}:
+        return ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_REQUEST_INVALID",
+            title="Account Center request invalid",
+            detail="Correct the request fields or narrow the filters.",
+            status=422,
+            context={"reasonCode": f"account_center_{reason}"},
+        )
+    return None
 
 
 class IntegrationAccountCenterPort:
@@ -2358,7 +2498,12 @@ class WeComMessageClient:
 class TeamsMessageClient:
     """Send one grant-bound Teams reply or private message through its Plugin."""
 
-    def __init__(self, client: DirectInvoker, *, deadline_seconds: float = 10.0) -> None:
+    def __init__(
+        self,
+        client: DirectInvoker,
+        *,
+        deadline_seconds: float = DEFAULT_TEAMS_MESSAGE_RPC_DEADLINE_SECONDS,
+    ) -> None:
         if deadline_seconds <= 0:
             raise ValueError("deadline_seconds must be positive")
         self._client = client
@@ -2560,6 +2705,16 @@ class TeamsMessageClient:
                 detail="The Teams provider denied this configured channel operation.",
                 status=403,
                 context={"reasonCode": "permission_denied"},
+            )
+        if (
+            result.status == message_wire.DELIVERY_STATUS_ACCEPTED
+            and not result.vendor_message_id.strip()
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_TEAMS_PROVIDER_RESPONSE_INVALID",
+                title="Teams connector response invalid",
+                detail="The Teams connector accepted the message without a vendor message ID.",
+                status=502,
             )
         evidence: dict[str, object] = {
             "status": message_wire.DeliveryStatus.Name(result.status),

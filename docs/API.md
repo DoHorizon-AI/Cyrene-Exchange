@@ -182,6 +182,10 @@ Host actor 列表只允许个人发送目标；每次发送仍需要新的签名
 | `POST /api/v1/accounts/link-sessions/wecom/confirm` | Confirm a WeCom link; requires `Idempotency-Key` |
 | `GET /api/v1/accounts/links` | List the verified actor's linked account metadata |
 | `POST /api/v1/accounts/links/{account_ref}/actions/unlink` | Unlink; requires `Idempotency-Key` |
+| `GET /api/v1/accounts/people` | Answer whose account this is and which accounts a person has. Filters (`subject`, `mail`, `provider`+`handle`, `name`, `limit`) are optional and ANDed. Returns metadata only, each account marked `declared` or `verified`; requires the connector operator role |
+| `POST /api/v1/accounts/people/handles` | Declare a platform account (GitHub, Hugging Face, Azure DevOps, WeCom, QQ, Bilibili) for a person named by `subject`, `mail`, or both. An address only, never a credential. `409` if the handle belongs to another person; requires `Idempotency-Key` and the connector operator role |
+| `POST /api/v1/accounts/people/handles/actions/retract` | Retire a declared account so it can be declared again; `404` if none is active; requires `Idempotency-Key` and the connector operator role |
+| `POST /api/v1/accounts/people/links/actions/revoke` | Dissolve every active verified link one person has to one provider (`subject`, `provider`), through the owner's own unlink path; a GitHub token is revoked at the provider. Shared workspace-operator profiles are never dissolved and are counted in `skippedShared`. Audited; requires `Idempotency-Key` and the connector operator role |
 | `POST /api/v1/integrations/connections` | Create a fixed provider connection using configured opaque aliases; requires `Idempotency-Key` |
 | `GET /api/v1/integrations/connections` | List the caller's minimal connection projection: Product id, provider, display name, legacy GitHub repository fields, enabled state, and timestamps |
 | `GET /api/v1/integrations/connections/{connection_id}/health` | Read the fixed Plugin runtime health observation; offline targets return `UNKNOWN` |
