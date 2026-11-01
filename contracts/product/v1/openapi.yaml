@@ -547,6 +547,115 @@ paths:
       security:
       - IntegrationBearer: []
       - ProductExecutionCredential: []
+  /api/v1/accounts/provider-profiles/bilibili/{profile_ref}:
+    get:
+      summary: Get Owned Bilibili Profile
+      operationId: accountGetOwnedBilibiliProfile
+      parameters:
+      - name: profile_ref
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: Non-secret Account Center metadata for the actor-owned Bilibili profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BilibiliAccountProfileResponse'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/provider-profiles/bilibili/qr-sessions:
+    post:
+      summary: Begin Bilibili QR Link
+      operationId: accountBeginBilibiliQrLink
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 8
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '202':
+          description: QR image and opaque login-flow reference for the authenticated actor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BilibiliQrBeginResponse'
+        '422':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/provider-profiles/bilibili/qr-sessions/{login_flow_id}:
+    get:
+      summary: Get Bilibili QR Link Status
+      operationId: accountGetBilibiliQrLinkStatus
+      parameters:
+      - name: login_flow_id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: QR state; a linked profile is returned only after actor-owned Account Center readback.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BilibiliQrStatusResponse'
+        '422':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
   /api/v1/accounts/provider-profiles/microsoft-graph/link-sessions:
     post:
       summary: Begin Microsoft Graph Link
@@ -3472,6 +3581,132 @@ components:
         targetScope:
           $ref: '#/components/schemas/AzureDevOpsProfileScope'
       title: LinkedAzureDevOpsProfileResponse
+    BilibiliAccountProfileResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - profileRef
+      - provider
+      - identityRef
+      - externalSubject
+      - authStatus
+      - authMode
+      - accessMode
+      - targetScope
+      - credentialRevision
+      properties:
+        profileRef:
+          type: string
+          format: uuid
+        provider:
+          type: string
+          const: bilibili
+        identityRef:
+          type: string
+          minLength: 1
+          maxLength: 256
+        externalSubject:
+          type: string
+          pattern: ^[0-9]{1,20}$
+        authStatus:
+          type: string
+          enum:
+          - healthy
+          - unavailable
+          - reauthorization_required
+          - revoked
+          - unknown
+        authMode:
+          type: string
+          const: session_cookie
+        accessMode:
+          type: string
+          const: actor_owned
+        targetScope:
+          type: object
+          additionalProperties: false
+          required:
+          - schema_version
+          - account_id
+          properties:
+            schema_version:
+              type: integer
+              const: 1
+            account_id:
+              type: string
+              pattern: ^[0-9]{1,20}$
+        expiresAt:
+          anyOf:
+          - type: integer
+          - type: 'null'
+        credentialRevision:
+          type: integer
+          minimum: 0
+        workspaceId:
+          anyOf:
+          - type: string
+          - type: 'null'
+        reauthRequired:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+      title: BilibiliAccountProfileResponse
+      description: Actor-owned non-secret profile metadata; cookies and leases are never returned.
+    BilibiliQrBeginResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - status
+      - loginFlowId
+      - expiresAt
+      properties:
+        status:
+          type: string
+          enum:
+          - PENDING
+          - EXPIRED
+        loginFlowId:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        qrPngBase64:
+          anyOf:
+          - type: string
+            minLength: 1
+            maxLength: 1500000
+          - type: 'null'
+        qrPngSha256:
+          anyOf:
+          - type: string
+            pattern: ^[0-9a-f]{64}$
+          - type: 'null'
+        expiresAt:
+          type: string
+          format: date-time
+      title: BilibiliQrBeginResponse
+      description: QR image and flow metadata only; account credentials and profile refs remain private.
+    BilibiliQrStatusResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - status
+      - profile
+      properties:
+        status:
+          type: string
+          enum:
+          - PENDING
+          - SCANNED
+          - LINKED
+          - EXPIRED
+          - FAILED
+          - UNKNOWN_RESULT
+          - NOT_FOUND
+        profile:
+          anyOf:
+          - $ref: '#/components/schemas/BilibiliAccountProfileResponse'
+          - type: 'null'
+      title: BilibiliQrStatusResponse
+      description: A linked profile is exposed only after exact actor-owned Account Center readback.
     AccountProviderProfilesResponse:
       type: object
       additionalProperties: false
@@ -3637,6 +3872,7 @@ components:
         provider:
           type: string
           enum:
+          - bilibili
           - github
           - wecom
           - azure
@@ -3693,6 +3929,7 @@ components:
         provider:
           type: string
           enum:
+          - bilibili
           - github
           - wecom
           - azure
@@ -3795,6 +4032,7 @@ components:
         provider:
           type: string
           enum:
+          - bilibili
           - github
           - wecom
           - azure
@@ -3995,6 +4233,7 @@ components:
         provider:
           type: string
           enum:
+          - bilibili
           - github
           - wecom
           - azure

@@ -1316,6 +1316,61 @@ def test_provider_business_states_do_not_masquerade_as_tool_lifecycle() -> None:
     )
 
 
+def test_bilibili_write_success_requires_matching_work_ref_and_readback_proof() -> None:
+    work_ref = "work-operation:00000000-0000-4000-8000-000000000222"
+    success = {
+        "status": "SUCCEEDED",
+        "operation_ref": work_ref,
+        "receipt_id": "00000000-0000-4000-8000-000000000333",
+        "external_id": "998877",
+        "readback_verified": True,
+        "readback_sha256": "a" * 64,
+    }
+    for operation_id in (
+        "bilibili.comment.create",
+        "bilibili.dynamic.publish",
+        "bilibili.dm.send",
+    ):
+        response = _connector_operation_response(
+            "bilibili-write-request",
+            success,
+            is_mutating=True,
+            operation_id=operation_id,
+            expected_operation_ref=work_ref,
+        )
+        assert response["outcome"] == "verified"
+        assert response["operationRef"] == work_ref
+
+        for uncertain in (
+            {**success, "status": "IN_PROGRESS"},
+            {"status": "UNKNOWN_RESULT", "operation_ref": work_ref},
+            {**success, "readback_verified": False},
+            {**success, "readback_sha256": "invalid"},
+            {**success, "operation_ref": "work-operation:00000000-0000-4000-8000-000000000444"},
+        ):
+            assert (
+                _connector_operation_response(
+                    "bilibili-write-request",
+                    uncertain,
+                    is_mutating=True,
+                    operation_id=operation_id,
+                    expected_operation_ref=work_ref,
+                )["outcome"]
+                == "uncertain"
+            )
+
+        assert (
+            _connector_operation_response(
+                "bilibili-write-request",
+                {"status": "REJECTED", "receipt_id": success["receipt_id"]},
+                is_mutating=True,
+                operation_id=operation_id,
+                expected_operation_ref=work_ref,
+            )["outcome"]
+            == "failed"
+        )
+
+
 def test_typed_connector_refusal_is_definite_but_mutating_5xx_is_unknown() -> None:
     refusal = ExchangeProductError(
         code="EXCHANGE_CONNECTOR_OPERATION_REJECTED",

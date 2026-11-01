@@ -46,6 +46,7 @@ from cyrene_exchange_product.integrations.ports import (
     PluginHealthObservation,
     PluginHealthPort,
     ProviderCredentialLeaseEvidence,
+    ProviderProfileMetadata,
     ProviderRejectedError,
     RetryableReadError,
     WriteEvidence,
@@ -977,6 +978,36 @@ class AccountCenterClient:
 
         return self._invoke_user("list_provider_profiles", principal, {})
 
+    def list_owned_provider_profiles(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        provider: str | None = None,
+    ) -> tuple[ProviderProfileMetadata, ...]:
+        """Return validated metadata for profiles Account Center lists to this actor."""
+
+        return _owned_provider_profiles(self.list_provider_profiles(principal), provider=provider)
+
+    def get_owned_provider_profile(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        provider: str | None = None,
+    ) -> ProviderProfileMetadata | None:
+        """Resolve one opaque profile ref only within the actor's signed Account Center list."""
+
+        if not isinstance(profile_ref, str) or not profile_ref:
+            raise ValueError("profile_ref is required")
+        return next(
+            (
+                profile
+                for profile in self.list_owned_provider_profiles(principal, provider=provider)
+                if profile.profile_ref == profile_ref
+            ),
+            None,
+        )
+
     def create_provider_credential_lease(
         self,
         principal: IntegrationPrincipal,
@@ -1278,6 +1309,45 @@ def _typed_account_payload(method: str, payload: Mapping[str, object]) -> dict[s
     return serialized
 
 
+def _owned_provider_profiles(
+    response: Any,
+    *,
+    provider: str | None,
+) -> tuple[ProviderProfileMetadata, ...]:
+    """Validate actor-scoped profile metadata without returning credential fields."""
+
+    values = response.get("profiles") if isinstance(response, Mapping) else None
+    if not isinstance(values, list):
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned an invalid provider profile listing.",
+            status=502,
+        )
+    result: list[ProviderProfileMetadata] = []
+    for value in values:
+        if not isinstance(value, Mapping):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned malformed provider profile metadata.",
+                status=502,
+            )
+        if provider is not None and value.get("provider") != provider:
+            continue
+        try:
+            profile = ProviderProfileMetadata.from_mapping(value)
+        except (TypeError, ValueError) as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned invalid provider profile metadata.",
+                status=502,
+            ) from exc
+        result.append(profile)
+    return tuple(result)
+
+
 class IntegrationAccountCenterPort:
     """Validate Account Center decisions and project opaque leases to dispatcher types."""
 
@@ -1291,6 +1361,44 @@ class IntegrationAccountCenterPort:
         """Read the current actor's non-secret profiles for per-operation isolation checks."""
 
         return self._client.list_provider_profiles(principal)
+
+    def list_owned_provider_profiles(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        provider: str | None = None,
+    ) -> tuple[ProviderProfileMetadata, ...]:
+        """Project actor-owned Account Center rows into the typed safe Product DTO."""
+
+        response = self.list_provider_profiles(principal)
+        if not isinstance(response, Mapping):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned an invalid provider profile listing.",
+                status=502,
+            )
+        return _owned_provider_profiles(response, provider=provider)
+
+    def get_owned_provider_profile(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        provider: str | None = None,
+    ) -> ProviderProfileMetadata | None:
+        """Resolve an opaque ref only from the exact actor's Account Center listing."""
+
+        if not isinstance(profile_ref, str) or not profile_ref:
+            raise ValueError("profile_ref is required")
+        return next(
+            (
+                profile
+                for profile in self.list_owned_provider_profiles(principal, provider=provider)
+                if profile.profile_ref == profile_ref
+            ),
+            None,
+        )
 
     def get_authorization(
         self,
@@ -1434,7 +1542,8 @@ class IntegrationAccountCenterPort:
             not isinstance(lease_ref, str)
             or not lease_ref
             or not isinstance(provider, str)
-            or provider not in {"github", "huggingface", "microsoft_graph", "azure_devops"}
+            or provider
+            not in {"github", "huggingface", "microsoft_graph", "azure_devops", "bilibili"}
             or isinstance(expires_at, bool)
             or not isinstance(expires_at, int)
         ):

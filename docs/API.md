@@ -67,6 +67,15 @@ Planner reads use `Tasks.Read`; writes require the explicit Planner-write consen
 SharePoint remains disabled until the actor selects one fixed site/list set and
 completes `Sites.Selected` consent.
 
+Bilibili linking is an explicit human action. Exchange selects the host-pinned
+`cyrene.connectors.bilibili` runtime and starts QR login with a server-generated
+Account Center profile reference. The flow is bound to the verified actor; the QR
+response contains only the image and opaque flow reference, and polling returns
+profile metadata only after Account Center confirms ownership. Ordinary Bilibili
+operations use the existing connector grant, DirectPlugin, and one-use Account
+Center lease path. Writes require a stable Work operation id and provider readback;
+an unknown result remains uncertain and is never blindly retried.
+
 Mail features are enabled only by the fixed host profile. Metadata reads use
 `Mail.ReadBasic`; listing and writing Drafts use `Mail.ReadWrite`; sending adds
 `Mail.Send` and always preflights an existing message in the user's Drafts folder.
@@ -114,6 +123,12 @@ actor 必须使用规范 Entra issuer 和 object ID，并与 Account Center `ext
 显式执行 Planner 写权限 consent 后开放。SharePoint 默认关闭；host binding 固定 site/list 且 actor 单独完成
 `Sites.Selected` consent 后才开放。
 
+Bilibili 绑定必须由真人显式发起。Exchange 选择服务端固定的
+`cyrene.connectors.bilibili` runtime，并以服务端生成的 Account Center profile 引用启动 QR 登录。登录流程绑定当前已验证
+actor；二维码响应只包含图片和不透明 flow 引用，只有 Account Center 确认 profile 属于该 actor 后，轮询才返回非秘密 profile
+元数据。普通 Bilibili 操作沿用现有 connector grant、DirectPlugin 和 Account Center 一次性 lease 链路。写入要求稳定的
+Work operation ID 与 Provider 回读；结果未知时保持 uncertain，绝不盲目重试。
+
 Mail feature 仅由固定 host profile 显式启用。Metadata 读取使用 `Mail.ReadBasic`，Drafts 列表和写入使用 `Mail.ReadWrite`，
 发送增加 `Mail.Send`，并且总会预检查当前用户 Drafts 文件夹中的既有草稿。Send-only grant 不能枚举 Drafts，只能接收精确的既有
 draft ID。既有关联缺少显式启用的 Mail scope 时，状态
@@ -145,6 +160,9 @@ Host actor 列表只允许个人发送目标；每次发送仍需要新的签名
 | `GET /api/v1/accounts/microsoft-graph/callback?state=…&code=…` | Complete the fixed Microsoft Graph OAuth callback |
 | `POST /api/v1/accounts/provider-profiles/azure-devops/link-sessions` | Begin actor-owned Entra consent for one fixed host source using `bindingRef` and `sourceId`; requires `Idempotency-Key` |
 | `GET /api/v1/accounts/azure-devops/callback?state=…&code=…` | Complete the fixed Azure DevOps OAuth callback |
+| `POST /api/v1/accounts/provider-profiles/bilibili/qr-sessions` | Start explicit actor-owned Bilibili QR login with an empty body and `Idempotency-Key`; provider and credential bindings remain server-selected |
+| `GET /api/v1/accounts/provider-profiles/bilibili/qr-sessions/{login_flow_id}` | Read one actor-owned Bilibili QR flow; return linked profile metadata only after Account Center readback |
+| `GET /api/v1/accounts/provider-profiles/bilibili/{profile_ref}` | Read one Bilibili profile after exact actor-scoped Account Center lookup; never returns credentials |
 | `POST /api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/enable-planner-write` | Explicitly request `Tasks.ReadWrite`; requires `Idempotency-Key` |
 | `POST /api/v1/accounts/provider-profiles/microsoft-graph/{profile_ref}/actions/select-sharepoint-target` | Select a host binding and start `Sites.Selected` consent for its fixed site/list allowlist; requires `Idempotency-Key` |
 | `GET /api/v1/accounts/microsoft-graph/scope-upgrade/callback?state=…&code=…` | Complete the stored Planner, SharePoint, or Mail consent upgrade |

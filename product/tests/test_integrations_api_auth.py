@@ -296,6 +296,7 @@ def test_system_notification_grant_mint_resolves_exact_profile_owner_and_route(
     ) -> bytes:
         payload = {
             "request_id": request_id,
+            "organization_id": "org-teams",
             "workspace_id": "workspace-teams",
             "principal_issuer": issuer,
             "principal_subject": subject,
@@ -1796,6 +1797,7 @@ def test_large_huggingface_upload_grant_floors_fractional_epochs_and_uses_route_
     )
     request_body = {
         "request_id": "large-hf-upload-grant",
+        "organization_id": owner.organization_id,
         "workspace_id": owner.workspace_id,
         "principal_issuer": owner.issuer,
         "principal_subject": owner.subject,
@@ -2083,6 +2085,7 @@ def test_host_computer_write_uses_directory_grant_and_keeps_unknown_result_block
     mint_path = "/internal/v1/connector-operation-grants"
     grant_request = {
         "request_id": request_id,
+        "organization_id": profile.organization_id,
         "workspace_id": profile.workspace_id,
         "principal_issuer": issuer,
         "principal_subject": subject,

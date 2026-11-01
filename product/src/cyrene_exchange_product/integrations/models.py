@@ -148,6 +148,7 @@ ProviderId = Literal[
     "wecom",
     "azure",
     "azure_devops",
+    "bilibili",
     "gcp",
     "hf",
     "microsoft_graph",
@@ -207,6 +208,13 @@ class IntegrationConnection(ContractModel):
             raise ValueError(
                 "Azure DevOps connections must use one actor-owned Account Center profile"
             )
+        if self.provider == "bilibili" and (
+            not self.account_link_ref
+            or not self.binding_ref
+            or self.target_ref is not None
+            or self.access_mode != "actor_owned"
+        ):
+            raise ValueError("Bilibili connections require one actor-owned Account Center profile")
         if self.access_mode == "workspace_operator" and self.provider not in {
             "github",
             "hf",
@@ -253,6 +261,12 @@ class CreateIntegrationConnection(ContractModel):
             )
         if self.provider == "azure_devops" and not self.account_link_ref:
             raise ValueError("Azure DevOps connections require this actor's Account Center profile")
+        if self.provider == "bilibili" and (
+            not self.account_link_ref or not self.binding_ref or self.target_ref is not None
+        ):
+            raise ValueError(
+                "Bilibili connections require an Account Center profile and host binding"
+            )
         return self
 
 

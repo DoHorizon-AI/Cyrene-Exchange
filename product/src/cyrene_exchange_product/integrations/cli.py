@@ -574,6 +574,7 @@ def build_production_services(
         )
 
     authorization_clients: dict[str, Any] = {}
+    authorization_health_clients: dict[str, DirectPluginHealthClient] = {}
     email_notification_client = None
     authorization_registry = None
     current_context_resolver = None
@@ -592,6 +593,8 @@ def build_production_services(
             if profile.endpoint.mtls is not None:
                 profile_endpoint["mtls"] = dict(profile.endpoint.mtls)
             authorization_clients[profile_ref] = direct_client(profile_endpoint)
+            if profile.provider == "bilibili":
+                authorization_health_clients[profile_ref] = direct_health_client(profile_endpoint)
             hmac_key(profile.context_key_ref)
             used_refs.add(profile.context_key_ref)
         email_profile = authorization_settings.email
@@ -638,6 +641,7 @@ def build_production_services(
             store=integration_store,
             registry=authorization_registry,
             provider_clients=authorization_clients,
+            provider_health_clients=authorization_health_clients,
             email_client=email_notification_client,
             account_center=accounts,
             current_context_resolver=current_context_resolver,
@@ -743,6 +747,7 @@ def build_production_services(
             *((computer_runtime,) if computer_runtime is not None else ()),
             github_health,
             *authorization_clients.values(),
+            *authorization_health_clients.values(),
             *((email_notification_client,) if email_notification_client is not None else ()),
         ),
     )

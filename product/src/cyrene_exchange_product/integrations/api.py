@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
 from functools import partial
 from math import floor
-from typing import Annotated, Any, Literal, Protocol
+from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import parse_qsl, urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -51,6 +51,8 @@ from cyrene_exchange_product.integrations.azure_devops import (
 )
 from cyrene_exchange_product.integrations.clients import AccountCenterClient, GitHubIssuesClient
 from cyrene_exchange_product.integrations.connector_operations import (
+    _resource_projection,
+    _resource_ref,
     teams_personal_resource_ref,
 )
 from cyrene_exchange_product.integrations.connector_profiles import (
@@ -494,6 +496,11 @@ class CreateConnectionBody(IntegrationRequestBody):
                 raise ValueError(
                     "Microsoft Graph connections require an Account Center profile and host binding"
                 )
+        elif self.provider == "bilibili":
+            if not self.account_link_ref or not self.binding_ref or self.target_ref is not None:
+                raise ValueError(
+                    "Bilibili connections require an Account Center profile and host binding"
+                )
         return self
 
 
@@ -697,6 +704,424 @@ class RenewalSessionResponse(_HttpResponseModel):
     reason_code: str | None = Field(default=None, alias="reasonCode")
 
 
+class BilibiliAccountProfileResponse(_HttpResponseModel):
+    """Actor-owned, non-secret Bilibili profile metadata."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    profile_ref: UUID = Field(alias="profileRef")
+    provider: Literal["bilibili"]
+    identity_ref: str = Field(alias="identityRef", min_length=1, max_length=256)
+    external_subject: str = Field(alias="externalSubject", pattern=r"^[0-9]{1,20}$")
+    auth_status: Literal[
+        "healthy", "unavailable", "reauthorization_required", "revoked", "unknown"
+    ] = Field(alias="authStatus")
+    auth_mode: Literal["session_cookie"] = Field(alias="authMode")
+    access_mode: Literal["actor_owned"] = Field(alias="accessMode")
+    target_scope: dict[str, object] = Field(alias="targetScope")
+    expires_at: int | None = Field(default=None, alias="expiresAt")
+    credential_revision: int = Field(alias="credentialRevision", ge=0)
+    workspace_id: str | None = Field(default=None, alias="workspaceId")
+    reauth_required: bool | None = Field(default=None, alias="reauthRequired")
+
+
+class BilibiliQrBeginResponse(_HttpResponseModel):
+    """Safe QR image and opaque flow locator; no Account Center reference or cookie."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    status: Literal["PENDING", "EXPIRED"]
+    login_flow_id: str = Field(alias="loginFlowId", pattern=r"^[0-9a-f]{64}$")
+    qr_png_base64: str | None = Field(
+        default=None,
+        alias="qrPngBase64",
+        min_length=1,
+        max_length=1_500_000,
+    )
+    qr_png_sha256: str | None = Field(default=None, alias="qrPngSha256", pattern=r"^[0-9a-f]{64}$")
+    expires_at: datetime = Field(alias="expiresAt")
+
+    @model_validator(mode="after")
+    def validate_qr_payload(self) -> BilibiliQrBeginResponse:
+        if self.status == "PENDING" and (self.qr_png_base64 is None or self.qr_png_sha256 is None):
+            raise ValueError("pending Bilibili QR response requires image and digest")
+        if self.status == "EXPIRED" and (
+            self.qr_png_base64 is not None or self.qr_png_sha256 is not None
+        ):
+            raise ValueError("expired Bilibili QR response cannot include a stale image")
+        return self
+
+
+class BilibiliQrStatusResponse(_HttpResponseModel):
+    """Poll result with profile metadata only after Account Center reports completion."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    status: Literal[
+        "PENDING", "SCANNED", "LINKED", "EXPIRED", "FAILED", "UNKNOWN_RESULT", "NOT_FOUND"
+    ]
+    profile: BilibiliAccountProfileResponse | None = None
+
+
+def _bilibili_account_profile_response(profile: Any) -> BilibiliAccountProfileResponse:
+    """Validate and project one actor-owned Account Center Bilibili profile."""
+
+    if (
+        getattr(profile, "provider", None) != "bilibili"
+        or getattr(profile, "auth_mode", None) != "session_cookie"
+        or getattr(profile, "access_mode", None) != "actor_owned"
+        or not isinstance(getattr(profile, "external_subject", None), str)
+        or re.fullmatch(r"[0-9]{1,20}", profile.external_subject) is None
+        or getattr(profile, "identity_ref", None) != profile.external_subject
+        or not isinstance(getattr(profile, "target_scope", None), Mapping)
+        or set(profile.target_scope) != {"schema_version", "account_id"}
+        or profile.target_scope.get("schema_version") != 1
+        or isinstance(profile.target_scope.get("schema_version"), bool)
+        or profile.target_scope.get("account_id") != profile.external_subject
+        or isinstance(getattr(profile, "credential_revision", None), bool)
+        or not isinstance(getattr(profile, "credential_revision", None), int)
+        or profile.credential_revision < 0
+        or (
+            profile.expires_at is not None
+            and (isinstance(profile.expires_at, bool) or not isinstance(profile.expires_at, int))
+        )
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="Account Center returned an invalid Bilibili profile projection.",
+            status=502,
+        )
+    return BilibiliAccountProfileResponse(
+        profileRef=profile.profile_ref,
+        provider="bilibili",
+        identityRef=profile.identity_ref,
+        externalSubject=profile.external_subject,
+        authStatus=profile.auth_status,
+        authMode="session_cookie",
+        accessMode="actor_owned",
+        targetScope=dict(profile.target_scope),
+        expiresAt=profile.expires_at,
+        credentialRevision=profile.credential_revision,
+        reauthRequired=profile.auth_status == "reauthorization_required",
+    )
+
+
+async def _invoke_bilibili_auth_tool(
+    services: Any,
+    principal: IntegrationPrincipal,
+    *,
+    operation_id: str,
+    arguments: Mapping[str, object],
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """Call only the server-resolved QR auth binding with a fresh signed request."""
+
+    registry = services.authorization_profile_registry
+    binding_ref = registry.settings.bilibili_auth_binding_ref if registry is not None else None
+    auth_provider = services.authorization_cloud
+    invoke = getattr(auth_provider, "invoke_bilibili_auth_tool", None)
+    if not isinstance(binding_ref, str) or not binding_ref or not callable(invoke):
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_CONNECTOR_NOT_CONFIGURED",
+            title="Bilibili login is not configured",
+            detail="Exchange has no host-pinned Bilibili connector binding.",
+            status=503,
+            retryable=True,
+        )
+    try:
+        result = await run_in_threadpool(
+            partial(
+                invoke,
+                principal,
+                operation_id=operation_id,
+                tool_id=operation_id,
+                arguments=dict(arguments),
+                request_id=request_id or str(uuid4()),
+            )
+        )
+    except ExchangeProductError:
+        raise
+    except PermissionError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+            title="Bilibili account setup is not authorized",
+            detail="The configured Bilibili connector is outside the verified actor scope.",
+            status=403,
+        ) from exc
+    except Exception as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_LOGIN_UNAVAILABLE",
+            title="Bilibili login is unavailable",
+            detail="The configured Bilibili connector could not complete the request.",
+            status=503,
+            retryable=True,
+        ) from exc
+    if not isinstance(result, Mapping):
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider returned an invalid login-flow response.",
+            status=502,
+        )
+    return dict(result)
+
+
+def _authorize_bilibili_auth_call(
+    services: Any,
+    principal: IntegrationPrincipal,
+    *,
+    operation_id: str,
+    arguments: Mapping[str, object],
+    request_id: str,
+) -> ConnectorGrantClaims:
+    """Require a fresh Directory grant for one server-pinned QR action."""
+
+    registry = services.authorization_profile_registry
+    binding_ref = registry.settings.bilibili_auth_binding_ref if registry is not None else None
+    profile = registry.settings.profiles.get(binding_ref or "") if registry is not None else None
+    authority = services.connector_grant_authority
+    verifier = services.connector_grant_verifier
+    if (
+        not isinstance(binding_ref, str)
+        or not binding_ref
+        or profile is None
+        or profile.provider != "bilibili"
+        or profile.access_mode != "actor_owned"
+        or profile.caller_workload != "cyrene.exchange.integrations"
+        or profile.targets
+        or principal.organization_id != profile.organization_id
+        or principal.workspace_id != profile.workspace_id
+        or not registry.principal_allowed_for_profile(principal, profile)
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_CONNECTOR_NOT_CONFIGURED",
+            title="Bilibili login is not configured",
+            detail="The requested actor is outside the server-pinned Bilibili auth profile.",
+            status=503,
+            retryable=True,
+        )
+    if authority is None or verifier is None or not getattr(verifier, "configured", False):
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+            title="Connector authorization is not configured",
+            detail="Exchange has no current Authority grant channel for Bilibili login.",
+            status=503,
+            retryable=True,
+            context={"reasonCode": "connector_authority_not_configured"},
+        )
+    try:
+        target = _resource_projection(
+            provider_id="bilibili",
+            profile_ref=binding_ref,
+            operation_id=operation_id,
+            arguments=arguments,
+        )
+        resource_ref = _resource_ref(
+            provider_id="bilibili",
+            profile_ref=binding_ref,
+            operation_id=operation_id,
+            target=target,
+        )
+        arguments_digest = digest_arguments(arguments)
+        connection_ref = f"bilibili-auth:{binding_ref}"
+        expected = {
+            "request_id": request_id,
+            "organization_id": profile.organization_id,
+            "workspace_id": profile.workspace_id,
+            "principal_issuer": principal.issuer,
+            "principal_subject": principal.subject,
+            "connection_ref": connection_ref,
+            "provider_id": "bilibili",
+            "profile_ref": binding_ref,
+            "operation_id": operation_id,
+            "resource_ref": resource_ref,
+            "arguments_digest_sha256": bytes.fromhex(arguments_digest),
+        }
+        grant = authority.authorize_connector_operation(
+            workspace_id=profile.workspace_id,
+            principal_issuer=principal.issuer,
+            principal_subject=principal.subject,
+            connection_ref=connection_ref,
+            provider_id="bilibili",
+            profile_ref=binding_ref,
+            operation_id=operation_id,
+            resource_ref=resource_ref,
+            arguments_digest_sha256=bytes.fromhex(arguments_digest),
+            request_id=request_id,
+        )
+        verifier.validate_authority_response(grant, expected=expected)
+        return cast(ConnectorGrantClaims, verifier.consume(grant, expected=expected))
+    except ExchangeProductError:
+        raise
+    except PermissionError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+            title="Bilibili login is not authorized",
+            detail="The current Directory policy denied this Bilibili login operation.",
+            status=403,
+        ) from exc
+    except Exception as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_CONNECTOR_AUTHORIZATION_UNAVAILABLE",
+            title="Bilibili authorization is unavailable",
+            detail="Exchange could not obtain and consume the current Directory grant.",
+            status=503,
+            retryable=True,
+        ) from exc
+
+
+async def _begin_bilibili_qr_link(
+    services: Any,
+    principal: IntegrationPrincipal,
+    *,
+    idempotency_key: str,
+    request_id: str | None = None,
+) -> BilibiliQrBeginResponse:
+    """Start one QR flow from stable actor-scoped idempotency inputs."""
+
+    profile_ref = _provider_profile_ref(principal, idempotency_key)
+    connector_idempotency_key = hashlib.sha256(
+        b"cyrene-bilibili-qr\x00"
+        + profile_ref.encode("ascii")
+        + b"\x00"
+        + idempotency_key.encode("ascii")
+    ).hexdigest()
+    arguments = {
+        "profile_ref": profile_ref,
+        "idempotency_key": connector_idempotency_key,
+    }
+    call_request_id = request_id or str(uuid4())
+    _authorize_bilibili_auth_call(
+        services,
+        principal,
+        operation_id="bilibili.auth.qr.begin",
+        arguments=arguments,
+        request_id=call_request_id,
+    )
+    result = await _invoke_bilibili_auth_tool(
+        services,
+        principal,
+        operation_id="bilibili.auth.qr.begin",
+        arguments=arguments,
+        request_id=call_request_id,
+    )
+    return _bilibili_qr_begin_response(result)
+
+
+async def _poll_bilibili_qr_link(
+    services: Any,
+    principal: IntegrationPrincipal,
+    *,
+    login_flow_id: str,
+    request_id: str | None = None,
+) -> BilibiliQrStatusResponse:
+    """Return QR status and reveal linked metadata only after actor-owned readback."""
+
+    arguments = {"login_flow_id": login_flow_id}
+    call_request_id = request_id or str(uuid4())
+    _authorize_bilibili_auth_call(
+        services,
+        principal,
+        operation_id="bilibili.auth.qr.status",
+        arguments=arguments,
+        request_id=call_request_id,
+    )
+    result = await _invoke_bilibili_auth_tool(
+        services,
+        principal,
+        operation_id="bilibili.auth.qr.status",
+        arguments=arguments,
+        request_id=call_request_id,
+    )
+    status = result.get("status")
+    allowed_status = {
+        "PENDING",
+        "SCANNED",
+        "LINKED",
+        "EXPIRED",
+        "FAILED",
+        "UNKNOWN_RESULT",
+        "NOT_FOUND",
+    }
+    if (
+        not isinstance(status, str)
+        or status not in allowed_status
+        or set(result) != ({"status", "profile"} if status == "LINKED" else {"status"})
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider returned an invalid QR status or unexpected fields.",
+            status=502,
+        )
+    if status != "LINKED":
+        return BilibiliQrStatusResponse(
+            status=cast(
+                Literal[
+                    "PENDING",
+                    "SCANNED",
+                    "LINKED",
+                    "EXPIRED",
+                    "FAILED",
+                    "UNKNOWN_RESULT",
+                    "NOT_FOUND",
+                ],
+                status,
+            )
+        )
+    provider_profile = result.get("profile")
+    allowed_profile_fields = {
+        "profile_ref",
+        "provider",
+        "auth_status",
+        "external_subject",
+        "expires_at",
+        "auth_mode",
+        "access_mode",
+        "workspace_id",
+        "credential_revision",
+        "reauth_required",
+    }
+    if (
+        not isinstance(provider_profile, Mapping)
+        or set(provider_profile) - allowed_profile_fields
+        or provider_profile.get("provider") != "bilibili"
+        or not isinstance(provider_profile.get("profile_ref"), str)
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider returned invalid linked-account metadata.",
+            status=502,
+        )
+    try:
+        normalized_ref = str(UUID(provider_profile["profile_ref"]))
+    except ValueError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider returned an invalid linked-account reference.",
+            status=502,
+        ) from exc
+    linked_profile = _owned_bilibili_profile(
+        services,
+        principal,
+        profile_ref=normalized_ref,
+    )
+    if linked_profile is None or linked_profile.auth_status != "healthy":
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+            title="Account Center response invalid",
+            detail="The completed Bilibili profile is not visible to the verified actor.",
+            status=502,
+        )
+    return BilibiliQrStatusResponse(
+        status="LINKED",
+        profile=_bilibili_account_profile_response(linked_profile),
+    )
+
+
 class CloudResourceResponse(_HttpResponseModel):
     """Safe cloud observation projection with explicit source and cache freshness."""
 
@@ -777,6 +1202,7 @@ class ConnectorOperationGrantBody(IntegrationRequestBody):
     """HMAC-authenticated request to mint one exact provider-operation grant."""
 
     request_id: str = Field(min_length=1, max_length=200)
+    organization_id: str = Field(min_length=1, max_length=200)
     workspace_id: str = Field(min_length=1, max_length=200)
     principal_issuer: str = Field(min_length=1, max_length=1000)
     principal_subject: str = Field(min_length=1, max_length=1000)
@@ -787,6 +1213,7 @@ class ConnectorOperationGrantBody(IntegrationRequestBody):
     resource_ref: str = Field(min_length=1, max_length=1000)
     arguments: dict[str, Any]
     arguments_digest_sha256: str = Field(pattern="^[0-9a-f]{64}$")
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class AuthorizationHealthSnapshotBody(IntegrationRequestBody):
@@ -813,6 +1240,182 @@ class ConnectorOperationBody(IntegrationRequestBody):
     operation_id: str = Field(min_length=1, max_length=200)
     resource_ref: str = Field(min_length=1, max_length=1000)
     arguments: dict[str, Any]
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class BilibiliOperationBody(IntegrationRequestBody):
+    """Human-authorized Bilibili arguments and optional durable Work operation ID."""
+
+    arguments: dict[str, Any]
+    work_operation_id: UUID | None = Field(default=None, alias="workOperationId")
+
+
+class _InternalBilibiliActorBody(BaseModel):
+    """Snake-case actor anchor authenticated by NavigatorHmacAuthenticator."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=200)
+    principal_issuer: str = Field(min_length=1, max_length=1000)
+    principal_subject: str = Field(min_length=1, max_length=1000)
+    organization_id: str = Field(min_length=1, max_length=200)
+    workspace_id: str = Field(min_length=1, max_length=200)
+
+
+class _InternalBilibiliProfileLookupBody(_InternalBilibiliActorBody):
+    profile_ref: str = Field(min_length=1, max_length=300)
+
+
+class _InternalBilibiliConnectionsBody(_InternalBilibiliActorBody):
+    """List selector bound to one verified Navigator actor and workspace."""
+
+
+class _InternalBilibiliQrBeginBody(_InternalBilibiliActorBody):
+    idempotency_key: str = Field(min_length=8, max_length=200)
+
+
+class _InternalBilibiliQrStatusBody(_InternalBilibiliActorBody):
+    login_flow_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def _bilibili_internal_principal(
+    body: _InternalBilibiliActorBody,
+    *,
+    operation_id: str,
+) -> IntegrationPrincipal:
+    """Build a per-request actor only from the verified signed internal body."""
+
+    return IntegrationPrincipal(
+        issuer=body.principal_issuer,
+        subject=body.principal_subject,
+        organization_id=body.organization_id,
+        workspace_id=body.workspace_id,
+        allowed_operation_ids=frozenset({operation_id, "navigator.connector.operator.v1"}),
+    )
+
+
+def _bilibili_profile_http_mapping(profile: Any) -> dict[str, Any]:
+    """Serialize one actor-owned Account Center DTO without any credential material."""
+
+    return _bilibili_account_profile_response(profile).model_dump(mode="json", by_alias=True)
+
+
+def _account_center_profile_port(services: Any) -> Any:
+    """Select the typed account profile port when production composition provides it."""
+
+    return services.account_center or services.accounts
+
+
+def _owned_bilibili_profile(
+    services: Any,
+    principal: IntegrationPrincipal,
+    *,
+    profile_ref: str,
+) -> Any | None:
+    """Resolve a Bilibili profile through the current actor's Account Center view."""
+
+    port = _account_center_profile_port(services)
+    getter = getattr(port, "get_owned_provider_profile", None)
+    if not callable(getter):
+        raise ExchangeProductError(
+            code="EXCHANGE_ACCOUNT_CENTER_NOT_CONFIGURED",
+            title="Account Center is unavailable",
+            detail="Exchange has no actor-scoped Account Center profile port.",
+            status=503,
+            retryable=True,
+        )
+    return getter(principal, profile_ref=profile_ref, provider="bilibili")
+
+
+def _bilibili_qr_begin_response(result: Mapping[str, Any]) -> BilibiliQrBeginResponse:
+    """Validate provider QR bytes and expose only a bounded, digest-checked PNG."""
+
+    status = result.get("status")
+    expected_fields = (
+        {"status", "login_flow_id", "qr_png_base64", "qr_png_sha256", "expires_at"}
+        if status == "PENDING"
+        else {"status", "login_flow_id", "expires_at"}
+        if status == "EXPIRED"
+        else set()
+    )
+    login_flow_id = result.get("login_flow_id")
+    expiry = result.get("expires_at")
+    if (
+        not expected_fields
+        or set(result) != expected_fields
+        or not isinstance(login_flow_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", login_flow_id) is None
+        or not isinstance(expiry, str)
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider did not return a closed safe QR response.",
+            status=502,
+        )
+    try:
+        expires_at = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider returned an invalid QR expiration time.",
+            status=502,
+        ) from exc
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider returned a timezone-free QR expiration time.",
+            status=502,
+        )
+    if status == "EXPIRED":
+        return BilibiliQrBeginResponse(
+            status="EXPIRED",
+            loginFlowId=login_flow_id,
+            expiresAt=expires_at.astimezone(UTC),
+        )
+    qr_png_base64 = result.get("qr_png_base64")
+    qr_png_sha256 = result.get("qr_png_sha256")
+    if (
+        not isinstance(qr_png_base64, str)
+        or not 1 <= len(qr_png_base64) <= 1_500_000
+        or not isinstance(qr_png_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", qr_png_sha256) is None
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider returned an invalid QR image or digest.",
+            status=502,
+        )
+    try:
+        qr_png = base64.b64decode(qr_png_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider returned an invalid QR image encoding.",
+            status=502,
+        ) from exc
+    if (
+        len(qr_png) > 1_000_000
+        or not qr_png.startswith(b"\x89PNG\r\n\x1a\n")
+        or hashlib.sha256(qr_png).hexdigest() != qr_png_sha256
+    ):
+        raise ExchangeProductError(
+            code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+            title="Bilibili provider response invalid",
+            detail="The provider QR image digest did not verify.",
+            status=502,
+        )
+    return BilibiliQrBeginResponse(
+        status="PENDING",
+        loginFlowId=login_flow_id,
+        qrPngBase64=qr_png_base64,
+        qrPngSha256=qr_png_sha256,
+        expiresAt=expires_at.astimezone(UTC),
+    )
 
 
 class TeamsConversationBody(IntegrationRequestBody):
@@ -1056,7 +1659,7 @@ class IntegrationServices:
             principal.require("integrationCreateConnection")
             return request.repository_name
 
-        if request.provider in {"github", "hf"}:
+        if request.provider in {"github", "hf", "bilibili"}:
             account_provider = "huggingface" if request.provider == "hf" else request.provider
             if not request.account_link_ref:
                 raise ExchangeProductError(
@@ -1122,6 +1725,28 @@ class IntegrationServices:
                         status=403,
                     )
                 return request.repository_name
+            if request.provider == "bilibili":
+                external_subject = profile.get("external_subject")
+                if (
+                    profile.get("auth_mode") != "session_cookie"
+                    or profile.get("access_mode", "actor_owned") != "actor_owned"
+                    or not isinstance(external_subject, str)
+                    or re.fullmatch(r"[0-9]{1,20}", external_subject) is None
+                    or not isinstance(scope, Mapping)
+                    or set(scope) != {"schema_version", "account_id"}
+                    or scope.get("schema_version") != 1
+                    or isinstance(scope.get("schema_version"), bool)
+                    or scope.get("account_id") != external_subject
+                ):
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_UNAVAILABLE",
+                        title="Bilibili profile is unavailable",
+                        detail=(
+                            "The selected Account Center profile is not a healthy Bilibili login."
+                        ),
+                        status=409,
+                    )
+                return "Bilibili"
             registry = self.authorization_profile_registry
             host_profile = (
                 registry.settings.profiles.get(request.binding_ref or "")
@@ -1485,6 +2110,7 @@ def _connector_operation_response(
     *,
     is_mutating: bool = False,
     operation_id: str | None = None,
+    expected_operation_ref: str | None = None,
 ) -> dict[str, Any]:
     """Project provider business state into the stable Navigator invocation envelope."""
 
@@ -1503,7 +2129,39 @@ def _connector_operation_response(
         "COMMAND_INTERRUPTED",
         "COMMAND_CANCELLED",
     } or remote_state_value in {"UNKNOWN", "UNKNOWN_RESULT", "UNVERIFIED"}
-    if is_mutating and unknown_mutation_state:
+    bilibili_write = is_mutating and operation_id in {
+        "bilibili.comment.create",
+        "bilibili.dynamic.publish",
+        "bilibili.dm.send",
+    }
+    operation_ref = _connector_operation_ref(result)
+    if bilibili_write:
+        external_id = result.get("external_id", result.get("externalId"))
+        readback_digest = result.get("readback_sha256", result.get("readbackSha256"))
+        readback_verified = result.get("readback_verified", result.get("readbackVerified"))
+        exact_operation_ref = (
+            isinstance(expected_operation_ref, str)
+            and re.fullmatch(
+                r"work-operation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                expected_operation_ref,
+            )
+            is not None
+            and operation_ref == expected_operation_ref
+        )
+        readback_proof = (
+            isinstance(external_id, str)
+            and re.fullmatch(r"[0-9]{1,20}", external_id) is not None
+            and readback_verified is True
+            and isinstance(readback_digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", readback_digest) is not None
+        )
+        if state == "SUCCEEDED" and exact_operation_ref and readback_proof:
+            outcome = "verified"
+        elif state in {"REJECTED", "FAILED", "ERROR"}:
+            outcome = "failed"
+        else:
+            outcome = "uncertain"
+    elif is_mutating and unknown_mutation_state:
         outcome = "uncertain"
     elif (
         is_mutating and operation_id == "microsoft_graph.mail.message.send" and state == "ACCEPTED"
@@ -1521,7 +2179,7 @@ def _connector_operation_response(
         outcome = "failed" if state else "uncertain"
     else:
         outcome = "verified"
-    operation_ref = result.get("operation_ref", result.get("operationRef"))
+
     if outcome == "pending" and not (isinstance(operation_ref, str) and operation_ref):
         outcome = "uncertain"
     response: dict[str, Any] = {
@@ -1550,6 +2208,7 @@ def _connector_envelope_sha256(
     operation_id: str,
     resource_ref: str,
     arguments_sha256: str,
+    idempotency_key: str | None = None,
 ) -> str:
     """Hash the exact host-bound action envelope without storing provider input."""
 
@@ -1561,6 +2220,8 @@ def _connector_envelope_sha256(
         "resourceRef": resource_ref,
         "argumentsDigestSha256": arguments_sha256,
     }
+    if idempotency_key is not None:
+        envelope["idempotencyKey"] = idempotency_key
     return hashlib.sha256(connector_canonical_json(envelope)).hexdigest()
 
 
@@ -2880,6 +3541,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             "huggingface",
             "microsoft_graph",
             "azure_devops",
+            "bilibili",
         }:
             raise ExchangeProductError(
                 code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
@@ -2935,7 +3597,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     status=502,
                 )
             if auth_mode is not None and (
-                provider not in {"huggingface", "microsoft_graph", "azure_devops"}
+                provider not in {"huggingface", "microsoft_graph", "azure_devops", "bilibili"}
                 or not isinstance(auth_mode, str)
                 or (
                     provider == "huggingface"
@@ -2943,11 +3605,19 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 )
                 or (provider == "microsoft_graph" and auth_mode != "delegated_oauth")
                 or (provider == "azure_devops" and auth_mode != "delegated_oauth")
+                or (provider == "bilibili" and auth_mode != "session_cookie")
             ):
                 raise ExchangeProductError(
                     code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
                     title="Account Center response invalid",
                     detail="Account Center returned an unsupported provider auth mode.",
+                    status=502,
+                )
+            if provider == "bilibili" and auth_mode != "session_cookie":
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Account Center Bilibili profiles require session_cookie auth mode.",
                     status=502,
                 )
             if not isinstance(access_mode, str) or access_mode not in {
@@ -2965,6 +3635,13 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
                     title="Account Center response invalid",
                     detail="Microsoft Graph provider profiles must remain bound to one actor.",
+                    status=502,
+                )
+            if provider == "bilibili" and access_mode != "actor_owned":
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Bilibili profiles must remain bound to one actor.",
                     status=502,
                 )
             if provider == "microsoft_graph":
@@ -3005,6 +3682,25 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         detail="Account Center returned an invalid Azure DevOps profile.",
                         status=502,
                     ) from exc
+            elif provider == "bilibili":
+                scope = item.get("target_scope")
+                external_subject = item.get("external_subject")
+                if (
+                    not isinstance(scope, Mapping)
+                    or set(scope) != {"schema_version", "account_id"}
+                    or scope.get("schema_version") != 1
+                    or isinstance(scope.get("schema_version"), bool)
+                    or not isinstance(external_subject, str)
+                    or re.fullmatch(r"[0-9]{1,20}", external_subject) is None
+                    or scope.get("account_id") != external_subject
+                ):
+                    raise ExchangeProductError(
+                        code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                        title="Account Center response invalid",
+                        detail="Account Center returned an invalid Bilibili account profile.",
+                        status=502,
+                    )
+                target_scope = {"schema_version": 1, "account_id": external_subject}
             else:
                 target_scope = (
                     dict(item["target_scope"])
@@ -3057,9 +3753,711 @@ def create_router(services: IntegrationServices) -> APIRouter:
                         if provider == "microsoft_graph"
                         else {}
                     ),
+                    **(
+                        {"credentialRevision": item.get("credential_revision")}
+                        if provider == "bilibili"
+                        and isinstance(item.get("credential_revision"), int)
+                        and not isinstance(item.get("credential_revision"), bool)
+                        else {}
+                    ),
                 }
             )
         return {"profiles": projected}
+
+    @router.get(
+        "/api/v1/accounts/provider-profiles/bilibili/{profile_ref}",
+        operation_id="accountGetOwnedBilibiliProfile",
+        response_model=BilibiliAccountProfileResponse,
+    )
+    async def get_owned_bilibili_profile(
+        profile_ref: str,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+    ) -> BilibiliAccountProfileResponse:
+        """Read one Bilibili profile only through the current actor's Account Center list."""
+
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        try:
+            normalized_ref = str(UUID(profile_ref))
+        except (TypeError, ValueError) as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                title="Provider profile reference is invalid",
+                detail="Select one opaque Account Center profile reference.",
+                status=422,
+            ) from exc
+        profile = _owned_bilibili_profile(
+            services,
+            actor,
+            profile_ref=normalized_ref,
+        )
+        if profile is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+                title="Provider profile unavailable",
+                detail="The Bilibili profile does not belong to the verified actor.",
+                status=404,
+            )
+        if (
+            profile.auth_mode != "session_cookie"
+            or profile.access_mode != "actor_owned"
+            or not isinstance(profile.external_subject, str)
+            or re.fullmatch(r"[0-9]{1,20}", profile.external_subject) is None
+            or profile.target_scope.get("schema_version") != 1
+            or profile.target_scope.get("account_id") != profile.external_subject
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned an invalid Bilibili account profile.",
+                status=502,
+            )
+        return _bilibili_account_profile_response(profile)
+
+    @router.post(
+        "/internal/v1/bilibili/provider-profiles/list",
+        operation_id="internalListOwnedBilibiliProfiles",
+    )
+    async def internal_list_owned_bilibili_profiles(request: Request) -> dict[str, Any]:
+        """List only safe Bilibili profile metadata visible to the signed actor."""
+
+        body = await signed_navigator_body(request, _InternalBilibiliActorBody)
+        actor = _bilibili_internal_principal(body, operation_id="accountListProviderProfiles")
+        require(actor, "navigator.connector.operator.v1")
+        port = _account_center_profile_port(services)
+        list_profiles = getattr(port, "list_owned_provider_profiles", None)
+        if not callable(list_profiles):
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_NOT_CONFIGURED",
+                title="Account Center is unavailable",
+                detail="Exchange has no actor-scoped provider profile port.",
+                status=503,
+                retryable=True,
+            )
+        try:
+            profiles = list_profiles(actor, provider="bilibili")
+        except ExchangeProductError:
+            raise
+        except Exception as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Exchange could not read the actor-owned Bilibili profiles.",
+                status=502,
+            ) from exc
+        return {"profiles": [_bilibili_profile_http_mapping(profile) for profile in profiles]}
+
+    @router.post(
+        "/internal/v1/bilibili/provider-profiles/get",
+        operation_id="internalGetOwnedBilibiliProfile",
+        response_model=BilibiliAccountProfileResponse,
+    )
+    async def internal_get_owned_bilibili_profile(request: Request) -> Any:
+        """Resolve one exact profile ref through the signed actor's Account Center view."""
+
+        body = await signed_navigator_body(request, _InternalBilibiliProfileLookupBody)
+        actor = _bilibili_internal_principal(body, operation_id="accountGetOwnedBilibiliProfile")
+        require(actor, "navigator.connector.operator.v1")
+        try:
+            normalized_ref = str(UUID(body.profile_ref))
+        except (TypeError, ValueError) as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                title="Provider profile reference is invalid",
+                detail="Select one opaque Account Center profile reference.",
+                status=422,
+            ) from exc
+        profile = _owned_bilibili_profile(services, actor, profile_ref=normalized_ref)
+        if profile is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_PROVIDER_PROFILE_FORBIDDEN",
+                title="Provider profile unavailable",
+                detail="The Bilibili profile does not belong to the verified actor.",
+                status=404,
+            )
+        return _bilibili_account_profile_response(profile)
+
+    @router.post(
+        "/api/v1/accounts/provider-profiles/bilibili/qr-sessions",
+        status_code=202,
+        operation_id="accountBeginBilibiliQrLink",
+        response_model=BilibiliQrBeginResponse,
+    )
+    async def begin_bilibili_qr_link(
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=200),
+    ) -> BilibiliQrBeginResponse:
+        """Start a provider-owned QR flow from a human-only authenticated action."""
+
+        if not re.fullmatch(r"[\x21-\x7E]{8,200}", idempotency_key):
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                title="Idempotency key is invalid",
+                detail="Bilibili login requires a bounded printable Idempotency-Key header.",
+                status=422,
+            )
+        request_body = await request.body()
+        if request_body not in {b"", b"{}"}:
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                title="Bilibili login request is invalid",
+                detail="The server selects all Bilibili provider and credential bindings.",
+                status=422,
+            )
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        require(actor, "bilibili.auth.qr.begin")
+        registry = services.authorization_profile_registry
+        binding_ref = registry.settings.bilibili_auth_binding_ref if registry is not None else None
+        auth_provider = services.authorization_cloud
+        if (
+            not isinstance(binding_ref, str)
+            or not binding_ref
+            or auth_provider is None
+            or not callable(getattr(auth_provider, "invoke_bilibili_auth_tool", None))
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_BILIBILI_CONNECTOR_NOT_CONFIGURED",
+                title="Bilibili login is not configured",
+                detail="Exchange has no host-pinned Bilibili connector binding.",
+                status=503,
+                retryable=True,
+            )
+        profile_ref = _provider_profile_ref(actor, idempotency_key)
+        connector_idempotency_key = hashlib.sha256(
+            b"cyrene-bilibili-qr\x00"
+            + profile_ref.encode("ascii")
+            + b"\x00"
+            + idempotency_key.encode("ascii")
+        ).hexdigest()
+        arguments = {
+            "profile_ref": profile_ref,
+            "idempotency_key": connector_idempotency_key,
+        }
+        request_id = str(uuid4())
+        _authorize_bilibili_auth_call(
+            services,
+            actor,
+            operation_id="bilibili.auth.qr.begin",
+            arguments=arguments,
+            request_id=request_id,
+        )
+        try:
+            result = await run_in_threadpool(
+                partial(
+                    auth_provider.invoke_bilibili_auth_tool,
+                    actor,
+                    operation_id="bilibili.auth.qr.begin",
+                    tool_id="bilibili.auth.qr.begin",
+                    arguments=arguments,
+                    request_id=request_id,
+                )
+            )
+        except ExchangeProductError:
+            raise
+        except PermissionError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Bilibili account setup is not authorized",
+                detail="The configured Bilibili connector is outside the verified actor scope.",
+                status=403,
+            ) from exc
+        except Exception as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_BILIBILI_LOGIN_UNAVAILABLE",
+                title="Bilibili login is unavailable",
+                detail="The configured Bilibili connector could not start the login flow.",
+                status=503,
+                retryable=True,
+            ) from exc
+        if not isinstance(result, Mapping):
+            raise ExchangeProductError(
+                code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+                title="Bilibili provider response invalid",
+                detail="The provider did not return the closed safe QR response.",
+                status=502,
+            )
+        return _bilibili_qr_begin_response(result)
+
+    @router.get(
+        "/api/v1/accounts/provider-profiles/bilibili/qr-sessions/{login_flow_id}",
+        operation_id="accountGetBilibiliQrLinkStatus",
+        response_model=BilibiliQrStatusResponse,
+    )
+    async def get_bilibili_qr_link_status(
+        login_flow_id: str,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+    ) -> BilibiliQrStatusResponse:
+        """Poll one private QR flow; only a verified Account Center row is returned on link."""
+
+        if re.fullmatch(r"[0-9a-f]{64}", login_flow_id) is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_INTEGRATION_REQUEST_INVALID",
+                title="Bilibili flow reference is invalid",
+                detail="Select one opaque Bilibili QR flow reference.",
+                status=422,
+            )
+        actor = await principal(
+            request,
+            workspace_id,
+            operation_id="navigator.connector.operator.v1",
+        )
+        require(actor, "navigator.connector.operator.v1")
+        require(actor, "bilibili.auth.qr.status")
+        registry = services.authorization_profile_registry
+        binding_ref = registry.settings.bilibili_auth_binding_ref if registry is not None else None
+        auth_provider = services.authorization_cloud
+        if (
+            not isinstance(binding_ref, str)
+            or not binding_ref
+            or auth_provider is None
+            or not callable(getattr(auth_provider, "invoke_bilibili_auth_tool", None))
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_BILIBILI_CONNECTOR_NOT_CONFIGURED",
+                title="Bilibili login is not configured",
+                detail="Exchange has no host-pinned Bilibili connector binding.",
+                status=503,
+                retryable=True,
+            )
+        arguments = {"login_flow_id": login_flow_id}
+        request_id = str(uuid4())
+        _authorize_bilibili_auth_call(
+            services,
+            actor,
+            operation_id="bilibili.auth.qr.status",
+            arguments=arguments,
+            request_id=request_id,
+        )
+        try:
+            result = await run_in_threadpool(
+                partial(
+                    auth_provider.invoke_bilibili_auth_tool,
+                    actor,
+                    operation_id="bilibili.auth.qr.status",
+                    tool_id="bilibili.auth.qr.status",
+                    arguments=arguments,
+                    request_id=request_id,
+                )
+            )
+        except ExchangeProductError:
+            raise
+        except PermissionError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Bilibili account setup is not authorized",
+                detail="The configured Bilibili connector is outside the verified actor scope.",
+                status=403,
+            ) from exc
+        except Exception as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_BILIBILI_LOGIN_UNAVAILABLE",
+                title="Bilibili login is unavailable",
+                detail="The configured Bilibili connector could not read login status.",
+                status=503,
+                retryable=True,
+            ) from exc
+        if not isinstance(result, Mapping):
+            raise ExchangeProductError(
+                code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+                title="Bilibili provider response invalid",
+                detail="The provider returned an invalid QR status response.",
+                status=502,
+            )
+        status = result.get("status")
+        allowed_status = {
+            "PENDING",
+            "SCANNED",
+            "LINKED",
+            "EXPIRED",
+            "FAILED",
+            "UNKNOWN_RESULT",
+            "NOT_FOUND",
+        }
+        if (
+            not isinstance(status, str)
+            or status not in allowed_status
+            or set(result) != ({"status", "profile"} if status == "LINKED" else {"status"})
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+                title="Bilibili provider response invalid",
+                detail="The provider returned an invalid QR status or unexpected fields.",
+                status=502,
+            )
+        if status != "LINKED":
+            return BilibiliQrStatusResponse(
+                status=cast(
+                    Literal[
+                        "PENDING",
+                        "SCANNED",
+                        "LINKED",
+                        "EXPIRED",
+                        "FAILED",
+                        "UNKNOWN_RESULT",
+                        "NOT_FOUND",
+                    ],
+                    status,
+                )
+            )
+        provider_profile = result.get("profile")
+        if (
+            not isinstance(provider_profile, Mapping)
+            or set(provider_profile)
+            - {
+                "profile_ref",
+                "provider",
+                "auth_status",
+                "external_subject",
+                "expires_at",
+                "auth_mode",
+                "access_mode",
+                "workspace_id",
+                "credential_revision",
+                "reauth_required",
+            }
+            or provider_profile.get("provider") != "bilibili"
+            or not isinstance(provider_profile.get("profile_ref"), str)
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+                title="Bilibili provider response invalid",
+                detail="The provider returned invalid linked-account metadata.",
+                status=502,
+            )
+        try:
+            normalized_ref = str(UUID(provider_profile["profile_ref"]))
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_BILIBILI_PROVIDER_RESPONSE_INVALID",
+                title="Bilibili provider response invalid",
+                detail="The provider returned an invalid linked-account reference.",
+                status=502,
+            ) from exc
+        linked_profile = _owned_bilibili_profile(
+            services,
+            actor,
+            profile_ref=normalized_ref,
+        )
+        if linked_profile is None or linked_profile.auth_status != "healthy":
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="The completed Bilibili profile is not visible to the verified actor.",
+                status=502,
+            )
+        return BilibiliQrStatusResponse(
+            status="LINKED",
+            profile=_bilibili_account_profile_response(linked_profile),
+        )
+
+    @router.post(
+        "/internal/v1/bilibili/qr-sessions/begin",
+        operation_id="internalBeginBilibiliQrLink",
+        response_model=BilibiliQrBeginResponse,
+    )
+    async def internal_begin_bilibili_qr_link(request: Request) -> BilibiliQrBeginResponse:
+        """Begin one actor-owned login through the HMAC-bound Navigator identity."""
+
+        body = await signed_navigator_body(request, _InternalBilibiliQrBeginBody)
+        actor = _bilibili_internal_principal(body, operation_id="bilibili.auth.qr.begin")
+        require(actor, "navigator.connector.operator.v1")
+        require(actor, "bilibili.auth.qr.begin")
+        return await _begin_bilibili_qr_link(
+            services,
+            actor,
+            idempotency_key=body.idempotency_key,
+            request_id=body.request_id,
+        )
+
+    @router.post(
+        "/internal/v1/bilibili/qr-sessions/status",
+        operation_id="internalPollBilibiliQrLink",
+        response_model=BilibiliQrStatusResponse,
+    )
+    async def internal_poll_bilibili_qr_link(request: Request) -> BilibiliQrStatusResponse:
+        """Poll one opaque flow with a fresh actor-scoped Directory grant."""
+
+        body = await signed_navigator_body(request, _InternalBilibiliQrStatusBody)
+        actor = _bilibili_internal_principal(body, operation_id="bilibili.auth.qr.status")
+        require(actor, "navigator.connector.operator.v1")
+        require(actor, "bilibili.auth.qr.status")
+        return await _poll_bilibili_qr_link(
+            services,
+            actor,
+            login_flow_id=body.login_flow_id,
+            request_id=body.request_id,
+        )
+
+    @router.post(
+        "/api/v1/integrations/connections/{connection_id}/bilibili/operations/{operation_id}",
+        operation_id="accountInvokeBilibiliOperation",
+    )
+    async def invoke_bilibili_operation(
+        connection_id: UUID,
+        operation_id: str,
+        body: BilibiliOperationBody,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+    ) -> dict[str, Any]:
+        """Invoke one account operation through Exchange's existing connector dispatcher."""
+
+        operations = {
+            "bilibili.search",
+            "bilibili.user.find",
+            "bilibili.video.read",
+            "bilibili.comments.list",
+            "bilibili.dynamics.list",
+            "bilibili.dynamic.read",
+            "bilibili.dm.list",
+            "bilibili.dm.read",
+            "bilibili.comment.create",
+            "bilibili.dynamic.publish",
+            "bilibili.dm.send",
+        }
+        if operation_id not in operations:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_OPERATION_INVALID",
+                title="Bilibili operation is invalid",
+                detail="Select one supported Bilibili account operation.",
+                status=422,
+            )
+        actor = await principal(request, workspace_id, operation_id=operation_id)
+        require(actor, "navigator.connector.operator.v1")
+        require(actor, operation_id)
+        dispatcher = services.connector_operation_dispatcher
+        authority = services.connector_grant_authority
+        verifier = services.connector_grant_verifier
+        if dispatcher is None or authority is None or verifier is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_CONFIGURED",
+                title="Bilibili operation is unavailable",
+                detail="Exchange has no complete connector dispatcher or authorization channel.",
+                status=503,
+                retryable=True,
+            )
+        if (
+            operation_id
+            in {
+                "bilibili.comment.create",
+                "bilibili.dynamic.publish",
+                "bilibili.dm.send",
+            }
+            and body.work_operation_id is None
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_IDEMPOTENCY_REQUIRED",
+                title="Stable operation reference required",
+                detail="Bilibili writes must be tied to a persisted Work operation ID.",
+                status=422,
+            )
+        try:
+            connection = services.store.connector_connection_for_actor(
+                connection_id,
+                issuer=actor.issuer,
+                subject=actor.subject,
+                organization_id=actor.organization_id,
+                workspace_id=actor.workspace_id,
+            )
+        except IntegrationNotFound as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_NOT_FOUND",
+                title="Bilibili connection unavailable",
+                detail="The selected connector connection is not visible to the verified actor.",
+                status=404,
+            ) from exc
+        if connection.provider != "bilibili" or not connection.account_link_ref:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_PROVIDER_SCOPE_FORBIDDEN",
+                title="Bilibili connection unavailable",
+                detail="Select a persisted Bilibili connection with an Account Center profile.",
+                status=403,
+            )
+        dispatcher_request_id = str(uuid4())
+        idempotency_key = (
+            f"work-operation:{body.work_operation_id}"
+            if body.work_operation_id is not None
+            else None
+        )
+        try:
+            target_projection = _resource_projection(
+                provider_id="bilibili",
+                profile_ref=str(connection.account_link_ref),
+                operation_id=operation_id,
+                arguments=body.arguments,
+            )
+            resource_ref = _resource_ref(
+                provider_id="bilibili",
+                profile_ref=str(connection.account_link_ref),
+                operation_id=operation_id,
+                target=target_projection,
+            )
+            prepared = dispatcher.prepare_connection_operation(
+                principal=actor,
+                connection=connection,
+                provider_id="bilibili",
+                profile_ref=str(connection.account_link_ref),
+                operation_id=operation_id,
+                resource_ref=resource_ref,
+                arguments=body.arguments,
+                request_id=dispatcher_request_id,
+                idempotency_key=idempotency_key,
+            )
+        except PermissionError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_DENIED",
+                title="Bilibili operation is not authorized",
+                detail="The operation is outside the verified connection or account scope.",
+                status=403,
+            ) from exc
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_REQUEST_INVALID",
+                title="Bilibili operation is invalid",
+                detail="The operation arguments do not match the fixed Bilibili schema.",
+                status=422,
+            ) from exc
+        arguments_sha256 = digest_arguments(prepared.arguments)
+        try:
+            grant_bytes = authority.authorize_connector_operation(
+                workspace_id=prepared.expected_workspace_id,
+                principal_issuer=actor.issuer,
+                principal_subject=actor.subject,
+                connection_ref=prepared.connection_ref,
+                provider_id=prepared.provider_id,
+                profile_ref=prepared.profile_ref,
+                operation_id=prepared.operation_id,
+                resource_ref=prepared.resource_ref,
+                arguments_digest_sha256=bytes.fromhex(arguments_sha256),
+                request_id=dispatcher_request_id,
+            )
+        except Exception as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_AUTHORIZATION_UNAVAILABLE",
+                title="Bilibili authorization is unavailable",
+                detail="Exchange could not obtain the current connector operation grant.",
+                status=503,
+                retryable=True,
+            ) from exc
+        expected_claims = {
+            "request_id": dispatcher_request_id,
+            "organization_id": prepared.expected_organization_id,
+            "workspace_id": prepared.expected_workspace_id,
+            "principal_issuer": actor.issuer,
+            "principal_subject": actor.subject,
+            "connection_ref": prepared.connection_ref,
+            "provider_id": prepared.provider_id,
+            "profile_ref": prepared.profile_ref,
+            "operation_id": prepared.operation_id,
+            "resource_ref": prepared.resource_ref,
+            "arguments_digest_sha256": bytes.fromhex(arguments_sha256),
+        }
+        try:
+            claims = verifier.consume(grant_bytes, expected=expected_claims)
+        except ExchangeProductError:
+            raise
+        envelope_sha256 = _connector_envelope_sha256(
+            connection_ref=prepared.connection_ref,
+            provider_id=prepared.provider_id,
+            profile_ref=prepared.profile_ref,
+            operation_id=prepared.operation_id,
+            resource_ref=prepared.resource_ref,
+            arguments_sha256=arguments_sha256,
+            idempotency_key=prepared.idempotency_key,
+        )
+        try:
+            reservation = services.store.reserve_connector_invocation(
+                actor,
+                request_id=dispatcher_request_id,
+                connection_ref=prepared.connection_ref,
+                provider_id=prepared.provider_id,
+                profile_ref=prepared.profile_ref,
+                operation_id=prepared.operation_id,
+                resource_ref=prepared.resource_ref,
+                arguments_sha256=arguments_sha256,
+                envelope_sha256=envelope_sha256,
+                grant_ref=claims.grant_ref,
+                is_mutating=prepared.is_mutating,
+                now_epoch=int(datetime.now(UTC).timestamp()),
+            )
+        except ConnectorInvocationLedgerFull as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONNECTOR_RECEIPT_CAPACITY_EXCEEDED",
+                title="Bilibili receipt capacity reached",
+                detail="Exchange cannot safely record another provider operation right now.",
+                status=503,
+                retryable=True,
+            ) from exc
+        if reservation.disposition != "NEW":
+            return _connector_replay_response(
+                request_id=dispatcher_request_id,
+                reservation=reservation,
+            )
+        services.store.attach_connector_invocation_grant(
+            actor,
+            request_id=dispatcher_request_id,
+            envelope_sha256=envelope_sha256,
+            grant_ref=claims.grant_ref,
+        )
+        try:
+            result = await _invoke_connector_dispatcher(
+                dispatcher,
+                prepared,
+                principal=actor,
+                claims=claims,
+            )
+        except ExchangeProductError as exc:
+            result = _connector_exception_result(exc, is_mutating=prepared.is_mutating)
+        except Exception:
+            result = {
+                "state": "UNKNOWN_RESULT" if prepared.is_mutating else "FAILED",
+                "error": {"code": "PROVIDER_UNAVAILABLE", "retryable": True},
+            }
+        response = _connector_operation_response(
+            dispatcher_request_id,
+            result,
+            is_mutating=prepared.is_mutating,
+            operation_id=prepared.operation_id,
+            expected_operation_ref=prepared.idempotency_key,
+        )
+        receipt_state = {
+            "verified": "SUCCEEDED",
+            "pending": "PENDING",
+            "uncertain": "UNKNOWN_RESULT",
+            "failed": "FAILED",
+        }[str(response["outcome"])]
+        services.store.complete_connector_invocation(
+            actor,
+            request_id=dispatcher_request_id,
+            envelope_sha256=envelope_sha256,
+            state=cast(
+                Literal[
+                    "PENDING",
+                    "UNKNOWN_RESULT",
+                    "SUCCEEDED",
+                    "FAILED",
+                    "REJECTED",
+                    "RATE_LIMITED",
+                ],
+                receipt_state,
+            ),
+            response=response,
+            operation_ref=_connector_operation_ref(result),
+            response_status=200,
+            now_epoch=int(datetime.now(UTC).timestamp()),
+        )
+        return response
 
     @router.post(
         "/api/v1/accounts/provider-profiles/github/app-installations",
@@ -3385,6 +4783,42 @@ def create_router(services: IntegrationServices) -> APIRouter:
         ]
 
     @router.post(
+        "/internal/v1/bilibili/connections/list",
+        operation_id="internalListOwnedBilibiliConnections",
+    )
+    async def internal_list_owned_bilibili_connections(request: Request) -> dict[str, Any]:
+        """Return Bilibili connection refs required by Navigator grant preparation."""
+
+        body = await signed_navigator_body(request, _InternalBilibiliConnectionsBody)
+        actor = _bilibili_internal_principal(body, operation_id="integrationListConnections")
+        require(actor, "navigator.connector.operator.v1")
+        rows = services.store.list_connections(actor)
+        connections: list[dict[str, Any]] = []
+        for connection in rows:
+            if connection.provider != "bilibili":
+                continue
+            profile_ref = connection.account_link_ref
+            if not isinstance(profile_ref, str) or not profile_ref:
+                raise ExchangeProductError(
+                    code="EXCHANGE_INTEGRATION_RESPONSE_INVALID",
+                    title="Integration connection invalid",
+                    detail="The persisted Bilibili connection has no Account Center profile ref.",
+                    status=500,
+                )
+            connections.append(
+                {
+                    "connectionRef": str(connection.id),
+                    "provider": "bilibili",
+                    "profileRef": profile_ref,
+                    "displayName": connection.display_name,
+                    "enabled": connection.enabled,
+                    "createdAt": connection.created_at,
+                    "updatedAt": connection.updated_at,
+                }
+            )
+        return {"connections": connections}
+
+    @router.post(
         "/internal/v1/connector-operation-grants",
         operation_id="internalMintConnectorOperationGrant",
     )
@@ -3414,6 +4848,11 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 )
                 if profile is None:
                     raise PermissionError("Teams message profile is not configured")
+                if (
+                    body.organization_id != profile.organization_id
+                    or body.workspace_id != profile.workspace_id
+                ):
+                    raise PermissionError("Teams operation is outside the configured tenant scope")
                 principal_value = IntegrationPrincipal(
                     issuer=body.principal_issuer,
                     subject=body.principal_subject,
@@ -3437,7 +4876,10 @@ def create_router(services: IntegrationServices) -> APIRouter:
                 profile = services.computer_runner_profile
                 if profile is None:
                     raise PermissionError("computer runner profile is not configured")
-                if body.workspace_id != profile.workspace_id:
+                if (
+                    body.organization_id != profile.organization_id
+                    or body.workspace_id != profile.workspace_id
+                ):
                     raise PermissionError("computer runner workspace is outside the host binding")
                 principal_value = IntegrationPrincipal(
                     issuer=body.principal_issuer,
@@ -3465,6 +4907,11 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     subject=body.principal_subject,
                     workspace_id=body.workspace_id,
                 )
+                if (
+                    connection.organization_id != body.organization_id
+                    or connection.workspace_id != body.workspace_id
+                ):
+                    raise PermissionError("connector connection is outside the signed tenant scope")
                 principal_value = IntegrationPrincipal(
                     issuer=body.principal_issuer,
                     subject=body.principal_subject,
@@ -3481,6 +4928,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     resource_ref=body.resource_ref,
                     arguments=body.arguments,
                     request_id=body.request_id,
+                    idempotency_key=body.idempotency_key,
                 )
         except ValueError as exc:
             raise ExchangeProductError(
@@ -3502,7 +4950,9 @@ def create_router(services: IntegrationServices) -> APIRouter:
             ) from exc
         calculated_digest = digest_arguments(prepared.arguments)
         if (
-            prepared.provider_id != body.provider_id
+            body.organization_id != prepared.expected_organization_id
+            or body.workspace_id != prepared.expected_workspace_id
+            or prepared.provider_id != body.provider_id
             or prepared.profile_ref != body.profile_ref
             or prepared.operation_id != body.operation_id
             or prepared.resource_ref != body.resource_ref
@@ -3706,6 +5156,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
                     resource_ref=body.resource_ref,
                     arguments=body.arguments,
                     request_id=body.request_id,
+                    idempotency_key=body.idempotency_key,
                 )
             except PermissionError as exc:
                 raise ExchangeProductError(
@@ -3747,6 +5198,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             operation_id=prepared.operation_id,
             resource_ref=prepared.resource_ref,
             arguments_sha256=calculated_digest,
+            idempotency_key=prepared.idempotency_key,
         )
         try:
             reservation = services.store.reserve_connector_invocation(
@@ -3821,6 +5273,7 @@ def create_router(services: IntegrationServices) -> APIRouter:
             result,
             is_mutating=prepared.is_mutating,
             operation_id=prepared.operation_id,
+            expected_operation_ref=prepared.idempotency_key,
         )
         outcome = response["outcome"]
         receipt_state = {
