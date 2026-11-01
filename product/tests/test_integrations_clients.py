@@ -446,6 +446,7 @@ def test_github_proactive_tool_call_uses_the_existing_provider_capability() -> N
         "github.branch.get",
         "github.file.commit",
         "github.file.get",
+        "github.commits.compare",
         "github.pull_request.draft.create",
         "github.pull_request.draft.find",
         "github.actions.rerun_failed",

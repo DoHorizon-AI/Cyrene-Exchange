@@ -80,6 +80,7 @@ _TOOL_IDS_BY_PROVIDER: Mapping[str, Mapping[str, str]] = {
         "github.branches.list": "github.branches.list",
         "github.pull_requests.list": "github.pull_requests.list",
         "github.pull_request.get": "github.pull_request.get",
+        "github.commits.compare": "github.commits.compare",
         "github.actions.runs.list": "github.actions.runs.list",
         "github.issues.search": "github.issues.search",
         "github.actions.jobs.list": "github.actions.jobs.list",
@@ -1246,6 +1247,8 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
                 if operation_id in {"github.repository.list", "github.vendor.cli.execute"}
                 else "github_pull_request"
                 if operation_id == "github.pull_request.get"
+                else "github_commit_comparison"
+                if operation_id == "github.commits.compare"
                 else "github_commit"
                 if operation_id == "github.ci.status"
                 else "github_actions_run"
@@ -1418,6 +1421,13 @@ def _resource_projection(
         target = _fields(arguments, {"repository_id", "repository"})
         if operation_id == "github.pull_request.get":
             target.update(_fields(arguments, {"pull_number"}))
+        elif operation_id == "github.commits.compare":
+            target.update(
+                {
+                    "base_sha": str(arguments["base_sha"]).lower(),
+                    "head_sha": str(arguments["head_sha"]).lower(),
+                }
+            )
         elif operation_id == "github.ci.status":
             target.update(_fields(arguments, {"commit_sha"}))
         elif operation_id.startswith("github.issue."):
@@ -1611,6 +1621,8 @@ def _validate_github_target(
     optional_fields: set[str] = set()
     if operation_id == "github.pull_requests.list":
         optional_fields = {"state", "page_cursor"}
+    elif operation_id == "github.commits.compare":
+        optional_fields = {"base_sha", "head_sha"}
     elif operation_id == "github.pull_request.get":
         optional_fields = {"pull_number"}
     elif operation_id == "github.actions.runs.list":
@@ -1675,6 +1687,9 @@ def _validate_github_target(
     elif operation_id == "github.pull_request.get":
         required_fields |= {"pull_number"}
         optional_fields = set()
+    elif operation_id == "github.commits.compare":
+        required_fields |= {"base_sha", "head_sha"}
+        optional_fields = set()
     elif operation_id == "github.ci.status":
         required_fields |= {"commit_sha"}
         optional_fields = set()
@@ -1731,6 +1746,11 @@ def _validate_github_target(
         raise PermissionError("GitHub repository does not match the selected connection")
     if operation_id == "github.pull_request.get":
         _positive_int(arguments.get("pull_number"), "pull_number")
+    elif operation_id == "github.commits.compare":
+        for field in ("base_sha", "head_sha"):
+            value = arguments.get(field)
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
+                raise ValueError(f"GitHub {field} is invalid")
     elif operation_id == "github.ci.status":
         _text(arguments.get("commit_sha"), "commit_sha")
     elif operation_id.startswith("github.issue."):
