@@ -11,6 +11,7 @@
 from cyrene_exchange_product.api import create_app
 from cyrene_exchange_product.audit_api import create_audit_app
 from cyrene_exchange_product.domain import (
+    CreateWorkspaceBindingRouteDraftRequest,
     ProductPrincipal,
     RequestAuditRecord,
     RequestAuditStatus,
@@ -28,6 +29,7 @@ from cyrene_exchange_product.routing import (
 )
 
 __all__ = [
+    "CreateWorkspaceBindingRouteDraftRequest",
     "ProductPrincipal",
     "ProductQuotaGuard",
     "ProductRoutingResolver",

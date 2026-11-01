@@ -15,7 +15,7 @@ from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -60,7 +60,13 @@ class UpstreamHandler(BaseHTTPRequestHandler):
             self.end_headers()
             for piece in ("upstream:", content):
                 event = {
-                    "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": piece},
+                            "finish_reason": None,
+                        },
+                    ],
                 }
                 self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
                 self.wfile.flush()
@@ -489,7 +495,8 @@ def test_route_source_origin_outside_the_allow_list_is_refused(tmp_path: Path) -
 
 
 def test_navigator_web_endpoints_and_proxy_rewrite(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CYRENE_PUBLIC_BASE_URL", "https://cyrene.example.test")
     mock_dist = tmp_path / "mock_dist"
@@ -607,3 +614,47 @@ def test_system_status_probes_return_standard_shape_on_any_host() -> None:
     assert isinstance(disk["available"], bool)
     if disk["available"]:
         assert disk["totalGib"] > 0
+
+
+def test_control_only_bearer_can_bootstrap_endpoint_but_cannot_call_gateway(
+    tmp_path: Path,
+) -> None:
+    control_token = "control-only-endpoint-admin"
+    gateway_token = "separate-gateway-data-token"
+    principal = ProductPrincipal("operator", "local", "cred://exchange/bootstrap")
+    app = build_product_app(
+        database_path=tmp_path / "bootstrap.sqlite3",
+        resolver=OperatorBindingResolver({}),
+        endpoint_id=uuid4(),
+        control_credentials={control_token: principal},
+        control_only_credentials={control_token: principal},
+        gateway_credentials={
+            gateway_token: ProductPrincipal("actor", "local", "cred://exchange/data")
+        },
+    )
+    with TestClient(app) as client:
+        endpoint = client.post(
+            "/api/v1/gateway-endpoints",
+            headers={
+                "Authorization": f"Bearer {control_token}",
+                "Idempotency-Key": "local-endpoint-bootstrap",
+            },
+            json={
+                "name": "Aether local model endpoint",
+                "publicBaseUrl": "http://127.0.0.1:18682/v1",
+                "authPolicyRef": "policy://cyrene/aether-local",
+            },
+        )
+        assert endpoint.status_code == 201, endpoint.text
+        assert endpoint.json()["state"] == "ACTIVE"
+
+        rejected_data_plane = client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {control_token}"},
+        )
+        assert rejected_data_plane.status_code == 401
+        accepted_data_plane = client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {gateway_token}"},
+        )
+        assert accepted_data_plane.status_code == 200

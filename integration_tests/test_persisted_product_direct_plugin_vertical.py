@@ -33,7 +33,7 @@ def _provision_route(database: Path, *, binding_id: str) -> UUID:
 
     中文:通过 control HTTP API 创建 Product endpoint 和 route 资源。
     """
-# 中文:通过控制 HTTP API 创建 Product 端点和路由资源。
+    # 中文:通过控制 HTTP API 创建 Product 端点和路由资源。
 
     control = create_app(database_path=database)
     try:
@@ -75,7 +75,7 @@ def _platform_delegate(
 
     中文:让 Product 查询通过 Platform 选择和 Direct Plugin client 完成。
     """
-# 中文:将 Product 查询绑定到 Platform 选择和直接 Plugin 客户端。
+    # 中文:将 Product 查询绑定到 Platform 选择和直接 Plugin 客户端。
 
     return PlatformResolverAdapter(
         [str(platform_binaries["cyrene-capability-resolver"])],
@@ -92,7 +92,7 @@ def _running_gateway(gateway: ExchangeGateway) -> Iterator[ThreadingHTTPServer]:
 
     中文:运行真实 loopback HTTP adapter,并确定性地释放 listener。
     """
-# 中文:运行真实的 loopback HTTP 适配器,并以确定方式释放其监听器。
+    # 中文:运行真实的 loopback HTTP 适配器,并以确定方式释放其监听器。
 
     server = create_reference_server(gateway)
     thread = Thread(target=server.serve_forever, daemon=True)
@@ -116,7 +116,7 @@ def test_persisted_route_reaches_official_worker_after_product_restart(
 
     中文:通过 control HTTP、SQLite、resolver、Direct Plugin endpoint 和 data-plane HTTP 进行端到端验证。
     """
-# 中文:覆盖控制 HTTP、SQLite、解析器、直接 Plugin 端点和数据平面 HTTP。
+    # 中文:覆盖控制 HTTP、SQLite、解析器、直接 Plugin 端点和数据平面 HTTP。
 
     database = tmp_path / "exchange.sqlite3"
     endpoint_id = _provision_route(database, binding_id="model-provider-local")
@@ -209,7 +209,7 @@ def test_persisted_unknown_binding_fails_closed_without_plugin_endpoint(
 
     中文:保持未知的 Product binding 不透明,直到 Product 组合层将其拒绝。
     """
-# 中文:在 Product 组合拒绝未知绑定之前,始终将其视为不透明值。
+    # 中文:在 Product 组合拒绝未知绑定之前,始终将其视为不透明值。
 
     database = tmp_path / "exchange.sqlite3"
     endpoint_id = _provision_route(database, binding_id="model-provider-missing")

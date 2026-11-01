@@ -20,6 +20,8 @@ This document describes only surfaces implemented by the current source.
 | `GET /api/v1/workspace/gateway-routes` | List routes for the authenticated organization/workspace |
 | `POST /api/v1/gateway-route-drafts` | Create a DRAFT from an explicit Product handoff |
 | `POST /api/v1/workspace/gateway-route-drafts` | Create a scoped DRAFT with an operator-granted endpoint |
+| `POST /api/v1/workspace/gateway-route-drafts/direct` | Create a scoped DRAFT for an operator-admitted provider binding without a Reactor source |
+| `POST /api/v1/workspace/gateway-route-drafts/{routeId}/actions/confirm` | Recheck current workspace endpoint grant and provider health, then activate the exact DRAFT version |
 | `PATCH /api/v1/gateway-route-drafts/{routeId}` | Edit the inspected DRAFT version |
 | `POST /api/v1/gateway-route-drafts/{routeId}/actions/confirm` | Revalidate and activate the exact DRAFT version |
 | `POST /api/v1/api-keys` | Generate a gateway API key; the secret is returned once |
@@ -39,6 +41,12 @@ use legacy global write operations; those remain available to existing
 organization-unscoped control credentials. Draft confirmation fails closed
 when source or provider validation is absent or fails.
 
+For model inference, Exchange uses the organization and workspace resolved
+from the Gateway bearer when selecting ACTIVE routes. An organization-scoped
+caller cannot match another workspace's route or fall back to legacy global
+routes; an unscoped legacy bearer continues to use only organization-unattributed
+routes. The models list and readiness probe follow the same persisted scope.
+
 控制凭据由 host 配置并映射为可信 actor、组织、workspace 与 credential reference；请求体
 不能覆盖身份。私有 Workspace 别名要求组织范围凭据。Endpoint 使用还需要 operator
 配置精确的 `(endpointId, organizationId, workspaceId)` grant；旧全局 Endpoint 不会自动
@@ -46,6 +54,10 @@ when source or provider validation is absent or fails.
 私有 scope 记录不会出现在旧路径中。组织范围凭据不能使用旧全局写入操作；旧写入只对
 现有无组织范围控制凭据保留。来源或 Provider 校验缺失、失败时，DRAFT 确认按
 fail-closed 处理。
+
+模型数据面按 Gateway Bearer 认证得到的组织和 workspace 选择 ACTIVE Route。组织范围
+调用者不能命中其他 workspace 路由或回退到 legacy 全局路由；无组织范围旧 Bearer 仍只
+使用组织归属未知的路由。Models 列表与 readiness 探针遵循相同持久化 scope。
 
 ## Integrations / 集成
 
@@ -353,17 +365,17 @@ API Key 由服务端生成为 `cyk_…` 密钥；Exchange 只保存 SHA-256 摘�
 密钥包含名称、可选过期时间和可选的 `fnmatch` 模型范围；范围为空表示允许全部
 ACTIVE 路由。
 
-`GET /v1/models` and `POST /v1/chat/completions` require a Gateway data-plane
+`GET /v1/models`, `POST /v1/chat/completions`, and `POST /v1/embeddings` require a Gateway data-plane
 credential or a generated API key. Organization-scoped Workspace control
 credentials are accepted only by their fixed private control paths and receive
-401 on both data-plane paths. The legacy organization-unscoped
+401 on all data-plane paths. The legacy organization-unscoped
 `--control-token(-env)` remains dual-use for compatibility and cannot access the
 private Workspace aliases. A key outside its model scope receives a
 `model_not_permitted` error and the rejected request is audited.
 
-`GET /v1/models` 与 `POST /v1/chat/completions` 要求独立的 Gateway 数据面凭据
+`GET /v1/models`、`POST /v1/chat/completions` 与 `POST /v1/embeddings` 要求独立的 Gateway 数据面凭据
 或服务端生成的 API key。组织范围 Workspace 控制凭据只能调用固定私有控制路径，
-访问两个数据面路径均返回 401。为兼容保留的旧无组织范围
+访问数据面路径均返回 401。为兼容保留的旧无组织范围
 `--control-token(-env)` 仍可双用途使用，但不能调用私有 Workspace 别名。超出模型
 范围的 key 请求返回 `model_not_permitted`，且拒绝会写入审计。
 
@@ -381,12 +393,26 @@ Bearer 使用 `--gateway-credential-env CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME`。
 不能配置为两种新角色。服务端生成的 API key 仍可作为数据面凭据。旧控制令牌必须无组织
 范围；为避免明文进入进程参数，优先使用环境变量形式。
 
-## Chat data plane / Chat 数据面
+## Model data plane / Model 数据面
 
 `POST /v1/chat/completions` supports OpenAI-compatible unary and SSE chat,
-structured tool calls, provider-reported usage, and cancellation. The route
-planner reads ACTIVE Product routes, while each `targetBindingId` remains opaque
-to Exchange and is resolved through the Platform/Plugins boundary.
+structured tool calls, provider-reported usage, typed image/audio/file content,
+and cancellation. The authenticated Product boundary resolves opaque
+`artifact_id` references to authorized bytes before dispatch; media URL and path
+forms are rejected. Inline media uses `data_base64` with a bounded aggregate
+size. An unresolved or unauthorized artifact receives `424 media_artifact_unavailable`. `POST
+/v1/embeddings` accepts one text or an ordered batch of at most 128 texts,
+routes through the same authenticated and audited model capability path, and
+returns vectors in input order with the model reported by the provider. It
+supports `encoding_format: "float"`; provider errors and cancellations remain
+visible to the caller. The Product ASGI endpoint and reference HTTP transport
+share the same Gateway method; client disconnects propagate a cancellation event
+to the selected provider. A response is published only after vector count,
+dimension, finite-number and nonzero checks pass. Exchange never generates a
+local fallback vector. HTTP errors retain their typed status and finite provider
+`Retry-After` hint. The route planner reads ACTIVE Product routes, while each
+`targetBindingId` remains opaque to Exchange and is resolved through the
+Platform/Plugins boundary.
 
 Enterprise and self-hosted inference use this same route and provider seam:
 the Plugin deployment owns the upstream service endpoint and its credential
@@ -397,7 +423,13 @@ usage aggregation to the existing billing capability. This configuration path
 does not by itself prove private-network inference or a deployed private model.
 
 `POST /v1/chat/completions` 支持 OpenAI-compatible 普通与 SSE Chat、结构化工具
-调用、Provider 报告的用量与取消。Route planner 只读取 ACTIVE Product Route；
+调用、Provider 报告的用量、类型化图片/音频/文件内容与取消。认证后的 Product 边界会在分发前
+将 `artifact_id` 解析为已授权 bytes；拒绝媒体 URL 和路径形式。内联媒体通过 `data_base64` 传输且有总大小限制。`POST /v1/embeddings` 接受单条文本或最多 128 条有序文本，
+经同一认证和审计模型能力链路路由，并按输入顺序返回向量和 Provider 实际报告的模型。只支持
+`encoding_format: "float"`；Provider 错误和取消会返回调用方。Product ASGI 路由和参考 HTTP
+传输共用同一个 Gateway 方法；客户端断开会向所选 Provider 传播取消事件。只有向量数量、维度、
+有限数值与非零校验通过后才返回结果，Exchange 不会生成本地回退向量。HTTP 保留类型化状态和
+Provider `Retry-After` 提示。Route planner 只读取 ACTIVE Product Route；
 `targetBindingId` 对 Exchange 保持不透明，并经 Platform/Plugins 边界解析。
 
 企业及自托管推理沿用同一 Route 和 Provider 边界：Plugin 部署管理上游服务地址与凭据
@@ -453,6 +485,8 @@ Anthropic Messages、WebSocket streaming、`GatewayFilterService`、MCP、Worker
 | `GET /api/v1/workspace/gateway-routes` | 按认证身份的组织/workspace 列出 Route。 |
 | `POST /api/v1/gateway-route-drafts` | 根据显式 Product 交接信息创建 DRAFT。 |
 | `POST /api/v1/workspace/gateway-route-drafts` | 使用 operator endpoint grant 创建 scoped DRAFT。 |
+| `POST /api/v1/workspace/gateway-route-drafts/direct` | 为 Exchange operator 已准入的 provider binding 创建无 Reactor 来源的 scoped DRAFT。 |
+| `POST /api/v1/workspace/gateway-route-drafts/{routeId}/actions/confirm` | 重查 endpoint grant 与 provider 健康后，启用精确 DRAFT 版本。 |
 | `PATCH /api/v1/gateway-route-drafts/{routeId}` | 编辑已检查版本的 DRAFT。 |
 | `POST /api/v1/gateway-route-drafts/{routeId}/actions/confirm` | 重新校验并启用精确版本的 DRAFT。 |
 | `POST /api/v1/api-keys` | 生成网关 API key；秘密值只返回一次。 |

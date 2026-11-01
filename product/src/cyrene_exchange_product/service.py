@@ -25,6 +25,7 @@ from cyrene_exchange_product.domain import (
     CreateEndpointRequest,
     CreateRouteDraftRequest,
     CreateRouteRequest,
+    CreateWorkspaceBindingRouteDraftRequest,
     EditRouteDraftRequest,
     EndpointState,
     GatewayEndpoint,
@@ -51,7 +52,9 @@ class ExchangeProductService:
         self.store = store
 
     def create_endpoint(
-        self, command: CreateEndpointRequest, idempotency_key: str | None
+        self,
+        command: CreateEndpointRequest,
+        idempotency_key: str | None,
     ) -> GatewayEndpoint:
         """Create or replay a GatewayEndpoint. | 创建或重放 GatewayEndpoint。"""
 
@@ -264,6 +267,61 @@ class ExchangeProductService:
             reactor_source_endpoint_id=reactor_source_endpoint_id,
         )
 
+    def create_workspace_binding_route_draft(
+        self,
+        command: CreateWorkspaceBindingRouteDraftRequest,
+        key: str,
+        principal: ProductPrincipal,
+    ) -> GatewayRoute:
+        """Persist a scoped draft for an operator-admitted provider binding."""
+
+        if principal.organization_id is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_CONTROL_PERMISSION_DENIED",
+                title="Workspace scope required",
+                detail="Use a control credential configured with organization and workspace scope.",
+                status=403,
+            )
+        self.get_endpoint(command.endpoint_id)
+        now = utc_now()
+        route = GatewayRoute(
+            id=uuid4(),
+            endpoint_id=command.endpoint_id,
+            state=RouteState.DRAFT,
+            model_pattern=command.model_pattern,
+            target_binding_id=command.target_binding_id,
+            target_model=command.target_model,
+            priority=command.priority,
+            created_at=now,
+            updated_at=now,
+            resource_version=1,
+            source=None,
+            created_by=principal.actor_id,
+            workspace_id=principal.workspace_id,
+            organization_id=principal.organization_id,
+        )
+        scope_digest = hashlib.sha256(
+            (principal.organization_id + "\0" + principal.workspace_id).encode("utf-8")
+        ).hexdigest()
+        request_digest = hashlib.sha256(
+            (
+                request_hash(command)
+                + "\0"
+                + principal.organization_id
+                + "\0"
+                + principal.workspace_id
+                + "\0"
+                + principal.actor_id
+            ).encode("utf-8")
+        ).hexdigest()
+        return self.store.create_route_draft(
+            route,
+            key,
+            request_digest,
+            idempotency_scope=f"create-workspace-binding-route-draft:v1:{scope_digest}",
+            workspace_binding_route=True,
+        )
+
     def edit_route_draft(
         self, route_id: UUID, command: EditRouteDraftRequest, principal: ProductPrincipal
     ) -> GatewayRoute:
@@ -343,6 +401,84 @@ class ExchangeProductService:
         """Return a draft only after checking its server-assigned owner scope."""
 
         return self._owned_draft(route_id, principal)
+
+    def get_owned_workspace_draft(
+        self, route_id: UUID, principal: ProductPrincipal
+    ) -> GatewayRoute:
+        """Load one DRAFT only inside the authenticated organization/workspace."""
+
+        route = self.store.get_route(route_id)
+        if (
+            route is None
+            or route.organization_id != principal.organization_id
+            or route.workspace_id != principal.workspace_id
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_NOT_FOUND",
+                title="GatewayRoute not found",
+                detail="No GatewayRoute exists in the authenticated workspace.",
+                status=404,
+            )
+        if route.created_by != principal.actor_id:
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_PERMISSION_DENIED",
+                title="Route not permitted",
+                detail="The draft belongs to another actor.",
+                status=403,
+            )
+        if route.state != RouteState.DRAFT:
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_NOT_DRAFT",
+                title="Route is not a draft",
+                detail="Only DRAFT routes can be confirmed through this action.",
+                status=409,
+            )
+        return route
+
+    def confirm_workspace_route_draft(
+        self,
+        route_id: UUID,
+        version: int,
+        principal: ProductPrincipal,
+        validate_target: Callable[[GatewayRoute], None],
+    ) -> GatewayRoute:
+        """Recheck current scope grants, endpoint state, and target before activation."""
+
+        route = self.get_owned_workspace_draft(route_id, principal)
+        if route.resource_version != version:
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_VERSION_CONFLICT",
+                title="Route changed",
+                detail="Refresh and inspect the current draft before confirming.",
+                status=409,
+            )
+        if principal.organization_id is None or not self.store.workspace_endpoint_is_granted(
+            route.endpoint_id,
+            principal.organization_id,
+            principal.workspace_id,
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_PERMISSION_DENIED",
+                title="Endpoint not permitted",
+                detail="No current operator grant permits this destination in the workspace.",
+                status=403,
+            )
+        if self.get_endpoint(route.endpoint_id).state != EndpointState.ACTIVE:
+            raise ExchangeProductError(
+                code="EXCHANGE_ENDPOINT_DISABLED",
+                title="Endpoint disabled",
+                detail="Select an active gateway endpoint before confirming this route.",
+                status=409,
+            )
+        validate_target(route)
+        active = route.model_copy(
+            update={
+                "state": RouteState.ACTIVE,
+                "updated_at": utc_now(),
+                "resource_version": version + 1,
+            }
+        )
+        return self.store.replace_route_version(active, version)
 
     # ── API keys ────────────────────────────────────────────────────────
     # 中文:API 密钥。
