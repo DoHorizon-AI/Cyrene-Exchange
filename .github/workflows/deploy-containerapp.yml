@@ -1,10 +1,6 @@
 name: Exchange immutable digest deployment
 
 on:
-  workflow_run:
-    workflows: [Immutable component release]
-    types: [completed]
-    branches: [main, release, develop]
   workflow_dispatch:
     inputs:
       catalog_release_id:
@@ -19,19 +15,12 @@ permissions:
   packages: read
 
 concurrency:
-  group: exchange-containerapp-${{ github.event.workflow_run.head_sha || github.sha }}
+  group: exchange-containerapp-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
   deploy-existing-app:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.name == 'Immutable component release' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.repository.full_name == 'DoHorizon-AI/Cyrene-Exchange' &&
-       github.event.workflow_run.head_repository.full_name == 'DoHorizon-AI/Cyrene-Exchange')
+    if: github.event_name == 'workflow_dispatch'
     name: Verify immutable Exchange release and update an existing Azure app
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -48,69 +37,17 @@ jobs:
     steps:
       - name: Resolve and validate the triggering source identity
         id: source
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json
           import os
           import re
-          import urllib.request
-          from pathlib import Path
 
-          repository = "DoHorizon-AI/Cyrene-Exchange"
           event_name = os.environ["GITHUB_EVENT_NAME"]
-          payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
-
-          def github_api(path):
-              request = urllib.request.Request(
-                  f"https://api.github.com/repos/{repository}/{path}",
-                  headers={
-                      "Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                  },
-              )
-              with urllib.request.urlopen(request, timeout=20) as response:
-                  return json.loads(response.read().decode("utf-8"))
-
-          if event_name == "workflow_run":
-              run = payload.get("workflow_run", {})
-              if (
-                  run.get("name") != "Immutable component release"
-                  or run.get("event") != "push"
-                  or run.get("conclusion") != "success"
-                  or run.get("repository", {}).get("full_name") != repository
-                  or run.get("head_repository", {}).get("full_name") != repository
-              ):
-                  raise SystemExit("trigger is not a successful same-repository component-release push")
-              workflow_id = run.get("workflow_id")
-              run_id = run.get("id")
-              attempt = run.get("run_attempt")
-              if not isinstance(workflow_id, int) or not isinstance(run_id, int) or not isinstance(attempt, int):
-                  raise SystemExit("workflow_run payload lacks numeric workflow/run identity")
-              workflow = github_api(f"actions/workflows/{workflow_id}")
-              if workflow.get("path") != ".github/workflows/component-release.yml":
-                  raise SystemExit("triggering workflow path is not the trusted component-release workflow")
-              verified_run = github_api(f"actions/runs/{run_id}/attempts/{attempt}")
-              if (
-                  verified_run.get("workflow_id") != workflow_id
-                  or verified_run.get("head_sha") != run.get("head_sha")
-                  or verified_run.get("head_branch") != run.get("head_branch")
-                  or verified_run.get("event") != "push"
-                  or verified_run.get("status") != "completed"
-                  or verified_run.get("conclusion") != "success"
-                  or verified_run.get("repository", {}).get("full_name") != repository
-              ):
-                  raise SystemExit("GitHub Actions API run identity differs from the workflow_run event")
-              source_commit = run["head_sha"]
-              branch = run["head_branch"]
-          elif event_name == "workflow_dispatch":
-              branch = os.environ["GITHUB_REF"].removeprefix("refs/heads/")
-              source_commit = os.environ["GITHUB_SHA"]
-          else:
+          if event_name != "workflow_dispatch":
               raise SystemExit(f"unsupported trigger event: {event_name}")
+          branch = os.environ["GITHUB_REF"].removeprefix("refs/heads/")
+          source_commit = os.environ["GITHUB_SHA"]
 
           if branch not in {"main", "release", "develop"}:
               raise SystemExit("source branch is outside the immutable release channel policy")
