@@ -1610,7 +1610,7 @@ def _validate_github_target(
     repository_fields = {"repository_id", "repository"}
     optional_fields: set[str] = set()
     if operation_id == "github.pull_requests.list":
-        optional_fields = {"state"}
+        optional_fields = {"state", "page_cursor"}
     elif operation_id == "github.pull_request.get":
         optional_fields = {"pull_number"}
     elif operation_id == "github.actions.runs.list":
@@ -1742,9 +1742,17 @@ def _validate_github_target(
             "CLOSED",
         }:
             raise ValueError("GitHub issue state must be OPEN or CLOSED")
-    elif operation_id == "github.pull_requests.list" and "state" in arguments:
-        if arguments["state"] not in {"OPEN", "CLOSED", "ALL"}:
+    elif operation_id == "github.pull_requests.list":
+        if "state" in arguments and arguments["state"] not in {"OPEN", "CLOSED", "ALL"}:
             raise ValueError("GitHub pull request state is invalid")
+        if "page_cursor" in arguments:
+            cursor = arguments["page_cursor"]
+            if (
+                not isinstance(cursor, str)
+                or re.fullmatch(r"[1-9][0-9]{0,3}", cursor) is None
+                or int(cursor) > 1000
+            ):
+                raise ValueError("GitHub pull request page cursor is invalid")
     elif operation_id == "github.actions.runs.list":
         for field in ("branch", "commit_sha"):
             if field in arguments:
