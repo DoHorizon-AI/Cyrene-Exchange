@@ -59,6 +59,7 @@ _PROVIDER_IDS = frozenset(
         "wecom",
         "azure",
         "azure_devops",
+        "bilibili",
         "gcp",
         "hf",
         "microsoft_graph",
@@ -184,6 +185,7 @@ class AuthorizationCloudSettings:
     contexts: Mapping[str, AuthorityActorContext]
     profiles: Mapping[str, AuthorizationProviderProfile]
     email: EmailNotificationProfile
+    bilibili_auth_binding_ref: str | None = None
 
 
 class AuthorizationCloudProfileRegistry:
@@ -246,6 +248,17 @@ class AuthorizationCloudProfileRegistry:
                     "Microsoft Graph bindings require a fixed v1 or v2 host profile"
                 )
             return "Microsoft Graph"
+        if request.provider == "bilibili":
+            if (
+                request.target_ref is not None
+                or profile.targets
+                or profile.access_mode != "actor_owned"
+                or not request.account_link_ref
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    "Bilibili bindings require one actor-owned Account Center profile"
+                )
+            return profile.display_name or "Bilibili"
         if request.provider == "azure_devops":
             sources = profile.authorized_sources or {}
             source = sources.get(request.target_ref or "")
@@ -358,12 +371,12 @@ class AuthorizationCloudProfileRegistry:
         if connection.organization_id != profile.organization_id:
             raise PermissionError("connection organization is outside the provider binding")
         target_ref: str | None = None
-        if connection.provider in {"wecom", "microsoft_graph"}:
+        if connection.provider in {"wecom", "microsoft_graph", "bilibili"}:
             if connection.target_ref is not None:
                 raise PermissionError("provider connection cannot select a cloud target")
-            if connection.provider == "microsoft_graph" and profile.targets:
+            if connection.provider in {"microsoft_graph", "bilibili"} and profile.targets:
                 raise PermissionError(
-                    "Microsoft Graph binding cannot contain host resource targets"
+                    "Account connector binding cannot contain host resource targets"
                 )
             if (
                 connection.provider == "microsoft_graph"
@@ -426,7 +439,7 @@ class AuthorizationCloudProfileRegistry:
         )
         if context is None or context.context_ref not in profile.allowed_context_refs:
             raise PermissionError("connection owner has no configured live bearer context")
-        if connection.provider in {"wecom", "microsoft_graph"}:
+        if connection.provider in {"wecom", "microsoft_graph", "bilibili"}:
             if connection.target_ref is not None:
                 raise PermissionError("provider connection cannot select a cloud target")
             if connection.provider == "microsoft_graph" and profile.targets:
@@ -632,7 +645,7 @@ def parse_authorization_cloud_settings(
     cloud = _object(
         value,
         required={"currentAuthority", "profiles"},
-        optional={"monitorIntervalSeconds"},
+        optional={"monitorIntervalSeconds", "bilibiliAuthBindingRef"},
         label="authorizationCloud",
     )
     interval = cloud.get("monitorIntervalSeconds", 900)
@@ -837,6 +850,17 @@ def parse_authorization_cloud_settings(
                 raise AuthorizationCloudConfigurationError(
                     "Azure DevOps requires an actor-owned fixed provider binding"
                 )
+        elif provider == "bilibili":
+            if (
+                targets
+                or display_name is not None
+                or authorization_ref is not None
+                or access_mode != "actor_owned"
+                or _text(item["callerWorkload"], "callerWorkload") != "cyrene.exchange.integrations"
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    "Bilibili requires an actor-owned fixed provider binding"
+                )
         elif not targets or display_name is not None or authorization_ref is not None:
             raise AuthorizationCloudConfigurationError(
                 "cloud profiles require target aliases and cannot select authorization refs"
@@ -1005,6 +1029,20 @@ def parse_authorization_cloud_settings(
                     raise AuthorizationCloudConfigurationError(
                         "Microsoft Graph SharePoint listIds contains duplicates"
                     )
+        elif provider == "bilibili":
+            if (
+                credential_secret_ref is not None
+                or account_scopes is not None
+                or auth_mode is not None
+                or "plannerPlanIds" in item
+                or "sharepointTargets" in item
+                or "officeV2" in item
+                or "tenantId" in item
+                or "authorizedSources" in item
+            ):
+                raise AuthorizationCloudConfigurationError(
+                    "Bilibili account cookies and scopes must remain in Account Center"
+                )
         elif (
             credential_secret_ref is not None
             or account_scopes is not None
@@ -1046,11 +1084,28 @@ def parse_authorization_cloud_settings(
         )
 
     email = _parse_email_profile(email_value, contexts)
+    bilibili_auth_binding_ref = (
+        _alias(cloud["bilibiliAuthBindingRef"], "bilibiliAuthBindingRef")
+        if "bilibiliAuthBindingRef" in cloud
+        else None
+    )
+    if bilibili_auth_binding_ref is not None:
+        selected_bilibili = profiles.get(bilibili_auth_binding_ref)
+        if (
+            selected_bilibili is None
+            or selected_bilibili.provider != "bilibili"
+            or selected_bilibili.access_mode != "actor_owned"
+            or selected_bilibili.caller_workload != "cyrene.exchange.integrations"
+        ):
+            raise AuthorizationCloudConfigurationError(
+                "bilibiliAuthBindingRef must resolve the fixed actor-owned Bilibili connector"
+            )
     return AuthorizationCloudSettings(
         monitor_interval_seconds=interval,
         contexts=contexts,
         profiles=profiles,
         email=email,
+        bilibili_auth_binding_ref=bilibili_auth_binding_ref,
     )
 
 

@@ -56,6 +56,14 @@ repository ID. The host profile's `targets.<alias>.targetRef` must equal the sam
 still sends the configured alias, never a caller-chosen repository ID. For example,
 `hf-primary-target` can map to `Qwen/Qwen2.5-0.5B-Instruct`.
 
+Bilibili QR linking has one optional server profile selected by
+`authorizationCloud.bilibiliAuthBindingRef`. That actor-owned profile uses
+`callerWorkload: "cyrene.exchange.integrations"` and
+`audience: "cyrene.connectors.bilibili"`. Exchange checks the DirectPlugin
+Health identity and requires plugin ID `cyrene.connectors.bilibili` before QR or
+account operations. The profile alias, runtime endpoint, signing key, and
+Account Center caller ID are host-owned.
+
 Cloud Account Center profile UUIDs are derived from the verified issuer,
 organization, workspace, provider, host profile alias, and exact target alias plus
 provider target. `workspace_operator` profiles omit the user subject so the one
@@ -154,8 +162,30 @@ An abridged host-owned configuration shape is:
             "allowedContextRefs": ["member-a"]
           }
         }
+      },
+      "bilibili-auth": {
+        "provider": "bilibili",
+        "directPlugin": {
+          "bindingId": "bilibili-plugin-binding",
+          "connectionRef": "grpc://127.0.0.1:7445",
+          "transport": "local"
+        },
+        "callerWorkload": "cyrene.exchange.integrations",
+        "audience": "cyrene.connectors.bilibili",
+        "expectedIssuer": "https://identity.example.invalid",
+        "contextKeyRef": "keys/bilibili",
+        "organizationId": "org-a",
+        "workspaceId": "workspace-a",
+        "allowedActors": [
+          {
+            "issuer": "https://identity.example.invalid",
+            "subject": "member-a"
+          }
+        ],
+        "accessMode": "actor_owned"
       }
-    }
+    },
+    "bilibiliAuthBindingRef": "bilibili-auth"
   },
   "emailNotifications": {
     "enabled": false
@@ -213,6 +243,21 @@ Authority grant and returns a `receiptOnly` summary. Read results say
 say `do-not-repeat`. Unresolved writes remain tombstones until status reconciliation
 or an explicit owner-verified new task. Terminal receipts are bounded by entry
 and byte budgets and may expire after 24 hours.
+
+Bilibili uses the same signed Navigator boundary. Actor-owned profile lookup and
+connection listing use fixed internal `POST` routes under
+`/internal/v1/bilibili/`; QR begin/status use the same raw-body HMAC and current
+Directory grant flow. The optional `bilibiliAuthBindingRef` selects the one host
+profile. Exchange binds QR grants to `bilibili-auth:<profile-alias>`, the fixed
+profile alias, and the server-generated Account Center profile or private QR
+flow reference. It consumes the grant before invoking only the pinned
+`cyrene.connectors.bilibili` plugin. Ordinary Bilibili operations continue
+through the connector grant and execute routes and receive one Account Center
+lease per call. The three writes require the persisted Work operation's stable
+`work-operation:<UUID>` key. Exchange reports a write as verified only when the
+provider returns that exact operation reference, `SUCCEEDED`, an external ID,
+and a verified readback digest; every missing or mismatched proof remains
+uncertain and is never blindly retried.
 
 Teams egress uses the same grant and receipt boundary at
 `POST /internal/v1/teams/messages` with a nested `conversation` containing tenant,
@@ -513,6 +558,18 @@ provider 响应、私有文件内容或凭据。相同 attempt 的回放必须�
 并且只返回 `receiptOnly` 摘要。读取回执会用 `freshRequestRequired` 指示原始数据未缓存；写入
 回执返回 `do-not-repeat`。未对账的写操作 tombstone 会保留到状态回读或 owner 明确发起新任务；
 终态回执按条目数与字节数双重限额，并可在 24 小时后过期。
+
+Bilibili 使用同一签名 Navigator 边界。Actor-owned profile 查询和 connection
+列表走 `/internal/v1/bilibili/` 下固定的内网 POST 路由；QR begin/status 使用相同的
+raw-body HMAC，并且在调用前获取当前 Directory grant。可选的
+`bilibiliAuthBindingRef` 只选择 Host 配置的固定 profile。Exchange 将 QR grant 绑定到
+`bilibili-auth:<profile-alias>`、固定 profile alias，以及服务端生成的 Account Center
+profile 或私有 QR flow 引用；消费 grant 后才会调用 pin 好的
+`cyrene.connectors.bilibili` 插件。普通 Bilibili 操作仍走 connector grant/execute 路由，
+每次调用获取一个 Account Center lease。三项写操作必须复用持久 Work operation 的稳定
+`work-operation:<UUID>` key。只有 provider 返回相同 operation reference、`SUCCEEDED`、
+external ID 和已验证 readback digest 时，Exchange 才报告 verified；证据缺失或不一致时保持
+uncertain，不会盲目重发。
 
 Teams egress 也经过同一 grant 和回执边界：请求发往
 `POST /internal/v1/teams/messages`，正文包含嵌套 `conversation`（租户、团队、频道、会话 ID、

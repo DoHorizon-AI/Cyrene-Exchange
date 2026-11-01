@@ -111,6 +111,21 @@ _TOOL_IDS_BY_PROVIDER: Mapping[str, Mapping[str, str]] = {
     "azure_devops": {
         operation_id: operation_id for operation_id in sorted(ADO_OBSERVATION_OPERATIONS)
     },
+    "bilibili": {
+        "bilibili.auth.qr.begin": "bilibili.auth.qr.begin",
+        "bilibili.auth.qr.status": "bilibili.auth.qr.status",
+        "bilibili.search": "bilibili.search",
+        "bilibili.user.find": "bilibili.user.find",
+        "bilibili.video.read": "bilibili.video.read",
+        "bilibili.comments.list": "bilibili.comments.list",
+        "bilibili.dynamics.list": "bilibili.dynamics.list",
+        "bilibili.dynamic.read": "bilibili.dynamic.read",
+        "bilibili.dm.list": "bilibili.dm.list",
+        "bilibili.dm.read": "bilibili.dm.read",
+        "bilibili.comment.create": "bilibili.comment.create",
+        "bilibili.dynamic.publish": "bilibili.dynamic.publish",
+        "bilibili.dm.send": "bilibili.dm.send",
+    },
     "azure": {
         "cloud.provider.health.read": "cloud_provider_health",
         "cloud.resources.list": "cloud_resources_list",
@@ -178,6 +193,10 @@ _MUTATING_OPERATIONS = (
             "computer.file.write",
             "github.vendor.cli.execute",
             "huggingface.file.upload",
+            "bilibili.auth.qr.begin",
+            "bilibili.comment.create",
+            "bilibili.dynamic.publish",
+            "bilibili.dm.send",
             "cloud.resource.create",
             "cloud.resource.deploy",
             "cloud.resource.start",
@@ -262,6 +281,16 @@ _COMPUTER_MAX_COMMAND_BYTES = 32_768
 _COMPUTER_MAX_PATH_CHARS = 1_024
 _COMPUTER_MAX_PATH_BYTES = 4_096
 _COMPUTER_MAX_READ_BYTES = 65_536
+_BILIBILI_WRITE_OPERATIONS = frozenset(
+    {
+        "bilibili.comment.create",
+        "bilibili.dynamic.publish",
+        "bilibili.dm.send",
+    }
+)
+_BILIBILI_OPERATION_IDEMPOTENCY_KEY = re.compile(
+    r"work-operation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +312,7 @@ class PreparedConnectorOperation:
     expected_organization_id: str
     expected_workspace_id: str
     is_mutating: bool
+    idempotency_key: str | None = None
 
 
 class ConnectorOperationDispatcher:
@@ -318,6 +348,7 @@ class ConnectorOperationDispatcher:
         resource_ref: str,
         arguments: Mapping[str, object],
         request_id: str,
+        idempotency_key: str | None = None,
     ) -> PreparedConnectorOperation:
         """Validate exact actor, provider, profile, operation, and resource projection."""
 
@@ -334,7 +365,7 @@ class ConnectorOperationDispatcher:
         shared_match = current.access_mode == "workspace_operator"
         if not same_scope or not (owner_match or shared_match):
             raise PermissionError("connector connection owner does not match the signed actor")
-        if current.provider in {"microsoft_graph", "azure_devops"} and (
+        if current.provider in {"microsoft_graph", "azure_devops", "bilibili"} and (
             not owner_match or current.access_mode != "actor_owned"
         ):
             raise PermissionError("actor-owned provider connections cannot cross actor identity")
@@ -343,7 +374,7 @@ class ConnectorOperationDispatcher:
             raise PermissionError("provider id does not match the persisted connection")
         expected_profile = (
             current.account_link_ref
-            if current.provider in {"github", "hf", "microsoft_graph", "azure_devops"}
+            if current.provider in {"github", "hf", "microsoft_graph", "azure_devops", "bilibili"}
             else current.binding_ref
         )
         if not expected_profile or profile_ref != expected_profile:
@@ -357,10 +388,16 @@ class ConnectorOperationDispatcher:
             raise PermissionError("restart is supported only by RunPod profiles")
         selected = dict(arguments)
         if (
-            current.provider not in {"github", "hf", "microsoft_graph", "azure_devops"}
+            current.provider not in {"github", "hf", "microsoft_graph", "azure_devops", "bilibili"}
             and selected.get("profile_ref") != profile_ref
         ):
             raise PermissionError("provider arguments do not bind the selected profile ref")
+        if (
+            current.provider == "bilibili"
+            and operation_id == "bilibili.auth.qr.begin"
+            and selected.get("profile_ref") != profile_ref
+        ):
+            raise PermissionError("Bilibili QR profile does not match the selected connection")
         graph_scope: dict[str, Any] | None = None
         azure_devops_scope: dict[str, Any] | None = None
         azure_devops_binding_id: str | None = None
@@ -376,6 +413,15 @@ class ConnectorOperationDispatcher:
                 current,
                 profile_ref,
             )
+        elif current.provider == "bilibili":
+            _validate_bilibili_arguments(operation_id, selected)
+            if operation_id in _BILIBILI_WRITE_OPERATIONS and (
+                not isinstance(idempotency_key, str)
+                or _BILIBILI_OPERATION_IDEMPOTENCY_KEY.fullmatch(idempotency_key) is None
+            ):
+                raise PermissionError(
+                    "Bilibili writes require a stable host-generated work-operation idempotency key"
+                )
         else:
             self._validate_cloud_target(principal, current, operation_id, selected)
         if operation_id in {
@@ -425,7 +471,8 @@ class ConnectorOperationDispatcher:
                     target_projection,
                     selected,
                 )
-                if current.provider in {"github", "hf", "microsoft_graph"}
+                if current.provider in {"github", "hf", "microsoft_graph", "bilibili"}
+                and not operation_id.startswith("bilibili.auth.qr.")
                 else None
             )
         return PreparedConnectorOperation(
@@ -444,6 +491,7 @@ class ConnectorOperationDispatcher:
             expected_organization_id=current.organization_id,
             expected_workspace_id=current.workspace_id,
             is_mutating=operation_id in _MUTATING_OPERATIONS,
+            idempotency_key=idempotency_key,
         )
 
     def _microsoft_graph_profile_scope(
@@ -948,11 +996,25 @@ class ConnectorOperationDispatcher:
                 tool_id=prepared.tool_id,
                 payload=prepared.arguments,
             )
+        elif prepared.provider_id == "bilibili" and prepared.operation_id.startswith(
+            "bilibili.auth.qr."
+        ):
+            if connection is None or self._authorization_cloud is None:
+                raise _connector_not_configured("bilibili_provider_not_configured")
+            result = self._authorization_cloud.invoke_connector_tool(
+                principal,
+                connection,
+                operation_id=prepared.operation_id,
+                tool_id=prepared.tool_id,
+                arguments=prepared.arguments,
+                request_id=prepared.request_id,
+            )
         elif prepared.provider_id in {
             "github",
             "huggingface",
             "microsoft_graph",
             "azure_devops",
+            "bilibili",
         }:
             if connection is None:
                 raise ValueError("provider connection is missing")
@@ -988,6 +1050,17 @@ class ConnectorOperationDispatcher:
                     code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
                     title="Account Center response invalid",
                     detail="Account Center returned a credential lease with a mismatched scope.",
+                    status=502,
+                )
+            if prepared.provider_id == "bilibili" and (
+                lease.provider != "bilibili"
+                or lease.target != prepared.account_lease_target
+                or lease.arguments_sha256 != lease_digest
+            ):
+                raise ExchangeProductError(
+                    code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                    title="Account Center response invalid",
+                    detail="Account Center returned a Bilibili lease with a mismatched scope.",
                     status=502,
                 )
             if prepared.provider_id == "github":
@@ -1056,6 +1129,28 @@ class ConnectorOperationDispatcher:
                     "profile_scope_sha256": scope_digest,
                     "payload": payload,
                 }
+                result = self._authorization_cloud.invoke_connector_tool(
+                    principal,
+                    connection,
+                    operation_id=prepared.operation_id,
+                    tool_id=prepared.tool_id,
+                    arguments=invocation_arguments,
+                    request_id=prepared.request_id,
+                )
+            elif prepared.provider_id == "bilibili":
+                if self._authorization_cloud is None:
+                    raise _connector_not_configured("bilibili_provider_not_configured")
+                if prepared.account_lease_target is None:
+                    raise ValueError("Bilibili Account Center target is missing")
+                invocation_arguments = {
+                    "profile_ref": prepared.profile_ref,
+                    "lease_ref": lease.lease_ref,
+                    "target": dict(prepared.account_lease_target),
+                    "arguments_sha256": lease_digest,
+                    "payload": payload,
+                }
+                if prepared.idempotency_key is not None:
+                    invocation_arguments["idempotency_key"] = prepared.idempotency_key
                 result = self._authorization_cloud.invoke_connector_tool(
                     principal,
                     connection,
@@ -1241,6 +1336,8 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
         return []
     result: list[dict[str, object]] = []
     for operation_id, tool_id in sorted(tools.items()):
+        if provider == "bilibili" and operation_id.startswith("bilibili.auth.qr."):
+            continue
         if provider == "github":
             projection = (
                 "profile"
@@ -1337,6 +1434,23 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
                 or operation_id == "huggingface.vendor.cli.execute"
                 else "huggingface_repository"
             )
+        elif provider == "bilibili":
+            projection = (
+                "bilibili_video"
+                if operation_id
+                in {
+                    "bilibili.video.read",
+                    "bilibili.comments.list",
+                    "bilibili.comment.create",
+                }
+                else "bilibili_user"
+                if operation_id in {"bilibili.user.find", "bilibili.dynamics.list"}
+                else "bilibili_dynamic"
+                if operation_id in {"bilibili.dynamic.read", "bilibili.dynamic.publish"}
+                else "bilibili_message"
+                if operation_id in {"bilibili.dm.list", "bilibili.dm.read", "bilibili.dm.send"}
+                else "bilibili_search"
+            )
         elif operation_id == "cloud.vendor.cli.execute":
             projection = "profile"
         elif operation_id in {
@@ -1410,6 +1524,34 @@ def _resource_projection(
                 "path": _text(arguments.get("path"), "path", maximum=4096),
             }
         raise PermissionError("computer operation is not in the fixed Exchange target map")
+    if provider_id == "bilibili":
+        selectors = {
+            "bilibili.auth.qr.begin": ("profile_ref",),
+            "bilibili.auth.qr.status": ("login_flow_id",),
+            "bilibili.search": ("search_type",),
+            "bilibili.user.find": ("user_id",),
+            "bilibili.video.read": ("video_id",),
+            "bilibili.comments.list": ("video_id", "root_comment_id"),
+            "bilibili.dynamics.list": ("user_id",),
+            "bilibili.dynamic.read": ("dynamic_id",),
+            "bilibili.dm.list": ("peer_user_id",),
+            "bilibili.dm.read": ("peer_user_id", "message_id"),
+            "bilibili.comment.create": (
+                "video_id",
+                "root_comment_id",
+                "parent_comment_id",
+            ),
+            "bilibili.dynamic.publish": ("user_id",),
+            "bilibili.dm.send": ("peer_user_id",),
+        }
+        fields = selectors.get(operation_id)
+        if fields is None:
+            raise PermissionError("Bilibili operation is not in the fixed target map")
+        if operation_id == "bilibili.comments.list":
+            return _fields(arguments, {"video_id"}) | {
+                key: arguments[key] for key in ("root_comment_id",) if key in arguments
+            }
+        return _fields(arguments, set(fields))
     if "target" in arguments:
         target = arguments["target"]
         if not isinstance(target, Mapping) or not target:
@@ -1559,6 +1701,11 @@ def _account_lease_target(
         if fields is None or any(field not in resource_projection for field in fields):
             raise ValueError("Microsoft Graph Account Center lease target is incomplete")
         return {field: resource_projection[field] for field in fields}
+    if provider_id == "bilibili" and operation_id in {
+        "bilibili.auth.qr.begin",
+        "bilibili.auth.qr.status",
+    }:
+        raise PermissionError("Bilibili QR operations do not use credential leases")
     if provider_id == "github" and operation_id == "github.repository.list":
         return {}
     hf_list_targets = {
@@ -1603,6 +1750,102 @@ def _fields(arguments: Mapping[str, object], names: set[str]) -> dict[str, objec
     if not selected or any(value is None for value in selected.values()):
         raise ValueError("provider resource projection is incomplete")
     return selected
+
+
+def _validate_bilibili_arguments(
+    operation_id: str,
+    arguments: Mapping[str, object],
+) -> None:
+    """Enforce the connector's exact Bilibili input schemas before any lease is minted."""
+
+    shapes: dict[str, tuple[set[str], set[str]]] = {
+        "bilibili.auth.qr.begin": ({"profile_ref", "idempotency_key"}, set()),
+        "bilibili.auth.qr.status": ({"login_flow_id"}, set()),
+        "bilibili.search": ({"keyword", "search_type"}, {"page"}),
+        "bilibili.user.find": ({"user_id"}, set()),
+        "bilibili.video.read": ({"video_id"}, set()),
+        "bilibili.comments.list": ({"video_id"}, {"root_comment_id", "page", "limit"}),
+        "bilibili.dynamics.list": ({"user_id"}, {"cursor", "limit"}),
+        "bilibili.dynamic.read": ({"dynamic_id"}, set()),
+        "bilibili.dm.list": ({"peer_user_id"}, {"cursor", "limit"}),
+        "bilibili.dm.read": ({"peer_user_id", "message_id"}, set()),
+        "bilibili.comment.create": (
+            {"video_id", "root_comment_id", "parent_comment_id", "content"},
+            set(),
+        ),
+        "bilibili.dynamic.publish": ({"user_id", "content"}, set()),
+        "bilibili.dm.send": ({"peer_user_id", "content"}, set()),
+    }
+    shape = shapes.get(operation_id)
+    if shape is None:
+        raise PermissionError("Bilibili operation is not in the fixed Exchange schema")
+    required, optional = shape
+    if not required <= set(arguments) or set(arguments) - required - optional:
+        raise PermissionError("Bilibili arguments do not match the fixed operation schema")
+    for field in {
+        "user_id",
+        "peer_user_id",
+        "message_id",
+        "dynamic_id",
+        "root_comment_id",
+        "parent_comment_id",
+    }:
+        value = arguments.get(field)
+        if field in arguments and (
+            not isinstance(value, str) or re.fullmatch(r"[0-9]{1,20}", value) is None
+        ):
+            raise PermissionError("Bilibili numeric ID is invalid")
+    video_id = arguments.get("video_id")
+    if "video_id" in arguments and (
+        not isinstance(video_id, str)
+        or re.fullmatch(r"(?:BV[0-9A-Za-z]{10}|av[1-9][0-9]{0,19})", video_id) is None
+    ):
+        raise PermissionError("Bilibili video ID is invalid")
+    for field in ("keyword", "content"):
+        if field in arguments:
+            value = arguments[field]
+            maximum = (
+                120 if field == "keyword" else 2000 if operation_id == "bilibili.dm.send" else 5000
+            )
+            if not isinstance(value, str) or not value or len(value) > maximum:
+                raise PermissionError("Bilibili text input is invalid")
+    if "search_type" in arguments and arguments["search_type"] not in {
+        "video",
+        "user",
+        "article",
+    }:
+        raise PermissionError("Bilibili search type is invalid")
+    for field, minimum, maximum in (("page", 1, 100), ("limit", 1, 50)):
+        value = arguments.get(field)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum
+        ):
+            raise PermissionError("Bilibili page bound is invalid")
+    if "cursor" in arguments and (
+        not isinstance(arguments["cursor"], str) or not 1 <= len(arguments["cursor"]) <= 1024
+    ):
+        raise PermissionError("Bilibili cursor is invalid")
+    if operation_id == "bilibili.auth.qr.begin" and (
+        not isinstance(arguments["profile_ref"], str)
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            arguments["profile_ref"],
+        )
+        is None
+        or not isinstance(arguments["idempotency_key"], str)
+        or re.fullmatch(r"[\x21-\x7E]{8,128}", arguments["idempotency_key"]) is None
+    ):
+        raise PermissionError("Bilibili QR begin selector is invalid")
+    if operation_id == "bilibili.auth.qr.status" and (
+        not isinstance(arguments["login_flow_id"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", arguments["login_flow_id"]) is None
+    ):
+        raise PermissionError("Bilibili login flow selector is invalid")
+    if operation_id == "bilibili.comment.create":
+        root = arguments["root_comment_id"]
+        parent = arguments["parent_comment_id"]
+        if (root == "0") != (parent == "0"):
+            raise PermissionError("Bilibili comment reply target is inconsistent")
 
 
 def _validate_github_target(

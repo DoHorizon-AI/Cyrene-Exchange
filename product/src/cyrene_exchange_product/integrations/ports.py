@@ -74,6 +74,73 @@ class ProviderCredentialLeaseEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderProfileMetadata:
+    """Non-secret Account Center profile metadata visible to one signed actor."""
+
+    profile_ref: str
+    provider: str
+    identity_ref: str
+    target_scope: Mapping[str, object]
+    auth_status: str
+    external_subject: str | None
+    expires_at: int | None
+    auth_mode: str | None
+    access_mode: str
+    credential_revision: int
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> ProviderProfileMetadata:
+        """Validate the safe profile projection returned by Account Center."""
+
+        profile_ref = value.get("profile_ref")
+        provider = value.get("provider")
+        identity_ref = value.get("identity_ref")
+        target_scope = value.get("target_scope")
+        auth_status = value.get("auth_status")
+        external_subject = value.get("external_subject")
+        expires_at = value.get("expires_at")
+        auth_mode = value.get("auth_mode")
+        access_mode = value.get("access_mode", "actor_owned")
+        credential_revision = value.get("credential_revision", 0)
+        if (
+            not isinstance(profile_ref, str)
+            or not profile_ref
+            or not isinstance(provider, str)
+            or not provider
+            or not isinstance(identity_ref, str)
+            or not identity_ref
+            or not isinstance(target_scope, Mapping)
+            or not isinstance(auth_status, str)
+            or not auth_status
+            or (external_subject is not None and not isinstance(external_subject, str))
+            or (
+                expires_at is not None
+                and (isinstance(expires_at, bool) or not isinstance(expires_at, int))
+            )
+            or (auth_mode is not None and not isinstance(auth_mode, str))
+            or not isinstance(access_mode, str)
+            or access_mode not in {"actor_owned", "workspace_operator"}
+            or isinstance(credential_revision, bool)
+            or not isinstance(credential_revision, int)
+            or credential_revision < 0
+            or set(value) & {"credential_blob", "credential_json", "access_token", "cookie"}
+        ):
+            raise ValueError("Account Center profile metadata is invalid")
+        return cls(
+            profile_ref=profile_ref,
+            provider=provider,
+            identity_ref=identity_ref,
+            target_scope=dict(target_scope),
+            auth_status=auth_status,
+            external_subject=external_subject,
+            expires_at=expires_at,
+            auth_mode=auth_mode,
+            access_mode=access_mode,
+            credential_revision=credential_revision,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class LinkedSender:
     """Account Center verified mapping from a vendor sender to a Cyrene actor."""
 
@@ -261,6 +328,21 @@ class ValidatedExecutionProof:
 
 class AccountCenterPort(Protocol):
     """Account Center references and verified external identity lookups."""
+
+    def list_owned_provider_profiles(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        provider: str | None = None,
+    ) -> tuple[ProviderProfileMetadata, ...]: ...
+
+    def get_owned_provider_profile(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        profile_ref: str,
+        provider: str | None = None,
+    ) -> ProviderProfileMetadata | None: ...
 
     def get_authorization(
         self,

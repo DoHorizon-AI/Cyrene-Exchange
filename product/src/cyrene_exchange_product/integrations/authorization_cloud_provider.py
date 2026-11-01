@@ -558,6 +558,7 @@ class AuthorizationCloudDirectProvider:
         store: IntegrationStore,
         registry: AuthorizationCloudProfileRegistry,
         provider_clients: Mapping[str, DirectInvoker],
+        provider_health_clients: Mapping[str, Any] | None = None,
         email_client: DirectInvoker | None,
         account_center: Any = None,
         current_context_resolver: Any,
@@ -566,6 +567,7 @@ class AuthorizationCloudDirectProvider:
         self._store = store
         self._registry = registry
         self._provider_clients = dict(provider_clients)
+        self._provider_health_clients = dict(provider_health_clients or {})
         self._email_client = email_client
         self._account_center = account_center
         self._current_context_resolver = current_context_resolver
@@ -579,13 +581,57 @@ class AuthorizationCloudDirectProvider:
         if (
             profile is None
             or profile.provider
-            not in {"hf", "microsoft_graph", "azure_devops", "azure", "gcp", "runpod"}
+            not in {
+                "hf",
+                "microsoft_graph",
+                "azure_devops",
+                "bilibili",
+                "azure",
+                "gcp",
+                "runpod",
+            }
             or client is None
         ):
             raise ProviderObservationUnavailable("provider tool catalog binding is unavailable")
         return list_provider_tool_catalog(
             client,
             binding_id=profile.endpoint.binding_id,
+        )
+
+    def invoke_bilibili_auth_tool(
+        self,
+        principal: IntegrationPrincipal,
+        *,
+        operation_id: str,
+        tool_id: str,
+        arguments: Mapping[str, object],
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Invoke pinned Bilibili QR tools before an account connection exists."""
+
+        if operation_id not in {"bilibili.auth.qr.begin", "bilibili.auth.qr.status"}:
+            raise PermissionError("Bilibili account setup supports QR auth operations only")
+        if tool_id != operation_id:
+            raise PermissionError("Bilibili auth tool ID does not match its fixed operation")
+        binding_ref = self._registry.settings.bilibili_auth_binding_ref
+        profile = self._registry.settings.profiles.get(binding_ref or "")
+        if (
+            profile is None
+            or profile.provider != "bilibili"
+            or profile.access_mode != "actor_owned"
+            or profile.caller_workload != "cyrene.exchange.integrations"
+            or profile.targets
+            or not self._registry.principal_allowed_for_profile(principal, profile)
+        ):
+            raise ProviderObservationUnavailable("Bilibili auth capability is not configured")
+        self._require_bilibili_runtime(profile)
+        principal.require(operation_id)
+        return self._call_profile(
+            profile,
+            principal,
+            tool_id=tool_id,
+            arguments=arguments,
+            request_id=request_id,
         )
 
     def authorization_health(
@@ -1449,6 +1495,7 @@ class AuthorizationCloudDirectProvider:
         if current.provider not in {
             "azure",
             "azure_devops",
+            "bilibili",
             "gcp",
             "hf",
             "microsoft_graph",
@@ -1464,7 +1511,7 @@ class AuthorizationCloudDirectProvider:
             raise PermissionError("provider profile does not match the connection")
         expected_profile_ref = (
             current.account_link_ref
-            if current.provider in {"hf", "microsoft_graph", "azure_devops"}
+            if current.provider in {"hf", "microsoft_graph", "azure_devops", "bilibili"}
             else current.binding_ref
         )
         if arguments.get("profile_ref") != expected_profile_ref:
@@ -1509,6 +1556,8 @@ class AuthorizationCloudDirectProvider:
                 arguments=arguments,
                 request_id=request_id,
             )
+        if current.provider == "bilibili":
+            self._require_bilibili_runtime(profile)
         return self._call_profile(
             profile,
             principal,
@@ -1516,6 +1565,29 @@ class AuthorizationCloudDirectProvider:
             arguments=arguments,
             request_id=request_id,
         )
+
+    def _require_bilibili_runtime(self, profile: AuthorizationProviderProfile) -> None:
+        """Fail closed unless the configured DirectPlugin endpoint proves Bilibili identity."""
+
+        health_client = self._provider_health_clients.get(profile.profile_ref)
+        if health_client is None:
+            raise ProviderObservationUnavailable(
+                "Bilibili DirectPlugin identity health binding is unavailable"
+            )
+        try:
+            health = health_client.observe()
+        except Exception as exc:
+            raise ProviderObservationUnavailable(
+                "Bilibili DirectPlugin identity could not be verified"
+            ) from exc
+        if (
+            getattr(health, "status", None) != "SERVING"
+            or getattr(health, "plugin_id", None) != "cyrene.connectors.bilibili"
+            or "tool.provider.v1" not in getattr(health, "capabilities", ())
+        ):
+            raise ProviderObservationUnavailable(
+                "configured DirectPlugin endpoint is not the Bilibili tool provider"
+            )
 
     def cloud_resources(
         self,
