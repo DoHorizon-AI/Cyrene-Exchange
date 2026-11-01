@@ -10,17 +10,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic
-from typing import Any
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -28,15 +31,26 @@ import httpx
 from cyrene_exchange.capabilities import (
     MODEL_PROVIDER_CAPABILITY,
     ProviderChunk,
+    ProviderEmbeddingBatch,
     ProviderInvocationCancelled,
     ProviderUsage,
 )
-from cyrene_exchange.gateway import GatewayError
-from cyrene_exchange.protocol import NormalizedInferenceRequest
+from cyrene_exchange.direct_plugin import DirectPluginModelProvider
+from cyrene_exchange.gateway import GatewayError, MediaArtifactResolver
+from cyrene_exchange.protocol import NormalizedEmbeddingRequest, NormalizedInferenceRequest
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from cyrene_exchange_product.api import create_app
 from cyrene_exchange_product.domain import (
@@ -61,6 +75,45 @@ _SSE_DATA_PREFIX = "data:"
 _AUTHORIZATION_CLOUD_RUNNER_INTERVAL_SECONDS = 900
 _AUTHORIZATION_CLOUD_RUNNER_SHUTDOWN_TIMEOUT_SECONDS = 60
 _LOGGER = logging.getLogger(__name__)
+
+
+class OpenAIEmbeddingDataResponse(BaseModel):
+    """One ordered finite vector in the public embeddings response.
+
+    中文：公开 embeddings 响应中的一个有序有限向量。
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    object: Literal["embedding"]
+    embedding: list[FiniteFloat] = Field(min_length=1, max_length=16_384)
+    index: int = Field(ge=0)
+
+    @field_validator("embedding")
+    @classmethod
+    def require_nonzero_vector(cls, value: list[float]) -> list[float]:
+        if not any(value):
+            raise ValueError("embedding vector must not be all zeros")
+        return value
+
+
+class OpenAIEmbeddingsResponse(BaseModel):
+    """Public unary response retaining vector order and provider model identity.
+
+    中文：保留向量顺序和 provider 模型身份的公开 unary 响应。
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    object: Literal["list"]
+    data: list[OpenAIEmbeddingDataResponse] = Field(min_length=1, max_length=128)
+    model: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def require_input_order(self) -> OpenAIEmbeddingsResponse:
+        if [item.index for item in self.data] != list(range(len(self.data))):
+            raise ValueError("embedding result indexes must preserve input order")
+        return self
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -246,6 +299,99 @@ class OperatorBindingResolver:
                 f"no operator provider is configured for binding {implementation_ref!r}"
             )
         return provider
+
+    def validate_route(self, route: Any) -> None:
+        """Run a provider-specific availability check before route activation.
+
+        中文：激活路由前执行提供方专属的可用性检查。
+        """
+
+        provider = self.resolve(MODEL_PROVIDER_CAPABILITY, route.target_binding_id)
+        validate = getattr(provider, "validate_route", None)
+        if callable(validate):
+            validate(route)
+
+    def close(self) -> None:
+        """Close provider adapters that own runtime connections."""
+
+        seen: set[int] = set()
+        for provider in self._bindings.values():
+            close = getattr(provider, "close", None)
+            if callable(close) and id(provider) not in seen:
+                seen.add(id(provider))
+                close()
+
+
+class HealthCheckedDirectPluginModelProvider:
+    """Bind one DirectPlugin endpoint and verify its model capability on confirm.
+
+    This adapter delegates inference to Exchange's existing model-provider
+    bridge; it does not select plugins or own their process lifecycle.
+
+    中文：绑定一个 DirectPlugin 端点，并在确认路由时核对其模型能力；不选择或启动插件。
+    """
+
+    def __init__(
+        self,
+        binding_id: str,
+        client: Any,
+        health_client: Any,
+        *,
+        expected_plugin_id: str = "cyrene.providers.model-api-connector",
+    ) -> None:
+        if not binding_id.strip() or not expected_plugin_id.strip():
+            raise ValueError("DirectPlugin binding and plugin identity must be non-empty")
+        self._binding_id = binding_id
+        self._provider = DirectPluginModelProvider(client)
+        self._client = client
+        self._health_client = health_client
+        self._expected_plugin_id = expected_plugin_id
+
+    def complete(
+        self,
+        request: NormalizedInferenceRequest,
+        *,
+        cancel_event: Event,
+    ) -> Iterable[ProviderChunk]:
+        """Forward normalized chat through the typed model.provider.v1 adapter."""
+
+        return cast(
+            Iterable[ProviderChunk],
+            self._provider.complete(request, cancel_event=cancel_event),
+        )
+
+    def embed(
+        self,
+        request: NormalizedEmbeddingRequest,
+        *,
+        cancel_event: Event,
+    ) -> ProviderEmbeddingBatch:
+        """Forward embeddings through the same DirectPlugin capability binding."""
+
+        return self._provider.embed(request, cancel_event=cancel_event)
+
+    def validate_route(self, route: Any) -> None:
+        """Require a serving model-api-connector endpoint before publication."""
+
+        if route.target_binding_id != self._binding_id:
+            raise ProviderUnavailableError("route binding does not match the DirectPlugin endpoint")
+        observation = self._health_client.observe()
+        if (
+            observation.status != "SERVING"
+            or observation.plugin_id != self._expected_plugin_id
+            or MODEL_PROVIDER_CAPABILITY not in observation.capabilities
+        ):
+            raise ProviderUnavailableError(
+                "the configured DirectPlugin endpoint is not serving model.provider.v1"
+            )
+
+    def close(self) -> None:
+        """Close the DirectPlugin invocation and Health channels exactly once."""
+
+        for resource in (self._health_client, self._client):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
 
 
 class RouteSourceProviderResolver:
@@ -517,6 +663,7 @@ def build_product_app(
     resolver: Any = None,
     resolver_factory: Callable[[Any], Any] | None = None,
     control_credentials: Mapping[str, ProductPrincipal] | None = None,
+    control_only_credentials: Mapping[str, ProductPrincipal] | None = None,
     gateway_credentials: Mapping[str, ProductPrincipal] | None = None,
     workspace_endpoint_grants: Iterable[WorkspaceEndpointGrant] = (),
     workspace_reactor_endpoint_grants: Iterable[WorkspaceReactorEndpointGrant] = (),
@@ -529,6 +676,7 @@ def build_product_app(
     record_requests: bool = True,
     web_dist: Path | str | None = None,
     integrations: IntegrationServices | None = None,
+    media_artifact_resolver: MediaArtifactResolver | None = None,
 ) -> FastAPI:
     """Fuse the control-plane API with the OpenAI-compatible data plane.
 
@@ -550,11 +698,14 @@ def build_product_app(
             "EXCHANGE_RESOLVER_INVALID: provide exactly one of resolver or resolver_factory"
         )
     control_map = control_credentials or {}
+    control_only_map = control_only_credentials or {}
     configured_gateway_map = gateway_credentials or {}
+    if any(control_map.get(token) != principal for token, principal in control_only_map.items()):
+        raise ValueError("control-only credentials must be present in control_credentials")
     effective_gateway_credentials = {
         token: principal
         for token, principal in control_map.items()
-        if principal.organization_id is None
+        if principal.organization_id is None and token not in control_only_map
     }
     for token, principal in configured_gateway_map.items():
         control_principal = control_map.get(token)
@@ -584,6 +735,7 @@ def build_product_app(
         store.list_active_activity_tasks,
     )
     effective = resolver_factory(store) if resolver_factory is not None else resolver
+    effective_endpoint_id = _select_endpoint(store, endpoint_id)
     app = create_app(
         database_path=database_path,
         control_credentials=control_credentials,
@@ -597,14 +749,19 @@ def build_product_app(
     )
     gateway = build_gateway_from_store(
         store,
-        _select_endpoint(store, endpoint_id),
+        effective_endpoint_id,
         effective,
         credentials=effective_gateway_credentials,
         record_requests=record_requests,
         activity=activity,
+        media_artifact_resolver=media_artifact_resolver,
     )
     if activity is not None:
         app.router.on_shutdown.append(activity.close)
+    for resource in (effective, media_artifact_resolver):
+        close = getattr(resource, "close", None)
+        if callable(close):
+            app.router.on_shutdown.append(close)
     data_plane_resolver = data_plane_principal_resolver(store, effective_gateway_credentials)
 
     @app.get("/healthz")
@@ -621,10 +778,13 @@ def build_product_app(
 
         中文:只有数据平面至少能服务一条路由时才报告就绪。"""
 
-        routes = store.list_active_routes()
-        if not routes:
+        route_count = store.active_route_count(effective_endpoint_id)
+        if route_count == 0:
             return JSONResponse(status_code=503, content={"status": "no-active-route"})
-        return JSONResponse(status_code=200, content={"status": "ready", "routes": len(routes)})
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ready", "routes": route_count},
+        )
 
     @app.get("/v1/models")
     def models(request: Request) -> Any:
@@ -644,7 +804,13 @@ def build_product_app(
         if principal is None:
             return _openai_error(401, "authentication_error", "invalid credentials")
         seen: list[str] = []
-        for route in store.list_active_routes():
+        for route in store.active_routes(
+            effective_endpoint_id,
+            organization_id=principal.organization_id,
+            workspace_id=(
+                principal.workspace_id if principal.organization_id is not None else None
+            ),
+        ):
             if route.model_pattern in seen:
                 continue
             if not principal.permits(route.model_pattern):
@@ -696,6 +862,79 @@ def build_product_app(
             headers={"X-Request-Id": response.request_id, "Cache-Control": "no-cache"},
         )
 
+    @app.post("/v1/embeddings", response_model=OpenAIEmbeddingsResponse)
+    async def embeddings(request: Request) -> Any:
+        """Execute one authenticated embeddings request through persisted routes.
+
+        The Gateway resolves the request principal, workspace-scoped ACTIVE
+        route, and `model.provider.v1` binding. This HTTP adapter accepts no
+        tenant, workspace, provider, or embedding-profile override from JSON.
+
+        中文：通过持久化路由执行一次已认证的 embedding 请求。JSON 不得覆盖租户、workspace、
+        provider 或向量配置；这些身份均由 Gateway 与存储路由解析。
+        """
+
+        raw = await request.body()
+        if not raw or len(raw) > _MAX_PAYLOAD_BYTES:
+            return _openai_error(400, "invalid_request_error", "invalid request body")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return _openai_error(400, "invalid_request_error", "request body must be JSON")
+        if not isinstance(payload, Mapping):
+            return _openai_error(400, "invalid_request_error", "request body must be an object")
+
+        cancel_event = Event()
+        request_id = getattr(request.state, "request_id", None)
+        gateway_headers = dict(request.headers.items())
+        trace_id = getattr(request.state, "trace_id", None)
+        if isinstance(trace_id, str):
+            gateway_headers["traceparent"] = f"00-{trace_id}-0000000000000001-01"
+        stop_disconnect_watch = asyncio.Event()
+        disconnect_watch = asyncio.create_task(
+            _watch_embeddings_disconnect(request, cancel_event, stop_disconnect_watch),
+            name="exchange-embeddings-disconnect-watch",
+        )
+        gateway_call = asyncio.create_task(
+            run_in_threadpool(
+                gateway.handle_openai_embeddings,
+                gateway_headers,
+                payload,
+                cancel_event=cancel_event,
+                request_id=request_id,
+            ),
+            name="exchange-embeddings-gateway-call",
+        )
+        try:
+            response = await asyncio.shield(gateway_call)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            with suppress(Exception):
+                await asyncio.shield(gateway_call)
+            raise
+        except GatewayError as exc:
+            return _gateway_error_response(exc)
+        finally:
+            stop_disconnect_watch.set()
+            disconnect_watch.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect_watch
+
+        try:
+            body = OpenAIEmbeddingsResponse.model_validate(response.body)
+        except ValidationError:
+            return _openai_error(
+                502,
+                "provider_error",
+                "embedding provider returned an invalid response shape",
+            )
+
+        return JSONResponse(
+            status_code=response.status_code,
+            content=body.model_dump(mode="json"),
+            headers={"X-Request-Id": response.request_id},
+        )
+
     @app.middleware("http")
     async def rewrite_exchange_proxy_path(request: Request, call_next: Any) -> Any:
         path = request.scope.get("path", "")
@@ -705,7 +944,7 @@ def build_product_app(
 
     @app.get("/api/v1/system/status")
     def system_status(request: Request) -> dict[str, Any]:
-        routes = store.list_active_routes()
+        route_count = store.active_route_count()
         keys = store.list_api_keys()
         active_keys = sum(
             1
@@ -735,7 +974,7 @@ def build_product_app(
                 "active": active_keys,
                 "revoked": revoked_keys,
             },
-            "routes": len(routes),
+            "routes": route_count,
             "gatewayBaseUrl": base_url,
             "gpu": gpu_info,
             "disk": disk_info,
@@ -802,6 +1041,10 @@ def build_product_app(
     @app.post("/api/proxy/exchange-gateway/v1/chat/completions")
     async def proxy_chat_completions(request: Request) -> Any:
         return await chat_completions(request)
+
+    @app.post("/api/proxy/exchange-gateway/v1/embeddings")
+    async def proxy_embeddings(request: Request) -> Any:
+        return await embeddings(request)
 
     effective_web_dist = Path(web_dist) if web_dist is not None else _find_web_dist()
     if (
@@ -993,4 +1236,43 @@ def _openai_error(status: int, error_type: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status,
         content={"error": {"type": error_type, "message": message}},
+    )
+
+
+async def _watch_embeddings_disconnect(
+    request: Request,
+    cancel_event: Event,
+    stop_event: asyncio.Event,
+) -> None:
+    """Cancel an in-flight unary provider call when its HTTP peer disconnects.
+
+    中文：客户端断开时取消正在执行的 unary embedding provider 调用。
+    """
+
+    while not stop_event.is_set():
+        if await request.is_disconnected():
+            cancel_event.set()
+            return
+        await asyncio.sleep(0.05)
+
+
+def _gateway_error_response(error: GatewayError) -> JSONResponse:
+    """Preserve the Gateway's typed status, body, and finite retry hint.
+
+    中文：保留 Gateway 的类型化状态、错误体和有限 Retry-After 提示。
+    """
+
+    headers: dict[str, str] = {}
+    retry_after = getattr(error, "retry_after_seconds", None)
+    if (
+        isinstance(retry_after, (int, float))
+        and not isinstance(retry_after, bool)
+        and math.isfinite(retry_after)
+        and retry_after >= 0
+    ):
+        headers["Retry-After"] = str(math.ceil(retry_after))
+    return JSONResponse(
+        status_code=error.status_code,
+        content=error.to_openai_error(),
+        headers=headers,
     )

@@ -88,6 +88,23 @@ class CreateWorkspaceRouteDraftRequest(ContractModel):
     source_endpoint: WorkspaceReactorEndpointSelector
 
 
+class CreateWorkspaceBindingRouteDraftRequest(ContractModel):
+    """Create a workspace-scoped draft for an operator-admitted binding.
+
+    This path is for provider bindings such as a local DirectPlugin endpoint
+    that are selected by Exchange configuration and have no Reactor source.
+
+    中文：为 Exchange operator 已准入的模型绑定创建 Workspace 范围草稿；
+    适用于无 Reactor 来源的 DirectPlugin 端点。
+    """
+
+    endpoint_id: UUID
+    model_pattern: str = Field(min_length=1, max_length=200)
+    target_binding_id: str = Field(min_length=1, max_length=300)
+    target_model: str = Field(min_length=1, max_length=200)
+    priority: int = Field(ge=0, le=10_000)
+
+
 @dataclass(frozen=True)
 class WorkspaceReactorEndpointGrant:
     """Operator-owned Reactor source assignment to one organization/workspace.

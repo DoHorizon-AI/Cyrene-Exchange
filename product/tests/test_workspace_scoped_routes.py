@@ -57,8 +57,7 @@ def _draft_body(endpoint_id: UUID) -> dict[str, object]:
         "targetModel": "upstream-chat",
         "priority": 10,
         "source": {
-            "resourceUri": "https://reactor.example/api/v1/endpoints/"
-            "11111111-1111-4111-8111-111111111111",
+            "resourceUri": "https://reactor.example/api/v1/endpoints/11111111-1111-4111-8111-111111111111",
             "resourceVersion": 2,
             "artifactDigest": "sha256:" + "a" * 64,
         },
@@ -90,7 +89,10 @@ def _app(tmp_path: Path):
     credentials = {
         TOKEN_A: ProductPrincipal("actor", WORKSPACE, "cred://exchange/a", organization_id=ORG_A),
         TOKEN_A_ROTATION: ProductPrincipal(
-            "actor", WORKSPACE, "cred://exchange/a-rotation", organization_id=ORG_A
+            "actor",
+            WORKSPACE,
+            "cred://exchange/a-rotation",
+            organization_id=ORG_A,
         ),
         TOKEN_B: ProductPrincipal("actor", WORKSPACE, "cred://exchange/b", organization_id=ORG_B),
         TOKEN_WRONG_WORKSPACE: ProductPrincipal(
@@ -123,7 +125,10 @@ def _app(tmp_path: Path):
 
 
 def _create_private_draft(
-    client: TestClient, token: str, endpoint_id: UUID, key: str
+    client: TestClient,
+    token: str,
+    endpoint_id: UUID,
+    key: str,
 ) -> dict[str, object]:
     response = client.post(
         "/api/v1/workspace/gateway-route-drafts",
@@ -132,6 +137,126 @@ def _create_private_draft(
     )
     assert response.status_code == 201, response.text
     return dict(response.json())
+
+
+def test_workspace_direct_binding_draft_requires_grants_and_confirm_health_check(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "workspace-direct-binding.sqlite3"
+    store = ExchangeStore(database)
+    endpoint_id = uuid4()
+    store.save_endpoint(_endpoint(endpoint_id))
+    grants = (WorkspaceEndpointGrant(endpoint_id, ORG_A, WORKSPACE),)
+    store.configure_workspace_endpoint_grants(grants)
+    control_credentials = {
+        TOKEN_A: ProductPrincipal("actor", WORKSPACE, "cred://exchange/a", organization_id=ORG_A),
+        TOKEN_B: ProductPrincipal("actor", WORKSPACE, "cred://exchange/b", organization_id=ORG_B),
+    }
+    validations: list[GatewayRoute] = []
+
+    def validate_target(route: GatewayRoute) -> None:
+        validations.append(route)
+        assert route.target_binding_id == "model-api-connector-local"
+        assert route.source is None
+
+    app = create_app(
+        database_path=database,
+        store=store,
+        control_credentials=control_credentials,
+        workspace_endpoint_grants=grants,
+        allowed_binding_ids=frozenset({"model-api-connector-local"}),
+        validate_route_target=validate_target,
+    )
+    body = {
+        "endpointId": str(endpoint_id),
+        "modelPattern": "cyrene-local-*",
+        "targetBindingId": "model-api-connector-local",
+        "targetModel": "cyrene-local-qwen25-05b",
+        "priority": 10,
+    }
+    try:
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/v1/workspace/gateway-route-drafts/direct",
+                headers={
+                    "Authorization": f"Bearer {TOKEN_A}",
+                    "Idempotency-Key": "local-model-route-v1",
+                },
+                json=body,
+            )
+            assert created.status_code == 201, created.text
+            draft = created.json()
+            assert draft["state"] == "DRAFT"
+            assert draft["targetBindingId"] == "model-api-connector-local"
+            assert draft["targetModel"] == "cyrene-local-qwen25-05b"
+            assert "sourceProvenance" not in draft
+            assert "source" not in draft
+            persisted = store.get_route(UUID(draft["id"]))
+            assert persisted is not None
+            assert (persisted.organization_id, persisted.workspace_id) == (ORG_A, WORKSPACE)
+            assert persisted.source is None
+
+            denied_binding = client.post(
+                "/api/v1/workspace/gateway-route-drafts/direct",
+                headers={
+                    "Authorization": f"Bearer {TOKEN_A}",
+                    "Idempotency-Key": "not-admitted",
+                },
+                json={**body, "targetBindingId": "arbitrary-provider"},
+            )
+            assert denied_binding.status_code == 403
+
+            denied_scope = client.post(
+                "/api/v1/workspace/gateway-route-drafts/direct",
+                headers={
+                    "Authorization": f"Bearer {TOKEN_B}",
+                    "Idempotency-Key": "org-b-not-granted",
+                },
+                json=body,
+            )
+            assert denied_scope.status_code == 403
+
+            forged_source = client.post(
+                "/api/v1/workspace/gateway-route-drafts/direct",
+                headers={
+                    "Authorization": f"Bearer {TOKEN_A}",
+                    "Idempotency-Key": "no-request-source",
+                },
+                json={**body, "source": _draft_body(endpoint_id)["source"]},
+            )
+            assert forged_source.status_code == 422
+
+            cross_org_confirm = client.post(
+                f"/api/v1/workspace/gateway-route-drafts/{draft['id']}/actions/confirm",
+                headers={"Authorization": f"Bearer {TOKEN_B}"},
+                json={"resourceVersion": 1},
+            )
+            assert cross_org_confirm.status_code == 404
+            assert validations == []
+
+            store.configure_workspace_endpoint_grants(())
+            revoked_grant = client.post(
+                f"/api/v1/workspace/gateway-route-drafts/{draft['id']}/actions/confirm",
+                headers={"Authorization": f"Bearer {TOKEN_A}"},
+                json={"resourceVersion": 1},
+            )
+            assert revoked_grant.status_code == 403
+            assert validations == []
+
+            store.configure_workspace_endpoint_grants(grants)
+            confirmed = client.post(
+                f"/api/v1/workspace/gateway-route-drafts/{draft['id']}/actions/confirm",
+                headers={"Authorization": f"Bearer {TOKEN_A}"},
+                json={"resourceVersion": 1},
+            )
+            assert confirmed.status_code == 200, confirmed.text
+            assert confirmed.json()["state"] == "ACTIVE"
+            assert confirmed.json()["resourceVersion"] == 2
+            assert validations == [persisted]
+            active = store.get_route(UUID(draft["id"]))
+            assert active is not None and active.state.value == "ACTIVE"
+    finally:
+        store.close()
 
 
 def test_private_routes_are_scoped_and_legacy_paths_do_not_expose_them(
@@ -184,7 +309,8 @@ def test_private_routes_are_scoped_and_legacy_paths_do_not_expose_them(
             assert "reactor.example" not in private_a.text
 
             legacy_list = client.get(
-                "/api/v1/gateway-routes", headers={"Authorization": f"Bearer {TOKEN_A}"}
+                "/api/v1/gateway-routes",
+                headers={"Authorization": f"Bearer {TOKEN_A}"},
             )
             assert legacy_list.status_code == 200
             assert legacy_list.json() == []
@@ -374,11 +500,13 @@ def test_control_and_gateway_bearers_have_separate_route_authority(tmp_path: Pat
 
 
 def test_serve_cli_keeps_scoped_control_secret_out_of_gateway_map(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
     monkeypatch.setenv("EXCHANGE_CONTROL_SECRET", "private-control-secret")
     monkeypatch.setenv("EXCHANGE_GATEWAY_SECRET", "separate-gateway-secret")
+    monkeypatch.setenv("EXCHANGE_BOOTSTRAP_SECRET", "control-only-bootstrap-secret")
     monkeypatch.setattr(
         cli,
         "build_product_app",
@@ -396,15 +524,25 @@ def test_serve_cli_keeps_scoped_control_secret_out_of_gateway_map(
                 "cred://exchange/private=org-a=workspace-a=EXCHANGE_CONTROL_SECRET",
                 "--gateway-credential-env",
                 "cred://exchange/gateway=workspace-a=EXCHANGE_GATEWAY_SECRET",
+                "--control-only-credential-env",
+                "cred://exchange/bootstrap=-=workspace-a=EXCHANGE_BOOTSTRAP_SECRET",
             ]
         )
         == 0
     )
     control_credentials = captured["control_credentials"]
+    control_only_credentials = captured["control_only_credentials"]
     gateway_credentials = captured["gateway_credentials"]
-    assert list(control_credentials) == ["private-control-secret"]
+    assert set(control_credentials) == {
+        "private-control-secret",
+        "control-only-bootstrap-secret",
+    }
+    assert control_only_credentials == {
+        "control-only-bootstrap-secret": control_credentials["control-only-bootstrap-secret"]
+    }
     assert list(gateway_credentials) == ["separate-gateway-secret"]
     assert control_credentials["private-control-secret"].organization_id == "org-a"
+    assert control_credentials["control-only-bootstrap-secret"].organization_id is None
 
     monkeypatch.setenv("EXCHANGE_LEGACY_SECRET", "legacy-control-secret")
     with pytest.raises(SystemExit, match="cannot carry organization scope"):
@@ -468,10 +606,12 @@ def test_workspace_api_keys_do_not_cross_organization_boundaries(tmp_path: Path)
             assert "organizationId" not in key_a
 
             listed_a = client.get(
-                "/api/v1/api-keys", headers={"Authorization": f"Bearer {TOKEN_A}"}
+                "/api/v1/api-keys",
+                headers={"Authorization": f"Bearer {TOKEN_A}"},
             )
             listed_b = client.get(
-                "/api/v1/api-keys", headers={"Authorization": f"Bearer {TOKEN_B}"}
+                "/api/v1/api-keys",
+                headers={"Authorization": f"Bearer {TOKEN_B}"},
             )
             assert [item["id"] for item in listed_a.json()] == [key_a["id"]]
             assert [item["id"] for item in listed_b.json()] == [key_b["id"]]
@@ -484,7 +624,8 @@ def test_workspace_api_keys_do_not_cross_organization_boundaries(tmp_path: Path)
             )
             assert (
                 client.get(
-                    "/api/v1/api-keys", headers={"Authorization": f"Bearer {TOKEN_LEGACY}"}
+                    "/api/v1/api-keys",
+                    headers={"Authorization": f"Bearer {TOKEN_LEGACY}"},
                 ).json()
                 == []
             )
@@ -528,8 +669,10 @@ def test_workspace_only_legacy_rows_survive_scope_migration(tmp_path: Path) -> N
             (str(endpoint.id), endpoint.model_dump_json(by_alias=True, exclude_none=True)),
         )
         connection.execute(
-            "INSERT INTO gateway_routes(id, endpoint_id, priority, state, document) "
-            "VALUES (?, ?, ?, ?, ?)",
+            """
+            INSERT INTO gateway_routes(id, endpoint_id, priority, state, document)
+            VALUES (?, ?, ?, ?, ?)
+            """,
             (
                 str(route.id),
                 str(route.endpoint_id),

@@ -21,35 +21,41 @@ the Product semantics live in :class:`ExchangeGateway`.
 """
 # 中文:Exchange Product 核心与参考传输适配器。本包依赖能力协议,而不依赖具体插件实现。HTTP 服务器是可替换的参考适配器;Product 语义由 :class:`ExchangeGateway` 承载。
 
-from .capabilities import (
-    MODEL_PROVIDER_CAPABILITY,
-    MODEL_ROUTING_CAPABILITY,
-    CapabilityResolver,
-    ProviderChunk,
-    ProviderUsage,
-    RouteTarget,
-    ToolCallDelta,
-)
 from .billing import (
     BillingUsageClient,
     BillingUsageError,
     HttpBillingUsageClient,
     TokenUsageEvent,
 )
+from .capabilities import (
+    MODEL_PROVIDER_CAPABILITY,
+    MODEL_ROUTING_CAPABILITY,
+    CapabilityResolver,
+    ProviderChunk,
+    ProviderEmbeddingBatch,
+    ProviderEmbeddingError,
+    ProviderUsage,
+    RouteTarget,
+    ToolCallDelta,
+)
 from .gateway import (
     AuthenticationError,
+    EmbeddingProviderResponseError,
     ExchangeGateway,
     GatewayError,
     GatewayResponse,
     InvalidRequestError,
+    MediaArtifactResolver,
+    MediaArtifactUnavailableError,
+    NoOpLifecycleObserver,
     NoRouteError,
     ProviderFailureError,
     QuotaExceededError,
     QuotaUnavailableError,
     RequestCancelled,
-    NoOpLifecycleObserver,
+    ResolvedMediaArtifact,
 )
-from .protocol import NormalizedInferenceRequest
+from .protocol import NormalizedEmbeddingRequest, NormalizedInferenceRequest
 
 _ADAPTER_EXPORTS = {
     "DirectPluginInvoker": (".direct_plugin", "DirectPluginInvoker"),
@@ -87,12 +93,15 @@ def __getattr__(name: str) -> object:
 
 __all__ = [
     "AuthenticationError",
+    "MediaArtifactUnavailableError",
+    "MediaArtifactResolver",
     "BillingUsageClient",
     "BillingUsageError",
     "CapabilityResolver",
     "DirectPluginInvoker",
     "DirectPluginModelProvider",
     "ExchangeGateway",
+    "EmbeddingProviderResponseError",
     "GatewayError",
     "GatewayResponse",
     "InvalidRequestError",
@@ -102,13 +111,17 @@ __all__ = [
     "ModelProviderExecutionError",
     "NoOpLifecycleObserver",
     "NoRouteError",
+    "NormalizedEmbeddingRequest",
     "NormalizedInferenceRequest",
     "ProviderChunk",
+    "ProviderEmbeddingBatch",
+    "ProviderEmbeddingError",
     "ProviderUsage",
     "ProviderFailureError",
     "QuotaExceededError",
     "QuotaUnavailableError",
     "RequestCancelled",
+    "ResolvedMediaArtifact",
     "RouteTarget",
     "ToolCallDelta",
     "TokenUsageEvent",

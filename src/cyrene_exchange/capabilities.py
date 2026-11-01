@@ -22,13 +22,14 @@ Platform capability contracts.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from threading import Event
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from .protocol import NormalizedInferenceRequest
+    from .protocol import NormalizedEmbeddingRequest, NormalizedInferenceRequest
 
 
 MODEL_ROUTING_CAPABILITY = "model.routing.v1"
@@ -176,6 +177,67 @@ class ProviderChunk:
         return self.usage
 
 
+@dataclass(frozen=True)
+class ProviderEmbeddingBatch:
+    """One provider-reported embedding batch in request order.
+
+    中文:按请求顺序排列的一组提供方 embedding 结果。
+    """
+
+    vectors: tuple[tuple[float, ...], ...]
+    dimensions: int
+    model: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError("embedding model must be non-empty provider-reported text")
+        if len(self.model) > 256:
+            raise ValueError("embedding model exceeds the maximum length")
+        if isinstance(self.dimensions, bool) or not isinstance(self.dimensions, int) or self.dimensions <= 0:
+            raise ValueError("embedding dimensions must be a positive integer")
+        if self.dimensions > 16_384:
+            raise ValueError("embedding dimensions exceed the supported maximum")
+        if not self.vectors:
+            raise ValueError("embedding batch must contain at least one vector")
+        for vector_index, vector in enumerate(self.vectors):
+            if len(vector) != self.dimensions:
+                raise ValueError(f"embedding vector {vector_index} does not match declared dimensions")
+            for value_index, value in enumerate(vector):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or abs(value) > 3.4028234663852886e38
+                ):
+                    raise ValueError(f"embedding vector {vector_index}[{value_index}] must be finite numeric data")
+            if not any(vector):
+                raise ValueError(f"embedding vector {vector_index} must not be all zeros")
+
+
+class ProviderEmbeddingError(RuntimeError):
+    """A typed provider error returned by ``model.provider.v1/embeddings``.
+
+    中文:由 ``model.provider.v1/embeddings`` 返回的有类型提供方错误。
+    """
+
+    def __init__(self, code: int, message: str, retry_after_seconds: float | None = None) -> None:
+        if code not in {1, 2, 3, 4, 5}:
+            raise ValueError("embedding provider error code is invalid")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("embedding provider error message must be non-empty")
+        if retry_after_seconds is not None and (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, (int, float))
+            or not math.isfinite(retry_after_seconds)
+            or not 0 <= retry_after_seconds <= 86_400
+        ):
+            raise ValueError("embedding retry delay must be between zero and one day")
+        self.code = code
+        self.message = message
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(message)
+
+
 class ProviderInvocationCancelled(RuntimeError):
     """A provider execution ended with canonical cancellation semantics.
 
@@ -187,7 +249,10 @@ class ModelRoutingCapability(Protocol):
 
     中文:由 ``model.routing.v1`` 提供的可复用路由候选选择器。"""
 
-    def plan(self, request: NormalizedInferenceRequest) -> Sequence[RouteTarget]:
+    def plan(
+        self,
+        request: NormalizedInferenceRequest | NormalizedEmbeddingRequest,
+    ) -> Sequence[RouteTarget]:
         """Return candidates in the order selected by the routing algorithm.
 
         中文:按路由算法选定的顺序返回候选项。"""
@@ -207,6 +272,24 @@ class ModelProviderCapability(Protocol):
         """Yield provider-neutral chunks and observe the cancellation event.
 
         中文:产出提供方无关的数据块,并观察取消事件。"""
+
+
+class ModelEmbeddingCapability(Protocol):
+    """Provider execution for bounded unary embedding batches.
+
+    中文:有界 unary embedding 批次的提供方执行接口。
+    """
+
+    def embed(
+        self,
+        request: NormalizedEmbeddingRequest,
+        *,
+        cancel_event: Event,
+    ) -> ProviderEmbeddingBatch:
+        """Return provider-reported vectors in exactly the requested order.
+
+        按请求顺序返回提供方实际生成的向量。
+        """
 
 
 class CapabilityResolver(Protocol):

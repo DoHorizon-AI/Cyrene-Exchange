@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from fnmatch import fnmatchcase
 from hashlib import sha256
+from typing import Any
 from uuid import UUID
 
 from cyrene_exchange.billing import BillingUsageClient
@@ -23,6 +24,7 @@ from cyrene_exchange.capabilities import (
 )
 from cyrene_exchange.gateway import (
     ExchangeGateway,
+    MediaArtifactResolver,
     NoOpLifecycleObserver,
     RequestPrincipal,
     TokenPrincipalResolver,
@@ -44,7 +46,35 @@ class StoredRoutePlanner:
         self._endpoint_id = endpoint_id
 
     def plan(self, request: NormalizedInferenceRequest) -> list[RouteTarget]:
-        """Return eligible opaque bindings in Product priority order. | 返回候选绑定。"""
+        """Return only legacy unscoped bindings for legacy callers."""
+
+        return self._plan_for_scope(request, organization_id=None, workspace_id=None)
+
+    def plan_for_principal(
+        self,
+        request: Any,
+        *,
+        principal: RequestPrincipal,
+    ) -> list[RouteTarget]:
+        """Return ACTIVE routes owned by the authenticated Product scope.
+
+        中文：仅返回认证 Product principal 所属 organization/workspace 的活动路由。
+        """
+
+        return self._plan_for_scope(
+            request,
+            organization_id=principal.organization_id,
+            workspace_id=principal.workspace_id if principal.organization_id is not None else None,
+        )
+
+    def _plan_for_scope(
+        self,
+        request: Any,
+        *,
+        organization_id: str | None,
+        workspace_id: str | None,
+    ) -> list[RouteTarget]:
+        """Project one trusted Product scope onto the routing capability."""
 
         endpoint = self._store.get_endpoint(self._endpoint_id)
         if endpoint is None or endpoint.state != EndpointState.ACTIVE:
@@ -55,7 +85,11 @@ class StoredRoutePlanner:
                 route_id=str(route.id),
                 model=route.target_model,
             )
-            for route in self._store.active_routes(endpoint.id)
+            for route in self._store.active_routes(
+                endpoint.id,
+                organization_id=organization_id,
+                workspace_id=workspace_id,
+            )
             if fnmatchcase(request.model, route.model_pattern)
         ]
 
@@ -109,6 +143,7 @@ def build_gateway_from_store(
     record_requests: bool = True,
     max_route_attempts: int = 1,
     activity: ActivitySourceLifecycleProtocol | None = None,
+    media_artifact_resolver: MediaArtifactResolver | None = None,
 ) -> ExchangeGateway:
     """Compose persisted Product routing with a caller-owned capability resolver.
 
@@ -139,5 +174,6 @@ def build_gateway_from_store(
         principal_resolver=principal_resolver,
         lifecycle_observer=observer,
         quota_checker=ProductQuotaGuard(store, billing),
+        media_artifact_resolver=media_artifact_resolver,
         max_route_attempts=max_route_attempts,
     )
