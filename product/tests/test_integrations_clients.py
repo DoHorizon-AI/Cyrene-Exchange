@@ -1140,7 +1140,14 @@ def test_wecom_explicit_rejected_ack_has_no_fabricated_receipt_ids() -> None:
     assert evidence.transport_request_id is None
 
 
-def test_teams_reply_forwards_validated_regional_service_url() -> None:
+@pytest.mark.parametrize(
+    ("deadline_seconds", "expected_deadline_seconds"),
+    [(None, 45.0), (7.25, 7.25)],
+)
+def test_teams_reply_forwards_validated_regional_service_url(
+    deadline_seconds: float | None,
+    expected_deadline_seconds: float,
+) -> None:
     delivery = message_wire.DeliveryResult(
         status=message_wire.DELIVERY_STATUS_ACCEPTED,
         vendor_message_id="message-1",
@@ -1153,7 +1160,11 @@ def test_teams_reply_forwards_validated_regional_service_url() -> None:
             )
         ]
     )
-    client = TeamsMessageClient(transport)
+    client = (
+        TeamsMessageClient(transport)
+        if deadline_seconds is None
+        else TeamsMessageClient(transport, deadline_seconds=deadline_seconds)
+    )
     service_url = "https://smba.trafficmanager.net/emea/"
     evidence = client.send_reply(
         bot_app_id="00000000-0000-4000-8000-000000000003",
@@ -1167,6 +1178,7 @@ def test_teams_reply_forwards_validated_regional_service_url() -> None:
         request_id="notification-1:attempt:1",
     )
     request = message_wire.SendMessageRequest.FromString(transport.calls[0]["request"].value)
+    assert transport.calls[0]["deadline_seconds"] == expected_deadline_seconds
     service_facts = {
         fact.value for fact in request.vendor_extension.facts if fact.name == "service_url"
     }
@@ -1216,6 +1228,38 @@ def test_teams_private_send_uses_exact_actor_route_and_private_proto() -> None:
     }
     assert evidence.accepted is True
     assert evidence.vendor_message_id == "private-message-1"
+
+
+def test_teams_accepted_reply_without_vendor_message_id_is_invalid() -> None:
+    delivery = message_wire.DeliveryResult(
+        status=message_wire.DELIVERY_STATUS_ACCEPTED,
+        vendor_message_id="   ",
+    )
+    transport = _DirectClient(
+        [
+            DirectPayload(
+                "type.cyrene.io/cyrene.message.connector.v1.DeliveryResult",
+                delivery.SerializeToString(deterministic=True),
+            )
+        ]
+    )
+    client = TeamsMessageClient(transport)
+
+    with pytest.raises(ExchangeProductError) as caught:
+        client.send_reply(
+            bot_app_id="00000000-0000-4000-8000-000000000003",
+            tenant_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            team_id="team-1",
+            channel_id="channel-1",
+            conversation_id="19:channel-conversation",
+            root_thread_id="1698765432101",
+            service_url="https://smba.trafficmanager.net/emea/",
+            text="The task completed.",
+            request_id="missing-vendor-message-id",
+        )
+
+    assert caught.value.code == "EXCHANGE_TEAMS_PROVIDER_RESPONSE_INVALID"
+    assert len(transport.calls) == 1
 
 
 def test_github_webhook_verifier_sends_original_bytes_without_connection_claim() -> None:
