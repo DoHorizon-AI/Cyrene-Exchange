@@ -401,6 +401,23 @@ class BeginLinkBody(IntegrationRequestBody):
     provider: str = Field(pattern="^(github|wecom)$")
 
 
+class DeclareAccountHandleBody(IntegrationRequestBody):
+    """One platform account an operator declares for a person; never a credential."""
+
+    provider: str = Field(pattern="^(github|huggingface|azure_devops|wecom|qq|bilibili)$")
+    handle: str = Field(min_length=1, max_length=254)
+    subject: str | None = Field(default=None, min_length=1, max_length=256)
+    mail: str | None = Field(default=None, min_length=3, max_length=254)
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class RetractAccountHandleBody(IntegrationRequestBody):
+    """The declared platform account to retire."""
+
+    provider: str = Field(pattern="^(github|huggingface|azure_devops|wecom|qq|bilibili)$")
+    handle: str = Field(min_length=1, max_length=254)
+
+
 class GitHubInstallationRepositoryBody(IntegrationRequestBody):
     """One selected repository in a verified GitHub App installation."""
 
@@ -1373,6 +1390,97 @@ class IntegrationServices:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
+
+
+def _invalid_people_response() -> ExchangeProductError:
+    return ExchangeProductError(
+        code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+        title="Account Center response invalid",
+        detail="Account Center returned an invalid people projection.",
+        status=502,
+    )
+
+
+def _person_account_response(item: Any) -> dict[str, Any]:
+    """Project one account of a person; the projection never includes references."""
+
+    if not isinstance(item, Mapping):
+        raise _invalid_people_response()
+    try:
+        return {
+            "source": item["source"],
+            "kind": item["kind"],
+            "provider": item["provider"],
+            "handle": item["handle"],
+            "externalSubject": item["external_subject"],
+            "status": item["status"],
+            "updatedAt": item["updated_at"],
+        }
+    except KeyError:
+        raise _invalid_people_response() from None
+
+
+def _find_people_response(result: Any) -> dict[str, Any]:
+    """Project the people directory into the closed public camelCase shape."""
+
+    if (
+        not isinstance(result, Mapping)
+        or not isinstance(result.get("people"), list)
+        or not isinstance(result.get("truncated"), bool)
+    ):
+        raise _invalid_people_response()
+    people: list[dict[str, Any]] = []
+    for person in result["people"]:
+        if not isinstance(person, Mapping) or not isinstance(person.get("accounts"), list):
+            raise _invalid_people_response()
+        try:
+            people.append(
+                {
+                    "personRef": person["person_ref"],
+                    "issuer": person["issuer"],
+                    "subject": person["subject"],
+                    "mail": person["mail"],
+                    "displayName": person["display_name"],
+                    "accounts": [_person_account_response(item) for item in person["accounts"]],
+                }
+            )
+        except KeyError:
+            raise _invalid_people_response() from None
+    return {"people": people, "truncated": result["truncated"]}
+
+
+def _declare_handle_response(result: Any) -> dict[str, Any]:
+    keys = ("person_ref", "handle_ref", "provider", "handle", "source", "created")
+    if (
+        not isinstance(result, Mapping)
+        or any(key not in result for key in keys)
+        or not isinstance(result["created"], bool)
+    ):
+        raise _invalid_people_response()
+    return {
+        "personRef": result["person_ref"],
+        "handleRef": result["handle_ref"],
+        "provider": result["provider"],
+        "handle": result["handle"],
+        "source": result["source"],
+        "created": result["created"],
+    }
+
+
+def _retract_handle_response(result: Any) -> dict[str, Any]:
+    keys = ("retracted", "person_ref", "provider", "handle")
+    if (
+        not isinstance(result, Mapping)
+        or any(key not in result for key in keys)
+        or result["retracted"] is not True
+    ):
+        raise _invalid_people_response()
+    return {
+        "retracted": True,
+        "personRef": result["person_ref"],
+        "provider": result["provider"],
+        "handle": result["handle"],
+    }
 
 
 def _operation_status(operation: Any) -> dict[str, Any]:
@@ -2850,6 +2958,92 @@ def create_router(services: IntegrationServices) -> APIRouter:
             result,
             expected_profile_ref=None,
             expected_provider="microsoft_graph",
+        )
+
+    @router.get("/api/v1/accounts/people", operation_id="accountFindPeople")
+    async def find_people(
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        subject: str | None = Query(default=None, min_length=1, max_length=256),
+        mail: str | None = Query(default=None, min_length=3, max_length=254),
+        provider: str | None = Query(
+            default=None,
+            pattern=(
+                "^(github|huggingface|azure_devops|wecom|qq|bilibili|azure|gcp|runpod"
+                "|microsoft_graph)$"
+            ),
+        ),
+        handle: str | None = Query(default=None, min_length=1, max_length=254),
+        name: str | None = Query(default=None, min_length=2, max_length=120),
+        limit: int | None = Query(default=None, ge=1, le=500),
+    ) -> dict[str, Any]:
+        """Answer whose account this is and which accounts a person has."""
+
+        actor = await principal(
+            request, workspace_id, operation_id="navigator.connector.operator.v1"
+        )
+        require(actor, "navigator.connector.operator.v1")
+        return _find_people_response(
+            services.accounts.find_people(
+                actor,
+                workspace_id=actor.workspace_id,
+                subject=subject,
+                mail=mail,
+                provider=provider,
+                handle=handle,
+                name=name,
+                limit=limit,
+            )
+        )
+
+    @router.post("/api/v1/accounts/people/handles", operation_id="accountDeclareHandle")
+    async def declare_handle(
+        body: DeclareAccountHandleBody,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        """Record a platform account an operator declares for a person."""
+
+        actor = await principal(
+            request, workspace_id, operation_id="navigator.connector.operator.v1"
+        )
+        require(actor, "navigator.connector.operator.v1")
+        return _declare_handle_response(
+            services.accounts.declare_account_handle(
+                actor,
+                provider=body.provider,
+                handle=body.handle,
+                subject=body.subject,
+                mail=body.mail,
+                display_name=body.display_name,
+                idempotency_key=idempotency_key,
+            )
+        )
+
+    @router.post(
+        "/api/v1/accounts/people/handles/actions/retract",
+        operation_id="accountRetractHandle",
+    )
+    async def retract_handle(
+        body: RetractAccountHandleBody,
+        request: Request,
+        workspace_id: str | None = Query(default=None, alias="workspaceId"),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        """Retire a declared platform account so it can be declared again later."""
+
+        actor = await principal(
+            request, workspace_id, operation_id="navigator.connector.operator.v1"
+        )
+        require(actor, "navigator.connector.operator.v1")
+        return _retract_handle_response(
+            services.accounts.retract_account_handle(
+                actor,
+                provider=body.provider,
+                handle=body.handle,
+                idempotency_key=idempotency_key,
+            )
         )
 
     @router.get("/api/v1/accounts/links", operation_id="accountListLinks")
