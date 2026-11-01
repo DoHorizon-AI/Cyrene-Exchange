@@ -260,6 +260,25 @@ def test_proactive_github_tools_use_exact_resource_targets_and_mutability() -> N
             False,
         ),
         (
+            "github.pull_requests.list",
+            {"state": "ALL", "page_cursor": "2"},
+            "github_repository",
+            {"repository_id": "42", "repository": "acme/demo"},
+            False,
+        ),
+        (
+            "github.commits.compare",
+            {"base_sha": "A" * 40, "head_sha": "b" * 40},
+            "github_commit_comparison",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+            },
+            False,
+        ),
+        (
             "github.actions.jobs.list",
             {"run_id": "9001", "limit": 50},
             "github_actions_run",
@@ -409,6 +428,33 @@ def test_proactive_github_tools_use_exact_resource_targets_and_mutability() -> N
             "updated_since": "2026-10-24T09:15:30Z",
         },
     )
+    _validate_github_target(
+        connection,
+        "github.pull_requests.list",
+        {"repository_id": "42", "repository": "acme/demo", "state": "ALL"},
+    )
+    _validate_github_target(
+        connection,
+        "github.commits.compare",
+        {
+            "repository_id": "42",
+            "repository": "acme/demo",
+            "base_sha": "A" * 40,
+            "head_sha": "b" * 40,
+        },
+    )
+    for cursor in ("0", "1001", 2):
+        with pytest.raises(ValueError):
+            _validate_github_target(
+                connection,
+                "github.pull_requests.list",
+                {
+                    "repository_id": "42",
+                    "repository": "acme/demo",
+                    "state": "ALL",
+                    "page_cursor": cursor,
+                },
+            )
 
     rerun_arguments = {
         "repository_id": "42",
@@ -551,6 +597,15 @@ def test_proactive_github_tools_use_exact_resource_targets_and_mutability() -> N
                 "expected_head_branch": "cyrene/assistant/task-1",
                 "expected_head_sha": "d" * 40,
                 "expected_attempt": 2,
+            },
+        ),
+        (
+            "github.commits.compare",
+            {
+                "repository_id": "42",
+                "repository": "acme/demo",
+                "base_sha": "a" * 39,
+                "head_sha": "b" * 40,
             },
         ),
     ],
