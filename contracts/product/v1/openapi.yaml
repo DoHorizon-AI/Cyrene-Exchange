@@ -171,6 +171,77 @@ paths:
           $ref: '#/components/responses/Problem'
         '503':
           $ref: '#/components/responses/Problem'
+  /api/v1/workspace/gateway-route-drafts/direct:
+    post:
+      operationId: createWorkspaceBindingRouteDraft
+      description: Create a source-less draft for a provider binding explicitly admitted by the Exchange operator. Endpoint access is checked against the authenticated organization and workspace.
+      security:
+      - WorkspaceControlBearer: []
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkspaceBindingRouteDraftRequest'
+      responses:
+        '201':
+          description: DRAFT created for the authenticated organization and workspace; provider selection remains an operator-owned binding.
+          content:
+            application/json:
+              schema:
+                $ref: ./workspace-gateway-route.schema.json
+        '403':
+          $ref: '#/components/responses/Problem'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+  /api/v1/workspace/gateway-route-drafts/{routeId}/actions/confirm:
+    post:
+      operationId: confirmWorkspaceGatewayRouteDraft
+      description: Recheck route ownership, current endpoint grant, endpoint state, admitted binding, and provider health before activating the exact draft version.
+      security:
+      - WorkspaceControlBearer: []
+      parameters:
+      - name: routeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmRouteRequest'
+      responses:
+        '200':
+          description: The confirmed workspace-scoped route without internal source URLs.
+          content:
+            application/json:
+              schema:
+                $ref: ./workspace-gateway-route.schema.json
+        '403':
+          $ref: '#/components/responses/Problem'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
   /api/v1/api-keys:
     post:
       operationId: createApiKey
@@ -2767,6 +2838,39 @@ components:
       description: >-
         Private Workspace command. The Reactor source selector is not a
         navigable ProductResourceReference and contains no network location.
+    CreateWorkspaceBindingRouteDraftRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - endpointId
+      - modelPattern
+      - targetBindingId
+      - targetModel
+      - priority
+      properties:
+        endpointId:
+          type: string
+          format: uuid
+        modelPattern:
+          type: string
+          minLength: 1
+          maxLength: 200
+        targetBindingId:
+          type: string
+          minLength: 1
+          maxLength: 300
+        targetModel:
+          type: string
+          minLength: 1
+          maxLength: 200
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 10000
+      title: CreateWorkspaceBindingRouteDraftRequest
+      description: >-
+        Workspace command for one Exchange operator-admitted provider binding.
+        It has no caller-supplied source URL or Reactor selector.
     EditRouteDraftRequest:
       properties:
         resourceVersion:

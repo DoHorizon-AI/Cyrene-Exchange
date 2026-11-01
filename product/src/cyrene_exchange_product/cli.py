@@ -34,8 +34,13 @@ from cyrene_exchange_product.domain import (
     WorkspaceEndpointGrant,
     WorkspaceReactorEndpointGrant,
 )
+from cyrene_exchange_product.media_artifacts import (
+    WorkAttachmentCredential,
+    WorkAttachmentHttpResolver,
+)
 from cyrene_exchange_product.route_admission import ReactorWorkspaceSourceResolver
 from cyrene_exchange_product.server import (
+    HealthCheckedDirectPluginModelProvider,
     OpenAICompatibleProvider,
     OperatorBindingResolver,
     RouteSourceProviderResolver,
@@ -183,6 +188,106 @@ def _bindings(entries: list[str]) -> dict[str, OpenAICompatibleProvider]:
     return resolved
 
 
+def _direct_plugin_bindings(
+    entries: list[str],
+) -> dict[str, HealthCheckedDirectPluginModelProvider]:
+    """Build local, Health-checked DirectPlugin model provider bindings.
+
+    中文：构建经 Health 检查的本地 DirectPlugin 模型提供方绑定。
+    """
+
+    if not entries:
+        return {}
+    try:
+        from cyrene_exchange_product.integrations.clients import (
+            DirectPluginHealthClient,
+            direct_plugin_client_from_connection,
+        )
+    except ImportError as exc:
+        raise SystemExit("DirectPlugin provider support requires the integrations extra") from exc
+
+    resolved: dict[str, HealthCheckedDirectPluginModelProvider] = {}
+    for entry in entries:
+        binding, separator, connection_ref = entry.partition("=")
+        binding = binding.strip()
+        connection_ref = connection_ref.strip()
+        if not separator or not binding or not connection_ref.startswith("grpc://"):
+            raise SystemExit(
+                "DirectPlugin providers must use BINDING=grpc://loopback-or-unix-target"
+            )
+        if binding in resolved:
+            raise SystemExit(f"DirectPlugin binding {binding!r} was configured more than once")
+        client = None
+        health_client = None
+        try:
+            client = direct_plugin_client_from_connection(connection_ref)
+            health_client = DirectPluginHealthClient(connection_ref)
+            resolved[binding] = HealthCheckedDirectPluginModelProvider(
+                binding,
+                client,
+                health_client,
+            )
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            for resource in (health_client, client):
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    close()
+            raise SystemExit(f"DirectPlugin provider binding {binding!r} is invalid") from exc
+    return resolved
+
+
+def _work_attachment_resolver(
+    origin: str | None,
+    entries: list[str],
+    *,
+    exchange_credentials: Mapping[str, ProductPrincipal],
+) -> WorkAttachmentHttpResolver | None:
+    """Resolve secrets from environment and bind each to an exact Product identity.
+
+    中文：从环境变量读取独立 Work 秘密，并绑定到确切的 Product 身份。
+    """
+
+    if bool(origin) != bool(entries):
+        raise SystemExit(
+            "Work attachment media requires both --work-attachment-origin and at least one "
+            "--work-attachment-credential-env"
+        )
+    if origin is None:
+        return None
+    profiles: dict[str, WorkAttachmentCredential] = {}
+    used_tokens = set(exchange_credentials)
+    for entry in entries:
+        parts = entry.split("=", 4)
+        if len(parts) != 5 or not all(part.strip() for part in parts):
+            raise SystemExit("Work media credential must use CREF=ORG=WORKSPACE=ACTOR=ENV")
+        credential_ref, organization_id, workspace_id, actor_id, variable_name = (
+            part.strip() for part in parts
+        )
+        token = os.environ.get(variable_name)
+        if not token or not token.strip():
+            raise SystemExit(
+                f"The configured Work attachment credential {variable_name!r} is empty"
+            )
+        if token in used_tokens:
+            raise SystemExit(
+                "Work attachment credentials must be distinct from Exchange credentials"
+            )
+        if credential_ref in profiles:
+            raise SystemExit("Work attachment credential_ref was configured more than once")
+        profiles[credential_ref] = WorkAttachmentCredential(
+            actor_id=actor_id,
+            workspace_id=workspace_id,
+            credential_ref=credential_ref,
+            organization_id=None if organization_id == "-" else organization_id,
+            token=token,
+        )
+        used_tokens.add(token)
+    try:
+        return WorkAttachmentHttpResolver(origin, profiles)
+    except ValueError as exc:
+        raise SystemExit("Work attachment resolver configuration is invalid") from exc
+
+
 def _principal(arguments: argparse.Namespace) -> ProductPrincipal:
     return ProductPrincipal(
         actor_id=arguments.actor_id,
@@ -205,7 +310,15 @@ def _timestamp(value: str) -> datetime:
 
 def _admitted_bindings(arguments: argparse.Namespace) -> frozenset[str]:
     declared = {entry.strip() for entry in arguments.allowed_bindings.split(",") if entry.strip()}
-    return frozenset(declared | set(_bindings(arguments.provider)))
+    direct_bindings: set[str] = set()
+    for entry in arguments.direct_plugin_provider:
+        binding, separator, connection_ref = entry.partition("=")
+        if not separator or not binding.strip() or not connection_ref.strip():
+            raise SystemExit(
+                "DirectPlugin providers must use BINDING=grpc://loopback-or-unix-target"
+            )
+        direct_bindings.add(binding.strip())
+    return frozenset(declared | set(_bindings(arguments.provider)) | direct_bindings)
 
 
 def _workspace_endpoint_grants(entries: list[str]) -> tuple[WorkspaceEndpointGrant, ...]:
@@ -303,6 +416,7 @@ def _serve(arguments: argparse.Namespace) -> int:
         raise SystemExit("--database is required for the selected runtime mode")
 
     credentials: dict[str, ProductPrincipal] = {}
+    control_only_credentials: dict[str, ProductPrincipal] = {}
     gateway_credentials: dict[str, ProductPrincipal] = {}
     if arguments.control_token and arguments.control_token_env:
         raise SystemExit("Choose either --control-token or --control-token-env")
@@ -313,10 +427,7 @@ def _serve(arguments: argparse.Namespace) -> int:
             raise SystemExit("The configured control credential variable is empty")
     if control_token:
         if arguments.organization_id:
-            raise SystemExit(
-                "Legacy --control-token credentials cannot carry organization scope; "
-                "use --control-credential-env"
-            )
+            raise SystemExit("Legacy --control-token credentials cannot carry organization scope")
         legacy_principal = ProductPrincipal(
             actor_id=arguments.actor_id,
             workspace_id=arguments.workspace_id,
@@ -346,13 +457,46 @@ def _serve(arguments: argparse.Namespace) -> int:
             credential_ref=credential_ref,
             organization_id=organization_id,
         )
-    for entry in arguments.gateway_credential_env:
-        parts = entry.split("=", 2)
-        if len(parts) != 3 or not all(part.strip() for part in parts):
+    for entry in arguments.control_only_credential_env:
+        parts = entry.split("=", 3)
+        if len(parts) != 4 or not all(part.strip() for part in parts):
             raise SystemExit(
-                "Gateway credential entries must use CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME"
+                "Control-only credentials must use CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME "
+                "(use '-' for an unscoped organization)"
             )
-        credential_ref, workspace_id, variable_name = (part.strip() for part in parts)
+        credential_ref, organization_id, workspace_id, variable_name = (
+            part.strip() for part in parts
+        )
+        token = os.environ.get(variable_name)
+        if not token:
+            raise SystemExit(
+                f"The configured control-only credential variable {variable_name!r} is empty"
+            )
+        if token in credentials or token in control_only_credentials:
+            raise SystemExit("The same bearer secret cannot be assigned to multiple control roles")
+        principal = ProductPrincipal(
+            actor_id=arguments.actor_id,
+            workspace_id=workspace_id,
+            credential_ref=credential_ref,
+            organization_id=None if organization_id == "-" else organization_id,
+        )
+        credentials[token] = principal
+        control_only_credentials[token] = principal
+    for entry in arguments.gateway_credential_env:
+        parts = entry.split("=", 3)
+        if len(parts) not in {3, 4} or not all(part.strip() for part in parts):
+            raise SystemExit(
+                "Gateway credentials must use CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME or "
+                "CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME"
+            )
+        if len(parts) == 3:
+            credential_ref, workspace_id, variable_name = (part.strip() for part in parts)
+            organization_id = None
+        else:
+            credential_ref, organization_id, workspace_id, variable_name = (
+                part.strip() for part in parts
+            )
+            organization_id = None if organization_id == "-" else organization_id
         token = os.environ.get(variable_name)
         if not token:
             raise SystemExit(
@@ -364,8 +508,17 @@ def _serve(arguments: argparse.Namespace) -> int:
             actor_id=arguments.actor_id,
             workspace_id=workspace_id,
             credential_ref=credential_ref,
+            organization_id=organization_id,
         )
-    providers = _bindings(arguments.provider)
+    if set(control_only_credentials) & set(gateway_credentials):
+        raise SystemExit(
+            "Control-only credentials must be distinct from Gateway data-plane credentials"
+        )
+    providers: dict[str, Any] = dict(_bindings(arguments.provider))
+    if arguments.provider_from_route_source and arguments.direct_plugin_provider:
+        raise SystemExit(
+            "--provider-from-route-source cannot be combined with DirectPlugin bindings"
+        )
     if arguments.provider_from_route_source:
         source_token = (
             os.environ.get(arguments.source_token_env) if arguments.source_token_env else None
@@ -380,15 +533,17 @@ def _serve(arguments: argparse.Namespace) -> int:
             allowed_source_origins=origins,
         )
     else:
-        resolver = OperatorBindingResolver(providers)
+        resolver = None
         resolver_factory = None
+    work_media_resolver = _work_attachment_resolver(
+        arguments.work_attachment_origin,
+        arguments.work_attachment_credential_env,
+        exchange_credentials={**credentials, **gateway_credentials},
+    )
     workspace_reactor_origin = arguments.workspace_reactor_origin
     workspace_reactor_token_env = arguments.workspace_reactor_token_env
     if bool(workspace_reactor_origin) != bool(workspace_reactor_token_env):
-        raise SystemExit(
-            "Workspace Reactor source requires both --workspace-reactor-origin and "
-            "--workspace-reactor-token-env"
-        )
+        raise SystemExit("Set both Workspace Reactor origin and token environment options")
     workspace_source_resolver = None
     if workspace_reactor_origin and workspace_reactor_token_env:
         workspace_reactor_token = os.environ.get(workspace_reactor_token_env)
@@ -405,23 +560,47 @@ def _serve(arguments: argparse.Namespace) -> int:
             )
         except ValueError as exc:
             raise SystemExit("Workspace Reactor source configuration is invalid") from exc
-    app = build_product_app(
-        database_path=arguments.database.resolve(),
-        resolver=resolver,
-        resolver_factory=resolver_factory,
-        control_credentials=credentials or None,
-        gateway_credentials=gateway_credentials or None,
-        workspace_endpoint_grants=_workspace_endpoint_grants(arguments.workspace_endpoint_grant),
-        workspace_reactor_endpoint_grants=_workspace_reactor_endpoint_grants(
-            arguments.workspace_reactor_endpoint_grant
-        ),
-        resolve_workspace_reactor_endpoint=(
-            workspace_source_resolver.resolve if workspace_source_resolver is not None else None
-        ),
-        allowed_binding_ids=_admitted_bindings(arguments),
-        endpoint_id=arguments.endpoint_id,
-        integrations=integrations,
+    endpoint_grants = _workspace_endpoint_grants(arguments.workspace_endpoint_grant)
+    reactor_endpoint_grants = _workspace_reactor_endpoint_grants(
+        arguments.workspace_reactor_endpoint_grant
     )
+    direct_providers = _direct_plugin_bindings(arguments.direct_plugin_provider)
+    duplicate_bindings = set(providers) & set(direct_providers)
+    if duplicate_bindings:
+        for provider in direct_providers.values():
+            provider.close()
+        if work_media_resolver is not None:
+            work_media_resolver.close()
+        raise SystemExit(
+            "provider bindings cannot be configured as both HTTP and DirectPlugin: "
+            + ", ".join(sorted(duplicate_bindings))
+        )
+    providers.update(direct_providers)
+    resolver = None if arguments.provider_from_route_source else OperatorBindingResolver(providers)
+    try:
+        app = build_product_app(
+            database_path=arguments.database.resolve(),
+            resolver=resolver,
+            resolver_factory=resolver_factory,
+            control_credentials=credentials or None,
+            control_only_credentials=control_only_credentials or None,
+            gateway_credentials=gateway_credentials or None,
+            workspace_endpoint_grants=endpoint_grants,
+            workspace_reactor_endpoint_grants=reactor_endpoint_grants,
+            resolve_workspace_reactor_endpoint=(
+                workspace_source_resolver.resolve if workspace_source_resolver is not None else None
+            ),
+            allowed_binding_ids=_admitted_bindings(arguments),
+            endpoint_id=arguments.endpoint_id,
+            integrations=integrations,
+            media_artifact_resolver=work_media_resolver,
+        )
+    except Exception:
+        for provider in direct_providers.values():
+            provider.close()
+        if work_media_resolver is not None:
+            work_media_resolver.close()
+        raise
     uvicorn.run(app, host=arguments.host, port=arguments.port, access_log=False)
     return 0
 
@@ -452,10 +631,7 @@ def _integration_listener_tls_options(
         environment_name=_INTEGRATION_TLS_KEY_ENV,
     )
     if (cert_path is None) != (key_path is None):
-        raise SystemExit(
-            "Exchange listener TLS requires both CYRENE_EXCHANGE_TLS_CERT_FILE and "
-            "CYRENE_EXCHANGE_TLS_KEY_FILE"
-        )
+        raise SystemExit("Exchange listener TLS requires both certificate and key files")
     if cert_path is None or key_path is None:
         return {}
     if runtime_mode != "integration-only":
@@ -1696,10 +1872,21 @@ def _key_revoke_api_key(arguments: argparse.Namespace) -> int:
 
 
 def _add_principal_arguments(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--actor-id", default="cyrene-operator")
-    command.add_argument("--workspace-id", default="default")
-    command.add_argument("--organization-id")
-    command.add_argument("--credential-ref", default="cred://exchange/operator")
+    command.add_argument(
+        "--actor-id",
+        default=os.environ.get("CYRENE_EXCHANGE_ACTOR_ID", "cyrene-operator"),
+    )
+    command.add_argument(
+        "--workspace-id",
+        default=os.environ.get("CYRENE_EXCHANGE_WORKSPACE_ID", "default"),
+    )
+    command.add_argument(
+        "--organization-id", default=os.environ.get("CYRENE_EXCHANGE_ORGANIZATION_ID")
+    )
+    command.add_argument(
+        "--credential-ref",
+        default=os.environ.get("CYRENE_EXCHANGE_CREDENTIAL_REF", "cred://exchange/operator"),
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1724,18 +1911,12 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--tls-cert-file",
         type=Path,
-        help=(
-            "Optional integration-only HTTPS certificate file; can also use "
-            "CYRENE_EXCHANGE_TLS_CERT_FILE"
-        ),
+        help="Optional integration HTTPS certificate; can use CYRENE_EXCHANGE_TLS_CERT_FILE",
     )
     serve.add_argument(
         "--tls-key-file",
         type=Path,
-        help=(
-            "Optional integration-only HTTPS private key file; can also use "
-            "CYRENE_EXCHANGE_TLS_KEY_FILE"
-        ),
+        help="Optional integration HTTPS private key; can use CYRENE_EXCHANGE_TLS_KEY_FILE",
     )
     serve.add_argument(
         "--control-token",
@@ -1760,13 +1941,23 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     serve.add_argument(
+        "--control-only-credential-env",
+        action="append",
+        default=[],
+        metavar="CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME",
+        help=(
+            "Add a control API bearer from an environment variable that cannot authenticate "
+            "Gateway data-plane requests; use '-' for an unscoped operator identity"
+        ),
+    )
+    serve.add_argument(
         "--gateway-credential-env",
         action="append",
         default=[],
-        metavar="CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME",
+        metavar="CREDENTIAL_REF=[ORG_ID=]WORKSPACE_ID=ENV_NAME",
         help=(
-            "Add a Gateway data-plane bearer from an environment variable; repeat "
-            "for multiple credentials or rotation"
+            "Add a Gateway data-plane bearer from an environment variable; include ORG_ID "
+            "for an organization-scoped identity (use '-' for an unscoped identity)"
         ),
     )
     serve.add_argument(
@@ -1774,10 +1965,7 @@ def parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="ENDPOINT_UUID=ORG_ID=WORKSPACE_ID",
-        help=(
-            "Operator grant allowing one organization/workspace to target an Exchange "
-            "GatewayEndpoint"
-        ),
+        help="Grant one organization/workspace access to an Exchange GatewayEndpoint",
     )
     serve.add_argument(
         "--workspace-reactor-endpoint-grant",
@@ -1801,6 +1989,30 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         metavar="BINDING=URL",
         help="Operator provider endpoint for one opaque binding id",
+    )
+    serve.add_argument(
+        "--direct-plugin-provider",
+        action="append",
+        default=[],
+        metavar="BINDING=grpc://LOOPBACK_OR_UNIX_TARGET",
+        help=(
+            "Bind a local DirectPluginRuntime model.provider.v1 endpoint; route confirmation "
+            "checks Health, plugin identity, and the declared capability"
+        ),
+    )
+    serve.add_argument(
+        "--work-attachment-origin",
+        help="Loopback HTTP or HTTPS origin of the Navigator Work attachment API",
+    )
+    serve.add_argument(
+        "--work-attachment-credential-env",
+        action="append",
+        default=[],
+        metavar="CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ACTOR_ID=ENV_NAME",
+        help=(
+            "Bind a separate Work bearer environment variable to one exact Exchange principal; "
+            "repeat for each authorized principal"
+        ),
     )
     serve.add_argument(
         "--provider-from-route-source",
@@ -1885,10 +2097,7 @@ def parser() -> argparse.ArgumentParser:
         )
     binding_export = integration_commands.add_parser(
         "connector-bindings",
-        help=(
-            "Export a Navigator launcher binding map for one actor and optional "
-            "organization/workspace"
-        ),
+        help="Export one actor's Navigator connector binding map",
     )
     binding_export.add_argument("--integration-database", type=Path, required=True)
     binding_export.add_argument("--issuer", required=True)
@@ -1906,10 +2115,7 @@ def parser() -> argparse.ArgumentParser:
     catalog_export.add_argument("--workspace-id", required=True)
     readiness_export = integration_commands.add_parser(
         "connector-readiness",
-        help=(
-            "Export Exchange-issued profiles, connections, and live tool catalogs "
-            "without credentials"
-        ),
+        help="Export safe Exchange profiles, connections, and live tool catalogs",
     )
     readiness_export.add_argument("--integration-database", type=Path, required=True)
     readiness_export.add_argument("--issuer", required=True)
@@ -1925,10 +2131,7 @@ def parser() -> argparse.ArgumentParser:
     bootstrap_connectors.add_argument(
         "--plan-only",
         action="store_true",
-        help=(
-            "Verify the current Directory role and print refs without linking profiles "
-            "or saving connections"
-        ),
+        help="Verify Directory role and print refs without linking profiles or saving connections",
     )
     office_setup = integration_commands.add_parser(
         "office-setup",

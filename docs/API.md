@@ -20,6 +20,8 @@ This document describes only surfaces implemented by the current source.
 | `GET /api/v1/workspace/gateway-routes` | List routes for the authenticated organization/workspace |
 | `POST /api/v1/gateway-route-drafts` | Create a DRAFT from an explicit Product handoff |
 | `POST /api/v1/workspace/gateway-route-drafts` | Create a scoped DRAFT with an operator-granted endpoint |
+| `POST /api/v1/workspace/gateway-route-drafts/direct` | Create a scoped DRAFT for an operator-admitted provider binding without a Reactor source |
+| `POST /api/v1/workspace/gateway-route-drafts/{routeId}/actions/confirm` | Recheck current workspace endpoint grant and provider health, then activate the exact DRAFT version |
 | `PATCH /api/v1/gateway-route-drafts/{routeId}` | Edit the inspected DRAFT version |
 | `POST /api/v1/gateway-route-drafts/{routeId}/actions/confirm` | Revalidate and activate the exact DRAFT version |
 | `POST /api/v1/api-keys` | Generate a gateway API key; the secret is returned once |
@@ -447,6 +449,8 @@ Anthropic Messages、WebSocket streaming、`GatewayFilterService`、MCP、Worker
 | `GET /api/v1/workspace/gateway-routes` | 按认证身份的组织/workspace 列出 Route。 |
 | `POST /api/v1/gateway-route-drafts` | 根据显式 Product 交接信息创建 DRAFT。 |
 | `POST /api/v1/workspace/gateway-route-drafts` | 使用 operator endpoint grant 创建 scoped DRAFT。 |
+| `POST /api/v1/workspace/gateway-route-drafts/direct` | 为 Exchange operator 已准入的 provider binding 创建无 Reactor 来源的 scoped DRAFT。 |
+| `POST /api/v1/workspace/gateway-route-drafts/{routeId}/actions/confirm` | 重查 endpoint grant 与 provider 健康后，启用精确 DRAFT 版本。 |
 | `PATCH /api/v1/gateway-route-drafts/{routeId}` | 编辑已检查版本的 DRAFT。 |
 | `POST /api/v1/gateway-route-drafts/{routeId}/actions/confirm` | 重新校验并启用精确版本的 DRAFT。 |
 | `POST /api/v1/api-keys` | 生成网关 API key；秘密值只返回一次。 |

@@ -10,6 +10,7 @@ This directory is the single persisted Product authority.
 | `store.py` | SQLite persistence and idempotency | SQLite 持久化与幂等 |
 | `service.py` | Endpoint and route commands | Endpoint 与 Route 命令 |
 | `routing.py` | ACTIVE-route projection and gateway composition | ACTIVE Route 投影与网关组合 |
+| `media_artifacts.py` | Principal-bound reads from authorized Work attachment storage | 按可信主体读取已授权 Work 附件 |
 | `route_admission.py` | Explicit source and provider validation | 显式来源与 Provider 校验 |
 | `audit.py` | Content-free request lifecycle observer | 不含内容的请求生命周期 observer |
 | `quota.py` | Product limit enforcement using Plugins-owned totals | 使用 Plugins-owned 总量执行 Product 上限 |

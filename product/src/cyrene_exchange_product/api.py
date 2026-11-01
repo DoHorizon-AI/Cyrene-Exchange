@@ -30,6 +30,7 @@ from cyrene_exchange_product.domain import (
     CreateEndpointRequest,
     CreateRouteDraftRequest,
     CreateRouteRequest,
+    CreateWorkspaceBindingRouteDraftRequest,
     CreateWorkspaceRouteDraftRequest,
     EditRouteDraftRequest,
     GatewayEndpoint,
@@ -60,6 +61,7 @@ from cyrene_exchange_product.service import ExchangeProductService
 from cyrene_exchange_product.store import ExchangeStore
 
 _TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
+WorkspaceReactorEndpointResolver = Callable[[WorkspaceReactorEndpointSelector, str], RouteSource]
 
 
 def _incoming_trace_id(value: str) -> str | None:
@@ -91,9 +93,7 @@ def create_app(
     control_credentials: Mapping[str, ProductPrincipal] | None = None,
     workspace_endpoint_grants: Iterable[WorkspaceEndpointGrant] = (),
     workspace_reactor_endpoint_grants: Iterable[WorkspaceReactorEndpointGrant] = (),
-    resolve_workspace_reactor_endpoint: (
-        Callable[[WorkspaceReactorEndpointSelector, str], RouteSource] | None
-    ) = None,
+    resolve_workspace_reactor_endpoint: WorkspaceReactorEndpointResolver | None = None,
     allowed_binding_ids: frozenset[str] = frozenset(),
     validate_route_target: Callable[[GatewayRoute], None] | None = None,
     store: ExchangeStore | None = None,
@@ -215,7 +215,8 @@ def create_app(
 
     @app.middleware("http")
     async def propagate_trace(
-        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
         parsed_trace = parse_w3c_traceparent(request.headers.get("traceparent"))
         if parsed_trace is not None:
@@ -426,7 +427,9 @@ def create_app(
         if organization_id is None:
             raise AssertionError("scoped_principal must return an organization-scoped identity")
         if not store.workspace_endpoint_is_granted(
-            command.endpoint_id, organization_id, identity.workspace_id
+            command.endpoint_id,
+            organization_id,
+            identity.workspace_id,
         ):
             raise ExchangeProductError(
                 code="EXCHANGE_ROUTE_PERMISSION_DENIED",
@@ -436,14 +439,14 @@ def create_app(
             )
         source_endpoint_id = command.source_endpoint.endpoint_id
         if not store.workspace_reactor_endpoint_is_granted(
-            source_endpoint_id, organization_id, identity.workspace_id
+            source_endpoint_id,
+            organization_id,
+            identity.workspace_id,
         ):
             raise ExchangeProductError(
                 code="EXCHANGE_SOURCE_PERMISSION_DENIED",
                 title="Reactor Endpoint not permitted",
-                detail=(
-                    "No operator grant permits this Reactor source in the authenticated workspace."
-                ),
+                detail="No operator grant permits this Reactor source in this workspace.",
                 status=403,
             )
         if resolve_workspace_reactor_endpoint is None:
@@ -470,6 +473,37 @@ def create_app(
             idempotency_command=command,
             reactor_source_endpoint_id=source_endpoint_id,
         )
+        return _workspace_route_projection(route)
+
+    @app.post(
+        "/api/v1/workspace/gateway-route-drafts/direct",
+        response_model=WorkspaceGatewayRoute,
+        status_code=201,
+    )
+    def create_workspace_binding_draft(
+        command: CreateWorkspaceBindingRouteDraftRequest,
+        request: Request,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> WorkspaceGatewayRoute:
+        """Create a source-less draft for one operator-admitted provider binding."""
+
+        identity = scoped_principal(request)
+        admit_binding(command.target_binding_id)
+        organization_id = identity.organization_id
+        if organization_id is None:
+            raise AssertionError("scoped_principal must return an organization-scoped identity")
+        if not store.workspace_endpoint_is_granted(
+            command.endpoint_id,
+            organization_id,
+            identity.workspace_id,
+        ):
+            raise ExchangeProductError(
+                code="EXCHANGE_ROUTE_PERMISSION_DENIED",
+                title="Endpoint not permitted",
+                detail="No operator grant permits this destination in the authenticated workspace.",
+                status=403,
+            )
+        route = service.create_workspace_binding_route_draft(command, idempotency_key, identity)
         return _workspace_route_projection(route)
 
     @app.patch("/api/v1/gateway-route-drafts/{routeId}", response_model=GatewayRoute)
@@ -501,8 +535,39 @@ def create_app(
                 retryable=True,
             )
         return service.confirm_route_draft(
-            route_id, command.resource_version, actor, validate_route_target
+            route_id,
+            command.resource_version,
+            actor,
+            validate_route_target,
         )
+
+    @app.post(
+        "/api/v1/workspace/gateway-route-drafts/{routeId}/actions/confirm",
+        response_model=WorkspaceGatewayRoute,
+    )
+    def confirm_workspace_draft(
+        route_id: Annotated[UUID, ApiPath(alias="routeId")],
+        command: ConfirmRouteRequest,
+        request: Request,
+    ) -> WorkspaceGatewayRoute:
+        identity = scoped_principal(request)
+        route = service.get_owned_workspace_draft(route_id, identity)
+        admit_binding(route.target_binding_id)
+        if validate_route_target is None:
+            raise ExchangeProductError(
+                code="EXCHANGE_TARGET_VALIDATOR_UNAVAILABLE",
+                title="Target verification unavailable",
+                detail="Configure the source and provider verifier before publishing this draft.",
+                status=503,
+                retryable=True,
+            )
+        active = service.confirm_workspace_route_draft(
+            route_id,
+            command.resource_version,
+            identity,
+            validate_route_target,
+        )
+        return _workspace_route_projection(active)
 
     @app.post(
         "/api/v1/api-keys",

@@ -46,6 +46,14 @@ Platform service calls use these fixed Product paths:
   credential's configured organization and workspace.
 - `POST /api/v1/workspace/gateway-route-drafts` creates a `DRAFT` in that same
   scope and requires `Idempotency-Key`.
+- `POST /api/v1/workspace/gateway-route-drafts/direct` creates a source-less
+  `DRAFT` for a provider binding explicitly admitted by the Exchange operator.
+  It still requires the current endpoint grant and cannot accept a Reactor URL.
+- `POST /api/v1/workspace/gateway-route-drafts/{routeId}/actions/confirm`
+  confirms the exact draft version after rechecking actor, organization,
+  workspace, current endpoint grant, endpoint state and provider availability.
+  DirectPlugin bindings must report `SERVING` for the expected plugin ID and
+  `model.provider.v1` before activation.
 
 The host maps each Bearer secret to a `ProductPrincipal` containing a
 server-assigned actor, organization, workspace and credential reference. Exchange
@@ -70,9 +78,13 @@ by a digest of the trusted organization/workspace pair.
 
 The operator CLI accepts repeatable `--control-credential-env
 CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME` entries for private control Bearers
-and `--gateway-credential-env CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME` entries for
-separate chat/data-plane Bearers. Both read secret values from environment
-variables; arguments contain only variable names. Keep the two maps distinct.
+and `--gateway-credential-env CREDENTIAL_REF=[ORG_ID=]WORKSPACE_ID=ENV_NAME`
+entries for separate chat/data-plane Bearers. The new
+`--control-only-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME`
+entry (use `-` for an unscoped organization) configures an operator API Bearer
+that is explicitly excluded from Gateway authentication. All secret values are
+read from environment variables; arguments contain only variable names. Keep
+the roles distinct.
 The old `--control-token(-env)` remains organization-unscoped and dual-use for
 legacy compatibility, but cannot call the private Workspace aliases. Prefer
 the environment form because raw CLI arguments can be visible to local process
@@ -81,13 +93,28 @@ inspection. Endpoint grants use repeatable
 control credential entries can provide same-scope token rotation under distinct
 credential references.
 
+For a local Plugins-owned provider, repeat
+`--direct-plugin-provider BINDING=grpc://127.0.0.1:PORT`. This local transport
+accepts only loopback or Unix-socket targets. Workspace route confirmation
+performs a bounded DirectPlugin Health check before publishing the binding.
+For authorized media, set `--work-attachment-origin` and repeat
+`--work-attachment-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ACTOR_ID=ENV_NAME`.
+Each Work bearer is separate from Exchange tokens and is bound to that exact
+Exchange principal; Work authorizes the attachment read and Exchange checks
+the returned digest, MIME type and bounded byte count before the model call.
+
 来源资源不可达、无权读取、版本变化、协议不兼容或 provider 探针失败时，草稿保持
 DRAFT 并返回明确错误。控制 API 不会把普通网关聊天凭据当作发布权限。只有上文的
 私有 Workspace 别名按组织和 workspace 隔离；其他 legacy control 路径保留现有实例级
 语义。WSL 不提供多租户 GPU 硬隔离。
 
 Platform 私有调用固定使用 `GET /api/v1/workspace/gateway-routes` 与
-`POST /api/v1/workspace/gateway-route-drafts`。Host 将 Bearer 摘要映射到服务端配置的
+`POST /api/v1/workspace/gateway-route-drafts`。模型提供方绑定还可通过
+`POST /api/v1/workspace/gateway-route-drafts/direct` 创建不带 Reactor 来源的 DRAFT；
+该路径只接受 operator 已准入的 binding，仍需精确 endpoint grant。
+`POST /api/v1/workspace/gateway-route-drafts/{routeId}/actions/confirm` 使用相同
+Workspace 控制凭据确认草稿，并在激活前重新检查 endpoint grant、Endpoint 状态、版本与
+Provider 健康。Host 将 Bearer 摘要映射到服务端配置的
 actor、组织、workspace 和 credential reference；数据库不保存明文 token。同一
 组织/workspace 可用不同 credential reference 配置多个轮换 token。没有组织范围或
 没有凭据时，私有路径拒绝请求。Operator 还必须通过
@@ -102,12 +129,21 @@ GatewayEndpoint；私有草稿在同一 SQLite 写事务中检查精确 grant �
 记录。草稿幂等键按可信组织/workspace 派生摘要分区。
 CLI 使用可重复的
 `--control-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME` 配置私有控制
-Bearer，并用 `--gateway-credential-env CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME` 配置独立
-聊天/数据面 Bearer；秘密从环境变量读取，参数中仅出现变量名。两类映射必须分开。
+Bearer，并用 `--gateway-credential-env CREDENTIAL_REF=[ORG_ID=]WORKSPACE_ID=ENV_NAME` 配置独立
+聊天/数据面 Bearer。`--control-only-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME`
+（无组织范围使用 `-`）能配置一个明确排除数据面认证的 Operator API Bearer；秘密从环境变量读取，参数中仅出现变量名。各角色必须分开。
 旧 `--control-token(-env)` 仅保留无组织范围的双用途兼容，不能调用私有 Workspace 别名。
 优先使用环境变量形式，避免明文出现在本机进程参数中。Endpoint grant 通过可重复的
 `--workspace-endpoint-grant ENDPOINT_UUID=ORG_ID=WORKSPACE_ID` 配置。多个控制凭据可用不同
 credential reference 为同一 scope 提供轮换。
+
+本地 Plugins-owned Provider 使用可重复的
+`--direct-plugin-provider BINDING=grpc://127.0.0.1:PORT`，只允许 loopback 或 Unix socket；
+Workspace 草稿确认前会通过 DirectPlugin Health 核对插件身份与 `model.provider.v1`。
+授权媒体使用 `--work-attachment-origin` 和可重复的
+`--work-attachment-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ACTOR_ID=ENV_NAME`；
+Work Bearer 独立于 Exchange 凭据并绑定到确切 Exchange principal。Work 负责授权附件读取，
+Exchange 在模型调用前校验摘要、MIME 与字节上限。
 
 ## Existing runner integration / 现有运行入口
 

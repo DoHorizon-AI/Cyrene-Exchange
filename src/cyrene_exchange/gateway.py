@@ -178,12 +178,17 @@ class RequestPrincipal:
     workspace_id: str
     credential_ref: str
     model_scope: frozenset[str] = field(default_factory=frozenset)
+    organization_id: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("actor_id", "workspace_id", "credential_ref"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"request principal {field_name} must be non-empty text")
+        if self.organization_id is not None and (
+            not isinstance(self.organization_id, str) or not self.organization_id.strip()
+        ):
+            raise ValueError("request principal organization_id must be non-empty text when configured")
         for pattern in self.model_scope:
             if not isinstance(pattern, str) or not pattern.strip():
                 raise ValueError("request principal model_scope patterns must be non-empty text")
@@ -1021,6 +1026,8 @@ class ExchangeGateway:
                         principal=principal,
                         cancel_event=cancel_event,
                     )
+                except RequestCancelled:
+                    raise
                 except Exception as exc:
                     raise MediaArtifactUnavailableError("media artifact is unavailable to this principal") from exc
                 if cancel_event.is_set():

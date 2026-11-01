@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -28,11 +28,13 @@ import httpx
 from cyrene_exchange.capabilities import (
     MODEL_PROVIDER_CAPABILITY,
     ProviderChunk,
+    ProviderEmbeddingBatch,
     ProviderInvocationCancelled,
     ProviderUsage,
 )
-from cyrene_exchange.gateway import GatewayError
-from cyrene_exchange.protocol import NormalizedInferenceRequest
+from cyrene_exchange.direct_plugin import DirectPluginModelProvider
+from cyrene_exchange.gateway import GatewayError, MediaArtifactResolver
+from cyrene_exchange.protocol import NormalizedEmbeddingRequest, NormalizedInferenceRequest
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -246,6 +248,99 @@ class OperatorBindingResolver:
                 f"no operator provider is configured for binding {implementation_ref!r}"
             )
         return provider
+
+    def validate_route(self, route: Any) -> None:
+        """Run a provider-specific availability check before route activation.
+
+        中文：激活路由前执行提供方专属的可用性检查。
+        """
+
+        provider = self.resolve(MODEL_PROVIDER_CAPABILITY, route.target_binding_id)
+        validate = getattr(provider, "validate_route", None)
+        if callable(validate):
+            validate(route)
+
+    def close(self) -> None:
+        """Close provider adapters that own runtime connections."""
+
+        seen: set[int] = set()
+        for provider in self._bindings.values():
+            close = getattr(provider, "close", None)
+            if callable(close) and id(provider) not in seen:
+                seen.add(id(provider))
+                close()
+
+
+class HealthCheckedDirectPluginModelProvider:
+    """Bind one DirectPlugin endpoint and verify its model capability on confirm.
+
+    This adapter delegates inference to Exchange's existing model-provider
+    bridge; it does not select plugins or own their process lifecycle.
+
+    中文：绑定一个 DirectPlugin 端点，并在确认路由时核对其模型能力；不选择或启动插件。
+    """
+
+    def __init__(
+        self,
+        binding_id: str,
+        client: Any,
+        health_client: Any,
+        *,
+        expected_plugin_id: str = "cyrene.providers.model-api-connector",
+    ) -> None:
+        if not binding_id.strip() or not expected_plugin_id.strip():
+            raise ValueError("DirectPlugin binding and plugin identity must be non-empty")
+        self._binding_id = binding_id
+        self._provider = DirectPluginModelProvider(client)
+        self._client = client
+        self._health_client = health_client
+        self._expected_plugin_id = expected_plugin_id
+
+    def complete(
+        self,
+        request: NormalizedInferenceRequest,
+        *,
+        cancel_event: Event,
+    ) -> Iterable[ProviderChunk]:
+        """Forward normalized chat through the typed model.provider.v1 adapter."""
+
+        return cast(
+            Iterable[ProviderChunk],
+            self._provider.complete(request, cancel_event=cancel_event),
+        )
+
+    def embed(
+        self,
+        request: NormalizedEmbeddingRequest,
+        *,
+        cancel_event: Event,
+    ) -> ProviderEmbeddingBatch:
+        """Forward embeddings through the same DirectPlugin capability binding."""
+
+        return self._provider.embed(request, cancel_event=cancel_event)
+
+    def validate_route(self, route: Any) -> None:
+        """Require a serving model-api-connector endpoint before publication."""
+
+        if route.target_binding_id != self._binding_id:
+            raise ProviderUnavailableError("route binding does not match the DirectPlugin endpoint")
+        observation = self._health_client.observe()
+        if (
+            observation.status != "SERVING"
+            or observation.plugin_id != self._expected_plugin_id
+            or MODEL_PROVIDER_CAPABILITY not in observation.capabilities
+        ):
+            raise ProviderUnavailableError(
+                "the configured DirectPlugin endpoint is not serving model.provider.v1"
+            )
+
+    def close(self) -> None:
+        """Close the DirectPlugin invocation and Health channels exactly once."""
+
+        for resource in (self._health_client, self._client):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
 
 
 class RouteSourceProviderResolver:
@@ -517,6 +612,7 @@ def build_product_app(
     resolver: Any = None,
     resolver_factory: Callable[[Any], Any] | None = None,
     control_credentials: Mapping[str, ProductPrincipal] | None = None,
+    control_only_credentials: Mapping[str, ProductPrincipal] | None = None,
     gateway_credentials: Mapping[str, ProductPrincipal] | None = None,
     workspace_endpoint_grants: Iterable[WorkspaceEndpointGrant] = (),
     workspace_reactor_endpoint_grants: Iterable[WorkspaceReactorEndpointGrant] = (),
@@ -529,6 +625,7 @@ def build_product_app(
     record_requests: bool = True,
     web_dist: Path | str | None = None,
     integrations: IntegrationServices | None = None,
+    media_artifact_resolver: MediaArtifactResolver | None = None,
 ) -> FastAPI:
     """Fuse the control-plane API with the OpenAI-compatible data plane.
 
@@ -550,11 +647,14 @@ def build_product_app(
             "EXCHANGE_RESOLVER_INVALID: provide exactly one of resolver or resolver_factory"
         )
     control_map = control_credentials or {}
+    control_only_map = control_only_credentials or {}
     configured_gateway_map = gateway_credentials or {}
+    if any(control_map.get(token) != principal for token, principal in control_only_map.items()):
+        raise ValueError("control-only credentials must be present in control_credentials")
     effective_gateway_credentials = {
         token: principal
         for token, principal in control_map.items()
-        if principal.organization_id is None
+        if principal.organization_id is None and token not in control_only_map
     }
     for token, principal in configured_gateway_map.items():
         control_principal = control_map.get(token)
@@ -602,9 +702,14 @@ def build_product_app(
         credentials=effective_gateway_credentials,
         record_requests=record_requests,
         activity=activity,
+        media_artifact_resolver=media_artifact_resolver,
     )
     if activity is not None:
         app.router.on_shutdown.append(activity.close)
+    for resource in (effective, media_artifact_resolver):
+        close = getattr(resource, "close", None)
+        if callable(close):
+            app.router.on_shutdown.append(close)
     data_plane_resolver = data_plane_principal_resolver(store, effective_gateway_credentials)
 
     @app.get("/healthz")

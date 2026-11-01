@@ -287,6 +287,7 @@ class ExchangeStore:
         *,
         idempotency_scope: str = "create-route-draft",
         reactor_source_endpoint_id: UUID | None = None,
+        workspace_binding_route: bool = False,
     ) -> GatewayRoute:
         """Atomically retain the draft and Send to retry identity. | 原子保存草稿与幂等身份。"""
         with self._mutation() as cursor:
@@ -318,34 +319,40 @@ class ExchangeStore:
                         detail="No GatewayEndpoint exists with the requested id.",
                         status=404,
                     )
-                if reactor_source_endpoint_id is None:
-                    raise ExchangeProductError(
-                        code="EXCHANGE_SOURCE_PERMISSION_DENIED",
-                        title="Reactor Endpoint not permitted",
-                        detail="A server-resolved Reactor Endpoint is required for private drafts.",
-                        status=403,
-                    )
-                source_grant = cursor.execute(
-                    """
-                    SELECT 1 FROM workspace_reactor_endpoint_grants
-                    WHERE endpoint_id = ? AND organization_id = ? AND workspace_id = ?
-                    """,
-                    (
-                        str(reactor_source_endpoint_id),
-                        route.organization_id,
-                        route.workspace_id,
-                    ),
-                ).fetchone()
-                if source_grant is None:
+                if reactor_source_endpoint_id is None and not (
+                    workspace_binding_route and route.source is None
+                ):
                     raise ExchangeProductError(
                         code="EXCHANGE_SOURCE_PERMISSION_DENIED",
                         title="Reactor Endpoint not permitted",
                         detail=(
-                            "No operator grant permits this Reactor Endpoint in the "
-                            "authenticated workspace."
+                            "A server-resolved Reactor Endpoint or an operator-admitted binding "
+                            "is required for private drafts."
                         ),
                         status=403,
                     )
+                if reactor_source_endpoint_id is not None:
+                    source_grant = cursor.execute(
+                        """
+                        SELECT 1 FROM workspace_reactor_endpoint_grants
+                        WHERE endpoint_id = ? AND organization_id = ? AND workspace_id = ?
+                        """,
+                        (
+                            str(reactor_source_endpoint_id),
+                            route.organization_id,
+                            route.workspace_id,
+                        ),
+                    ).fetchone()
+                    if source_grant is None:
+                        raise ExchangeProductError(
+                            code="EXCHANGE_SOURCE_PERMISSION_DENIED",
+                            title="Reactor Endpoint not permitted",
+                            detail=(
+                                "No operator grant permits this Reactor Endpoint in the "
+                                "authenticated workspace."
+                            ),
+                            status=403,
+                        )
             replay = self.resolve_idempotency(idempotency_scope, key, digest)
             if replay is not None:
                 existing = self.get_route(UUID(replay))
@@ -762,7 +769,7 @@ class ExchangeStore:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT actor_id, workspace_id, credential_ref, model_scope
+                SELECT actor_id, workspace_id, credential_ref, model_scope, organization_id
                 FROM api_credentials
                 WHERE token_digest = ? AND enabled = 1
                   AND (expires_at IS NULL OR expires_at > ?)
@@ -777,6 +784,9 @@ class ExchangeStore:
             workspace_id=str(row["workspace_id"]),
             credential_ref=str(row["credential_ref"]),
             model_scope=frozenset(str(item) for item in scope),
+            organization_id=(
+                str(row["organization_id"]) if row["organization_id"] is not None else None
+            ),
         )
 
     def resolve_data_plane_credential(
@@ -798,7 +808,8 @@ class ExchangeStore:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT actor_id, workspace_id, credential_ref, model_scope, api_key_id
+                SELECT actor_id, workspace_id, credential_ref, model_scope, api_key_id,
+                       organization_id
                 FROM api_credentials
                 WHERE token_digest = ? AND enabled = 1
                   AND (expires_at IS NULL OR expires_at > ?)
@@ -813,6 +824,9 @@ class ExchangeStore:
             workspace_id=str(row["workspace_id"]),
             credential_ref=str(row["credential_ref"]),
             model_scope=frozenset(str(item) for item in scope),
+            organization_id=(
+                str(row["organization_id"]) if row["organization_id"] is not None else None
+            ),
         )
 
     def resolve_product_credential(self, token: str) -> ProductPrincipal | None:
