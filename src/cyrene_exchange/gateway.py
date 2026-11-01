@@ -16,30 +16,33 @@ Exchange Product Core 的请求策略与能力编排。
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from threading import Event
 from typing import Any, Literal, Protocol
-
-from .logging import format_cyrene_log, parse_w3c_traceparent
 
 from .capabilities import (
     MODEL_PROVIDER_CAPABILITY,
     MODEL_ROUTING_CAPABILITY,
     CapabilityResolver,
+    ModelEmbeddingCapability,
     ModelProviderCapability,
     ModelRoutingCapability,
     ProviderChunk,
+    ProviderEmbeddingBatch,
+    ProviderEmbeddingError,
     ProviderInvocationCancelled,
     ProviderUsage,
     RouteTarget,
     ToolCallDelta,
 )
-from .protocol import NormalizedInferenceRequest, ProtocolError
+from .logging import format_cyrene_log, parse_w3c_traceparent
+from .protocol import MAX_CHAT_MEDIA_BYTES, NormalizedEmbeddingRequest, NormalizedInferenceRequest, ProtocolError
 
 
 class GatewayError(Exception):
@@ -79,6 +82,16 @@ class InvalidRequestError(GatewayError):
     error_type = "invalid_request_error"
 
 
+class MediaArtifactUnavailableError(GatewayError):
+    """A requested opaque media reference could not be safely resolved.
+
+    中文:请求中的不透明媒体引用无法安全解析。
+    """
+
+    status_code = 424
+    error_type = "media_artifact_unavailable"
+
+
 class ModelNotPermittedError(GatewayError):
     """The credential's model scope excludes the requested model.
 
@@ -101,6 +114,33 @@ class ProviderFailureError(GatewayError):
     def __init__(self, message: str, *, usage: ProviderUsage | None = None) -> None:
         super().__init__(message)
         self.usage = usage
+
+
+class EmbeddingProviderResponseError(GatewayError):
+    """A typed error returned by the selected embeddings provider.
+
+    中文:所选 embeddings 提供方返回的有类型错误。
+    """
+
+    _ERRORS = {
+        1: (400, "invalid_request_error"),
+        2: (404, "model_not_found"),
+        3: (502, "provider_error"),
+        4: (502, "provider_error"),
+        5: (429, "rate_limit_error"),
+    }
+
+    def __init__(self, error: ProviderEmbeddingError) -> None:
+        self.status_code, self.error_type = self._ERRORS[error.code]
+        self.code = error.code
+        self.retry_after_seconds = error.retry_after_seconds
+        super().__init__(error.message)
+
+    def to_openai_error(self) -> dict[str, Any]:
+        detail: dict[str, Any] = {"message": self.message, "type": self.error_type, "code": self.code}
+        if self.retry_after_seconds is not None:
+            detail["retry_after_seconds"] = self.retry_after_seconds
+        return {"error": detail}
 
 
 class RequestCancelled(GatewayError):
@@ -157,6 +197,38 @@ class RequestPrincipal:
         if not self.model_scope:
             return True
         return any(fnmatchcase(model, pattern) for pattern in self.model_scope)
+
+
+@dataclass(frozen=True)
+class ResolvedMediaArtifact:
+    """Authorized media bytes and their content identity from a Product store.
+
+    中文:Product 存储返回的、已授权媒体 bytes 及其内容身份。
+    """
+
+    mime_type: str
+    data: bytes
+    sha256: str
+    size: int
+
+
+class MediaArtifactResolver(Protocol):
+    """Product adapter that resolves an opaque media ID for one principal.
+
+    中文:按调用主体解析不透明媒体 ID 的 Product adapter。
+    """
+
+    def read(
+        self,
+        artifact_id: str,
+        *,
+        principal: RequestPrincipal,
+        cancel_event: Event,
+    ) -> ResolvedMediaArtifact:
+        """Return the artifact only when this principal may read it.
+
+        仅在此主体有权读取制品时返回内容。
+        """
 
 
 @dataclass(frozen=True)
@@ -251,6 +323,36 @@ class NoOpLifecycleObserver:
         stream: bool | None,
     ) -> None:
         pass
+
+
+def _request_for_routing(request: NormalizedInferenceRequest) -> NormalizedInferenceRequest:
+    """Keep media bytes and artifact IDs out of model-route selection.
+
+    中文:路由选择只保留媒体类型和大小，不传媒体 bytes 或 artifact ID。
+    """
+
+    messages: list[dict[str, Any]] = []
+    for message in request.messages:
+        content = message.get("content")
+        if not isinstance(content, (list, tuple)):
+            messages.append(dict(message))
+            continue
+        routed_parts: list[dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, Mapping) or part.get("type") == "text":
+                routed_parts.append(dict(part) if isinstance(part, Mapping) else {})
+                continue
+            metadata: dict[str, Any] = {"type": part.get("type"), "mime_type": part.get("mime_type")}
+            data = part.get("data")
+            if isinstance(data, bytes):
+                metadata["byte_length"] = len(data)
+            else:
+                metadata["has_artifact"] = "artifact_id" in part
+            routed_parts.append(metadata)
+        routed_message = dict(message)
+        routed_message["content"] = tuple(routed_parts)
+        messages.append(routed_message)
+    return replace(request, messages=tuple(messages))
 
 
 @dataclass(frozen=True)
@@ -351,6 +453,7 @@ class ExchangeGateway:
         principal_resolver: TokenPrincipalResolver | None = None,
         lifecycle_observer: RequestLifecycleObserver | None = None,
         quota_checker: Callable[[RequestPrincipal], None] | None = None,
+        media_artifact_resolver: MediaArtifactResolver | None = None,
         max_route_attempts: int = 3,
     ) -> None:
         if max_route_attempts <= 0:
@@ -365,6 +468,7 @@ class ExchangeGateway:
         self._principal_resolver = principal_resolver
         self._lifecycle_observer = lifecycle_observer
         self._quota_checker = quota_checker
+        self._media_artifact_resolver = media_artifact_resolver
         self._max_route_attempts = max_route_attempts
 
     # ════════════════════════════════════════════════════════════════════════
@@ -481,7 +585,7 @@ class ExchangeGateway:
             )
             raise error from exc
         try:
-            candidates = list(router.plan(request))[: self._max_route_attempts]
+            candidates = list(router.plan(_request_for_routing(request)))[: self._max_route_attempts]
         except Exception as exc:
             error = NoRouteError(f"model routing failed: {exc}")
             self._observe_rejected(
@@ -504,6 +608,29 @@ class ExchangeGateway:
                 stream=request.stream,
             )
             raise error
+
+        try:
+            request = self._resolve_media_artifacts(request, principal, cancel_event)
+        except RequestCancelled as exc:
+            self._observe_rejected(
+                request_id=request_id,
+                principal=principal,
+                status="cancelled",
+                error_type=exc.error_type,
+                model=request.model,
+                stream=request.stream,
+            )
+            raise
+        except MediaArtifactUnavailableError as exc:
+            self._observe_rejected(
+                request_id=request_id,
+                principal=principal,
+                status="rejected",
+                error_type=exc.error_type,
+                model=request.model,
+                stream=request.stream,
+            )
+            raise
 
         failures: list[str] = []
         for target in candidates:
@@ -623,6 +750,206 @@ class ExchangeGateway:
         detail = "; ".join(failures) or "all provider candidates failed"
         raise ProviderFailureError(detail)
 
+    def handle_openai_embeddings(
+        self,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        *,
+        cancel_event: Event | None = None,
+        request_id: str | None = None,
+    ) -> GatewayResponse:
+        """Authenticate, route, audit and execute one embeddings request.
+
+        中文:认证、路由、审计并执行一次 embeddings 请求。
+        """
+
+        request_id = request_id or f"emb-{uuid.uuid4().hex}"
+        cancel_event = cancel_event or Event()
+        try:
+            principal = self._authenticate(headers)
+        except AuthenticationError as exc:
+            self._observe_rejected(
+                request_id=request_id,
+                principal=None,
+                status="rejected",
+                error_type=exc.error_type,
+                model=self._payload_model(payload),
+                stream=False,
+            )
+            raise
+
+        if self._quota_checker is not None:
+            try:
+                self._quota_checker(principal)
+            except (QuotaExceededError, QuotaUnavailableError) as exc:
+                self._observe_rejected(
+                    request_id=request_id,
+                    principal=principal,
+                    status="rejected",
+                    error_type=exc.error_type,
+                    model=self._payload_model(payload),
+                    stream=False,
+                )
+                raise
+        if cancel_event.is_set():
+            self._observe_rejected(
+                request_id=request_id,
+                principal=principal,
+                status="cancelled",
+                error_type=RequestCancelled.error_type,
+                model=self._payload_model(payload),
+                stream=False,
+            )
+            raise RequestCancelled("request was cancelled before routing")
+
+        try:
+            request = NormalizedEmbeddingRequest.from_openai(payload)
+        except ProtocolError as exc:
+            error = InvalidRequestError(str(exc))
+            self._observe_rejected(
+                request_id=request_id,
+                principal=principal,
+                status="rejected",
+                error_type=error.error_type,
+                model=self._payload_model(payload),
+                stream=False,
+            )
+            raise error from exc
+
+        if not principal.permits(request.model):
+            error = ModelNotPermittedError(f"credential is not permitted to use model {request.model}")
+            self._observe_rejected(
+                request_id=request_id,
+                principal=principal,
+                status="rejected",
+                error_type=error.error_type,
+                model=request.model,
+                stream=False,
+            )
+            raise error
+
+        try:
+            router = self._resolve_router()
+            candidates = list(router.plan(request))[: self._max_route_attempts]
+        except NoRouteError as exc:
+            self._observe_rejected(
+                request_id=request_id,
+                principal=principal,
+                status="rejected",
+                error_type=exc.error_type,
+                model=request.model,
+                stream=False,
+            )
+            raise
+        except Exception as exc:
+            error = NoRouteError(f"model routing failed: {exc}")
+            self._observe_rejected(
+                request_id=request_id,
+                principal=principal,
+                status="rejected",
+                error_type=error.error_type,
+                model=request.model,
+                stream=False,
+            )
+            raise error from exc
+        if not candidates:
+            error = NoRouteError(f"no route available for model '{request.model}'")
+            self._observe_rejected(
+                request_id=request_id,
+                principal=principal,
+                status="rejected",
+                error_type=error.error_type,
+                model=request.model,
+                stream=False,
+            )
+            raise error
+
+        failures: list[str] = []
+        for target in candidates:
+            if cancel_event.is_set():
+                self._observe_rejected(
+                    request_id=request_id,
+                    principal=principal,
+                    status="cancelled",
+                    error_type=RequestCancelled.error_type,
+                    model=request.model,
+                    stream=False,
+                )
+                raise RequestCancelled("request was cancelled before provider execution")
+            route_id = target.route_id or target.provider_ref
+            metadata = RequestMetadata(
+                request_id=request_id,
+                model=request.model,
+                stream=False,
+                route_id=route_id,
+                provider_ref=target.provider_ref,
+                principal=principal,
+            )
+            started = False
+            try:
+                self._observe_started(metadata)
+                started = True
+                provider = self._resolve_embedding_provider(target)
+                provider_request = request
+                if target.model and target.model != request.model:
+                    provider_request = NormalizedEmbeddingRequest(
+                        model=target.model,
+                        inputs=request.inputs,
+                    )
+                batch = provider.embed(provider_request, cancel_event=cancel_event)
+                if not isinstance(batch, ProviderEmbeddingBatch) or len(batch.vectors) != len(request.inputs):
+                    raise ProviderFailureError("embedding provider returned an incomplete batch")
+                body = {
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "embedding": list(vector), "index": index}
+                        for index, vector in enumerate(batch.vectors)
+                    ],
+                    "model": batch.model,
+                }
+                self._observe_finished(metadata, status="completed", usage=None, error_type=None)
+                return GatewayResponse(
+                    request_id=request_id,
+                    model=batch.model,
+                    status_code=200,
+                    body=body,
+                    stream=False,
+                    route_id=route_id,
+                )
+            except RequestCancelled as exc:
+                if started:
+                    self._observe_finished(metadata, status="cancelled", usage=None, error_type=exc.error_type)
+                raise
+            except ProviderInvocationCancelled as exc:
+                error = RequestCancelled("embedding provider invocation was cancelled")
+                if started:
+                    self._observe_finished(metadata, status="cancelled", usage=None, error_type=error.error_type)
+                raise error from exc
+            except ProviderEmbeddingError as exc:
+                error = EmbeddingProviderResponseError(exc)
+                if started:
+                    self._observe_finished(metadata, status="failed", usage=None, error_type=error.error_type)
+                raise error from exc
+            except GatewayLifecycleError:
+                raise
+            except Exception as exc:
+                if cancel_event.is_set():
+                    error = RequestCancelled("request was cancelled during provider execution")
+                    if started:
+                        self._observe_finished(metadata, status="cancelled", usage=None, error_type=error.error_type)
+                    raise error from exc
+                if started:
+                    self._observe_finished(
+                        metadata,
+                        status="failed",
+                        usage=None,
+                        error_type=self._audit_error_type(exc),
+                    )
+                failures.append(f"{route_id}: {exc}")
+
+        detail = "; ".join(failures) or "all embedding provider candidates failed"
+        raise ProviderFailureError(detail)
+
     def _authenticate(self, headers: Mapping[str, str]) -> RequestPrincipal:
         authorization = next(
             (value for key, value in headers.items() if key.lower() == "authorization"),
@@ -656,6 +983,69 @@ class ExchangeGateway:
         if isinstance(principal, RequestPrincipal):
             return principal
         raise AuthenticationError("invalid credentials")
+
+    def _resolve_media_artifacts(
+        self,
+        request: NormalizedInferenceRequest,
+        principal: RequestPrincipal,
+        cancel_event: Event,
+    ) -> NormalizedInferenceRequest:
+        total_bytes = 0
+        resolved_messages: list[dict[str, Any]] = []
+        for message_index, message in enumerate(request.messages):
+            content = message.get("content")
+            if not isinstance(content, (list, tuple)):
+                resolved_messages.append(dict(message))
+                continue
+            resolved_parts: list[dict[str, Any]] = []
+            for part_index, raw_part in enumerate(content):
+                if not isinstance(raw_part, Mapping) or "artifact_id" not in raw_part:
+                    inline = raw_part.get("data") if isinstance(raw_part, Mapping) else None
+                    if isinstance(inline, bytes):
+                        total_bytes += len(inline)
+                        if total_bytes > MAX_CHAT_MEDIA_BYTES:
+                            raise MediaArtifactUnavailableError("resolved media exceeds the maximum aggregate size")
+                    resolved_parts.append(dict(raw_part) if isinstance(raw_part, Mapping) else {})
+                    continue
+                if cancel_event.is_set():
+                    raise RequestCancelled("request was cancelled while resolving media")
+                resolver = self._media_artifact_resolver
+                if resolver is None:
+                    raise MediaArtifactUnavailableError("media artifact resolution is unavailable")
+                artifact_id = raw_part.get("artifact_id")
+                if not isinstance(artifact_id, str):
+                    raise MediaArtifactUnavailableError("media artifact reference is invalid")
+                try:
+                    artifact = resolver.read(
+                        artifact_id,
+                        principal=principal,
+                        cancel_event=cancel_event,
+                    )
+                except Exception as exc:
+                    raise MediaArtifactUnavailableError("media artifact is unavailable to this principal") from exc
+                if cancel_event.is_set():
+                    raise RequestCancelled("request was cancelled while resolving media")
+                if not isinstance(artifact, ResolvedMediaArtifact):
+                    raise MediaArtifactUnavailableError("media artifact resolver returned an invalid result")
+                expected_mime = raw_part.get("mime_type")
+                if artifact.mime_type != expected_mime or not isinstance(artifact.data, bytes) or not artifact.data:
+                    raise MediaArtifactUnavailableError("media artifact content does not match its reference")
+                if artifact.size != len(artifact.data) or artifact.size > MAX_CHAT_MEDIA_BYTES:
+                    raise MediaArtifactUnavailableError("media artifact size is invalid")
+                digest = hashlib.sha256(artifact.data).hexdigest()
+                if artifact.sha256 != digest:
+                    raise MediaArtifactUnavailableError("media artifact digest verification failed")
+                total_bytes += artifact.size
+                if total_bytes > MAX_CHAT_MEDIA_BYTES:
+                    raise MediaArtifactUnavailableError("resolved media exceeds the maximum aggregate size")
+                resolved = dict(raw_part)
+                resolved.pop("artifact_id", None)
+                resolved["data"] = artifact.data
+                resolved_parts.append(resolved)
+            copied = dict(message)
+            copied["content"] = tuple(resolved_parts)
+            resolved_messages.append(copied)
+        return replace(request, messages=tuple(resolved_messages))
 
     @staticmethod
     def _payload_model(payload: Mapping[str, Any]) -> str | None:
@@ -738,6 +1128,12 @@ class ExchangeGateway:
         provider = self._resolver.resolve(MODEL_PROVIDER_CAPABILITY, target.provider_ref)
         if not hasattr(provider, "complete"):
             raise ProviderFailureError(f"resolved provider '{target.provider_ref}' is invalid")
+        return provider  # type: ignore[return-value]
+
+    def _resolve_embedding_provider(self, target: RouteTarget) -> ModelEmbeddingCapability:
+        provider = self._resolver.resolve(MODEL_PROVIDER_CAPABILITY, target.provider_ref)
+        if not hasattr(provider, "embed"):
+            raise ProviderFailureError(f"resolved embedding provider '{target.provider_ref}' is invalid")
         return provider  # type: ignore[return-value]
 
     def _collect_response(

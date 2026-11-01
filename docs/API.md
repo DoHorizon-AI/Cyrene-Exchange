@@ -335,17 +335,17 @@ API Key 由服务端生成为 `cyk_…` 密钥；Exchange 只保存 SHA-256 摘�
 密钥包含名称、可选过期时间和可选的 `fnmatch` 模型范围；范围为空表示允许全部
 ACTIVE 路由。
 
-`GET /v1/models` and `POST /v1/chat/completions` require a Gateway data-plane
+`GET /v1/models`, `POST /v1/chat/completions`, and `POST /v1/embeddings` require a Gateway data-plane
 credential or a generated API key. Organization-scoped Workspace control
 credentials are accepted only by their fixed private control paths and receive
-401 on both data-plane paths. The legacy organization-unscoped
+401 on all data-plane paths. The legacy organization-unscoped
 `--control-token(-env)` remains dual-use for compatibility and cannot access the
 private Workspace aliases. A key outside its model scope receives a
 `model_not_permitted` error and the rejected request is audited.
 
-`GET /v1/models` 与 `POST /v1/chat/completions` 要求独立的 Gateway 数据面凭据
+`GET /v1/models`、`POST /v1/chat/completions` 与 `POST /v1/embeddings` 要求独立的 Gateway 数据面凭据
 或服务端生成的 API key。组织范围 Workspace 控制凭据只能调用固定私有控制路径，
-访问两个数据面路径均返回 401。为兼容保留的旧无组织范围
+访问数据面路径均返回 401。为兼容保留的旧无组织范围
 `--control-token(-env)` 仍可双用途使用，但不能调用私有 Workspace 别名。超出模型
 范围的 key 请求返回 `model_not_permitted`，且拒绝会写入审计。
 
@@ -363,12 +363,21 @@ Bearer 使用 `--gateway-credential-env CREDENTIAL_REF=WORKSPACE_ID=ENV_NAME`。
 不能配置为两种新角色。服务端生成的 API key 仍可作为数据面凭据。旧控制令牌必须无组织
 范围；为避免明文进入进程参数，优先使用环境变量形式。
 
-## Chat data plane / Chat 数据面
+## Model data plane / Model 数据面
 
 `POST /v1/chat/completions` supports OpenAI-compatible unary and SSE chat,
-structured tool calls, provider-reported usage, and cancellation. The route
-planner reads ACTIVE Product routes, while each `targetBindingId` remains opaque
-to Exchange and is resolved through the Platform/Plugins boundary.
+structured tool calls, provider-reported usage, typed image/audio/file content,
+and cancellation. The authenticated Product boundary resolves opaque
+`artifact_id` references to authorized bytes before dispatch; media URL and path
+forms are rejected. Inline media uses `data_base64` with a bounded aggregate
+size. An unresolved or unauthorized artifact receives `424 media_artifact_unavailable`. `POST
+/v1/embeddings` accepts one text or an ordered batch of at most 128 texts,
+routes through the same authenticated and audited model capability path, and
+returns vectors in input order with the model reported by the provider. It
+supports `encoding_format: "float"`; provider errors and cancellations remain
+visible to the caller. The route planner reads ACTIVE Product routes, while each
+`targetBindingId` remains opaque to Exchange and is resolved through the
+Platform/Plugins boundary.
 
 Enterprise and self-hosted inference use this same route and provider seam:
 the Plugin deployment owns the upstream service endpoint and its credential
@@ -379,7 +388,10 @@ usage aggregation to the existing billing capability. This configuration path
 does not by itself prove private-network inference or a deployed private model.
 
 `POST /v1/chat/completions` 支持 OpenAI-compatible 普通与 SSE Chat、结构化工具
-调用、Provider 报告的用量与取消。Route planner 只读取 ACTIVE Product Route；
+调用、Provider 报告的用量、类型化图片/音频/文件内容与取消。认证后的 Product 边界会在分发前
+将 `artifact_id` 解析为已授权 bytes；拒绝媒体 URL 和路径形式。内联媒体通过 `data_base64` 传输且有总大小限制。`POST /v1/embeddings` 接受单条文本或最多 128 条有序文本，
+经同一认证和审计模型能力链路路由，并按输入顺序返回向量和 Provider 实际报告的模型。只支持
+`encoding_format: "float"`；Provider 错误和取消会返回调用方。Route planner 只读取 ACTIVE Product Route；
 `targetBindingId` 对 Exchange 保持不透明，并经 Platform/Plugins 边界解析。
 
 企业及自托管推理沿用同一 Route 和 Provider 边界：Plugin 部署管理上游服务地址与凭据

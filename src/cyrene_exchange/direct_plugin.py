@@ -12,8 +12,9 @@ plane.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
 import json
+from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from threading import Event
 from typing import Protocol
 
@@ -25,23 +26,40 @@ from cyrene_model_provider_contracts import (
     CHAT_COMPLETION_RESPONSE_TYPE_URL,
     CHAT_COMPLETION_V2_INTERFACE_VERSION,
     CHAT_COMPLETION_V2_METHOD,
+    CHAT_COMPLETION_V3_INTERFACE_VERSION,
+    CHAT_COMPLETION_V3_METHOD,
+    CHAT_COMPLETION_V3_REQUEST_TYPE_URL,
+    EMBEDDINGS_METHOD,
+    EMBEDDINGS_REQUEST_TYPE_URL,
+    EMBEDDINGS_RESPONSE_TYPE_URL,
     INTERFACE_VERSION,
+    AudioContentPart,
     ChatCompletionChunk,
     ChatCompletionRequest,
+    ChatCompletionRequestV3,
     ChatFunction,
     ChatMessage,
+    ChatMessageV3,
     ChatRole,
     ChatTool,
     ChatToolCall,
     ChatToolCallDelta,
     ChatToolCallFunction,
     ChatToolChoice,
+    EmbeddingsRequest,
+    FileContentPart,
+    ImageContentPart,
+    TextContentPart,
     decode_chat_completion_chunk,
     decode_chat_completion_chunk_v2,
     decode_chat_completion_response,
     decode_chat_completion_response_v2,
+    decode_chat_completion_response_v3,
+    decode_embeddings_response,
     encode_chat_completion_request,
     encode_chat_completion_request_v2,
+    encode_chat_completion_request_v3,
+    encode_embeddings_request,
 )
 from cyrene_plugin_runtime import (
     DirectPayload,
@@ -51,9 +69,14 @@ from cyrene_plugin_runtime import (
     DirectPluginInvocationCancelled,
 )
 
-from .capabilities import ProviderChunk, ProviderInvocationCancelled, ProviderUsage
-from .protocol import NormalizedInferenceRequest
-
+from .capabilities import (
+    ProviderChunk,
+    ProviderEmbeddingBatch,
+    ProviderEmbeddingError,
+    ProviderInvocationCancelled,
+    ProviderUsage,
+)
+from .protocol import NormalizedEmbeddingRequest, NormalizedInferenceRequest
 
 _ROLE_VALUES = {
     "system": ChatRole.SYSTEM,
@@ -138,24 +161,24 @@ class DirectPluginModelProvider:
         调用协商后的 chat 方法,并按顺序返回提供方数据块。
         """
 
-        typed_request = _to_chat_request(request)
-        structured = _requires_structured_chat(request)
+        version = 3 if _requires_v3_chat(request) else 2 if _requires_structured_chat(request) else 1
+        typed_request = _to_chat_request_v3(request) if version == 3 else _to_chat_request(request)
         if request.stream:
             return self._stream_chunks(
                 typed_request,
-                structured=structured,
+                version=version,
                 cancel_event=cancel_event,
             )
         try:
             response = self._client.invoke(
                 capability=CAPABILITY_ID,
-                interface_version=(CHAT_COMPLETION_V2_INTERFACE_VERSION if structured else INTERFACE_VERSION),
-                method=(CHAT_COMPLETION_V2_METHOD if structured else CHAT_COMPLETION_METHOD),
-                request=_pack_chat_request(typed_request, structured=structured),
+                interface_version=_chat_interface_version(version),
+                method=_chat_method(version),
+                request=_pack_chat_request(typed_request, version=version),
                 deadline_seconds=self._deadline_seconds,
                 cancel_event=cancel_event,
             )
-            decoded = _unpack_chat_response(response, structured=structured)
+            decoded = _unpack_chat_response(response, version=version)
         except DirectPluginInvocationCancelled as error:
             raise ProviderInvocationCancelled(str(error)) from error
         except DirectPluginFailure as error:
@@ -170,11 +193,64 @@ class DirectPluginModelProvider:
             raise ModelProviderExecutionError("model.provider.v1 returned no chat-completion chunks")
         return chunks
 
+    def embed(
+        self,
+        request: NormalizedEmbeddingRequest,
+        *,
+        cancel_event: Event,
+    ) -> ProviderEmbeddingBatch:
+        """Invoke the canonical embeddings method on the selected Plugin.
+
+        中文:在已选中的 Plugin 上调用规范 embeddings 方法。
+        """
+
+        typed_request = EmbeddingsRequest(inputs=request.inputs, model=request.model)
+        try:
+            response = self._client.invoke(
+                capability=CAPABILITY_ID,
+                interface_version=INTERFACE_VERSION,
+                method=EMBEDDINGS_METHOD,
+                request=DirectPayload(
+                    EMBEDDINGS_REQUEST_TYPE_URL,
+                    encode_embeddings_request(typed_request),
+                ),
+                deadline_seconds=self._deadline_seconds,
+                cancel_event=cancel_event,
+            )
+            if response.type_url != EMBEDDINGS_RESPONSE_TYPE_URL:
+                raise ModelProviderExecutionError(f"unexpected payload type {response.type_url!r}")
+            decoded = decode_embeddings_response(response.value)
+        except DirectPluginInvocationCancelled as error:
+            raise ProviderInvocationCancelled(str(error)) from error
+        except DirectPluginFailure as error:
+            if error.is_cancelled:
+                raise ProviderInvocationCancelled(str(error)) from error
+            raise ModelProviderExecutionError(str(error)) from error
+        except DirectPluginError as error:
+            raise ModelProviderExecutionError(str(error)) from error
+        except ValueError as error:
+            raise ModelProviderExecutionError(f"invalid embeddings contract payload: {error}") from error
+
+        if decoded.error is not None:
+            raise ProviderEmbeddingError(
+                int(decoded.error.code),
+                decoded.error.message,
+                decoded.error.retry_after_seconds,
+            )
+        batch = decoded.embeddings
+        if batch is None:
+            raise ModelProviderExecutionError("model.provider.v1 returned no embeddings result")
+        return ProviderEmbeddingBatch(
+            vectors=tuple(tuple(vector.values) for vector in batch.vectors),
+            dimensions=batch.dimensions,
+            model=batch.model,
+        )
+
     def _stream_chunks(
         self,
-        typed_request: ChatCompletionRequest,
+        typed_request: ChatCompletionRequest | ChatCompletionRequestV3,
         *,
-        structured: bool,
+        version: int,
         cancel_event: Event,
     ) -> Iterable[ProviderChunk]:
         """Forward Plugin-owned typed chunks without local materialization.
@@ -182,8 +258,9 @@ class DirectPluginModelProvider:
         转发 Plugins 所有的类型化数据块,不在本地物化完整结果。
         """
 
-        method = CHAT_COMPLETION_V2_METHOD if structured else CHAT_COMPLETION_METHOD
-        interface_version = CHAT_COMPLETION_V2_INTERFACE_VERSION if structured else INTERFACE_VERSION
+        structured = version >= 2
+        method = _chat_method(version)
+        interface_version = _chat_interface_version(version)
 
         def iter_chunks() -> Iterable[ProviderChunk]:
             saw_chunk = False
@@ -192,7 +269,7 @@ class DirectPluginModelProvider:
                     capability=CAPABILITY_ID,
                     interface_version=interface_version,
                     method=method,
-                    request=_pack_chat_request(typed_request, structured=structured),
+                    request=_pack_chat_request(typed_request, version=version),
                     deadline_seconds=self._deadline_seconds,
                     cancel_event=cancel_event,
                 )
@@ -223,19 +300,46 @@ def local_plugin_client(connection_ref: str) -> DirectPluginClient:
     return DirectPluginClient.for_local_connection_ref(connection_ref)
 
 
-def _pack_chat_request(request: ChatCompletionRequest, *, structured: bool) -> DirectPayload:
+def _chat_interface_version(version: int) -> str:
+    if version == 3:
+        return CHAT_COMPLETION_V3_INTERFACE_VERSION
+    if version == 2:
+        return CHAT_COMPLETION_V2_INTERFACE_VERSION
+    return INTERFACE_VERSION
+
+
+def _chat_method(version: int) -> str:
+    if version == 3:
+        return CHAT_COMPLETION_V3_METHOD
+    if version == 2:
+        return CHAT_COMPLETION_V2_METHOD
+    return CHAT_COMPLETION_METHOD
+
+
+def _pack_chat_request(
+    request: ChatCompletionRequest | ChatCompletionRequestV3,
+    *,
+    version: int,
+) -> DirectPayload:
+    if version == 3:
+        if not isinstance(request, ChatCompletionRequestV3):
+            raise ModelProviderExecutionError("v3 request projection is invalid")
+        return DirectPayload(CHAT_COMPLETION_V3_REQUEST_TYPE_URL, encode_chat_completion_request_v3(request))
+    if not isinstance(request, ChatCompletionRequest):
+        raise ModelProviderExecutionError("text chat request projection is invalid")
+    structured = version == 2
     encoded = encode_chat_completion_request_v2(request) if structured else encode_chat_completion_request(request)
     return DirectPayload(CHAT_COMPLETION_REQUEST_TYPE_URL, encoded)
 
 
-def _unpack_chat_response(payload: DirectPayload, *, structured: bool):
+def _unpack_chat_response(payload: DirectPayload, *, version: int):
     if payload.type_url != CHAT_COMPLETION_RESPONSE_TYPE_URL:
         raise ModelProviderExecutionError(f"unexpected payload type {payload.type_url!r}")
-    return (
-        decode_chat_completion_response_v2(payload.value)
-        if structured
-        else decode_chat_completion_response(payload.value)
-    )
+    if version == 3:
+        return decode_chat_completion_response_v3(payload.value)
+    if version == 2:
+        return decode_chat_completion_response_v2(payload.value)
+    return decode_chat_completion_response(payload.value)
 
 
 def _unpack_chat_chunk(payload: DirectPayload, *, structured: bool) -> ChatCompletionChunk:
@@ -319,6 +423,82 @@ def _requires_structured_chat(request: NormalizedInferenceRequest) -> bool:
         or request.parallel_tool_calls is not None
         or request.stream_options is not None
         or any("tool_calls" in message for message in request.messages)
+    )
+
+
+def _requires_v3_chat(request: NormalizedInferenceRequest) -> bool:
+    """Select v3 whenever a message carries typed content parts.
+
+    中文:消息携带类型化内容片段时选择 v3。
+    """
+
+    return any(not isinstance(message.get("content"), (str, type(None))) for message in request.messages)
+
+
+def _to_chat_request_v3(request: NormalizedInferenceRequest) -> ChatCompletionRequestV3:
+    messages = tuple(_to_chat_message_v3(index, item) for index, item in enumerate(request.messages))
+    text_messages = tuple({**message, "content": ""} for message in request.messages)
+    text_request = _to_chat_request(replace(request, messages=text_messages))
+    return ChatCompletionRequestV3(
+        messages=messages,
+        model=request.model,
+        stream=request.stream,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        tools=text_request.tools,
+        tool_choice=text_request.tool_choice,
+        parallel_tool_calls=request.parallel_tool_calls,
+        include_usage=(
+            bool(request.stream_options.get("include_usage", False)) if request.stream_options is not None else None
+        ),
+    )
+
+
+def _to_chat_message_v3(index: int, message: Mapping[str, object]) -> ChatMessageV3:
+    raw_content = message.get("content")
+    if not isinstance(raw_content, (list, tuple)):
+        raise ModelProviderExecutionError(f"messages[{index}].content must contain typed parts")
+    content_parts: list[TextContentPart | ImageContentPart | AudioContentPart | FileContentPart] = []
+    for part_index, raw_part in enumerate(raw_content):
+        if not isinstance(raw_part, Mapping):
+            raise ModelProviderExecutionError(f"messages[{index}].content[{part_index}] is invalid")
+        part_type = raw_part.get("type")
+        if part_type == "text":
+            text = raw_part.get("text")
+            if not isinstance(text, str):
+                raise ModelProviderExecutionError(f"messages[{index}].content[{part_index}].text is invalid")
+            content_parts.append(TextContentPart(text=text))
+            continue
+        mime_type = raw_part.get("mime_type")
+        data = raw_part.get("data")
+        artifact_id = raw_part.get("artifact_id")
+        if not isinstance(mime_type, str):
+            raise ModelProviderExecutionError(f"messages[{index}].content[{part_index}].mime_type is invalid")
+        if data is not None and not isinstance(data, bytes):
+            raise ModelProviderExecutionError(f"messages[{index}].content[{part_index}].data is invalid")
+        if artifact_id is not None and not isinstance(artifact_id, str):
+            raise ModelProviderExecutionError(f"messages[{index}].content[{part_index}].artifact_id is invalid")
+        if part_type == "image":
+            content_parts.append(ImageContentPart(mime_type=mime_type, data=data, artifact_id=artifact_id))
+        elif part_type == "audio":
+            content_parts.append(AudioContentPart(mime_type=mime_type, data=data, artifact_id=artifact_id))
+        elif part_type == "file":
+            filename = raw_part.get("filename")
+            if filename is not None and not isinstance(filename, str):
+                raise ModelProviderExecutionError(f"messages[{index}].content[{part_index}].filename is invalid")
+            content_parts.append(
+                FileContentPart(mime_type=mime_type, data=data, artifact_id=artifact_id, filename=filename)
+            )
+        else:
+            raise ModelProviderExecutionError(f"messages[{index}].content[{part_index}].type is unsupported")
+
+    normalized = _to_chat_message(index, {**message, "content": ""})
+    return ChatMessageV3(
+        role=normalized.role,
+        content=tuple(content_parts),
+        name=normalized.name,
+        tool_call_id=normalized.tool_call_id,
+        tool_calls=normalized.tool_calls,
     )
 
 

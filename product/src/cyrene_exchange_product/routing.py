@@ -23,6 +23,7 @@ from cyrene_exchange.capabilities import (
 )
 from cyrene_exchange.gateway import (
     ExchangeGateway,
+    MediaArtifactResolver,
     NoOpLifecycleObserver,
     RequestPrincipal,
     TokenPrincipalResolver,
@@ -109,6 +110,7 @@ def build_gateway_from_store(
     record_requests: bool = True,
     max_route_attempts: int = 1,
     activity: ActivitySourceLifecycleProtocol | None = None,
+    media_artifact_resolver: MediaArtifactResolver | None = None,
 ) -> ExchangeGateway:
     """Compose persisted Product routing with a caller-owned capability resolver.
 
@@ -139,5 +141,6 @@ def build_gateway_from_store(
         principal_resolver=principal_resolver,
         lifecycle_observer=observer,
         quota_checker=ProductQuotaGuard(store, billing),
+        media_artifact_resolver=media_artifact_resolver,
         max_route_attempts=max_route_attempts,
     )
