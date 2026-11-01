@@ -67,6 +67,14 @@ transaction. Historical global endpoints receive no workspace grant by
 migration. Request bodies cannot supply the organization, workspace, actor or
 endpoint grant.
 
+Gateway data-plane route selection uses the organization and workspace resolved
+from the authenticated bearer. An organization-scoped credential sees only
+ACTIVE routes for that exact pair; it never falls back to another workspace or
+the legacy global route list. An unscoped legacy credential continues to see
+only rows with unknown organization attribution. The models list, readiness
+probe, and service route count use the same persisted state without exposing
+another workspace's route definitions.
+
 The legacy `/api/v1/gateway-routes` list and `/{routeId}` read return only rows
 whose organization is unknown (`organization_id IS NULL`). Existing
 workspace-only rows stay visible through those paths after migration and remain
@@ -127,6 +135,11 @@ GatewayEndpoint；私有草稿在同一 SQLite 写事务中检查精确 grant �
 但不会被当作私有 scope。新私有记录不会通过旧路由读取或编辑接口暴露。组织范围凭据
 不能调用旧的全局写入操作；无组织范围的旧控制凭据保留原写入语义并创建 unscoped
 记录。草稿幂等键按可信组织/workspace 派生摘要分区。
+
+Gateway 数据面路由选择使用认证 Bearer 解析出的组织和 workspace。组织范围凭据只可
+读取精确 scope 的 ACTIVE Route，不会回退到其他 workspace 或 legacy 全局路由；无组织
+范围的旧凭据仍只读取组织归属未知的路由。Models 列表、readyz 和服务路由计数基于同一
+持久状态，不返回其他 workspace 的路由定义。
 CLI 使用可重复的
 `--control-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME` 配置私有控制
 Bearer，并用 `--gateway-credential-env CREDENTIAL_REF=[ORG_ID=]WORKSPACE_ID=ENV_NAME` 配置独立

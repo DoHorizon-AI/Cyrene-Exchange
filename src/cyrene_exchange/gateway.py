@@ -590,7 +590,11 @@ class ExchangeGateway:
             )
             raise error from exc
         try:
-            candidates = list(router.plan(_request_for_routing(request)))[: self._max_route_attempts]
+            candidates = self._plan_routes(
+                router,
+                _request_for_routing(request),
+                principal,
+            )[: self._max_route_attempts]
         except Exception as exc:
             error = NoRouteError(f"model routing failed: {exc}")
             self._observe_rejected(
@@ -835,7 +839,7 @@ class ExchangeGateway:
 
         try:
             router = self._resolve_router()
-            candidates = list(router.plan(request))[: self._max_route_attempts]
+            candidates = self._plan_routes(router, request, principal)[: self._max_route_attempts]
         except NoRouteError as exc:
             self._observe_rejected(
                 request_id=request_id,
@@ -1130,6 +1134,26 @@ class ExchangeGateway:
         if not hasattr(router, "plan"):
             raise NoRouteError("resolved model routing capability is invalid")
         return router  # type: ignore[return-value]
+
+    @staticmethod
+    def _plan_routes(
+        router: Any,
+        request: NormalizedInferenceRequest | NormalizedEmbeddingRequest,
+        principal: RequestPrincipal,
+    ) -> list[RouteTarget]:
+        """Pass authenticated identity to Product routers with scoped routes.
+
+        Generic model-routing providers keep their request-only protocol.
+        Product adapters may expose an additive plan_for_principal method whose
+        scope is derived from authenticated credentials, never request fields.
+
+        中文：对支持租户隔离的 Product 路由器传入认证主体；通用路由接口保持兼容。
+        """
+
+        plan_for_principal = getattr(router, "plan_for_principal", None)
+        if callable(plan_for_principal):
+            return list(plan_for_principal(request, principal=principal))
+        return list(router.plan(request))
 
     def _resolve_provider(self, target: RouteTarget) -> ModelProviderCapability:
         provider = self._resolver.resolve(MODEL_PROVIDER_CAPABILITY, target.provider_ref)

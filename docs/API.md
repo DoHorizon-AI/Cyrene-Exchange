@@ -41,6 +41,12 @@ use legacy global write operations; those remain available to existing
 organization-unscoped control credentials. Draft confirmation fails closed
 when source or provider validation is absent or fails.
 
+For model inference, Exchange uses the organization and workspace resolved
+from the Gateway bearer when selecting ACTIVE routes. An organization-scoped
+caller cannot match another workspace's route or fall back to legacy global
+routes; an unscoped legacy bearer continues to use only organization-unattributed
+routes. The models list and readiness probe follow the same persisted scope.
+
 控制凭据由 host 配置并映射为可信 actor、组织、workspace 与 credential reference；请求体
 不能覆盖身份。私有 Workspace 别名要求组织范围凭据。Endpoint 使用还需要 operator
 配置精确的 `(endpointId, organizationId, workspaceId)` grant；旧全局 Endpoint 不会自动
@@ -48,6 +54,10 @@ when source or provider validation is absent or fails.
 私有 scope 记录不会出现在旧路径中。组织范围凭据不能使用旧全局写入操作；旧写入只对
 现有无组织范围控制凭据保留。来源或 Provider 校验缺失、失败时，DRAFT 确认按
 fail-closed 处理。
+
+模型数据面按 Gateway Bearer 认证得到的组织和 workspace 选择 ACTIVE Route。组织范围
+调用者不能命中其他 workspace 路由或回退到 legacy 全局路由；无组织范围旧 Bearer 仍只
+使用组织归属未知的路由。Models 列表与 readiness 探针遵循相同持久化 scope。
 
 ## Integrations / 集成
 

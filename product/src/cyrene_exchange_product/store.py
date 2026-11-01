@@ -479,18 +479,51 @@ class ExchangeStore:
             )
         return route
 
-    def active_routes(self, endpoint_id: UUID) -> list[GatewayRoute]:
-        """Return active routes in stable priority order. | 按稳定优先级返回活动路由。"""
+    def active_routes(
+        self,
+        endpoint_id: UUID,
+        *,
+        organization_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> list[GatewayRoute]:
+        """Return active routes only within one trusted Product scope.
+
+        Omitting both scope values preserves the legacy organization-unscoped
+        projection. An organization-scoped read must supply its exact workspace;
+        incomplete private scope fails closed.
+
+        中文：只读取一个可信 Product scope 下的活动路由；私有 scope 缺失时失败关闭。
+        """
 
         with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT document, organization_id, workspace_id FROM gateway_routes
-                WHERE endpoint_id = ? AND state = ? AND organization_id IS NULL
-                ORDER BY priority ASC, id ASC
-                """,
-                (str(endpoint_id), RouteState.ACTIVE.value),
-            ).fetchall()
+            if organization_id is None:
+                if workspace_id is not None:
+                    return []
+                rows = self._connection.execute(
+                    """
+                    SELECT document, organization_id, workspace_id FROM gateway_routes
+                    WHERE endpoint_id = ? AND state = ? AND organization_id IS NULL
+                    ORDER BY priority ASC, id ASC
+                    """,
+                    (str(endpoint_id), RouteState.ACTIVE.value),
+                ).fetchall()
+            else:
+                if not workspace_id:
+                    return []
+                rows = self._connection.execute(
+                    """
+                    SELECT document, organization_id, workspace_id FROM gateway_routes
+                    WHERE endpoint_id = ? AND state = ?
+                      AND organization_id = ? AND workspace_id = ?
+                    ORDER BY priority ASC, id ASC
+                    """,
+                    (
+                        str(endpoint_id),
+                        RouteState.ACTIVE.value,
+                        organization_id,
+                        workspace_id,
+                    ),
+                ).fetchall()
         return [_route_from_row(row) for row in rows]
 
     def list_endpoints(self) -> list[GatewayEndpoint]:
@@ -515,6 +548,23 @@ class ExchangeStore:
                 (RouteState.ACTIVE.value,),
             ).fetchall()
         return [_route_from_row(row) for row in rows]
+
+    def active_route_count(self, endpoint_id: UUID | None = None) -> int:
+        """Count active routes without exposing route documents across scopes."""
+
+        with self._lock:
+            if endpoint_id is None:
+                row = self._connection.execute(
+                    "SELECT COUNT(*) AS route_count FROM gateway_routes WHERE state = ?",
+                    (RouteState.ACTIVE.value,),
+                ).fetchone()
+            else:
+                row = self._connection.execute(
+                    "SELECT COUNT(*) AS route_count FROM gateway_routes "
+                    "WHERE state = ? AND endpoint_id = ?",
+                    (RouteState.ACTIVE.value, str(endpoint_id)),
+                ).fetchone()
+        return int(row["route_count"]) if row is not None else 0
 
     def list_legacy_routes(self) -> list[GatewayRoute]:
         """Return rows without trustworthy organization attribution."""

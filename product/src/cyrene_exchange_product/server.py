@@ -684,6 +684,7 @@ def build_product_app(
         store.list_active_activity_tasks,
     )
     effective = resolver_factory(store) if resolver_factory is not None else resolver
+    effective_endpoint_id = _select_endpoint(store, endpoint_id)
     app = create_app(
         database_path=database_path,
         control_credentials=control_credentials,
@@ -697,7 +698,7 @@ def build_product_app(
     )
     gateway = build_gateway_from_store(
         store,
-        _select_endpoint(store, endpoint_id),
+        effective_endpoint_id,
         effective,
         credentials=effective_gateway_credentials,
         record_requests=record_requests,
@@ -726,10 +727,13 @@ def build_product_app(
 
         中文:只有数据平面至少能服务一条路由时才报告就绪。"""
 
-        routes = store.list_active_routes()
-        if not routes:
+        route_count = store.active_route_count(effective_endpoint_id)
+        if route_count == 0:
             return JSONResponse(status_code=503, content={"status": "no-active-route"})
-        return JSONResponse(status_code=200, content={"status": "ready", "routes": len(routes)})
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ready", "routes": route_count},
+        )
 
     @app.get("/v1/models")
     def models(request: Request) -> Any:
@@ -749,7 +753,13 @@ def build_product_app(
         if principal is None:
             return _openai_error(401, "authentication_error", "invalid credentials")
         seen: list[str] = []
-        for route in store.list_active_routes():
+        for route in store.active_routes(
+            effective_endpoint_id,
+            organization_id=principal.organization_id,
+            workspace_id=(
+                principal.workspace_id if principal.organization_id is not None else None
+            ),
+        ):
             if route.model_pattern in seen:
                 continue
             if not principal.permits(route.model_pattern):
@@ -810,7 +820,7 @@ def build_product_app(
 
     @app.get("/api/v1/system/status")
     def system_status(request: Request) -> dict[str, Any]:
-        routes = store.list_active_routes()
+        route_count = store.active_route_count()
         keys = store.list_api_keys()
         active_keys = sum(
             1
@@ -840,7 +850,7 @@ def build_product_app(
                 "active": active_keys,
                 "revoked": revoked_keys,
             },
-            "routes": len(routes),
+            "routes": route_count,
             "gatewayBaseUrl": base_url,
             "gpu": gpu_info,
             "disk": disk_info,
