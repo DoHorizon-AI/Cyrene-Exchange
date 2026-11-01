@@ -1,0 +1,571 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.cyrene.dev/exchange/authorization-cloud-configuration/v1/schema.json",
+  "title": "Exchange authorization and cloud host configuration v1",
+  "description": "Structural schema for authorization/cloud configuration fragments. The side-effect-free Exchange preflight also checks cross-reference and secret resolution rules.",
+  "type": "object",
+  "additionalProperties": false,
+  "anyOf": [
+    { "required": ["authorizationCloud"] },
+    { "required": ["emailNotifications"] },
+    { "required": ["connectorHost"] }
+  ],
+  "properties": {
+    "authorizationCloud": { "$ref": "#/$defs/authorizationCloud" },
+    "emailNotifications": { "$ref": "#/$defs/emailNotifications" },
+    "connectorHost": { "$ref": "#/$defs/connectorHost" },
+    "hostSecretRefs": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+      }
+    }
+  },
+  "$defs": {
+    "alias": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$"
+    },
+    "shortAlias": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
+    },
+    "huggingFaceRepositoryRef": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$"
+    },
+    "secretRef": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "endpoint": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bindingId", "connectionRef", "transport"],
+          "properties": {
+            "bindingId": { "$ref": "#/$defs/alias" },
+            "connectionRef": { "type": "string", "minLength": 1 },
+            "transport": { "const": "local" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bindingId", "connectionRef", "transport", "mtls"],
+          "properties": {
+            "bindingId": { "$ref": "#/$defs/alias" },
+            "connectionRef": { "type": "string", "minLength": 1 },
+            "transport": { "const": "mtls" },
+            "mtls": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rootCertificateRef", "clientCertificateRef", "clientKeyRef"],
+              "properties": {
+                "rootCertificateRef": { "$ref": "#/$defs/secretRef" },
+                "clientCertificateRef": { "$ref": "#/$defs/secretRef" },
+                "clientKeyRef": { "$ref": "#/$defs/secretRef" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "actorContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contextRef",
+        "issuer",
+        "subject",
+        "organizationId",
+        "workspaceId",
+        "bearerTokenEnvRef"
+      ],
+      "properties": {
+        "contextRef": { "$ref": "#/$defs/alias" },
+        "issuer": { "type": "string", "minLength": 1 },
+        "subject": { "type": "string", "minLength": 1 },
+        "organizationId": { "type": "string", "minLength": 1 },
+        "workspaceId": { "type": "string", "minLength": 1 },
+        "bearerTokenEnvRef": { "$ref": "#/$defs/secretRef" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetRef", "displayName"],
+      "properties": {
+        "targetRef": {
+          "oneOf": [
+            { "$ref": "#/$defs/alias" },
+            { "$ref": "#/$defs/huggingFaceRepositoryRef" }
+          ]
+        },
+        "displayName": { "type": "string", "minLength": 1 },
+        "allowedContextRefs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/alias" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "graphResourceIds": {
+      "type": "array",
+      "maxItems": 100,
+      "items": { "type": "string", "maxLength": 256 },
+      "uniqueItems": true
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "directPlugin",
+        "callerWorkload",
+        "audience",
+        "expectedIssuer",
+        "contextKeyRef",
+        "organizationId",
+        "workspaceId"
+      ],
+      "properties": {
+        "provider": {
+          "enum": ["wecom", "azure", "gcp", "hf", "microsoft_graph", "runpod", "tailscale"]
+        },
+        "directPlugin": { "$ref": "#/$defs/endpoint" },
+        "callerWorkload": { "type": "string", "minLength": 1 },
+        "audience": { "type": "string", "minLength": 1 },
+        "expectedIssuer": { "type": "string", "minLength": 1 },
+        "contextKeyRef": { "$ref": "#/$defs/secretRef" },
+        "organizationId": { "type": "string", "minLength": 1 },
+        "workspaceId": { "type": "string", "minLength": 1 },
+        "plannerPlanIds": {
+          "type": "array",
+          "maxItems": 100,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
+          "uniqueItems": true
+        },
+        "sharepointTargets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["siteId", "listIds"],
+          "properties": {
+            "siteId": { "type": "string", "minLength": 1 },
+            "listIds": {
+              "type": "array",
+              "maxItems": 100,
+              "items": { "type": "string", "format": "uuid" },
+              "uniqueItems": true
+            }
+          }
+        },
+        "officeV2": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "tenantId", "workspaceId", "enabledFeatures", "targets"],
+          "properties": {
+            "schemaVersion": { "const": 2 },
+            "tenantId": { "type": "string", "format": "uuid" },
+            "workspaceId": { "type": "string", "format": "uuid" },
+            "enabledFeatures": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "plannerEnabled",
+                "todoEnabled",
+                "calendarEnabled",
+                "mailMetadataEnabled",
+                "mailDraftsEnabled",
+                "mailSendEnabled",
+                "sharePointDriveMetadataEnabled"
+              ],
+              "properties": {
+                "plannerEnabled": { "type": "boolean" },
+                "todoEnabled": { "type": "boolean" },
+                "calendarEnabled": { "type": "boolean" },
+                "mailMetadataEnabled": { "type": "boolean" },
+                "mailDraftsEnabled": { "type": "boolean" },
+                "mailSendEnabled": { "type": "boolean" },
+                "sharePointDriveMetadataEnabled": { "type": "boolean" }
+              }
+            },
+            "targets": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "plannerPlanIds",
+                "sharePointSiteIds",
+                "sharePointListIds",
+                "sharePointDriveIds",
+                "toDoTaskListIds",
+                "calendarIds",
+                "mailFolderIds",
+                "freebusySubjects"
+              ],
+              "properties": {
+                "plannerPlanIds": { "$ref": "#/$defs/graphResourceIds" },
+                "sharePointSiteIds": {
+                  "type": "array",
+                  "maxItems": 1,
+                  "items": { "type": "string", "pattern": "^[A-Za-z0-9.-]{1,255},[0-9a-fA-F-]{36},[0-9a-fA-F-]{36}$" },
+                  "uniqueItems": true
+                },
+                "sharePointListIds": {
+                  "type": "array",
+                  "maxItems": 100,
+                  "items": { "type": "string", "format": "uuid" },
+                  "uniqueItems": true
+                },
+                "sharePointDriveIds": { "$ref": "#/$defs/graphResourceIds" },
+                "toDoTaskListIds": { "$ref": "#/$defs/graphResourceIds" },
+                "calendarIds": { "$ref": "#/$defs/graphResourceIds" },
+                "mailFolderIds": { "$ref": "#/$defs/graphResourceIds" },
+                "freebusySubjects": {
+                  "type": "array",
+                  "maxItems": 100,
+                  "items": { "type": "string", "format": "email" },
+                  "uniqueItems": true
+                }
+              }
+            }
+          }
+        },
+        "allowedContextRefs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/alias" },
+          "uniqueItems": true
+        },
+        "allowedActors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["issuer", "subject"],
+            "properties": {
+              "issuer": { "type": "string", "minLength": 1 },
+              "subject": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "accessMode": { "enum": ["actor_owned", "workspace_operator"] },
+        "displayName": { "type": "string", "minLength": 1 },
+        "authorizationRef": { "$ref": "#/$defs/alias" },
+        "identityRef": { "$ref": "#/$defs/alias" },
+        "credentialSecretRef": { "$ref": "#/$defs/secretRef" },
+        "authMode": { "enum": ["fine_grained_token", "device_oauth"] },
+        "accountScopes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repositories"],
+          "properties": {
+            "repositories": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["repoType", "repoId", "permissions"],
+                "properties": {
+                  "repoType": { "enum": ["model", "dataset", "space"] },
+                  "repoId": { "type": "string", "minLength": 1 },
+                  "permissions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "enum": ["read", "write"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "targets": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/target" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["accessMode"],
+            "properties": { "accessMode": { "const": "workspace_operator" } }
+          },
+          "else": {
+            "anyOf": [
+              { "required": ["allowedContextRefs"] },
+              { "required": ["allowedActors"] }
+            ]
+          }
+        },
+        {
+          "if": { "properties": { "provider": { "const": "wecom" } } },
+          "then": {
+            "required": ["displayName", "authorizationRef"],
+            "properties": { "targets": { "maxProperties": 0 } }
+          },
+          "else": {
+            "if": {
+              "properties": { "provider": { "const": "microsoft_graph" } },
+              "required": ["provider"]
+            },
+            "then": {
+              "not": {
+                "anyOf": [
+                  { "required": ["displayName"] },
+                  { "required": ["authorizationRef"] }
+                ]
+              }
+            },
+            "else": {
+              "required": ["targets"],
+              "not": {
+                "anyOf": [
+                  { "required": ["displayName"] },
+                  { "required": ["authorizationRef"] }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "provider": { "const": "hf" } } },
+          "then": {
+            "required": ["credentialSecretRef", "accountScopes"],
+            "properties": {
+              "targets": {
+                "additionalProperties": {
+                  "properties": {
+                    "targetRef": { "$ref": "#/$defs/huggingFaceRepositoryRef" }
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["credentialSecretRef"] },
+                { "required": ["accountScopes"] }
+              ]
+            },
+            "properties": {
+              "targets": {
+                "additionalProperties": {
+                  "properties": { "targetRef": { "$ref": "#/$defs/alias" } }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "authorizationCloud": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["currentAuthority", "profiles"],
+      "properties": {
+        "monitorIntervalSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 86400,
+          "default": 900
+        },
+        "currentAuthority": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contexts"],
+          "properties": {
+            "contexts": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/actorContext" }
+            }
+          }
+        },
+        "profiles": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/profile" }
+        }
+      }
+    },
+    "emailNotifications": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": { "enabled": { "const": false } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "directPlugin",
+            "callerWorkload",
+            "audience",
+            "expectedIssuer",
+            "contextKeyRef",
+            "organizationId",
+            "workspaceId",
+            "recipientRef",
+            "allowedContextRefs"
+          ],
+          "properties": {
+            "enabled": { "const": true },
+            "directPlugin": { "$ref": "#/$defs/endpoint" },
+            "callerWorkload": { "type": "string", "minLength": 1 },
+            "audience": { "type": "string", "minLength": 1 },
+            "expectedIssuer": { "type": "string", "minLength": 1 },
+            "contextKeyRef": { "$ref": "#/$defs/secretRef" },
+            "organizationId": { "type": "string", "minLength": 1 },
+            "workspaceId": { "type": "string", "minLength": 1 },
+            "recipientRef": { "$ref": "#/$defs/shortAlias" },
+            "allowedContextRefs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/alias" },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "connectorHost": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "navigatorConnector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["keyId", "keyFileRef"],
+          "properties": {
+            "keyId": { "$ref": "#/$defs/shortAlias" },
+            "keyFileRef": { "$ref": "#/$defs/secretRef" }
+          }
+        },
+        "teamsMessages": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "profileRef",
+            "connectionRef",
+            "organizationId",
+            "workspaceId",
+            "tenantId",
+            "allowedTeamIds",
+            "botAppId",
+            "expectedIssuer",
+            "directPlugin"
+          ],
+          "properties": {
+            "profileRef": { "$ref": "#/$defs/alias" },
+            "connectionRef": { "$ref": "#/$defs/alias" },
+            "organizationId": { "type": "string", "minLength": 1 },
+            "workspaceId": { "type": "string", "minLength": 1 },
+            "tenantId": { "type": "string", "format": "uuid" },
+            "allowedTeamIds": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+            },
+            "allowedChannelIds": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+            },
+            "personalActorSubjects": {
+              "type": "array",
+              "uniqueItems": true,
+              "description": "Optional Entra object IDs authorized for owner-private delivery; an empty or omitted list disables it.",
+              "items": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              }
+            },
+            "botAppId": { "type": "string", "format": "uuid" },
+            "expectedIssuer": { "type": "string", "format": "uri" },
+            "directPlugin": { "$ref": "#/$defs/endpoint" }
+          }
+        },
+        "computerRunner": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "profileRef",
+            "connectionRef",
+            "organizationId",
+            "workspaceId",
+            "expectedIssuer",
+            "directPlugin"
+          ],
+          "properties": {
+            "profileRef": { "$ref": "#/$defs/alias" },
+            "connectionRef": { "type": "string", "format": "uuid" },
+            "organizationId": { "type": "string", "minLength": 1 },
+            "workspaceId": { "type": "string", "minLength": 1 },
+            "expectedIssuer": {
+              "type": "string",
+              "pattern": "^https://login\\.microsoftonline\\.com/[0-9a-fA-F-]{36}/v2\\.0$"
+            },
+            "directPlugin": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["bindingId", "connectionRef", "transport", "mtls"],
+              "properties": {
+                "bindingId": { "const": "computer-runtime" },
+                "connectionRef": { "type": "string", "pattern": "^grpcs://[^ ]+$" },
+                "transport": { "const": "mtls" },
+                "mtls": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "rootCertificateRef",
+                    "clientCertificateRef",
+                    "clientKeyRef"
+                  ],
+                  "properties": {
+                    "rootCertificateRef": { "$ref": "#/$defs/secretRef" },
+                    "clientCertificateRef": { "$ref": "#/$defs/secretRef" },
+                    "clientKeyRef": { "$ref": "#/$defs/secretRef" }
+                  }
+                }
+              }
+            },
+            "maxCommandTimeoutMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 600000
+            },
+            "maxFileBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1048576
+            },
+            "maxReadBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65536
+            },
+            "maxDirectoryDepth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            }
+          }
+        }
+      },
+      "anyOf": [
+        { "required": ["navigatorConnector"] },
+        { "required": ["teamsMessages"] },
+        { "required": ["computerRunner"] }
+      ]
+    }
+  }
+}

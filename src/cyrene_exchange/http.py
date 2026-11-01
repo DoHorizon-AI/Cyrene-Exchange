@@ -9,14 +9,18 @@
 # 职责：Exchange Product 实现。
 # 本头部说明归属；参考传输会输出结构化 SSE。
 ###############################################################################
-"""Reference stdlib HTTP transport for the Exchange Product Core."""
+"""Reference stdlib HTTP transport for the Exchange Product Core.
+
+Exchange Product Core 使用的标准库 HTTP 参考传输层。
+"""
 
 from __future__ import annotations
 
 import json
+import math
 import select
 import socket
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Event, Thread
@@ -27,13 +31,17 @@ from .gateway import ExchangeGateway, GatewayError
 
 
 def _watch_client_disconnect(connection: socket.socket, cancel_event: Event, stop_event: Event) -> None:
-    """Set ``cancel_event`` when the peer closes while Product work is running."""
+    """Set ``cancel_event`` when the peer closes while Product work is running.
+
+    Product 工作进行期间,如果对端关闭连接则设置 ``cancel_event``。
+    """
 
     peek_flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
     while not stop_event.wait(0.05):
         try:
             readable, _, _ = select.select([connection], [], [], 0.1)
         except (OSError, ValueError):
+            cancel_event.set()
             return
         if not readable:
             continue
@@ -62,7 +70,10 @@ def create_reference_server(
     host: str = "127.0.0.1",
     port: int = 0,
 ) -> ThreadingHTTPServer:
-    """Create an HTTP adapter without starting or owning the server thread."""
+    """Create an HTTP adapter without starting or owning the server thread.
+
+    创建 HTTP adapter,但不启动或拥有服务线程。
+    """
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
@@ -71,15 +82,18 @@ def create_reference_server(
             # Mint the correlation ID before parsing or authenticating. Never
             # accept a caller-selected ID as a durable ledger primary key.
             # 在解析和认证之前创建关联 ID，不接受调用方指定的账本主键。
-            request_id = f"chatcmpl-{uuid4().hex}"
-            if self.path != "/v1/chat/completions":
+            is_chat = self.path == "/v1/chat/completions"
+            is_embeddings = self.path == "/v1/embeddings"
+            request_id = f"{'chatcmpl' if is_chat else 'emb'}-{uuid4().hex}"
+            if not is_chat and not is_embeddings:
                 self._write_error(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found", request_id)
                 return
 
             length_header = self.headers.get("Content-Length")
             try:
                 length = int(length_header or "0")
-                if length <= 0 or length > 2 * 1024 * 1024:
+                max_length = 32 * 1024 * 1024 if is_chat else 2 * 1024 * 1024
+                if length <= 0 or length > max_length:
                     raise ValueError("invalid content length")
                 payload = json.loads(self.rfile.read(length))
             except (ValueError, json.JSONDecodeError) as exc:
@@ -96,7 +110,8 @@ def create_reference_server(
             )
             disconnect_watcher.start()
             try:
-                response = gateway.handle_openai_chat(
+                handler = gateway.handle_openai_chat if is_chat else gateway.handle_openai_embeddings
+                response = handler(
                     dict(self.headers.items()),
                     payload,
                     cancel_event=cancel_event,
@@ -108,7 +123,16 @@ def create_reference_server(
                     self._write_json(response.status_code, response.body, request_id)
             except GatewayError as exc:
                 try:
-                    self._write_json(exc.status_code, exc.to_openai_error(), request_id)
+                    response_headers: dict[str, str] = {}
+                    retry_after = getattr(exc, "retry_after_seconds", None)
+                    if isinstance(retry_after, (int, float)) and math.isfinite(retry_after) and retry_after >= 0:
+                        response_headers["Retry-After"] = str(math.ceil(retry_after))
+                    self._write_json(
+                        exc.status_code,
+                        exc.to_openai_error(),
+                        request_id,
+                        response_headers=response_headers,
+                    )
                 except (BrokenPipeError, ConnectionResetError):
                     cancel_event.set()
             except (BrokenPipeError, ConnectionResetError):
@@ -117,11 +141,20 @@ def create_reference_server(
                 disconnect_stop.set()
                 disconnect_watcher.join(timeout=0.5)
 
-        def _write_json(self, status: int, body: object, request_id: str) -> None:
+        def _write_json(
+            self,
+            status: int,
+            body: object,
+            request_id: str,
+            *,
+            response_headers: Mapping[str, str] | None = None,
+        ) -> None:
             encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("X-Request-Id", request_id)
+            for name, value in (response_headers or {}).items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("Connection", "close")
             self.end_headers()
@@ -150,6 +183,7 @@ def create_reference_server(
                 # Headers are already committed, so a second JSON response
                 # would corrupt the SSE stream. The client observes a
                 # truncated stream and the request is not retried.
+                # 响应标头已经提交,再发送 JSON 响应会破坏 SSE 流。客户端会观察到流被截断,且请求不会重试。
                 cancel_event.set()
 
         def log_message(self, format: str, *args: Any) -> None:

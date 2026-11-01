@@ -13,7 +13,15 @@
     "code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]+$"},
     "retryable": {"type": "boolean"},
     "traceId": {"type": "string", "pattern": "^(?!0{32}$)[0-9a-f]{32}$"},
-    "resourceRef": {"type": "string"}
+    "resourceRef": {"type": "string"},
+    "context": {
+      "type": "object",
+      "properties": {
+        "connectionId": {"type": "string", "format": "uuid"},
+        "authorizationRef": {"type": "string", "minLength": 1, "maxLength": 300}
+      },
+      "additionalProperties": false
+    }
   },
   "additionalProperties": false
 }

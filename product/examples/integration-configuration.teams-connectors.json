@@ -1,0 +1,121 @@
+{
+  "schemaVersion": 1,
+  "hostSecretRefs": {
+    "platform/connector-root": "PLATFORM_CONNECTOR_AUTHORITY_ROOT_CERTIFICATE_PATH",
+    "platform/connector-client-cert": "EXCHANGE_CONNECTOR_CLIENT_CERTIFICATE_PATH",
+    "platform/connector-client-key": "EXCHANGE_CONNECTOR_CLIENT_PRIVATE_KEY_PATH",
+    "tls/plugin-root": "PLUGIN_RUNTIME_ROOT_CERTIFICATE_PATH",
+    "tls/exchange-account-center-client-cert": "EXCHANGE_ACCOUNT_CENTER_CLIENT_CERTIFICATE_PATH",
+    "tls/exchange-account-center-client-key": "EXCHANGE_ACCOUNT_CENTER_CLIENT_PRIVATE_KEY_PATH",
+    "tls/exchange-plugin-client-cert": "EXCHANGE_PLUGIN_CLIENT_CERTIFICATE_PATH",
+    "tls/exchange-plugin-client-key": "EXCHANGE_PLUGIN_CLIENT_PRIVATE_KEY_PATH",
+    "account/signing": "EXCHANGE_ACCOUNT_CONTEXT_HMAC_KEY",
+    "navigator/exchange-hmac": "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE",
+    "keys/hf": "EXCHANGE_HF_AUTH_CONTEXT_HMAC_KEY"
+  },
+  "platformAuthority": {
+    "connectorWorkload": {
+      "connectionRef": "grpcs://connector-authority.internal.example:7443",
+      "rootCertificateRef": "platform/connector-root",
+      "clientCertificateRef": "platform/connector-client-cert",
+      "clientKeyRef": "platform/connector-client-key"
+    }
+  },
+  "accountCenter": {
+    "bindingId": "host-account-center-binding",
+    "connectionRef": "grpcs://account-center.internal.example:7443",
+    "transport": "mtls",
+    "mtls": {
+      "rootCertificateRef": "tls/plugin-root",
+      "clientCertificateRef": "tls/exchange-account-center-client-cert",
+      "clientKeyRef": "tls/exchange-account-center-client-key"
+    },
+    "callerId": "exchange-service",
+    "signingKeyRef": "account/signing",
+    "githubAppInstallationDeadlineSeconds": 50
+  },
+  "githubIssues": {
+    "bindingId": "host-github-issues-binding",
+    "connectionRef": "grpcs://github-issues.internal.example:7443",
+    "transport": "mtls",
+    "deadlineSeconds": 50,
+    "mtls": {
+      "rootCertificateRef": "tls/plugin-root",
+      "clientCertificateRef": "tls/exchange-plugin-client-cert",
+      "clientKeyRef": "tls/exchange-plugin-client-key"
+    },
+    "callerId": "exchange-service",
+    "signingKeyRef": "account/signing"
+  },
+  "connectorHost": {
+    "navigatorConnector": {
+      "keyId": "navigator-v1",
+      "keyFileRef": "navigator/exchange-hmac"
+    },
+    "teamsMessages": {
+      "profileRef": "teams-primary",
+      "connectionRef": "teams-connection-ref-from-bootstrap",
+      "organizationId": "org-from-authority-deployment",
+      "workspaceId": "workspace-from-authority-deployment",
+      "tenantId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "allowedTeamIds": ["team-id-from-teams"],
+      "allowedChannelIds": [],
+      "botAppId": "teams-bot-app-client-id",
+      "expectedIssuer": "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0",
+      "directPlugin": {
+        "bindingId": "host-teams-message-binding",
+        "connectionRef": "grpcs://teams-messages.internal.example:7443",
+        "transport": "mtls",
+        "mtls": {
+          "rootCertificateRef": "tls/plugin-root",
+          "clientCertificateRef": "tls/exchange-plugin-client-cert",
+          "clientKeyRef": "tls/exchange-plugin-client-key"
+        }
+      }
+    }
+  },
+  "authorizationCloud": {
+    "currentAuthority": {
+      "contexts": []
+    },
+    "profiles": {
+      "hf-primary": {
+        "provider": "hf",
+        "directPlugin": {
+          "bindingId": "host-huggingface-provider-binding",
+          "connectionRef": "grpcs://huggingface.internal.example:7443",
+          "transport": "mtls",
+          "mtls": {
+            "rootCertificateRef": "tls/plugin-root",
+            "clientCertificateRef": "tls/exchange-plugin-client-cert",
+            "clientKeyRef": "tls/exchange-plugin-client-key"
+          }
+        },
+        "callerWorkload": "exchange-service",
+        "audience": "huggingface-provider",
+        "expectedIssuer": "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0",
+        "contextKeyRef": "keys/hf",
+        "organizationId": "org-from-authority-deployment",
+        "workspaceId": "workspace-from-authority-deployment",
+        "accessMode": "workspace_operator",
+        "targets": {
+          "hf-primary-target": {
+            "targetRef": "example-org/example-private-model",
+            "displayName": "Hugging Face primary account"
+          }
+        },
+        "credentialSecretRef": "huggingface/connector-token",
+        "authMode": "device_oauth",
+        "accountScopes": {
+          "repositories": [
+            {
+              "repoType": "model",
+              "repoId": "example-org/example-private-model",
+              "permissions": ["read", "write"]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

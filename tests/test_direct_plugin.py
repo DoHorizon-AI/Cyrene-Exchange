@@ -9,34 +9,59 @@ from threading import Event
 
 import grpc
 import pytest
-
 from cyrene_model_provider_contracts import (
     CHAT_COMPLETION_REQUEST_TYPE_URL,
     CHAT_COMPLETION_RESPONSE_TYPE_URL,
     CHAT_COMPLETION_V2_INTERFACE_VERSION,
     CHAT_COMPLETION_V2_METHOD,
+    CHAT_COMPLETION_V3_METHOD,
+    CHAT_COMPLETION_V3_REQUEST_TYPE_URL,
+    EMBEDDINGS_METHOD,
+    EMBEDDINGS_REQUEST_TYPE_URL,
+    EMBEDDINGS_RESPONSE_TYPE_URL,
     ChatCompletionChunk,
-    ChatCompletionRequest,
+    ChatCompletionRequestV3,
     ChatCompletionResponse,
+    ChatMessageV3,
+    EmbeddingBatch,
+    EmbeddingError,
+    EmbeddingsResponse,
+    EmbeddingVector,
+    ImageContentPart,
+    TextContentPart,
     decode_chat_completion_request,
     decode_chat_completion_request_v2,
+    decode_chat_completion_request_v3,
+    decode_embeddings_request,
     encode_chat_completion_response,
+    encode_chat_completion_response_v3,
+    encode_embeddings_response,
 )
 from cyrene_plugin_runtime import (
     DirectPayload,
     DirectPluginFailure,
     DirectPluginInvocationCancelled,
 )
-from cyrene_exchange.capabilities import ProviderInvocationCancelled, ProviderUsage
+
+from cyrene_exchange.capabilities import (
+    ProviderEmbeddingError,
+    ProviderInvocationCancelled,
+    ProviderUsage,
+)
 from cyrene_exchange.direct_plugin import (
     DirectPluginModelProvider,
     ModelProviderExecutionError,
 )
-from cyrene_exchange.protocol import NormalizedInferenceRequest
+from cyrene_exchange.protocol import NormalizedEmbeddingRequest, NormalizedInferenceRequest
 
 
 class RecordingInvoker:
-    """Record one typed invocation and return a configurable response."""
+    """Record one typed invocation and return a configurable response.
+
+    中文:记录一次类型化调用,并返回可配置的响应。
+    """
+
+    # 中文:记录一次有类型的调用,并返回可配置的响应.
 
     def __init__(self, response: DirectPayload) -> None:
         self.response = response
@@ -121,19 +146,68 @@ def test_provider_calls_direct_endpoint_with_canonical_typed_payload():
     assert request.max_tokens == 32
 
 
-def test_provider_rejects_unrepresented_message_shape_before_dispatch():
+def test_provider_calls_canonical_embeddings_method_and_preserves_actual_model():
+    response = EmbeddingsResponse(
+        embeddings=EmbeddingBatch(
+            vectors=(EmbeddingVector(values=(0.25, -0.5)), EmbeddingVector(values=(1.0, 0.0))),
+            dimensions=2,
+            model="provider-actual-model",
+        )
+    )
+    invoker = RecordingInvoker(DirectPayload(EMBEDDINGS_RESPONSE_TYPE_URL, encode_embeddings_response(response)))
+    provider = DirectPluginModelProvider(invoker, deadline_seconds=9)
+    cancellation = Event()
+    request = NormalizedEmbeddingRequest(model="route-model", inputs=("first", "second"))
+
+    batch = provider.embed(request, cancel_event=cancellation)
+
+    assert batch.model == "provider-actual-model"
+    assert batch.dimensions == 2
+    assert batch.vectors == ((0.25, -0.5), (1.0, 0.0))
+    assert len(invoker.calls) == 1
+    call = invoker.calls[0]
+    assert call["capability"] == "model.provider.v1"
+    assert call["interface_version"] == "1"
+    assert call["method"] == EMBEDDINGS_METHOD
+    assert call["deadline_seconds"] == 9
+    assert call["cancel_event"] is cancellation
+    typed = call["request"]
+    assert isinstance(typed, DirectPayload)
+    assert typed.type_url == EMBEDDINGS_REQUEST_TYPE_URL
+    decoded = decode_embeddings_request(typed.value)
+    assert decoded.inputs == ("first", "second")
+    assert decoded.model == "route-model"
+
+
+def test_provider_preserves_typed_embedding_errors_and_rejects_wrong_type_url():
+    error_response = EmbeddingsResponse(error=EmbeddingError(code=5, message="provider busy", retry_after_seconds=2.0))
+    invoker = RecordingInvoker(DirectPayload(EMBEDDINGS_RESPONSE_TYPE_URL, encode_embeddings_response(error_response)))
+    provider = DirectPluginModelProvider(invoker)
+    request = NormalizedEmbeddingRequest(model="route-model", inputs=("text",))
+
+    with pytest.raises(ProviderEmbeddingError) as captured:
+        provider.embed(request, cancel_event=Event())
+    assert captured.value.code == 5
+    assert captured.value.retry_after_seconds == 2.0
+
+    invoker.response = DirectPayload("type.googleapis.com/example.Wrong", b"")
+    with pytest.raises(ModelProviderExecutionError, match="unexpected payload type"):
+        provider.embed(request, cancel_event=Event())
+
+
+def test_provider_rejects_arbitrary_media_url_before_dispatch():
     invoker = RecordingInvoker(response_payload(ChatCompletionChunk(delta="unused")))
     provider = DirectPluginModelProvider(invoker)
     request = normalized_request(
         messages=(
             {
                 "role": "user",
-                "content": [{"type": "text", "text": "multimodal"}],
+                "content": [{"type": "image_url", "url": "https://example.test/image.png"}],
             },
         )
     )
 
-    with pytest.raises(ModelProviderExecutionError, match="content must be text"):
+    with pytest.raises(ModelProviderExecutionError, match="mime_type is invalid"):
         tuple(provider.complete(request, cancel_event=Event()))
 
     assert invoker.calls == []
@@ -165,6 +239,59 @@ def test_provider_negotiates_v2_when_exchange_request_contains_tool_metadata():
     assert decoded.tools[0].function.name == "weather"
     assert decoded.tool_choice is not None
     assert decoded.tool_choice.mode == "auto"
+
+
+def test_provider_negotiates_v3_for_typed_media_and_keeps_tool_usage_response_fields():
+    response = ChatCompletionResponse(
+        chunks=(
+            ChatCompletionChunk(
+                delta="answer",
+                role="assistant",
+                finish_reason="stop",
+                prompt_tokens=2,
+                completion_tokens=1,
+                total_tokens=3,
+            ),
+        )
+    )
+    invoker = RecordingInvoker(
+        DirectPayload(
+            CHAT_COMPLETION_RESPONSE_TYPE_URL,
+            encode_chat_completion_response_v3(response),
+        )
+    )
+    provider = DirectPluginModelProvider(invoker)
+    request = normalized_request(
+        messages=(
+            {
+                "role": "user",
+                "content": (
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "mime_type": "image/png", "data": b"inline-image"},
+                ),
+            },
+        )
+    )
+
+    chunks = tuple(provider.complete(request, cancel_event=Event()))
+
+    assert chunks[0].delta == "answer"
+    assert chunks[0].role == "assistant"
+    assert chunks[0].finish_reason == "stop"
+    assert chunks[0].usage == ProviderUsage(prompt_tokens=2, completion_tokens=1, total_tokens=3)
+    call = invoker.calls[0]
+    assert call["interface_version"] == "3"
+    assert call["method"] == CHAT_COMPLETION_V3_METHOD
+    typed = call["request"]
+    assert isinstance(typed, DirectPayload)
+    assert typed.type_url == CHAT_COMPLETION_V3_REQUEST_TYPE_URL
+    decoded = decode_chat_completion_request_v3(typed.value)
+    assert isinstance(decoded, ChatCompletionRequestV3)
+    assert isinstance(decoded.messages[0], ChatMessageV3)
+    assert decoded.messages[0].content == (
+        TextContentPart("describe"),
+        ImageContentPart(mime_type="image/png", data=b"inline-image"),
+    )
 
 
 def test_provider_preserves_plugin_failure_and_rejects_wrong_response_type():

@@ -1,0 +1,997 @@
+"""Closed host-profile startup checks without contacting Authority or Plugins.
+
+Module: product.tests.test_authorization_cloud_config
+Role: Verify production builder configuration and per-call bearer revalidation.
+模块职责：验证生产配置构建以及每次调用重新验证 bearer。
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+from jsonschema import Draft202012Validator, ValidationError
+
+import cyrene_exchange_product.integrations.auth as auth_module
+import cyrene_exchange_product.integrations.cli as integration_cli
+import cyrene_exchange_product.integrations.clients as clients_module
+from cyrene_exchange_product.integrations.authorization_cloud_profiles import (
+    AuthorizationCloudConfigurationError,
+    AuthorizationCloudProfileRegistry,
+    parse_authorization_cloud_settings,
+)
+from cyrene_exchange_product.integrations.models import (
+    CreateIntegrationConnection,
+    IntegrationPrincipal,
+)
+from cyrene_exchange_product.server import build_integration_app
+
+
+def _config(tmp_path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    root_cert = tmp_path / "platform-root.pem"
+    product_cert = tmp_path / "product-cert.pem"
+    product_key = tmp_path / "product-key.pem"
+    for path in (root_cert, product_cert, product_key):
+        path.write_text("synthetic test material", encoding="ascii")
+    product_key.chmod(0o600)
+    secret_refs = {
+        "platform/root": "PLATFORM_ROOT",
+        "platform/product-cert": "PLATFORM_PRODUCT_CERT",
+        "platform/product-key": "PLATFORM_PRODUCT_KEY",
+        "account/signing": "ACCOUNT_SIGNING",
+        "account/callback": "ACCOUNT_CALLBACK",
+        "account/wecom-source": "ACCOUNT_WECOM_SOURCE",
+        "wecom/inbound": "WECOM_INBOUND",
+        "bearers/actor-a": "CURRENT_ACTOR_BEARER",
+        "keys/wecom": "WECOM_AUTH_CONTEXT_KEY",
+        "keys/azure": "AZURE_AUTH_CONTEXT_KEY",
+        "keys/email": "EMAIL_CONTEXT_KEY",
+    }
+    configuration = {
+        "schemaVersion": 1,
+        "hostSecretRefs": secret_refs,
+        "platformAuthority": {
+            "audience": "exchange-product",
+            "identity": {
+                "connectionRef": "unix:///tmp/platform-authority.sock",
+                "transport": "local",
+            },
+            "productWorkload": {
+                "connectionRef": "grpcs://authority.example:7443",
+                "workloadId": "exchange-product",
+                "audience": "exchange-product",
+                "rootCertificateRef": "platform/root",
+                "clientCertificateRef": "platform/product-cert",
+                "clientKeyRef": "platform/product-key",
+            },
+        },
+        "accountCenter": {
+            "bindingId": "account-center-binding",
+            "connectionRef": "grpc://127.0.0.1:5500",
+            "transport": "local",
+            "callerId": "exchange-service",
+            "signingKeyRef": "account/signing",
+            "callbackCallerId": "exchange-callback",
+            "callbackSigningKeyRef": "account/callback",
+            "wecomSourceCallerId": "exchange-wecom-source",
+            "wecomSourceSigningKeyRef": "account/wecom-source",
+        },
+        "githubIssues": {
+            "bindingId": "github-binding",
+            "connectionRef": "grpc://127.0.0.1:5501",
+            "transport": "local",
+            "callerId": "exchange-service",
+            "signingKeyRef": "account/signing",
+        },
+        "wecom": {
+            "bindingId": "wecom-message-binding",
+            "connectionRef": "grpc://127.0.0.1:5502",
+            "transport": "local",
+            "targets": {"oncall": {"botId": "bot-1", "conversationId": "group-1", "kind": "GROUP"}},
+            "inboundSources": {
+                "0a8f22dd-2a49-4ef2-9b36-a8d37ac10a12": {
+                    "organizationId": "org-a",
+                    "workspaceId": "workspace-a",
+                    "sourceAuthority": "wecom.example",
+                    "botNamespace": "bot-namespace",
+                    "accountId": "bot:exchange",
+                    "groupConversationId": "group-1",
+                    "requestHmacSecretRef": "wecom/inbound",
+                }
+            },
+        },
+        "authorizationCloud": {
+            "monitorIntervalSeconds": 900,
+            "currentAuthority": {
+                "contexts": [
+                    {
+                        "contextRef": "actor-a",
+                        "issuer": "https://identity.example.test",
+                        "subject": "member-a",
+                        "organizationId": "org-a",
+                        "workspaceId": "workspace-a",
+                        "bearerTokenEnvRef": "bearers/actor-a",
+                    }
+                ]
+            },
+            "profiles": {
+                "wecom-prod": {
+                    "provider": "wecom",
+                    "directPlugin": {
+                        "bindingId": "wecom.authorization.binding",
+                        "connectionRef": "grpc://127.0.0.1:5503",
+                        "transport": "local",
+                    },
+                    "callerWorkload": "exchange.integrations",
+                    "audience": "wecom-authorization",
+                    "expectedIssuer": "https://identity.example.test",
+                    "contextKeyRef": "keys/wecom",
+                    "organizationId": "org-a",
+                    "workspaceId": "workspace-a",
+                    "allowedContextRefs": ["actor-a"],
+                    "displayName": "WeCom Production",
+                    "authorizationRef": "wecom-auth-1",
+                },
+                "azure-prod": {
+                    "provider": "azure",
+                    "directPlugin": {
+                        "bindingId": "cloud.binding.azure",
+                        "connectionRef": "grpc://127.0.0.1:5504",
+                        "transport": "local",
+                    },
+                    "callerWorkload": "exchange.integrations",
+                    "audience": "cloud-management",
+                    "expectedIssuer": "https://identity.example.test",
+                    "contextKeyRef": "keys/azure",
+                    "organizationId": "org-a",
+                    "workspaceId": "workspace-a",
+                    "allowedContextRefs": ["actor-a"],
+                    "targets": {
+                        "vm-prod": {
+                            "targetRef": "azure-vm-1",
+                            "displayName": "Production VM",
+                            "allowedContextRefs": ["actor-a"],
+                        }
+                    },
+                },
+            },
+        },
+        "emailNotifications": {
+            "enabled": True,
+            "directPlugin": {
+                "bindingId": "email.binding.notifications",
+                "connectionRef": "grpc://127.0.0.1:5505",
+                "transport": "local",
+            },
+            "callerWorkload": "cyrene-exchange",
+            "audience": "cyrene.connectors.email-notification",
+            "expectedIssuer": "https://identity.example.test",
+            "contextKeyRef": "keys/email",
+            "organizationId": "org-a",
+            "workspaceId": "workspace-a",
+            "recipientRef": "oncall",
+            "allowedContextRefs": ["actor-a"],
+        },
+    }
+    environ = {
+        integration_cli.CONFIGURATION_ENV: json.dumps(configuration),
+        "PLATFORM_ROOT": str(root_cert),
+        "PLATFORM_PRODUCT_CERT": str(product_cert),
+        "PLATFORM_PRODUCT_KEY": str(product_key),
+        "ACCOUNT_SIGNING": "a" * 64,
+        "ACCOUNT_CALLBACK": "b" * 64,
+        "ACCOUNT_WECOM_SOURCE": "c" * 64,
+        "WECOM_INBOUND": "request-hmac-key-value-that-is-long-enough",
+        "WECOM_AUTH_CONTEXT_KEY": "d" * 64,
+        "AZURE_AUTH_CONTEXT_KEY": "e" * 64,
+        "EMAIL_CONTEXT_KEY": "f" * 64,
+        # Intentionally absent until a host supplies a live actor bearer.
+    }
+    return configuration, environ
+
+
+def test_host_preflight_accepts_live_bearer_reference_without_caching_a_value(
+    tmp_path: Path,
+) -> None:
+    _, environ = _config(tmp_path)
+
+    result = integration_cli.validate_host_configuration(environ=environ)
+
+    assert result["authorizationCloudProfileCount"] == 2
+    assert result["currentAuthorityContextCount"] == 1
+    assert result["emailNotificationsEnabled"] is True
+    assert "CURRENT_ACTOR_BEARER" not in str(result)
+
+
+def test_host_profiles_reject_unbound_or_mismatched_actor_contexts(tmp_path: Path) -> None:
+    configuration, _ = _config(tmp_path)
+    settings = configuration["authorizationCloud"]
+    settings["profiles"]["azure-prod"]["allowedContextRefs"] = ["not-configured"]
+
+    with pytest.raises(AuthorizationCloudConfigurationError, match="unknown actor context"):
+        parse_authorization_cloud_settings(
+            settings,
+            email_value=configuration["emailNotifications"],
+        )
+
+
+def test_target_specific_actor_allowlist_denies_other_configured_member(
+    tmp_path: Path,
+) -> None:
+    configuration, _ = _config(tmp_path)
+    settings = configuration["authorizationCloud"]
+    settings["currentAuthority"]["contexts"].append(
+        {
+            "contextRef": "member-b",
+            "issuer": "https://identity.example.test",
+            "subject": "member-b",
+            "organizationId": "org-a",
+            "workspaceId": "workspace-a",
+            "bearerTokenEnvRef": "bearers/member-b",
+        }
+    )
+    settings["profiles"]["azure-prod"]["allowedContextRefs"].append("member-b")
+    registry = AuthorizationCloudProfileRegistry(
+        parse_authorization_cloud_settings(
+            settings,
+            email_value=configuration["emailNotifications"],
+        )
+    )
+    other_actor = IntegrationPrincipal(
+        issuer="https://identity.example.test",
+        subject="member-b",
+        organization_id="org-a",
+        workspace_id="workspace-a",
+        allowed_operation_ids=frozenset({"integrationCreateConnection"}),
+    )
+
+    with pytest.raises(PermissionError, match="target is not allowed"):
+        registry.display_name_for_connection(
+            other_actor,
+            CreateIntegrationConnection(
+                provider="azure",
+                binding_ref="azure-prod",
+                target_ref="vm-prod",
+            ),
+        )
+
+    configuration, _ = _config(tmp_path)
+    settings = configuration["authorizationCloud"]
+    settings["profiles"]["azure-prod"]["expectedIssuer"] = "https://wrong.example"
+    with pytest.raises(AuthorizationCloudConfigurationError, match="actor pins"):
+        parse_authorization_cloud_settings(
+            settings,
+            email_value=configuration["emailNotifications"],
+        )
+
+
+def test_disabled_mail_profile_cannot_retain_binding_or_recipient(tmp_path: Path) -> None:
+    configuration, _ = _config(tmp_path)
+    settings = configuration["authorizationCloud"]
+    with pytest.raises(AuthorizationCloudConfigurationError, match="disabled emailNotifications"):
+        parse_authorization_cloud_settings(
+            settings,
+            email_value={"enabled": False, "recipientRef": "oncall"},
+        )
+
+
+def test_documented_host_configuration_sample_matches_the_closed_parser() -> None:
+    sample_path = (
+        Path(__file__).parents[1] / "examples/integration-configuration.authorization-cloud.json"
+    )
+    configuration = json.loads(sample_path.read_text(encoding="utf-8"))
+    settings = parse_authorization_cloud_settings(
+        configuration["authorizationCloud"],
+        email_value=configuration["emailNotifications"],
+    )
+    assert set(settings.profiles) == {"wecom-primary", "azure-primary"}
+    assert settings.email.enabled is False
+
+
+def test_microsoft_profiles_use_fixed_host_plan_and_source_allowlists(tmp_path: Path) -> None:
+    configuration, _ = _config(tmp_path)
+    cloud = configuration["authorizationCloud"]
+    tenant_id = "11111111-2222-4333-8444-555555555555"
+    office_workspace_id = "33333333-4444-4555-8666-777777777777"
+    oid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+    cloud["currentAuthority"]["contexts"].append(
+        {
+            "contextRef": "entra-actor",
+            "issuer": issuer,
+            "subject": oid,
+            "organizationId": "org-a",
+            "workspaceId": office_workspace_id,
+            "bearerTokenEnvRef": "bearers/actor-a",
+        }
+    )
+    common = {
+        "directPlugin": {
+            "bindingId": "microsoft-provider-binding",
+            "connectionRef": "grpc://127.0.0.1:5510",
+            "transport": "local",
+        },
+        "audience": "microsoft-provider",
+        "expectedIssuer": issuer,
+        "contextKeyRef": "keys/azure",
+        "organizationId": "org-a",
+        "workspaceId": office_workspace_id,
+        "allowedContextRefs": ["entra-actor"],
+        "accessMode": "actor_owned",
+    }
+    cloud["profiles"]["graph-planner"] = {
+        **common,
+        "provider": "microsoft_graph",
+        "callerWorkload": "microsoft-graph-provider",
+        "plannerPlanIds": ["xqQg5FS2LkCp935s-FIFm2QAFkHM"],
+        "sharepointTargets": {
+            "siteId": (
+                "contoso.sharepoint.com,11111111-2222-4333-8444-555555555555,"
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            ),
+            "listIds": ["bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"],
+        },
+    }
+    cloud["profiles"]["graph-office-v2"] = {
+        **common,
+        "directPlugin": {
+            "bindingId": "microsoft-office-v2-binding",
+            "connectionRef": "grpc://127.0.0.1:5512",
+            "transport": "local",
+        },
+        "provider": "microsoft_graph",
+        "callerWorkload": "microsoft-graph-provider",
+        "officeV2": {
+            "schemaVersion": 2,
+            "tenantId": tenant_id,
+            "workspaceId": office_workspace_id,
+            "enabledFeatures": {
+                "plannerEnabled": False,
+                "todoEnabled": False,
+                "calendarEnabled": False,
+                "mailMetadataEnabled": True,
+                "mailDraftsEnabled": False,
+                "mailSendEnabled": False,
+                "sharePointDriveMetadataEnabled": False,
+            },
+            "targets": {
+                "plannerPlanIds": [],
+                "sharePointSiteIds": [],
+                "sharePointListIds": [],
+                "sharePointDriveIds": [],
+                "toDoTaskListIds": [],
+                "calendarIds": [],
+                "mailFolderIds": [],
+                "freebusySubjects": [],
+            },
+        },
+    }
+    cloud["profiles"]["ado-pipeline"] = {
+        **common,
+        "directPlugin": {**common["directPlugin"], "bindingId": "ado-provider-binding"},
+        "provider": "azure_devops",
+        "callerWorkload": "azure-devops-observation-provider",
+        "tenantId": tenant_id,
+        "organization": "contoso",
+        "authorizedSources": [
+            {
+                "source_id": "pipeline-source-a",
+                "kind": "pipeline_runs",
+                "project_id": "22222222-3333-4444-8555-666666666666",
+                "project_name": "Builds",
+                "profile_ref": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+                "pipeline_id": 31,
+            }
+        ],
+    }
+
+    settings = parse_authorization_cloud_settings(
+        cloud,
+        email_value=configuration["emailNotifications"],
+    )
+
+    assert settings.profiles["graph-planner"].microsoft_graph_plan_ids == (
+        "xqQg5FS2LkCp935s-FIFm2QAFkHM",
+    )
+    assert settings.profiles["graph-planner"].microsoft_graph_sharepoint_list_ids == (
+        "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+    )
+    office_v2 = settings.profiles["graph-office-v2"].microsoft_graph_office_v2
+    assert office_v2 is not None
+    assert office_v2.enabled_features["mailMetadataEnabled"] is True
+    assert office_v2.targets["mailFolderIds"] == ()
+    schema = json.loads(
+        (
+            Path(__file__).parents[1] / "examples/authorization-cloud-configuration.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(schema)
+    Draft202012Validator(schema).validate(
+        {
+            "authorizationCloud": {
+                "currentAuthority": cloud["currentAuthority"],
+                "profiles": {"graph-office-v2": cloud["profiles"]["graph-office-v2"]},
+            },
+            "emailNotifications": configuration["emailNotifications"],
+        }
+    )
+    ado_source = settings.profiles["ado-pipeline"].authorized_sources["pipeline-source-a"]
+    assert ado_source.profile_ref == "66666666-7777-4888-8999-aaaaaaaaaaaa"
+
+
+def test_microsoft_host_allowlist_defaults_empty_and_rejects_duplicate_plan_ids(
+    tmp_path: Path,
+) -> None:
+    configuration, _ = _config(tmp_path)
+    cloud = configuration["authorizationCloud"]
+    cloud["profiles"]["graph-disabled"] = {
+        "provider": "microsoft_graph",
+        "directPlugin": {
+            "bindingId": "graph-disabled-binding",
+            "connectionRef": "grpc://127.0.0.1:5511",
+            "transport": "local",
+        },
+        "callerWorkload": "microsoft-graph-provider",
+        "audience": "microsoft-provider",
+        "expectedIssuer": "https://identity.example.test",
+        "contextKeyRef": "keys/azure",
+        "organizationId": "org-a",
+        "workspaceId": "workspace-a",
+        "allowedContextRefs": ["actor-a"],
+    }
+    settings = parse_authorization_cloud_settings(
+        cloud,
+        email_value=configuration["emailNotifications"],
+    )
+    assert settings.profiles["graph-disabled"].microsoft_graph_plan_ids == ()
+
+    cloud["profiles"]["graph-disabled"]["plannerPlanIds"] = ["same-plan", "same-plan"]
+    with pytest.raises(AuthorizationCloudConfigurationError, match="duplicates"):
+        parse_authorization_cloud_settings(
+            cloud,
+            email_value=configuration["emailNotifications"],
+        )
+    cloud["profiles"]["graph-disabled"].pop("plannerPlanIds")
+    cloud["profiles"]["graph-disabled"]["sharepointTargets"] = {
+        "siteId": (
+            "contoso.sharepoint.com,11111111-2222-4333-8444-555555555555,"
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        ),
+        "listIds": ["not-a-uuid"],
+    }
+    with pytest.raises(AuthorizationCloudConfigurationError, match="invalid ID"):
+        parse_authorization_cloud_settings(
+            cloud,
+            email_value=configuration["emailNotifications"],
+        )
+
+
+def test_microsoft_office_mail_folder_targets_require_explicit_metadata_feature(
+    tmp_path: Path,
+) -> None:
+    configuration, _ = _config(tmp_path)
+    cloud = configuration["authorizationCloud"]
+    tenant_id = "11111111-2222-4333-8444-555555555555"
+    office_workspace_id = "33333333-4444-4555-8666-777777777777"
+    cloud["currentAuthority"]["contexts"].append(
+        {
+            "contextRef": "entra-actor",
+            "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+            "subject": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "organizationId": "org-a",
+            "workspaceId": office_workspace_id,
+            "bearerTokenEnvRef": "bearers/actor-a",
+        }
+    )
+    cloud["profiles"]["graph-office-v2"] = {
+        "provider": "microsoft_graph",
+        "directPlugin": {
+            "bindingId": "microsoft-office-v2-binding",
+            "connectionRef": "grpc://127.0.0.1:5512",
+            "transport": "local",
+        },
+        "callerWorkload": "microsoft-graph-provider",
+        "audience": "microsoft-provider",
+        "expectedIssuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+        "contextKeyRef": "keys/azure",
+        "organizationId": "org-a",
+        "workspaceId": office_workspace_id,
+        "allowedContextRefs": ["entra-actor"],
+        "accessMode": "actor_owned",
+        "officeV2": {
+            "schemaVersion": 2,
+            "tenantId": tenant_id,
+            "workspaceId": office_workspace_id,
+            "enabledFeatures": {
+                "plannerEnabled": False,
+                "todoEnabled": False,
+                "calendarEnabled": False,
+                "mailMetadataEnabled": False,
+                "mailDraftsEnabled": False,
+                "mailSendEnabled": False,
+                "sharePointDriveMetadataEnabled": False,
+            },
+            "targets": {
+                "plannerPlanIds": [],
+                "sharePointSiteIds": [],
+                "sharePointListIds": [],
+                "sharePointDriveIds": [],
+                "toDoTaskListIds": [],
+                "calendarIds": [],
+                "mailFolderIds": ["AAMkFolder-opaque=="],
+                "freebusySubjects": [],
+            },
+        },
+    }
+    with pytest.raises(
+        AuthorizationCloudConfigurationError, match="folder targets require metadata"
+    ):
+        parse_authorization_cloud_settings(
+            cloud,
+            email_value=configuration["emailNotifications"],
+        )
+
+
+def test_documented_configuration_schema_accepts_default_and_enabled_email_examples() -> None:
+    """Keep the reusable schema synchronized with both copyable configuration examples."""
+
+    examples = Path(__file__).parents[1] / "examples"
+    schema = json.loads(
+        (examples / "authorization-cloud-configuration.schema.json").read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(schema)
+
+    full_configuration = json.loads(
+        (examples / "integration-configuration.authorization-cloud.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    default_fragment = {
+        "authorizationCloud": full_configuration["authorizationCloud"],
+        "emailNotifications": full_configuration["emailNotifications"],
+    }
+    Draft202012Validator(schema).validate(default_fragment)
+
+    enabled_email = json.loads(
+        (examples / "email-notifications.enabled.fragment.json").read_text(encoding="utf-8")
+    )
+    Draft202012Validator(schema).validate(enabled_email)
+
+    teams_connectors = json.loads(
+        (examples / "integration-configuration.teams-connectors.json").read_text(encoding="utf-8")
+    )
+    connector_fragment = {
+        "authorizationCloud": teams_connectors["authorizationCloud"],
+        "connectorHost": teams_connectors["connectorHost"],
+        "hostSecretRefs": teams_connectors["hostSecretRefs"],
+    }
+    Draft202012Validator(schema).validate(connector_fragment)
+    invalid_hf_target = json.loads(json.dumps(connector_fragment))
+    invalid_hf_target["authorizationCloud"]["profiles"]["hf-primary"]["targets"][
+        "hf-primary-target"
+    ]["targetRef"] = "account-scope"
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(invalid_hf_target)
+
+    computer_fragment = {
+        "hostSecretRefs": {
+            "tls/plugin-root": "PLUGIN_RUNTIME_ROOT_CERTIFICATE_PATH",
+            "tls/exchange-plugin-client-cert": "EXCHANGE_PLUGIN_CLIENT_CERTIFICATE_PATH",
+            "tls/exchange-plugin-client-key": "EXCHANGE_PLUGIN_CLIENT_PRIVATE_KEY_PATH",
+        },
+        "connectorHost": {
+            "computerRunner": {
+                "profileRef": "computer-workspace-main",
+                "connectionRef": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "organizationId": "organization-id",
+                "workspaceId": "workspace-id",
+                "expectedIssuer": (
+                    "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0"
+                ),
+                "directPlugin": {
+                    "bindingId": "computer-runtime",
+                    "connectionRef": "grpcs://computer-runtime-proxy:7443",
+                    "transport": "mtls",
+                    "mtls": {
+                        "rootCertificateRef": "tls/plugin-root",
+                        "clientCertificateRef": "tls/exchange-plugin-client-cert",
+                        "clientKeyRef": "tls/exchange-plugin-client-key",
+                    },
+                },
+                "maxCommandTimeoutMs": 600000,
+                "maxFileBytes": 1048576,
+                "maxReadBytes": 65536,
+                "maxDirectoryDepth": 32,
+            }
+        },
+    }
+    Draft202012Validator(schema).validate(computer_fragment)
+
+
+def test_hf_target_ref_is_repo_identity_but_connection_ref_remains_an_alias() -> None:
+    """Bind one request alias to the exact Account Center repository ID."""
+
+    example = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "examples"
+            / "integration-configuration.teams-connectors.json"
+        ).read_text(encoding="utf-8")
+    )
+    settings = parse_authorization_cloud_settings(
+        example["authorizationCloud"],
+        email_value={"enabled": False},
+    )
+    registry = AuthorizationCloudProfileRegistry(settings)
+    profile = settings.profiles["hf-primary"]
+    target = profile.targets["hf-primary-target"]
+    assert target.target_ref == "example-org/example-private-model"
+
+    principal = IntegrationPrincipal(
+        issuer=profile.expected_issuer,
+        subject="owner-subject",
+        organization_id=profile.organization_id,
+        workspace_id=profile.workspace_id,
+        allowed_operation_ids=frozenset(
+            {"integrationCreateConnection", "navigator.connector.operator.v1"}
+        ),
+    )
+    request = CreateIntegrationConnection(
+        provider="hf",
+        binding_ref="hf-primary",
+        target_ref="hf-primary-target",
+        account_link_ref="00000000-0000-4000-8000-000000000401",
+    )
+    assert (
+        registry.display_name_for_connection(principal, request) == "Hugging Face primary account"
+    )
+    first_profile_ref = registry.account_center_profile_ref(
+        principal,
+        profile,
+        target_alias="hf-primary-target",
+    )
+    second_operator = replace(principal, subject="another-operator")
+    assert (
+        registry.account_center_profile_ref(
+            second_operator,
+            profile,
+            target_alias="hf-primary-target",
+        )
+        == first_profile_ref
+    )
+    another_target = replace(target, target_ref="example-org/another-model")
+    other_profile = replace(
+        profile,
+        targets={**profile.targets, "hf-secondary-target": another_target},
+    )
+    assert (
+        registry.account_center_profile_ref(
+            principal,
+            other_profile,
+            target_alias="hf-secondary-target",
+        )
+        != first_profile_ref
+    )
+
+
+class _FakeAuthority:
+    def __init__(self, principals: dict[str, IntegrationPrincipal]) -> None:
+        self.principals = principals
+        self.calls: list[str] = []
+
+    def principal_for(self, *, bearer_token: str, workspace_id: str) -> IntegrationPrincipal:
+        self.calls.append(bearer_token)
+        principal = self.principals[bearer_token]
+        assert principal.workspace_id == workspace_id
+        return principal
+
+
+class _FakeDirectClient:
+    def __init__(self) -> None:
+        self.closed = False
+        self.invokes = 0
+
+    def invoke(self, **_kwargs: Any) -> None:
+        self.invokes += 1
+        raise AssertionError("startup must not call a provider")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeHealth:
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize(
+    ("github_deadline_seconds", "expected_deadline_seconds"),
+    [(None, 50.0), (37.5, 37.5)],
+    ids=("default-provider-budget", "configured-provider-budget"),
+)
+def test_production_builder_wires_profiles_and_rechecks_rotating_bearer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    github_deadline_seconds: float | None,
+    expected_deadline_seconds: float,
+) -> None:
+    configuration, environ = _config(tmp_path)
+    if github_deadline_seconds is not None:
+        configuration["githubIssues"]["deadlineSeconds"] = github_deadline_seconds
+        environ[integration_cli.CONFIGURATION_ENV] = json.dumps(configuration)
+    operations = {
+        "integrationCreateConnection",
+        "integrationGetAuthorizationHealth",
+        "integrationRefreshConnectionResources",
+        "integrationListNotifications",
+        "integrationDeliverNotification",
+        "integrationGetOperation",
+    }
+    principal = IntegrationPrincipal(
+        issuer="https://identity.example.test",
+        subject="member-a",
+        organization_id="org-a",
+        workspace_id="workspace-a",
+        allowed_operation_ids=frozenset(operations),
+    )
+    revoked = IntegrationPrincipal(
+        issuer=principal.issuer,
+        subject=principal.subject,
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        allowed_operation_ids=frozenset(),
+    )
+    authority = _FakeAuthority({"token-v1": principal, "token-v2": principal, "revoked": revoked})
+    direct_clients: list[_FakeDirectClient] = []
+
+    monkeypatch.setattr(
+        auth_module.PlatformAuthorityIdentityVerifier,
+        "from_unix_socket",
+        classmethod(lambda _cls, _path: authority),
+    )
+
+    def direct_client(_reference: str, **_kwargs: Any) -> _FakeDirectClient:
+        client = _FakeDirectClient()
+        direct_clients.append(client)
+        return client
+
+    monkeypatch.setattr(clients_module, "direct_plugin_client_from_connection", direct_client)
+    monkeypatch.setattr(clients_module, "DirectPluginHealthClient", _FakeHealth)
+    environ["CURRENT_ACTOR_BEARER"] = "token-v1"
+
+    services = integration_cli.build_production_services(
+        tmp_path / "integrations.sqlite3",
+        environ=environ,
+    )
+    try:
+        assert services.authorization_cloud is not None
+        assert services.current_context_resolver is not None
+        assert services.email_notifications is not None
+        assert services.authorization_cloud_runner is not None
+        assert services.email_delivery_recipient_resolver is not None
+        assert services.github._deadline_seconds == expected_deadline_seconds
+
+        request = CreateIntegrationConnection(
+            provider="azure",
+            binding_ref="azure-prod",
+            target_ref="vm-prod",
+        )
+        assert services.connection_profile_resolver is not None
+        request = request.model_copy(
+            update={"display_name": services.connection_profile_resolver(principal, request)}
+        )
+        connection = services.store.create_connection(
+            principal,
+            request,
+            idempotency_key="builder-profile-test",
+        )
+        resolver = services.current_context_resolver
+        assert (
+            resolver.for_connection(
+                connection,
+                operation_id="integrationGetAuthorizationHealth",
+            )
+            == principal
+        )
+
+        environ["CURRENT_ACTOR_BEARER"] = "token-v2"
+        assert (
+            resolver.for_connection(
+                connection,
+                operation_id="integrationGetAuthorizationHealth",
+            )
+            == principal
+        )
+
+        environ["CURRENT_ACTOR_BEARER"] = "revoked"
+        assert (
+            resolver.for_connection(
+                connection,
+                operation_id="integrationGetAuthorizationHealth",
+            )
+            is None
+        )
+        assert authority.calls == ["token-v1", "token-v2", "revoked"]
+        assert services.email_delivery_recipient_resolver(principal) == "oncall"
+        assert direct_clients and all(client.invokes == 0 for client in direct_clients)
+    finally:
+        services.close()
+
+
+@pytest.mark.parametrize("deadline_seconds", [0, 121, True, "25", 10**1000])
+def test_host_preflight_rejects_invalid_github_provider_deadline(
+    tmp_path: Path,
+    deadline_seconds: object,
+) -> None:
+    configuration, environ = _config(tmp_path)
+    configuration["githubIssues"]["deadlineSeconds"] = deadline_seconds
+    environ[integration_cli.CONFIGURATION_ENV] = json.dumps(configuration)
+
+    with pytest.raises(
+        integration_cli.IntegrationConfigurationError,
+        match=r"githubIssues\.deadlineSeconds",
+    ):
+        integration_cli.validate_host_configuration(environ=environ)
+
+
+def test_minimal_teams_github_huggingface_profile_builds_without_legacy_services(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Connector-only cold start needs no WeCom or Product identity/workload service."""
+
+    example = (
+        Path(__file__).parents[1] / "examples" / "integration-configuration.teams-connectors.json"
+    )
+    configuration = json.loads(example.read_text(encoding="utf-8"))
+    configuration["accountCenter"]["githubAppInstallationDeadlineSeconds"] = 37.5
+    paths: dict[str, Path] = {}
+    for secret_ref in configuration["hostSecretRefs"]:
+        if secret_ref in {"account/signing", "keys/hf"}:
+            continue
+        path = tmp_path / secret_ref.replace("/", "-")
+        path.write_text("synthetic material", encoding="ascii")
+        paths[secret_ref] = path
+    for secret_ref in {
+        "platform/connector-client-key",
+        "tls/exchange-account-center-client-key",
+        "tls/exchange-plugin-client-key",
+        "navigator/exchange-hmac",
+    }:
+        paths[secret_ref].chmod(0o600)
+    keyring = tmp_path / "authority-keyring.json"
+    keyring.write_text(
+        json.dumps(
+            {"keys": {"test-authority": base64.b64encode(b"k" * 32).decode("ascii")}},
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    keyring.chmod(0o600)
+    environ = {
+        integration_cli.CONFIGURATION_ENV: json.dumps(configuration),
+        "CYRENE_EXCHANGE_AUTHORITY_SIGNING_KEYS_FILE": str(keyring),
+        "CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE": "exchange",
+        "EXCHANGE_ACCOUNT_CONTEXT_HMAC_KEY": "a" * 64,
+        "EXCHANGE_HF_AUTH_CONTEXT_HMAC_KEY": "b" * 64,
+    }
+    environ.update(
+        {
+            environment_name: str(paths[secret_ref])
+            for secret_ref, environment_name in configuration["hostSecretRefs"].items()
+            if secret_ref not in {"account/signing", "keys/hf"}
+        }
+    )
+
+    report = integration_cli.validate_host_configuration(environ=environ)
+    assert report["valid"] is True
+    assert report["wecomBindingId"] is None
+    assert report["currentAuthorityContextCount"] == 0
+    assert report["teamsMessagesConfigured"] is True
+    assert report["teamsSystemNotificationConfigured"] is False
+    assert "identity" not in configuration["platformAuthority"]
+    assert "productWorkload" not in configuration["platformAuthority"]
+    assert "wecom" not in configuration
+
+    notification_configuration = json.loads(json.dumps(configuration))
+    notification_configuration["connectorHost"]["teamsMessages"]["systemNotification"] = {
+        "profileRef": "teams-owner-notification-v1",
+        "ownerSubject": "owner-object-id-from-directory",
+        "fixedRoute": {
+            "tenantId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "teamId": "team-id-from-teams",
+            "channelId": "channel-id-from-teams",
+            "conversationId": "19:owner-thread@thread.tacv2",
+            "rootThreadId": "1740000000000",
+            "serviceUrl": "https://smba.trafficmanager.net/amer/",
+        },
+    }
+    notification_environ = {
+        **environ,
+        integration_cli.CONFIGURATION_ENV: json.dumps(notification_configuration),
+    }
+    notification_report = integration_cli.validate_host_configuration(environ=notification_environ)
+    assert notification_report["teamsSystemNotificationConfigured"] is True
+
+    invalid_configuration = json.loads(json.dumps(configuration))
+    invalid_configuration["accountCenter"]["githubAppInstallationDeadlineSeconds"] = 121
+    invalid_environ = {
+        **environ,
+        integration_cli.CONFIGURATION_ENV: json.dumps(invalid_configuration),
+    }
+    with pytest.raises(
+        integration_cli.IntegrationConfigurationError,
+        match="githubAppInstallationDeadlineSeconds",
+    ):
+        integration_cli.validate_host_configuration(environ=invalid_environ)
+
+    class _NoNetworkClient:
+        def close(self) -> None:
+            pass
+
+        def invoke(self, **_kwargs: Any) -> Any:
+            raise AssertionError("cold start must not contact a provider")
+
+    class _FakeGrantClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+    class _FakeHealth:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        clients_module,
+        "direct_plugin_client_from_connection",
+        lambda *_args, **_kwargs: _NoNetworkClient(),
+    )
+    monkeypatch.setattr(clients_module, "PlatformConnectorAuthorizationClient", _FakeGrantClient)
+    monkeypatch.setattr(clients_module, "DirectPluginHealthClient", _FakeHealth)
+    services = integration_cli.build_production_services(
+        tmp_path / "minimal-connectors.sqlite3",
+        environ=environ,
+    )
+    try:
+        assert services.accounts._github_app_installation_deadline_seconds == 37.5
+        assert services.authorizer is None
+        assert services.delegation_authorizer is None
+        assert services.dispatcher is None
+        assert services.dispatcher_runner is None
+        assert services.connector_grant_authority is not None
+        assert services.connector_grant_verifier.configured is True
+        assert services.teams_message_profile is not None
+        assert services.authorization_profile_registry.settings.contexts == {}
+        assert services.wecom_sources == {}
+        hf_profile = services.authorization_profile_registry.settings.profiles["hf-primary"]
+        assert hf_profile.auth_mode == "device_oauth"
+        hf_actor = IntegrationPrincipal(
+            issuer=hf_profile.expected_issuer,
+            subject="aad-object-id-from-directory-bootstrap",
+            organization_id=hf_profile.organization_id,
+            workspace_id=hf_profile.workspace_id,
+            allowed_operation_ids=frozenset({"huggingface.models.list"}),
+        )
+        assert services.authorization_profile_registry.principal_allowed_for_profile(
+            hf_actor,
+            hf_profile,
+        )
+        app = build_integration_app(
+            database_path=tmp_path / "minimal-connectors.sqlite3",
+            integrations=services,
+        )
+        with TestClient(app) as client:
+            assert client.get("/healthz").json() == {"status": "ok"}
+            assert client.get("/readyz").json() == {"status": "ready"}
+    finally:
+        services.close()

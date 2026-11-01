@@ -1,0 +1,192 @@
+{
+  "schemaVersion": 1,
+  "hostSecretRefs": {
+    "platform/root": "PLATFORM_AUTHORITY_ROOT_CERTIFICATE_PATH",
+    "platform/client-cert": "EXCHANGE_PRODUCT_CERTIFICATE_PATH",
+    "platform/client-key": "EXCHANGE_PRODUCT_PRIVATE_KEY_PATH",
+    "account/signing": "EXCHANGE_ACCOUNT_CONTEXT_HMAC_KEY",
+    "account/callback": "EXCHANGE_CALLBACK_CONTEXT_HMAC_KEY",
+    "account/wecom-source": "EXCHANGE_WECOM_SOURCE_CONTEXT_HMAC_KEY",
+    "wecom/inbound": "EXCHANGE_WECOM_INBOUND_HMAC_KEY",
+    "navigator/exchange-hmac": "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE",
+    "bearers/member-a": "EXCHANGE_MEMBER_A_CURRENT_BEARER",
+    "keys/wecom": "EXCHANGE_WECOM_AUTH_CONTEXT_HMAC_KEY",
+    "keys/azure": "EXCHANGE_CLOUD_AUTH_CONTEXT_HMAC_KEY",
+    "tls/plugin-root": "PLUGIN_RUNTIME_ROOT_CERTIFICATE_PATH",
+    "tls/exchange-client-cert": "EXCHANGE_PLUGIN_CLIENT_CERTIFICATE_PATH",
+    "tls/exchange-client-key": "EXCHANGE_PLUGIN_CLIENT_PRIVATE_KEY_PATH"
+  },
+  "platformAuthority": {
+    "audience": "exchange-product",
+    "identity": {
+      "connectionRef": "grpcs://authority.example.invalid:7443",
+      "transport": "mtls",
+      "mtls": {
+        "rootCertificateRef": "platform/root",
+        "clientCertificateRef": "platform/client-cert",
+        "clientKeyRef": "platform/client-key"
+      }
+    },
+    "productWorkload": {
+      "connectionRef": "grpcs://authority.example.invalid:7443",
+      "workloadId": "exchange-product",
+      "audience": "exchange-product",
+      "rootCertificateRef": "platform/root",
+      "clientCertificateRef": "platform/client-cert",
+      "clientKeyRef": "platform/client-key"
+    }
+  },
+  "accountCenter": {
+    "bindingId": "host-account-center-binding",
+    "connectionRef": "grpcs://account-center.example.invalid:7443",
+    "transport": "mtls",
+    "mtls": {
+      "rootCertificateRef": "tls/plugin-root",
+      "clientCertificateRef": "tls/exchange-client-cert",
+      "clientKeyRef": "tls/exchange-client-key"
+    },
+    "callerId": "exchange-service",
+    "signingKeyRef": "account/signing",
+    "callbackCallerId": "exchange-github-callback",
+    "callbackSigningKeyRef": "account/callback",
+    "wecomSourceCallerId": "exchange-wecom-source",
+    "wecomSourceSigningKeyRef": "account/wecom-source"
+  },
+  "githubIssues": {
+    "bindingId": "host-github-issues-binding",
+    "connectionRef": "grpcs://github-issues.example.invalid:7443",
+    "transport": "mtls",
+    "deadlineSeconds": 50,
+    "mtls": {
+      "rootCertificateRef": "tls/plugin-root",
+      "clientCertificateRef": "tls/exchange-client-cert",
+      "clientKeyRef": "tls/exchange-client-key"
+    },
+    "callerId": "exchange-service",
+    "signingKeyRef": "account/signing"
+  },
+  "wecom": {
+    "bindingId": "host-wecom-message-binding",
+    "connectionRef": "grpcs://wecom.example.invalid:7443",
+    "transport": "mtls",
+    "mtls": {
+      "rootCertificateRef": "tls/plugin-root",
+      "clientCertificateRef": "tls/exchange-client-cert",
+      "clientKeyRef": "tls/exchange-client-key"
+    },
+    "targets": {
+      "ops-oncall": {
+        "botId": "configured-bot-id",
+        "conversationId": "configured-conversation-id",
+        "kind": "GROUP"
+      }
+    },
+    "inboundSources": {
+      "00000000-0000-4000-8000-000000000001": {
+        "organizationId": "org-a",
+        "workspaceId": "workspace-a",
+        "sourceAuthority": "wecom.example.invalid",
+        "botNamespace": "exchange-wecom",
+        "accountId": "bot:exchange",
+        "groupConversationId": "configured-conversation-id",
+        "requestHmacSecretRef": "wecom/inbound"
+      }
+    }
+  },
+  "connectorHost": {
+    "navigatorConnector": {
+      "keyId": "navigator-v1",
+      "keyFileRef": "navigator/exchange-hmac"
+    },
+    "teamsMessages": {
+      "profileRef": "teams-primary",
+      "connectionRef": "teams-messages-primary",
+      "organizationId": "org-a",
+      "workspaceId": "workspace-a",
+      "tenantId": "00000000-0000-4000-8000-000000000002",
+      "allowedTeamIds": ["team-ops"],
+      "allowedChannelIds": ["channel-ops"],
+      "botAppId": "00000000-0000-4000-8000-000000000003",
+      "expectedIssuer": "https://login.microsoftonline.com/00000000-0000-4000-8000-000000000002/v2.0",
+      "directPlugin": {
+        "bindingId": "host-teams-message-binding",
+        "connectionRef": "grpcs://teams-connector.example.invalid:7443",
+        "transport": "mtls",
+        "mtls": {
+          "rootCertificateRef": "tls/plugin-root",
+          "clientCertificateRef": "tls/exchange-client-cert",
+          "clientKeyRef": "tls/exchange-client-key"
+        }
+      }
+    }
+  },
+  "authorizationCloud": {
+    "monitorIntervalSeconds": 900,
+    "currentAuthority": {
+      "contexts": [
+        {
+          "contextRef": "member-a",
+          "issuer": "https://identity.example.invalid",
+          "subject": "member-a",
+          "organizationId": "org-a",
+          "workspaceId": "workspace-a",
+          "bearerTokenEnvRef": "bearers/member-a"
+        }
+      ]
+    },
+    "profiles": {
+      "wecom-primary": {
+        "provider": "wecom",
+        "directPlugin": {
+          "bindingId": "host-wecom-authorization-binding",
+          "connectionRef": "grpcs://wecom.example.invalid:7443",
+          "transport": "mtls",
+          "mtls": {
+            "rootCertificateRef": "tls/plugin-root",
+            "clientCertificateRef": "tls/exchange-client-cert",
+            "clientKeyRef": "tls/exchange-client-key"
+          }
+        },
+        "callerWorkload": "exchange.integrations",
+        "audience": "wecom-authorization",
+        "expectedIssuer": "https://identity.example.invalid",
+        "contextKeyRef": "keys/wecom",
+        "organizationId": "org-a",
+        "workspaceId": "workspace-a",
+        "allowedContextRefs": ["member-a"],
+        "displayName": "WeCom Production",
+        "authorizationRef": "native-wecom-authorization-ref"
+      },
+      "azure-primary": {
+        "provider": "azure",
+        "directPlugin": {
+          "bindingId": "host-cloud-resources-binding",
+          "connectionRef": "grpcs://cloud-resources.example.invalid:7443",
+          "transport": "mtls",
+          "mtls": {
+            "rootCertificateRef": "tls/plugin-root",
+            "clientCertificateRef": "tls/exchange-client-cert",
+            "clientKeyRef": "tls/exchange-client-key"
+          }
+        },
+        "callerWorkload": "exchange.integrations",
+        "audience": "cloud-resources",
+        "expectedIssuer": "https://identity.example.invalid",
+        "contextKeyRef": "keys/azure",
+        "organizationId": "org-a",
+        "workspaceId": "workspace-a",
+        "allowedContextRefs": ["member-a"],
+        "targets": {
+          "vm-prod": {
+            "targetRef": "cloud-resources-vm-prod",
+            "displayName": "Production VM",
+            "allowedContextRefs": ["member-a"]
+          }
+        }
+      }
+    }
+  },
+  "emailNotifications": {
+    "enabled": false
+  }
+}

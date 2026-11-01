@@ -15,6 +15,8 @@ This module is used by integration tests as a replaceable route planner. It
 is not instantiated by ``ExchangeGateway`` and is not the production routing
 implementation; the future ``cyrene.policy.model-routing`` plugin owns that
 capability implementation.
+
+实验性路由能力的参考实现,仅供参考。集成测试会将此模块用作可替换的路由规划器。它不会由 ``ExchangeGateway`` 实例化,也不是生产路由实现;未来该能力实现将由 ``cyrene.policy.model-routing`` 插件所有。
 """
 
 from __future__ import annotations
@@ -26,7 +28,10 @@ from .capabilities import RouteTarget
 
 
 class StaticRoutePlanner:
-    """Return configured candidates; fallback lifecycle remains Product-owned."""
+    """Return configured candidates; fallback lifecycle remains Product-owned.
+
+    返回已配置的候选项;fallback 生命周期仍归 Product 所有。
+    """
 
     def __init__(self, config: Mapping[str, Any] | None = None) -> None:
         config = config or {}

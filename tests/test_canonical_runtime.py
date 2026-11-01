@@ -11,11 +11,14 @@
 ###############################################################################
 from __future__ import annotations
 
+import base64
+import hashlib
 import http.client
 import inspect
 import json
 import threading
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -26,6 +29,8 @@ from cyrene_exchange.capabilities import (
     MODEL_PROVIDER_CAPABILITY,
     MODEL_ROUTING_CAPABILITY,
     ProviderChunk,
+    ProviderEmbeddingBatch,
+    ProviderEmbeddingError,
     ProviderInvocationCancelled,
     ProviderUsage,
     RouteTarget,
@@ -35,19 +40,24 @@ from cyrene_exchange.gateway import (
     AuthenticationError,
     ExchangeGateway,
     InvalidRequestError,
+    NoOpLifecycleObserver,
     RequestCancelled,
     RequestPrincipal,
+    ResolvedMediaArtifact,
 )
 from cyrene_exchange.http import create_reference_server
 from cyrene_exchange.protocol import NormalizedInferenceRequest
-
 
 HEADERS = {"Authorization": "Bearer test-token", "Content-Type": "application/json"}
 TEST_PRINCIPAL = RequestPrincipal("actor-test", "workspace-test", "credential-test")
 
 
 def resolve_test_principal(token: str) -> RequestPrincipal | None:
-    """Resolve only the explicit test credential to a trusted identity."""
+    """Resolve only the explicit test credential to a trusted identity.
+
+    中文:仅将明确指定的测试凭据解析为可信身份。
+    """
+    # 中文:只将显式测试凭据解析为可信身份.
 
     return TEST_PRINCIPAL if token == "test-token" else None
 
@@ -63,10 +73,19 @@ class FakeRouter:
 
 
 class FakeProvider:
-    def __init__(self, chunks: Iterable[ProviderChunk] | None = None, error: Exception | None = None):
+    def __init__(
+        self,
+        chunks: Iterable[ProviderChunk] | None = None,
+        error: Exception | None = None,
+        embedding_batch: ProviderEmbeddingBatch | None = None,
+        embedding_error: Exception | None = None,
+    ):
         self.chunks = list(chunks or [])
         self.error = error
+        self.embedding_batch = embedding_batch
+        self.embedding_error = embedding_error
         self.requests = []
+        self.embedding_requests = []
         self.cancel_events: list[Event] = []
 
     def complete(self, request, *, cancel_event: Event):
@@ -75,6 +94,13 @@ class FakeProvider:
         if self.error:
             raise self.error
         yield from self.chunks
+
+    def embed(self, request, *, cancel_event: Event):
+        self.embedding_requests.append(request)
+        self.cancel_events.append(cancel_event)
+        if self.embedding_error:
+            raise self.embedding_error
+        return self.embedding_batch
 
 
 class FailingAfterFirstProvider(FakeProvider):
@@ -117,7 +143,11 @@ def payload(*, stream: bool = False) -> dict[str, Any]:
 
 
 def tool_payload(*, stream: bool = False, include_usage: bool = False) -> dict[str, Any]:
-    """Build a text-only request with one function tool and tool history."""
+    """Build a text-only request with one function tool and tool history.
+
+    中文:构造仅含文本、一个 function tool 及其调用历史的请求。
+    """
+    # 中文:构造一个包含函数工具和工具历史记录的纯文本请求.
 
     value: dict[str, Any] = {
         "model": "requested-model",
@@ -163,20 +193,64 @@ def tool_payload(*, stream: bool = False, include_usage: bool = False) -> dict[s
     return value
 
 
-def make_gateway(router, providers):
+def make_gateway(router, providers, max_route_attempts: int = 3):
+    return create_test_gateway(Resolver(router, providers), max_route_attempts=max_route_attempts)
+
+
+def create_test_gateway(resolver, max_route_attempts: int = 3, media_artifact_resolver=None):
     return ExchangeGateway(
-        Resolver(router, providers),
+        resolver,
         principal_resolver=resolve_test_principal,
+        lifecycle_observer=NoOpLifecycleObserver(),
+        media_artifact_resolver=media_artifact_resolver,
+        max_route_attempts=max_route_attempts,
     )
 
 
-def http_json_request(gateway, request_payload, headers=HEADERS):
+def test_gateway_requires_lifecycle_observer() -> None:
+    with pytest.raises(ValueError, match="lifecycle_observer is required"):
+        ExchangeGateway(
+            Resolver(FakeRouter([]), {}),
+            principal_resolver=resolve_test_principal,
+        )
+
+
+def test_auth_resolution_failure_logs_trace_without_credential(capsys: pytest.CaptureFixture[str]) -> None:
+    """Keep the boundary trace while a failing resolver cannot leak its credential.
+
+    中文:解析器失败时保留边界 trace，且不泄露凭据。"""
+
+    secret = "sensitive-credential"
+    trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+
+    def fail_resolver(_token: str) -> RequestPrincipal | None:
+        raise RuntimeError(f"resolver rejected {secret}")
+
+    gateway = ExchangeGateway(
+        Resolver(FakeRouter([]), {}),
+        principal_resolver=fail_resolver,
+        lifecycle_observer=NoOpLifecycleObserver(),
+        max_route_attempts=1,
+    )
+    with pytest.raises(AuthenticationError, match="invalid credentials"):
+        gateway._authenticate(
+            {
+                "Authorization": f"Bearer {secret}",
+                "traceparent": f"00-{trace_id}-00f067aa0ba902b7-01",
+            }
+        )
+    log_line = capsys.readouterr().err
+    assert json.loads(log_line)["trace_id"] == trace_id
+    assert secret not in log_line
+
+
+def http_json_request(gateway, request_payload, headers=HEADERS, path="/v1/chat/completions"):
     server = create_reference_server(gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         connection = http.client.HTTPConnection(*server.server_address, timeout=5)
-        connection.request("POST", "/v1/chat/completions", json.dumps(request_payload), headers)
+        connection.request("POST", path, json.dumps(request_payload), headers)
         response = connection.getresponse()
         body = json.loads(response.read())
         connection.close()
@@ -188,7 +262,11 @@ def http_json_request(gateway, request_payload, headers=HEADERS):
 
 
 def http_stream_request(gateway, request_payload, headers=HEADERS):
-    """Send one real HTTP request and return its status, headers, and SSE body."""
+    """Send one real HTTP request and return its status, headers, and SSE body.
+
+    中文:发送一次真实 HTTP 请求,并返回状态码、headers 与 SSE 正文。
+    """
+    # 中文:发送一条真实 HTTP 请求,并返回其状态码、标头和 SSE 正文。
 
     server = create_reference_server(gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -211,7 +289,7 @@ def test_http_request_uses_platform_resolver_routing_provider_and_normalizes_res
     router = FakeRouter([RouteTarget("provider-a", route_id="primary")])
     provider = FakeProvider([ProviderChunk(delta="hello "), ProviderChunk(delta="world", finish_reason="stop")])
     resolver = Resolver(router, {"provider-a": provider})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver)
     server = create_reference_server(gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -367,7 +445,7 @@ def test_invalid_auth_and_invalid_request_are_product_errors():
 def test_http_maps_invalid_auth_and_invalid_request_without_resolving_capabilities():
     router = FakeRouter([])
     resolver = Resolver(router, {})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver)
 
     auth_status, auth_body = http_json_request(gateway, payload(), headers={})
     request_status, request_body = http_json_request(
@@ -382,12 +460,255 @@ def test_http_maps_invalid_auth_and_invalid_request_without_resolving_capabiliti
     assert resolver.calls == []
 
 
+def test_embeddings_endpoint_authenticates_routes_and_preserves_provider_model_and_order():
+    router = FakeRouter([RouteTarget("provider-a", route_id="embedding-route", model="routed-model")])
+    batch = ProviderEmbeddingBatch(
+        vectors=((0.25, -0.5), (1.0, 0.0)),
+        dimensions=2,
+        model="provider-actual-model",
+    )
+    provider = FakeProvider(embedding_batch=batch)
+    resolver = Resolver(router, {"provider-a": provider})
+    gateway = create_test_gateway(resolver)
+
+    status, body = http_json_request(
+        gateway,
+        {"model": "requested-model", "input": ["first", "second"]},
+        path="/v1/embeddings",
+    )
+
+    assert status == 200
+    assert body["object"] == "list"
+    assert body["model"] == "provider-actual-model"
+    assert [item["index"] for item in body["data"]] == [0, 1]
+    assert [item["embedding"] for item in body["data"]] == [[0.25, -0.5], [1.0, 0.0]]
+    assert provider.embedding_requests[0].model == "routed-model"
+    assert provider.embedding_requests[0].inputs == ("first", "second")
+    assert router.requests[0].operation == "embeddings"
+    assert resolver.calls == [
+        (MODEL_ROUTING_CAPABILITY, None),
+        (MODEL_PROVIDER_CAPABILITY, "provider-a"),
+    ]
+
+
+def test_embeddings_reject_auth_scope_and_oversized_or_invalid_input_before_provider():
+    router = FakeRouter([RouteTarget("provider-a")])
+    provider = FakeProvider(embedding_batch=ProviderEmbeddingBatch(((1.0,),), 1, "actual-model"))
+    gateway = create_test_gateway(Resolver(router, {"provider-a": provider}))
+
+    auth_status, auth_body = http_json_request(
+        gateway,
+        {"model": "requested-model", "input": "hello"},
+        headers={},
+        path="/v1/embeddings",
+    )
+    invalid_status, invalid_body = http_json_request(
+        gateway,
+        {"model": "requested-model", "input": ["", "ok"]},
+        path="/v1/embeddings",
+    )
+
+    assert auth_status == 401
+    assert auth_body["error"]["type"] == "authentication_error"
+    assert invalid_status == 400
+    assert invalid_body["error"]["type"] == "invalid_request_error"
+    assert provider.embedding_requests == []
+    assert router.requests == []
+
+
+def test_embeddings_surface_provider_rate_limit_and_retry_after():
+    router = FakeRouter([RouteTarget("provider-a")])
+    provider = FakeProvider(embedding_error=ProviderEmbeddingError(5, "provider busy", 2.0))
+    gateway = create_test_gateway(Resolver(router, {"provider-a": provider}))
+
+    status, body = http_json_request(
+        gateway,
+        {"model": "requested-model", "input": "hello"},
+        path="/v1/embeddings",
+    )
+
+    assert status == 429
+    assert body["error"]["type"] == "rate_limit_error"
+    assert body["error"]["code"] == 5
+    assert body["error"]["retry_after_seconds"] == 2.0
+
+
+def test_embedding_provider_batch_rejects_zero_vectors():
+    with pytest.raises(ValueError, match="all zeros"):
+        ProviderEmbeddingBatch(vectors=((0.0, 0.0),), dimensions=2, model="actual-model")
+
+
+def test_embeddings_discard_late_provider_success_after_cancellation():
+    """A peer that ignores cancellation must not publish or audit late success.
+
+    中文：提供方忽略取消后返回的结果不得发布或记为完成。
+    """
+    started = Event()
+    release = Event()
+    cancelled = Event()
+    terminal_statuses = []
+
+    class LateProvider(FakeProvider):
+        def embed(self, request, *, cancel_event):
+            self.embedding_requests.append(request)
+            started.set()
+            assert release.wait(timeout=5)
+            return ProviderEmbeddingBatch(((0.25, -0.5),), 2, "late-model")
+
+    class RecordingObserver(NoOpLifecycleObserver):
+        def on_request_finished(self, metadata, *, status, usage, error_type):
+            terminal_statuses.append((status, error_type))
+
+    late = LateProvider()
+    healthy = FakeProvider(embedding_batch=ProviderEmbeddingBatch(((1.0, 0.0),), 2, "other-model"))
+    gateway = ExchangeGateway(
+        Resolver(FakeRouter([RouteTarget("late"), RouteTarget("healthy")]), {"late": late, "healthy": healthy}),
+        principal_resolver=resolve_test_principal,
+        lifecycle_observer=RecordingObserver(),
+        max_route_attempts=2,
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(
+            gateway.handle_openai_embeddings,
+            HEADERS,
+            {"model": "requested-model", "input": "hello"},
+            cancel_event=cancelled,
+        )
+        try:
+            assert started.wait(timeout=5)
+            cancelled.set()
+        finally:
+            release.set()
+        with pytest.raises(RequestCancelled, match="cancelled during embedding"):
+            result.result(timeout=5)
+
+    assert terminal_statuses == [("cancelled", RequestCancelled.error_type)]
+    assert healthy.embedding_requests == []
+
+
+class FakeMediaArtifactResolver:
+    def __init__(self, mime_type: str, data: bytes) -> None:
+        self.mime_type = mime_type
+        self.data = data
+        self.calls = []
+
+    def read(self, artifact_id, *, principal, cancel_event):
+        self.calls.append((artifact_id, principal, cancel_event))
+        return ResolvedMediaArtifact(
+            mime_type=self.mime_type,
+            data=self.data,
+            sha256=hashlib.sha256(self.data).hexdigest(),
+            size=len(self.data),
+        )
+
+
+def test_v3_inline_media_is_normalized_as_bytes_and_routes_to_provider():
+    router = FakeRouter([RouteTarget("provider-a")])
+    provider = FakeProvider([ProviderChunk(delta="described", finish_reason="stop")])
+    gateway = create_test_gateway(Resolver(router, {"provider-a": provider}))
+    payload_value = {
+        "model": "vision-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {
+                        "type": "image",
+                        "mime_type": "image/png",
+                        "data_base64": base64.b64encode(b"png-bytes").decode("ascii"),
+                    },
+                ],
+            }
+        ],
+    }
+
+    status, body = http_json_request(gateway, payload_value)
+
+    assert status == 200
+    assert body["choices"][0]["message"]["content"] == "described"
+    normalized_parts = provider.requests[0].messages[0]["content"]
+    assert normalized_parts[0] == {"type": "text", "text": "describe this"}
+    assert normalized_parts[1]["data"] == b"png-bytes"
+    assert normalized_parts[1]["mime_type"] == "image/png"
+    routed_part = router.requests[0].messages[0]["content"][1]
+    assert routed_part == {"type": "image", "mime_type": "image/png", "byte_length": 9}
+    assert "data" not in routed_part
+
+
+def test_v3_artifact_id_is_resolved_for_authenticated_principal_before_provider_call():
+    router = FakeRouter([RouteTarget("provider-a")])
+    provider = FakeProvider([ProviderChunk(delta="described", finish_reason="stop")])
+    media_resolver = FakeMediaArtifactResolver("image/png", b"authorized-image")
+    gateway = create_test_gateway(
+        Resolver(router, {"provider-a": provider}),
+        media_artifact_resolver=media_resolver,
+    )
+
+    status, _ = http_json_request(
+        gateway,
+        {
+            "model": "vision-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "mime_type": "image/png", "artifact_id": "turn-media-1"}],
+                }
+            ],
+        },
+    )
+
+    assert status == 200
+    assert media_resolver.calls[0][0] == "turn-media-1"
+    assert media_resolver.calls[0][1] == TEST_PRINCIPAL
+    part = provider.requests[0].messages[0]["content"][0]
+    assert part["data"] == b"authorized-image"
+    assert "artifact_id" not in part
+
+
+def test_v3_media_fails_closed_without_resolver_and_rejects_arbitrary_urls():
+    router = FakeRouter([RouteTarget("provider-a")])
+    provider = FakeProvider([ProviderChunk(delta="must not run")])
+    gateway = create_test_gateway(Resolver(router, {"provider-a": provider}))
+
+    artifact_status, artifact_body = http_json_request(
+        gateway,
+        {
+            "model": "vision-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "mime_type": "image/png", "artifact_id": "turn-media-1"}],
+                }
+            ],
+        },
+    )
+    url_status, url_body = http_json_request(
+        gateway,
+        {
+            "model": "vision-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "mime_type": "image/png", "url": "https://example.test/x"}],
+                }
+            ],
+        },
+    )
+
+    assert artifact_status == 424
+    assert artifact_body["error"]["type"] == "media_artifact_unavailable"
+    assert url_status == 400
+    assert url_body["error"]["type"] == "invalid_request_error"
+    assert provider.requests == []
+
+
 def test_provider_failure_before_first_token_uses_routing_candidates_in_order():
     router = FakeRouter([RouteTarget("down", route_id="primary"), RouteTarget("healthy", route_id="fallback")])
     down = FakeProvider(error=RuntimeError("connection refused"))
     healthy = FakeProvider([ProviderChunk(delta="fallback response", finish_reason="stop")])
     resolver = Resolver(router, {"down": down, "healthy": healthy})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver, max_route_attempts=3)
 
     response = gateway.handle_openai_chat(HEADERS, payload())
 
@@ -405,7 +726,7 @@ def test_provider_cancellation_never_falls_back_to_another_route():
     cancelled = FakeProvider(error=ProviderInvocationCancelled("execution cancelled"))
     healthy = FakeProvider([ProviderChunk(delta="must not run")])
     resolver = Resolver(router, {"cancelled": cancelled, "healthy": healthy})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver)
 
     with pytest.raises(RequestCancelled):
         gateway.handle_openai_chat(HEADERS, payload())
@@ -422,7 +743,7 @@ def test_provider_failure_after_first_stream_token_is_not_double_routed():
     partial = FailingAfterFirstProvider()
     healthy = FakeProvider([ProviderChunk(delta="fallback")])
     resolver = Resolver(router, {"partial": partial, "healthy": healthy})
-    gateway = ExchangeGateway(resolver, principal_resolver=resolve_test_principal)
+    gateway = create_test_gateway(resolver, max_route_attempts=3)
 
     response = gateway.handle_openai_chat(HEADERS, payload(stream=True))
     events = iter(response.body)
@@ -439,10 +760,7 @@ def test_provider_cancellation_after_first_stream_token_maps_to_request_cancelle
     router = FakeRouter([RouteTarget("cancelled", route_id="primary"), RouteTarget("healthy")])
     cancelled = CancellingAfterFirstProvider()
     healthy = FakeProvider([ProviderChunk(delta="must not run")])
-    gateway = ExchangeGateway(
-        Resolver(router, {"cancelled": cancelled, "healthy": healthy}),
-        principal_resolver=resolve_test_principal,
-    )
+    gateway = make_gateway(router, {"cancelled": cancelled, "healthy": healthy})
 
     response = gateway.handle_openai_chat(HEADERS, payload(stream=True))
     events = iter(response.body)

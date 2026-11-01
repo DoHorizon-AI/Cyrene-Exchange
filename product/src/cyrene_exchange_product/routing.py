@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from fnmatch import fnmatchcase
+from hashlib import sha256
+from typing import Any
 from uuid import UUID
 
 from cyrene_exchange.billing import BillingUsageClient
@@ -22,6 +24,9 @@ from cyrene_exchange.capabilities import (
 )
 from cyrene_exchange.gateway import (
     ExchangeGateway,
+    MediaArtifactResolver,
+    NoOpLifecycleObserver,
+    RequestPrincipal,
     TokenPrincipalResolver,
 )
 from cyrene_exchange.protocol import NormalizedInferenceRequest
@@ -29,6 +34,7 @@ from cyrene_exchange.protocol import NormalizedInferenceRequest
 from cyrene_exchange_product.audit import RequestAuditRecorder
 from cyrene_exchange_product.domain import EndpointState, ProductPrincipal
 from cyrene_exchange_product.quota import ProductQuotaGuard
+from cyrene_exchange_product.runtime_activity import ActivitySourceLifecycleProtocol
 from cyrene_exchange_product.store import ExchangeStore
 
 
@@ -40,7 +46,35 @@ class StoredRoutePlanner:
         self._endpoint_id = endpoint_id
 
     def plan(self, request: NormalizedInferenceRequest) -> list[RouteTarget]:
-        """Return eligible opaque bindings in Product priority order. | 返回候选绑定。"""
+        """Return only legacy unscoped bindings for legacy callers."""
+
+        return self._plan_for_scope(request, organization_id=None, workspace_id=None)
+
+    def plan_for_principal(
+        self,
+        request: Any,
+        *,
+        principal: RequestPrincipal,
+    ) -> list[RouteTarget]:
+        """Return ACTIVE routes owned by the authenticated Product scope.
+
+        中文：仅返回认证 Product principal 所属 organization/workspace 的活动路由。
+        """
+
+        return self._plan_for_scope(
+            request,
+            organization_id=principal.organization_id,
+            workspace_id=principal.workspace_id if principal.organization_id is not None else None,
+        )
+
+    def _plan_for_scope(
+        self,
+        request: Any,
+        *,
+        organization_id: str | None,
+        workspace_id: str | None,
+    ) -> list[RouteTarget]:
+        """Project one trusted Product scope onto the routing capability."""
 
         endpoint = self._store.get_endpoint(self._endpoint_id)
         if endpoint is None or endpoint.state != EndpointState.ACTIVE:
@@ -51,7 +85,11 @@ class StoredRoutePlanner:
                 route_id=str(route.id),
                 model=route.target_model,
             )
-            for route in self._store.active_routes(endpoint.id)
+            for route in self._store.active_routes(
+                endpoint.id,
+                organization_id=organization_id,
+                workspace_id=workspace_id,
+            )
             if fnmatchcase(request.model, route.model_pattern)
         ]
 
@@ -71,6 +109,30 @@ class ProductRoutingResolver:
         return self._delegate.resolve(capability_id, implementation_ref)
 
 
+def data_plane_principal_resolver(
+    store: ExchangeStore, credentials: Mapping[str, ProductPrincipal]
+) -> TokenPrincipalResolver:
+    """Accept only API keys and explicitly configured Gateway Bearers.
+
+    The store also contains Workspace control credentials so the control API
+    can resolve server-assigned scope. Keep those identities out of chat
+    authentication unless the token was independently configured as a
+    Gateway credential.
+
+    中文:只接受 API key 与显式配置的 Gateway Bearer。控制 API 使用的 Workspace
+    凭据也保存在同一身份表中；除非令牌另行配置为 Gateway 凭据，否则不得用于聊天。
+    """
+
+    configured_digests = frozenset(
+        sha256(token.encode("utf-8")).hexdigest() for token in credentials
+    )
+
+    def resolve(token: str) -> RequestPrincipal | None:
+        return store.resolve_data_plane_credential(token, configured_digests)
+
+    return resolve
+
+
 def build_gateway_from_store(
     store: ExchangeStore,
     endpoint_id: UUID,
@@ -80,6 +142,8 @@ def build_gateway_from_store(
     billing: BillingUsageClient | None = None,
     record_requests: bool = True,
     max_route_attempts: int = 1,
+    activity: ActivitySourceLifecycleProtocol | None = None,
+    media_artifact_resolver: MediaArtifactResolver | None = None,
 ) -> ExchangeGateway:
     """Compose persisted Product routing with a caller-owned capability resolver.
 
@@ -99,12 +163,17 @@ def build_gateway_from_store(
     """
 
     store.configure_credentials(credentials)
-    principal_resolver: TokenPrincipalResolver = store.resolve_credential
-    observer = RequestAuditRecorder(store, billing) if record_requests else None
+    principal_resolver = data_plane_principal_resolver(store, credentials)
+    observer = (
+        RequestAuditRecorder(store, billing, activity)
+        if record_requests or activity is not None
+        else NoOpLifecycleObserver()
+    )
     return ExchangeGateway(
         ProductRoutingResolver(StoredRoutePlanner(store, endpoint_id), delegate),
         principal_resolver=principal_resolver,
         lifecycle_observer=observer,
         quota_checker=ProductQuotaGuard(store, billing),
+        media_artifact_resolver=media_artifact_resolver,
         max_route_attempts=max_route_attempts,
     )

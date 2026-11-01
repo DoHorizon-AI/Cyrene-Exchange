@@ -11,12 +11,15 @@
 from cyrene_exchange_product.api import create_app
 from cyrene_exchange_product.audit_api import create_audit_app
 from cyrene_exchange_product.domain import (
+    CreateWorkspaceBindingRouteDraftRequest,
     ProductPrincipal,
     RequestAuditRecord,
     RequestAuditStatus,
     RequestUsageAudit,
     TenantQuota,
     UsageState,
+    WorkspaceEndpointGrant,
+    WorkspaceReactorEndpointGrant,
 )
 from cyrene_exchange_product.quota import ProductQuotaGuard
 from cyrene_exchange_product.routing import (
@@ -26,6 +29,7 @@ from cyrene_exchange_product.routing import (
 )
 
 __all__ = [
+    "CreateWorkspaceBindingRouteDraftRequest",
     "ProductPrincipal",
     "ProductQuotaGuard",
     "ProductRoutingResolver",
@@ -35,6 +39,8 @@ __all__ = [
     "StoredRoutePlanner",
     "TenantQuota",
     "UsageState",
+    "WorkspaceEndpointGrant",
+    "WorkspaceReactorEndpointGrant",
     "build_gateway_from_store",
     "create_app",
     "create_audit_app",

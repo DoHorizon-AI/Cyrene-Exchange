@@ -28,6 +28,7 @@ target/
 **/build/
 node_modules/
 dist/
+web_dist/
 out/
 .pnpm-store/
 coverage/

@@ -8,12 +8,14 @@ its persisted authority, and its Platform/Plugins boundaries.
 | Path | Responsibility | 职责 |
 | --- | --- | --- |
 | [`API.md`](API.md) | Implemented HTTP and Product contracts | 已实现 HTTP 与 Product 契约 |
+| [`AUTHORIZATION_CLOUD_RUNBOOK.md`](AUTHORIZATION_CLOUD_RUNBOOK.md) | Host configuration, deterministic monitoring, renewal, and notification operations | Host 配置、确定性监控、授权续期与通知运维 |
 | [`REPOSITORY-LIFECYCLE.md`](REPOSITORY-LIFECYCLE.md) | Ownership, branches, CI, and publication gates | 权威、分支、CI 与公开门 |
 | [`architecture/`](architecture/README.md) | Topology and capability flow | 拓扑与能力流 |
 | [`modules/`](modules/README.md) | Active source reading guide | 活动源码阅读导览 |
 | [`governance/`](governance/README.md) | Recorded boundary decisions | 已记录边界决策 |
 | [`glossary.md`](glossary.md) | English-Chinese vocabulary | 中英术语表 |
 | [`faq.md`](faq.md) | Common operational questions | 常见运维问题 |
+| [`logging-and-errors.md`](logging-and-errors.md) | Cross-repository logging, error codes, and diagnostics specification | 跨仓日志、错误码与诊断规范 (草案 v0.1) |
 
 Suggested order: API, architecture overview, Exchange module guide, lifecycle,
 then tests and contracts.

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "actor": {
+    "issuer": "https://login.microsoftonline.com/<tenant-uuid>/v2.0",
+    "subject": "<lowercase-aad-object-uuid>",
+    "organizationId": "<authority-organization-id>",
+    "workspaceId": "<authority-workspace-id>"
+  },
+  "github": {
+    "installationId": "<github-app-installation-id>",
+    "expectedAccessMode": "workspace_operator",
+    "profileIdempotencyKey": "phase1-github-app-installation",
+    "repositories": [
+      {
+        "repositoryId": "<numeric-github-repository-id>",
+        "owner": "<repository-owner>",
+        "name": "<repository-name>"
+      }
+    ]
+  },
+  "huggingface": {
+    "profileAlias": "hf-primary",
+    "targetAlias": "hf-primary-target",
+    "expectedAccessMode": "workspace_operator",
+    "profileIdempotencyKey": "phase1-huggingface-primary",
+    "credentialSecretRef": "huggingface/connector-token"
+  }
+}
