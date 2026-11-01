@@ -754,6 +754,225 @@ paths:
       security:
       - IntegrationBearer: []
       - ProductExecutionCredential: []
+  /api/v1/accounts/people:
+    get:
+      summary: Find People
+      description: Answer whose account this is and which accounts a person has. Requires the connector operator role.
+      operationId: accountFindPeople
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: subject
+        in: query
+        required: false
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 256
+      - name: mail
+        in: query
+        required: false
+        schema:
+          type: string
+          minLength: 3
+          maxLength: 254
+      - name: provider
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: ^(github|huggingface|azure_devops|wecom|qq|bilibili|azure|gcp|runpod|microsoft_graph)$
+      - name: handle
+        in: query
+        required: false
+        description: Requires provider; github, huggingface, azure_devops, wecom, qq, or bilibili.
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 254
+      - name: name
+        in: query
+        required: false
+        schema:
+          type: string
+          minLength: 2
+          maxLength: 120
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      responses:
+        '200':
+          description: People of the workspace with their declared and verified accounts. Metadata only.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountFindPeopleResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/people/handles:
+    post:
+      summary: Declare Account Handle
+      description: Record a platform account an operator declares for a person. The handle is an address and never carries a credential. A handle belongs to one person per workspace.
+      operationId: accountDeclareHandle
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeclareAccountHandleBody'
+      responses:
+        '200':
+          description: The person and handle record; created is false when the same handle was already declared for the same person.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountDeclareHandleResponse'
+        '404':
+          description: Not found.
+        '409':
+          description: The handle belongs to another person, or the identity conflicts with the stored person.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/people/handles/actions/retract:
+    post:
+      summary: Retract Account Handle
+      description: Retire a declared platform account. The record is kept for audit and the handle can be declared again.
+      operationId: accountRetractHandle
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetractAccountHandleBody'
+      responses:
+        '200':
+          description: The retired handle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountRetractHandleResponse'
+        '404':
+          description: No active declared account matches.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
+  /api/v1/accounts/people/links/actions/revoke:
+    post:
+      summary: Revoke Person Links
+      description: Dissolve every active verified link one person has to one provider, through the same path the owner's own unlink uses. A GitHub token is revoked at the provider. Shared workspace-operator profiles are never dissolved; they are counted in skippedShared. Requires the connector operator role.
+      operationId: accountRevokePersonLinks
+      parameters:
+      - name: workspaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      - name: X-Cyrene-Workspace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+        description: Workspace scope for first-party bearer requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokePersonLinksBody'
+      responses:
+        '200':
+          description: The per-link outcomes. Nothing to dissolve is a success with unlinked 0.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountRevokePersonLinksResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - IntegrationBearer: []
+      - ProductExecutionCredential: []
   /api/v1/accounts/provider-profiles/microsoft-graph/link-sessions:
     post:
       summary: Begin Microsoft Graph Link
@@ -3370,6 +3589,231 @@ components:
       - provider
       title: BeginLinkBody
       description: Fixed external account provider selector.
+    DeclareAccountHandleBody:
+      type: object
+      additionalProperties: false
+      required:
+      - provider
+      - handle
+      properties:
+        provider:
+          type: string
+          pattern: ^(github|huggingface|azure_devops|wecom|qq|bilibili)$
+        handle:
+          type: string
+          minLength: 1
+          maxLength: 254
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Entra object ID or another stable identity subject of the person.
+        mail:
+          type: string
+          minLength: 3
+          maxLength: 254
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 120
+      description: At least one of subject and mail names the person.
+    RetractAccountHandleBody:
+      type: object
+      additionalProperties: false
+      required:
+      - provider
+      - handle
+      properties:
+        provider:
+          type: string
+          pattern: ^(github|huggingface|azure_devops|wecom|qq|bilibili)$
+        handle:
+          type: string
+          minLength: 1
+          maxLength: 254
+    AccountDeclareHandleResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - personRef
+      - handleRef
+      - provider
+      - handle
+      - source
+      - created
+      properties:
+        personRef:
+          type: string
+          format: uuid
+        handleRef:
+          type: string
+          format: uuid
+        provider:
+          type: string
+        handle:
+          type: string
+        source:
+          type: string
+          enum:
+          - declared
+        created:
+          type: boolean
+    AccountRetractHandleResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - retracted
+      - personRef
+      - provider
+      - handle
+      properties:
+        retracted:
+          type: boolean
+          enum:
+          - true
+        personRef:
+          type: string
+          format: uuid
+        provider:
+          type: string
+        handle:
+          type: string
+    AccountPersonAccount:
+      type: object
+      additionalProperties: false
+      required:
+      - source
+      - kind
+      - provider
+      - handle
+      - externalSubject
+      - status
+      - updatedAt
+      properties:
+        source:
+          type: string
+          enum:
+          - declared
+          - verified
+          description: declared accounts are addresses an operator recorded; verified accounts were linked by the person.
+        kind:
+          type: string
+          enum:
+          - handle
+          - account
+          - profile
+        provider:
+          type: string
+        handle:
+          type: string
+          nullable: true
+        externalSubject:
+          type: string
+          nullable: true
+        status:
+          type: string
+        updatedAt:
+          type: integer
+          minimum: 0
+    AccountPerson:
+      type: object
+      additionalProperties: false
+      required:
+      - personRef
+      - issuer
+      - subject
+      - mail
+      - displayName
+      - accounts
+      properties:
+        personRef:
+          type: string
+          format: uuid
+          nullable: true
+          description: Null for a person known only by a verified link.
+        issuer:
+          type: string
+        subject:
+          type: string
+          nullable: true
+        mail:
+          type: string
+          nullable: true
+        displayName:
+          type: string
+          nullable: true
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountPersonAccount'
+    AccountFindPeopleResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - people
+      - truncated
+      properties:
+        people:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountPerson'
+        truncated:
+          type: boolean
+    RevokePersonLinksBody:
+      type: object
+      additionalProperties: false
+      required:
+      - subject
+      - provider
+      properties:
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 256
+        provider:
+          type: string
+          pattern: ^(github|huggingface|azure_devops|wecom|qq|bilibili|azure|gcp|runpod|microsoft_graph)$
+    AccountRevokePersonLinksResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - subject
+      - provider
+      - unlinked
+      - skippedShared
+      - results
+      properties:
+        subject:
+          type: string
+        provider:
+          type: string
+        unlinked:
+          type: integer
+          minimum: 0
+        skippedShared:
+          type: integer
+          minimum: 0
+          description: Shared workspace-operator profiles that were left in place.
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+            - kind
+            - status
+            properties:
+              kind:
+                type: string
+                enum:
+                - account
+                - profile
+              status:
+                type: string
+                enum:
+                - unlinked
+                - revocation_unknown
+                - revocation_failed
     BeginMicrosoftGraphLinkBody:
       type: object
       additionalProperties: false
