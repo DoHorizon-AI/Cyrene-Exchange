@@ -916,6 +916,8 @@ class ExchangeGateway:
                     ],
                     "model": batch.model,
                 }
+                if cancel_event.is_set():
+                    raise RequestCancelled("request was cancelled during embedding provider execution")
                 self._observe_finished(metadata, status="completed", usage=None, error_type=None)
                 return GatewayResponse(
                     request_id=request_id,

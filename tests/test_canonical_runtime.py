@@ -18,6 +18,7 @@ import inspect
 import json
 import threading
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -535,6 +536,54 @@ def test_embeddings_surface_provider_rate_limit_and_retry_after():
 def test_embedding_provider_batch_rejects_zero_vectors():
     with pytest.raises(ValueError, match="all zeros"):
         ProviderEmbeddingBatch(vectors=((0.0, 0.0),), dimensions=2, model="actual-model")
+
+
+def test_embeddings_discard_late_provider_success_after_cancellation():
+    """A peer that ignores cancellation must not publish or audit late success.
+
+    中文：提供方忽略取消后返回的结果不得发布或记为完成。
+    """
+    started = Event()
+    release = Event()
+    cancelled = Event()
+    terminal_statuses = []
+
+    class LateProvider(FakeProvider):
+        def embed(self, request, *, cancel_event):
+            self.embedding_requests.append(request)
+            started.set()
+            assert release.wait(timeout=5)
+            return ProviderEmbeddingBatch(((0.25, -0.5),), 2, "late-model")
+
+    class RecordingObserver(NoOpLifecycleObserver):
+        def on_request_finished(self, metadata, *, status, usage, error_type):
+            terminal_statuses.append((status, error_type))
+
+    late = LateProvider()
+    healthy = FakeProvider(embedding_batch=ProviderEmbeddingBatch(((1.0, 0.0),), 2, "other-model"))
+    gateway = ExchangeGateway(
+        Resolver(FakeRouter([RouteTarget("late"), RouteTarget("healthy")]), {"late": late, "healthy": healthy}),
+        principal_resolver=resolve_test_principal,
+        lifecycle_observer=RecordingObserver(),
+        max_route_attempts=2,
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(
+            gateway.handle_openai_embeddings,
+            HEADERS,
+            {"model": "requested-model", "input": "hello"},
+            cancel_event=cancelled,
+        )
+        try:
+            assert started.wait(timeout=5)
+            cancelled.set()
+        finally:
+            release.set()
+        with pytest.raises(RequestCancelled, match="cancelled during embedding"):
+            result.result(timeout=5)
+
+    assert terminal_statuses == [("cancelled", RequestCancelled.error_type)]
+    assert healthy.embedding_requests == []
 
 
 class FakeMediaArtifactResolver:
