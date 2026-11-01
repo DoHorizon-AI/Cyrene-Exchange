@@ -387,7 +387,12 @@ size. An unresolved or unauthorized artifact receives `424 media_artifact_unavai
 routes through the same authenticated and audited model capability path, and
 returns vectors in input order with the model reported by the provider. It
 supports `encoding_format: "float"`; provider errors and cancellations remain
-visible to the caller. The route planner reads ACTIVE Product routes, while each
+visible to the caller. The Product ASGI endpoint and reference HTTP transport
+share the same Gateway method; client disconnects propagate a cancellation event
+to the selected provider. A response is published only after vector count,
+dimension, finite-number and nonzero checks pass. Exchange never generates a
+local fallback vector. HTTP errors retain their typed status and finite provider
+`Retry-After` hint. The route planner reads ACTIVE Product routes, while each
 `targetBindingId` remains opaque to Exchange and is resolved through the
 Platform/Plugins boundary.
 
@@ -403,7 +408,10 @@ does not by itself prove private-network inference or a deployed private model.
 调用、Provider 报告的用量、类型化图片/音频/文件内容与取消。认证后的 Product 边界会在分发前
 将 `artifact_id` 解析为已授权 bytes；拒绝媒体 URL 和路径形式。内联媒体通过 `data_base64` 传输且有总大小限制。`POST /v1/embeddings` 接受单条文本或最多 128 条有序文本，
 经同一认证和审计模型能力链路路由，并按输入顺序返回向量和 Provider 实际报告的模型。只支持
-`encoding_format: "float"`；Provider 错误和取消会返回调用方。Route planner 只读取 ACTIVE Product Route；
+`encoding_format: "float"`；Provider 错误和取消会返回调用方。Product ASGI 路由和参考 HTTP
+传输共用同一个 Gateway 方法；客户端断开会向所选 Provider 传播取消事件。只有向量数量、维度、
+有限数值与非零校验通过后才返回结果，Exchange 不会生成本地回退向量。HTTP 保留类型化状态和
+Provider `Retry-After` 提示。Route planner 只读取 ACTIVE Product Route；
 `targetBindingId` 对 Exchange 保持不透明，并经 Platform/Plugins 边界解析。
 
 企业及自托管推理沿用同一 Route 和 Provider 边界：Plugin 部署管理上游服务地址与凭据

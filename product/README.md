@@ -75,6 +75,18 @@ only rows with unknown organization attribution. The models list, readiness
 probe, and service route count use the same persisted state without exposing
 another workspace's route definitions.
 
+## Embeddings data plane
+
+The fused Product server exposes `POST /v1/embeddings` through the same persisted
+route planner, Gateway credentials, and `model.provider.v1` facade as chat. It
+accepts one text or an ordered batch of up to 128 texts with
+`encoding_format: "float"`; response indexes follow input order and the response
+model comes from the provider. Product rejects incomplete batches, dimension
+drift, non-finite values, and zero vectors before returning a response. Client
+disconnects signal cancellation to the provider call. Typed provider failures
+retain their HTTP status and finite `Retry-After` hint. The endpoint never
+synthesizes vectors or chooses a chat model as an embedding fallback.
+
 The legacy `/api/v1/gateway-routes` list and `/{routeId}` read return only rows
 whose organization is unknown (`organization_id IS NULL`). Existing
 workspace-only rows stay visible through those paths after migration and remain
@@ -140,6 +152,15 @@ Gateway 数据面路由选择使用认证 Bearer 解析出的组织和 workspace
 读取精确 scope 的 ACTIVE Route，不会回退到其他 workspace 或 legacy 全局路由；无组织
 范围的旧凭据仍只读取组织归属未知的路由。Models 列表、readyz 和服务路由计数基于同一
 持久状态，不返回其他 workspace 的路由定义。
+
+## Embeddings 数据面
+
+融合的 Product 服务通过与 Chat 相同的持久路由规划器、Gateway 凭据和
+`model.provider.v1` facade 提供 `POST /v1/embeddings`。请求接受单条文本或最多 128 条
+有序文本，并仅支持 `encoding_format: "float"`；响应 index 与输入顺序一致，模型名来自
+Provider 实际回报。Product 在返回前拒绝不完整批次、维度漂移、非有限值和零向量。客户端
+断开会向 Provider 传播取消；有类型 Provider 错误保留 HTTP 状态和有限 `Retry-After`。
+此 endpoint 不伪造向量，也不会把 Chat 模型作为 embeddings 回退。
 CLI 使用可重复的
 `--control-credential-env CREDENTIAL_REF=ORG_ID=WORKSPACE_ID=ENV_NAME` 配置私有控制
 Bearer，并用 `--gateway-credential-env CREDENTIAL_REF=[ORG_ID=]WORKSPACE_ID=ENV_NAME` 配置独立

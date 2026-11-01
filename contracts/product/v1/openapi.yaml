@@ -338,6 +338,7 @@ paths:
                 model:
                   type: string
                   minLength: 1
+                  maxLength: 256
                 messages:
                   type: array
                   minItems: 1
@@ -446,20 +447,63 @@ paths:
       responses:
         '200':
           description: Ordered provider-reported embeddings and actual model identity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIEmbeddingsResponse'
         '400':
           description: Invalid embeddings request or provider rejection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIErrorResponse'
         '401':
           description: OpenAI-compatible authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIErrorResponse'
         '403':
           description: Credential model scope excludes the requested model
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIErrorResponse'
         '404':
           description: Requested embedding model is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIErrorResponse'
         '429':
           description: Product quota exhausted or provider rate limited the request
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                minimum: 0
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIErrorResponse'
+        '499':
+          description: Client request cancelled while provider execution was in flight
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIErrorResponse'
         '502':
           description: Provider execution or response validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIErrorResponse'
         '503':
           description: No eligible persisted route or quota usage source unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIErrorResponse'
   /api/v1/gateway-route-drafts:
     post:
       summary: Create Draft
@@ -2575,6 +2619,71 @@ components:
           schema:
             $ref: ./generated/common/problem-details.schema.json
   schemas:
+    OpenAIEmbeddingData:
+      type: object
+      required:
+      - object
+      - embedding
+      - index
+      properties:
+        object:
+          type: string
+          const: embedding
+        embedding:
+          type: array
+          minItems: 1
+          maxItems: 16384
+          items:
+            type: number
+        index:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+    OpenAIEmbeddingsResponse:
+      type: object
+      required:
+      - object
+      - data
+      - model
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/OpenAIEmbeddingData'
+        model:
+          type: string
+          minLength: 1
+          maxLength: 256
+      additionalProperties: false
+    OpenAIErrorResponse:
+      type: object
+      required:
+      - error
+      properties:
+        error:
+          type: object
+          required:
+          - type
+          - message
+          properties:
+            type:
+              type: string
+              minLength: 1
+            message:
+              type: string
+              minLength: 1
+            code:
+              type: integer
+            retry_after_seconds:
+              type: number
+              minimum: 0
+          additionalProperties: true
+      additionalProperties: false
     CreateEndpointRequest:
       type: object
       required:

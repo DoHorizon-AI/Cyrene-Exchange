@@ -10,17 +10,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -39,6 +42,15 @@ from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from cyrene_exchange_product.api import create_app
 from cyrene_exchange_product.domain import (
@@ -63,6 +75,45 @@ _SSE_DATA_PREFIX = "data:"
 _AUTHORIZATION_CLOUD_RUNNER_INTERVAL_SECONDS = 900
 _AUTHORIZATION_CLOUD_RUNNER_SHUTDOWN_TIMEOUT_SECONDS = 60
 _LOGGER = logging.getLogger(__name__)
+
+
+class OpenAIEmbeddingDataResponse(BaseModel):
+    """One ordered finite vector in the public embeddings response.
+
+    中文：公开 embeddings 响应中的一个有序有限向量。
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    object: Literal["embedding"]
+    embedding: list[FiniteFloat] = Field(min_length=1, max_length=16_384)
+    index: int = Field(ge=0)
+
+    @field_validator("embedding")
+    @classmethod
+    def require_nonzero_vector(cls, value: list[float]) -> list[float]:
+        if not any(value):
+            raise ValueError("embedding vector must not be all zeros")
+        return value
+
+
+class OpenAIEmbeddingsResponse(BaseModel):
+    """Public unary response retaining vector order and provider model identity.
+
+    中文：保留向量顺序和 provider 模型身份的公开 unary 响应。
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    object: Literal["list"]
+    data: list[OpenAIEmbeddingDataResponse] = Field(min_length=1, max_length=128)
+    model: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def require_input_order(self) -> OpenAIEmbeddingsResponse:
+        if [item.index for item in self.data] != list(range(len(self.data))):
+            raise ValueError("embedding result indexes must preserve input order")
+        return self
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -811,6 +862,79 @@ def build_product_app(
             headers={"X-Request-Id": response.request_id, "Cache-Control": "no-cache"},
         )
 
+    @app.post("/v1/embeddings", response_model=OpenAIEmbeddingsResponse)
+    async def embeddings(request: Request) -> Any:
+        """Execute one authenticated embeddings request through persisted routes.
+
+        The Gateway resolves the request principal, workspace-scoped ACTIVE
+        route, and `model.provider.v1` binding. This HTTP adapter accepts no
+        tenant, workspace, provider, or embedding-profile override from JSON.
+
+        中文：通过持久化路由执行一次已认证的 embedding 请求。JSON 不得覆盖租户、workspace、
+        provider 或向量配置；这些身份均由 Gateway 与存储路由解析。
+        """
+
+        raw = await request.body()
+        if not raw or len(raw) > _MAX_PAYLOAD_BYTES:
+            return _openai_error(400, "invalid_request_error", "invalid request body")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return _openai_error(400, "invalid_request_error", "request body must be JSON")
+        if not isinstance(payload, Mapping):
+            return _openai_error(400, "invalid_request_error", "request body must be an object")
+
+        cancel_event = Event()
+        request_id = getattr(request.state, "request_id", None)
+        gateway_headers = dict(request.headers.items())
+        trace_id = getattr(request.state, "trace_id", None)
+        if isinstance(trace_id, str):
+            gateway_headers["traceparent"] = f"00-{trace_id}-0000000000000001-01"
+        stop_disconnect_watch = asyncio.Event()
+        disconnect_watch = asyncio.create_task(
+            _watch_embeddings_disconnect(request, cancel_event, stop_disconnect_watch),
+            name="exchange-embeddings-disconnect-watch",
+        )
+        gateway_call = asyncio.create_task(
+            run_in_threadpool(
+                gateway.handle_openai_embeddings,
+                gateway_headers,
+                payload,
+                cancel_event=cancel_event,
+                request_id=request_id,
+            ),
+            name="exchange-embeddings-gateway-call",
+        )
+        try:
+            response = await asyncio.shield(gateway_call)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            with suppress(Exception):
+                await asyncio.shield(gateway_call)
+            raise
+        except GatewayError as exc:
+            return _gateway_error_response(exc)
+        finally:
+            stop_disconnect_watch.set()
+            disconnect_watch.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect_watch
+
+        try:
+            body = OpenAIEmbeddingsResponse.model_validate(response.body)
+        except ValidationError:
+            return _openai_error(
+                502,
+                "provider_error",
+                "embedding provider returned an invalid response shape",
+            )
+
+        return JSONResponse(
+            status_code=response.status_code,
+            content=body.model_dump(mode="json"),
+            headers={"X-Request-Id": response.request_id},
+        )
+
     @app.middleware("http")
     async def rewrite_exchange_proxy_path(request: Request, call_next: Any) -> Any:
         path = request.scope.get("path", "")
@@ -917,6 +1041,10 @@ def build_product_app(
     @app.post("/api/proxy/exchange-gateway/v1/chat/completions")
     async def proxy_chat_completions(request: Request) -> Any:
         return await chat_completions(request)
+
+    @app.post("/api/proxy/exchange-gateway/v1/embeddings")
+    async def proxy_embeddings(request: Request) -> Any:
+        return await embeddings(request)
 
     effective_web_dist = Path(web_dist) if web_dist is not None else _find_web_dist()
     if (
@@ -1108,4 +1236,43 @@ def _openai_error(status: int, error_type: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status,
         content={"error": {"type": error_type, "message": message}},
+    )
+
+
+async def _watch_embeddings_disconnect(
+    request: Request,
+    cancel_event: Event,
+    stop_event: asyncio.Event,
+) -> None:
+    """Cancel an in-flight unary provider call when its HTTP peer disconnects.
+
+    中文：客户端断开时取消正在执行的 unary embedding provider 调用。
+    """
+
+    while not stop_event.is_set():
+        if await request.is_disconnected():
+            cancel_event.set()
+            return
+        await asyncio.sleep(0.05)
+
+
+def _gateway_error_response(error: GatewayError) -> JSONResponse:
+    """Preserve the Gateway's typed status, body, and finite retry hint.
+
+    中文：保留 Gateway 的类型化状态、错误体和有限 Retry-After 提示。
+    """
+
+    headers: dict[str, str] = {}
+    retry_after = getattr(error, "retry_after_seconds", None)
+    if (
+        isinstance(retry_after, (int, float))
+        and not isinstance(retry_after, bool)
+        and math.isfinite(retry_after)
+        and retry_after >= 0
+    ):
+        headers["Retry-After"] = str(math.ceil(retry_after))
+    return JSONResponse(
+        status_code=error.status_code,
+        content=error.to_openai_error(),
+        headers=headers,
     )
