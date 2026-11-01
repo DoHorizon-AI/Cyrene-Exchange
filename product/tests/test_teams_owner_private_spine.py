@@ -22,10 +22,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from cyrene_plugin_runtime import DirectPayload
 from fastapi.testclient import TestClient
 
 from cyrene_exchange_product.api import create_app
 from cyrene_exchange_product.errors import ExchangeProductError
+from cyrene_exchange_product.integrations._generated.cyrene.message.connector.v1 import (
+    message_connector_pb2 as message_wire,
+)
 from cyrene_exchange_product.integrations.api import IntegrationServices
 from cyrene_exchange_product.integrations.clients import TeamsMessageClient
 from cyrene_exchange_product.integrations.connector_operations import (
@@ -125,6 +129,24 @@ class _LocalTeamsInvoker:
         if not accepted:
             raise RuntimeError("the local Teams connector rejected the request")
         return response
+
+
+class _IndeterminateTeamsInvoker:
+    """Return one timeout or an accepted response without its required receipt ID."""
+
+    def __init__(self, *, outcome: str) -> None:
+        self.outcome = outcome
+        self.calls: list[dict[str, Any]] = []
+
+    def invoke(self, **kwargs: Any) -> DirectPayload:
+        self.calls.append(kwargs)
+        if self.outcome == "timeout":
+            raise TimeoutError("synthetic Teams RPC timeout")
+        delivery = message_wire.DeliveryResult(status=message_wire.DELIVERY_STATUS_ACCEPTED)
+        return DirectPayload(
+            "type.cyrene.io/cyrene.message.connector.v1.DeliveryResult",
+            delivery.SerializeToString(deterministic=True),
+        )
 
 
 class _GrantVerifier:
@@ -261,7 +283,7 @@ def _services(
     tmp_path: Path,
     *,
     profile: Any,
-    invoker: _LocalTeamsInvoker,
+    invoker: Any,
     verifier: _GrantVerifier,
 ) -> IntegrationServices:
     """Assemble the internal egress route around the exact DirectPlugin seam."""
@@ -522,4 +544,44 @@ def test_unknown_private_delivery_duplicate_returns_receipt_without_resend(
             ]
     finally:
         connector.on_shutdown()
+        services.close()
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "accepted_without_vendor_id"])
+def test_indeterminate_private_delivery_duplicate_returns_original_receipt_without_resend(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    """A timed-out or ID-less accepted RPC stays unknown under the original request ID."""
+
+    invoker = _IndeterminateTeamsInvoker(outcome=outcome)
+    verifier = _GrantVerifier()
+    services = _services(
+        tmp_path,
+        profile=_profile(allowed_actors=[_ACTOR_ID]),
+        invoker=invoker,
+        verifier=verifier,
+    )
+    try:
+        with TestClient(
+            create_app(
+                database_path=tmp_path / "exchange.sqlite3",
+                integrations=services,
+            )
+        ) as client:
+            payload = _payload(request_id=f"indeterminate-{outcome}")
+            grant = verifier.add(payload)
+            headers = {"x-cyrene-connector-grant-bin": base64.b64encode(grant).decode("ascii")}
+            first = client.post(_GRANT_PATH, json=payload, headers=headers)
+            second = client.post(_GRANT_PATH, json=payload, headers=headers)
+            expected = {
+                "requestId": payload["requestId"],
+                "status": "uncertain",
+                "reasonCode": "teams_delivery_outcome_unknown",
+            }
+
+            assert first.status_code == second.status_code == 200
+            assert first.json() == second.json() == expected
+            assert len(invoker.calls) == 1
+    finally:
         services.close()
