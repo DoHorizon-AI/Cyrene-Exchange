@@ -80,8 +80,14 @@ def build_production_services(
         WeComMessageClient,
         direct_plugin_client_from_connection,
     )
+    from cyrene_exchange_product.integrations.connector_manifest import (
+        ConnectorManifestError,
+        load_declared_operations,
+        verify_declared_operations,
+    )
     from cyrene_exchange_product.integrations.connector_operations import (
         ConnectorOperationDispatcher,
+        exchange_operation_facts,
     )
     from cyrene_exchange_product.integrations.connector_profiles import (
         ConnectorHostConfigurationError,
@@ -102,6 +108,13 @@ def build_production_services(
 
     source = os.environ if environ is None else environ
     validate_host_configuration(environ=source)
+    try:
+        declared_operations = load_declared_operations(source)
+        verify_declared_operations(declared_operations, exchange_operation_facts())
+    except ConnectorManifestError as exc:
+        raise IntegrationConfigurationError(
+            f"connector operation manifest was refused: {exc}"
+        ) from exc
     configuration = _read_configuration(source)
     refs = _secret_refs(configuration.get("hostSecretRefs"))
     used_refs: set[str] = set()
@@ -686,6 +699,7 @@ def build_production_services(
         registry=authorization_registry,
         computer=computer_runner_client,
         computer_runner_profile=computer_runner_profile,
+        declared=declared_operations,
     )
     dispatcher = None
     runner = None

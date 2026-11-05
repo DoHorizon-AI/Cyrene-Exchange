@@ -995,3 +995,90 @@ def test_minimal_teams_github_huggingface_profile_builds_without_legacy_services
             assert client.get("/readyz").json() == {"status": "ready"}
     finally:
         services.close()
+
+
+def _approved_manifest(tmp_path: Path) -> tuple[Path, str]:
+    """Write a manifest stating this Exchange's own tables, and return it with its digest."""
+
+    import hashlib
+
+    from cyrene_exchange_product.integrations.connector_operations import (
+        exchange_operation_facts,
+    )
+
+    rows = [
+        {
+            "operationId": operation_id,
+            "providerIds": sorted(facts.tool_ids),
+            "mutating": facts.mutating,
+            "exchangeToolIds": dict(facts.tool_ids),
+            "exchangeResourceProjections": dict(facts.resource_projections),
+        }
+        for operation_id, facts in sorted(exchange_operation_facts().items())
+        if operation_id != "github.repository.list"
+    ]
+    data = json.dumps(
+        {"schemaVersion": "cyrene.connector-operations.v1", "operations": rows}
+    ).encode()
+    path = tmp_path / "connector-operations.json"
+    path.write_bytes(data)
+    return path, "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def test_production_builder_hands_the_approved_manifest_to_the_dispatcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cyrene_exchange_product.integrations.connector_manifest import (
+        MANIFEST_FILE_ENV,
+        MANIFEST_SHA256_ENV,
+    )
+
+    _configuration, environ = _config(tmp_path)
+    principal = IntegrationPrincipal(
+        issuer="https://identity.example.test",
+        subject="member-a",
+        organization_id="org-a",
+        workspace_id="workspace-a",
+        allowed_operation_ids=frozenset({"integrationCreateConnection"}),
+    )
+    monkeypatch.setattr(
+        auth_module.PlatformAuthorityIdentityVerifier,
+        "from_unix_socket",
+        classmethod(lambda _cls, _path: _FakeAuthority({"token-v1": principal})),
+    )
+    monkeypatch.setattr(
+        clients_module,
+        "direct_plugin_client_from_connection",
+        lambda _reference, **_kwargs: _FakeDirectClient(),
+    )
+    monkeypatch.setattr(clients_module, "DirectPluginHealthClient", _FakeHealth)
+    environ["CURRENT_ACTOR_BEARER"] = "token-v1"
+    manifest_path, digest = _approved_manifest(tmp_path)
+    environ[MANIFEST_FILE_ENV] = str(manifest_path)
+    environ[MANIFEST_SHA256_ENV] = digest
+
+    services = integration_cli.build_production_services(
+        tmp_path / "integrations.sqlite3",
+        environ=environ,
+    )
+    try:
+        declared = services.connector_operation_dispatcher.declared_operations
+        assert declared.digest == digest
+        assert not declared.allows("github", "github.repository.list")
+        assert declared.allows("github", "github.branch.get")
+    finally:
+        services.close()
+
+    environ[MANIFEST_SHA256_ENV] = "sha256:" + "0" * 64
+    with pytest.raises(integration_cli.IntegrationConfigurationError, match="manifest was refused"):
+        integration_cli.build_production_services(
+            tmp_path / "integrations-refused.sqlite3",
+            environ=environ,
+        )
+    del environ[MANIFEST_SHA256_ENV]
+    with pytest.raises(integration_cli.IntegrationConfigurationError, match="set both"):
+        integration_cli.build_production_services(
+            tmp_path / "integrations-half.sqlite3",
+            environ=environ,
+        )

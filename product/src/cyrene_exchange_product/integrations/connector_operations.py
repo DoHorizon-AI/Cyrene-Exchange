@@ -14,7 +14,7 @@ import base64
 import binascii
 import hashlib
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -35,6 +35,10 @@ from cyrene_exchange_product.integrations.azure_devops import (
 )
 from cyrene_exchange_product.integrations.azure_devops import (
     validate_profile_scope as validate_azure_devops_profile_scope,
+)
+from cyrene_exchange_product.integrations.connector_manifest import (
+    DeclaredOperations,
+    ExchangeOperationFacts,
 )
 from cyrene_exchange_product.integrations.connector_profiles import (
     ComputerRunnerProfile,
@@ -315,8 +319,67 @@ class PreparedConnectorOperation:
     idempotency_key: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ConnectionCall:
+    """One connection operation, as a provider's own checks see it."""
+
+    principal: IntegrationPrincipal
+    connection: IntegrationConnection
+    profile_ref: str
+    operation_id: str
+    arguments: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderTarget:
+    """A target that a provider's checks projected from its own scope.
+
+    `lease_decided` is true when the checks also chose the Account Center target, so the shared
+    flow must not derive one.
+    """
+
+    projection: dict[str, object]
+    lease_target: dict[str, object] | None = None
+    lease_decided: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderCall:
+    """One grant-checked call, with its credential lease when the provider uses one."""
+
+    principal: IntegrationPrincipal
+    connection: IntegrationConnection
+    prepared: PreparedConnectorOperation
+    lease: Any = None
+    payload: dict[str, object] | None = None
+    payload_digest: str | None = None
+    lease_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderRoute:
+    """Everything provider-specific about how Exchange prepares and calls one provider.
+
+    The shared flow in `ConnectorOperationDispatcher` reads these. A provider with no `check`
+    or `call` keeps its own inline path, which only Bilibili does.
+    """
+
+    check: Callable[[ConnectorOperationDispatcher, _ConnectionCall], _ProviderTarget | None] | None
+    call: Callable[[ConnectorOperationDispatcher, _ProviderCall], object] | None
+    # The profile is the Account Center link, not the host binding, and arguments needn't name it.
+    account_profile: bool = False
+    # The connection can never be shared with another actor.
+    actor_owned_only: bool = False
+    # Calls go through an Account Center credential lease.
+    account_lease: bool = False
+
+
 class ConnectorOperationDispatcher:
-    """Validate current connection scope and route fixed tools to provider clients."""
+    """Validate current connection scope and route fixed tools to provider clients.
+
+    Provider-specific checks and calls live in `_PROVIDER_ROUTES`. Operations outside an
+    approved manifest are refused when the deployment pins one.
+    """
 
     def __init__(
         self,
@@ -328,7 +391,9 @@ class ConnectorOperationDispatcher:
         registry: Any,
         computer: Any = None,
         computer_runner_profile: ComputerRunnerProfile | None = None,
+        declared: DeclaredOperations | None = None,
     ) -> None:
+        self._declared = declared if declared is not None else DeclaredOperations.builtin()
         self._store = store
         self._accounts = accounts
         self._github = github
@@ -336,6 +401,12 @@ class ConnectorOperationDispatcher:
         self._registry = registry
         self._computer = computer
         self._computer_runner_profile = computer_runner_profile
+
+    @property
+    def declared_operations(self) -> DeclaredOperations:
+        """The operations this dispatcher allows, fixed at startup."""
+
+        return self._declared
 
     def prepare_connection_operation(
         self,
@@ -365,32 +436,28 @@ class ConnectorOperationDispatcher:
         shared_match = current.access_mode == "workspace_operator"
         if not same_scope or not (owner_match or shared_match):
             raise PermissionError("connector connection owner does not match the signed actor")
-        if current.provider in {"microsoft_graph", "azure_devops", "bilibili"} and (
-            not owner_match or current.access_mode != "actor_owned"
-        ):
-            raise PermissionError("actor-owned provider connections cannot cross actor identity")
         canonical_provider = _canonical_provider(current.provider)
+        route = _provider_route(canonical_provider)
+        if route.actor_owned_only and (not owner_match or current.access_mode != "actor_owned"):
+            raise PermissionError("actor-owned provider connections cannot cross actor identity")
         if provider_id != canonical_provider:
             raise PermissionError("provider id does not match the persisted connection")
         expected_profile = (
-            current.account_link_ref
-            if current.provider in {"github", "hf", "microsoft_graph", "azure_devops", "bilibili"}
-            else current.binding_ref
+            current.account_link_ref if route.account_profile else current.binding_ref
         )
         if not expected_profile or profile_ref != expected_profile:
             raise PermissionError("profile ref does not match the persisted connection")
         tool_id = _TOOL_IDS_BY_PROVIDER.get(canonical_provider, {}).get(operation_id)
         if tool_id is None:
             raise PermissionError("provider operation is not in the fixed Exchange tool map")
+        if not self._declared.allows(canonical_provider, operation_id):
+            raise PermissionError("provider operation is not in the approved manifest")
         if current.provider == "runpod" and operation_id == "cloud.resource.restart":
             pass
         elif current.provider != "runpod" and operation_id == "cloud.resource.restart":
             raise PermissionError("restart is supported only by RunPod profiles")
         selected = dict(arguments)
-        if (
-            current.provider not in {"github", "hf", "microsoft_graph", "azure_devops", "bilibili"}
-            and selected.get("profile_ref") != profile_ref
-        ):
+        if not route.account_profile and selected.get("profile_ref") != profile_ref:
             raise PermissionError("provider arguments do not bind the selected profile ref")
         if (
             current.provider == "bilibili"
@@ -398,20 +465,17 @@ class ConnectorOperationDispatcher:
             and selected.get("profile_ref") != profile_ref
         ):
             raise PermissionError("Bilibili QR profile does not match the selected connection")
-        graph_scope: dict[str, Any] | None = None
-        azure_devops_scope: dict[str, Any] | None = None
-        azure_devops_binding_id: str | None = None
-        if current.provider == "github":
-            _validate_github_target(current, operation_id, selected)
-        elif current.provider == "hf":
-            self._validate_huggingface_target(current, operation_id, selected)
-        elif current.provider == "microsoft_graph":
-            graph_scope = self._microsoft_graph_profile_scope(principal, current, profile_ref)
-        elif current.provider == "azure_devops":
-            azure_devops_scope, azure_devops_binding_id = self._azure_devops_profile_scope(
-                principal,
-                current,
-                profile_ref,
+        provider_target: _ProviderTarget | None = None
+        if route.check is not None:
+            provider_target = route.check(
+                self,
+                _ConnectionCall(
+                    principal=principal,
+                    connection=current,
+                    profile_ref=profile_ref,
+                    operation_id=operation_id,
+                    arguments=selected,
+                ),
             )
         elif current.provider == "bilibili":
             _validate_bilibili_arguments(operation_id, selected)
@@ -422,8 +486,6 @@ class ConnectorOperationDispatcher:
                 raise PermissionError(
                     "Bilibili writes require a stable host-generated work-operation idempotency key"
                 )
-        else:
-            self._validate_cloud_target(principal, current, operation_id, selected)
         if operation_id in {
             "cloud.vendor.cli.execute",
             "github.vendor.cli.execute",
@@ -434,20 +496,8 @@ class ConnectorOperationDispatcher:
             _reject_credential_export(selected)
         target_projection: dict[str, object]
         lease_target: dict[str, object] | None = None
-        if graph_scope is not None:
-            target_projection = microsoft_graph_target_for_operation(
-                operation_id,
-                selected,
-                graph_scope,
-            )
-        elif azure_devops_scope is not None and azure_devops_binding_id is not None:
-            target_projection, lease_target = azure_devops_targets_for_operation(
-                operation_id,
-                selected,
-                azure_devops_scope,
-                binding_id=azure_devops_binding_id,
-                selected_source_id=str(current.target_ref),
-            )
+        if provider_target is not None:
+            target_projection = provider_target.projection
         else:
             target_projection = _resource_projection(
                 provider_id=canonical_provider,
@@ -463,17 +513,14 @@ class ConnectorOperationDispatcher:
         )
         if resource_ref != expected_resource_ref:
             raise PermissionError("resource ref does not match canonical provider arguments")
-        if azure_devops_scope is None:
-            lease_target = (
-                _account_lease_target(
-                    canonical_provider,
-                    operation_id,
-                    target_projection,
-                    selected,
-                )
-                if current.provider in {"github", "hf", "microsoft_graph", "bilibili"}
-                and not operation_id.startswith("bilibili.auth.qr.")
-                else None
+        if provider_target is not None and provider_target.lease_decided:
+            lease_target = provider_target.lease_target
+        elif route.account_lease and not operation_id.startswith("bilibili.auth.qr."):
+            lease_target = _account_lease_target(
+                canonical_provider,
+                operation_id,
+                target_projection,
+                selected,
             )
         return PreparedConnectorOperation(
             connection=current,
@@ -791,6 +838,8 @@ class ConnectorOperationDispatcher:
             raise PermissionError("Teams actor or profile does not match the fixed host binding")
         profile.authorize_principal(principal)
         principal.require(operation_id)
+        if not self._declared.allows(provider_id, operation_id):
+            raise PermissionError("Teams operation is not in the approved manifest")
         selected = dict(arguments)
         is_owner_private = selected.get("targetKind") == "owner_private"
         _exact_fields(
@@ -924,6 +973,8 @@ class ConnectorOperationDispatcher:
         tool_id = _TOOL_IDS_BY_PROVIDER["computer"].get(operation_id)
         if tool_id is None:
             raise PermissionError("computer operation is not in the fixed Exchange tool map")
+        if not self._declared.allows(provider_id, operation_id):
+            raise PermissionError("computer operation is not in the approved manifest")
         selected = dict(arguments)
         _validate_computer_target(profile, operation_id, selected)
         target_projection = _resource_projection(
@@ -1009,13 +1060,7 @@ class ConnectorOperationDispatcher:
                 arguments=prepared.arguments,
                 request_id=prepared.request_id,
             )
-        elif prepared.provider_id in {
-            "github",
-            "huggingface",
-            "microsoft_graph",
-            "azure_devops",
-            "bilibili",
-        }:
+        elif _provider_route(prepared.provider_id).account_lease:
             if connection is None:
                 raise ValueError("provider connection is missing")
             if prepared.account_lease_target is None:
@@ -1063,81 +1108,7 @@ class ConnectorOperationDispatcher:
                     detail="Account Center returned a Bilibili lease with a mismatched scope.",
                     status=502,
                 )
-            if prepared.provider_id == "github":
-                result = self._github.call_provider_tool(
-                    principal,
-                    tool_id=prepared.tool_id,
-                    profile_ref=prepared.profile_ref,
-                    lease_ref=lease.lease_ref,
-                    payload=payload,
-                )
-            elif prepared.provider_id == "microsoft_graph":
-                if self._authorization_cloud is None:
-                    raise _connector_not_configured("microsoft_graph_provider_not_configured")
-                try:
-                    scope_digest = validate_microsoft_graph_scope_digest(
-                        lease.profile_scope_sha256,
-                        required=True,
-                    )
-                except ValueError as exc:
-                    raise ExchangeProductError(
-                        code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
-                        title="Account Center response invalid",
-                        detail="Account Center returned an invalid Microsoft Graph scope digest.",
-                        status=502,
-                    ) from exc
-                if prepared.account_lease_target is None:
-                    raise ValueError("Microsoft Graph Account Center target is missing")
-                invocation_arguments = {
-                    "profile_ref": prepared.profile_ref,
-                    "lease_ref": lease.lease_ref,
-                    "target": dict(prepared.account_lease_target),
-                    "arguments_sha256": lease_digest,
-                    "profile_scope_sha256": scope_digest,
-                    "payload": payload,
-                }
-                result = self._authorization_cloud.invoke_connector_tool(
-                    principal,
-                    connection,
-                    operation_id=prepared.operation_id,
-                    tool_id=prepared.tool_id,
-                    arguments=invocation_arguments,
-                    request_id=prepared.request_id,
-                )
-            elif prepared.provider_id == "azure_devops":
-                if self._authorization_cloud is None:
-                    raise _connector_not_configured("azure_devops_provider_not_configured")
-                try:
-                    scope_digest = validate_microsoft_graph_scope_digest(
-                        lease.profile_scope_sha256,
-                        required=True,
-                    )
-                except ValueError as exc:
-                    raise ExchangeProductError(
-                        code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
-                        title="Account Center response invalid",
-                        detail="Account Center returned an invalid Azure DevOps scope digest.",
-                        status=502,
-                    ) from exc
-                if prepared.account_lease_target is None:
-                    raise ValueError("Azure DevOps Account Center target is missing")
-                invocation_arguments = {
-                    "profile_ref": prepared.profile_ref,
-                    "lease_ref": lease.lease_ref,
-                    "target": dict(prepared.account_lease_target),
-                    "arguments_sha256": payload_digest,
-                    "profile_scope_sha256": scope_digest,
-                    "payload": payload,
-                }
-                result = self._authorization_cloud.invoke_connector_tool(
-                    principal,
-                    connection,
-                    operation_id=prepared.operation_id,
-                    tool_id=prepared.tool_id,
-                    arguments=invocation_arguments,
-                    request_id=prepared.request_id,
-                )
-            elif prepared.provider_id == "bilibili":
+            if prepared.provider_id == "bilibili":
                 if self._authorization_cloud is None:
                     raise _connector_not_configured("bilibili_provider_not_configured")
                 if prepared.account_lease_target is None:
@@ -1160,31 +1131,22 @@ class ConnectorOperationDispatcher:
                     request_id=prepared.request_id,
                 )
             else:
-                if self._authorization_cloud is None:
-                    raise _connector_not_configured("huggingface_provider_not_configured")
-                invocation_arguments = {
-                    "profile_ref": prepared.profile_ref,
-                    "lease_ref": lease.lease_ref,
-                    "payload": payload,
-                }
-                result = self._authorization_cloud.invoke_connector_tool(
-                    principal,
-                    connection,
-                    operation_id=prepared.operation_id,
-                    tool_id=prepared.tool_id,
-                    arguments=invocation_arguments,
-                    request_id=prepared.request_id,
+                result = self._call_route(
+                    _ProviderCall(
+                        principal=principal,
+                        connection=connection,
+                        prepared=prepared,
+                        lease=lease,
+                        payload=payload,
+                        payload_digest=payload_digest,
+                        lease_digest=lease_digest,
+                    )
                 )
         else:
-            if self._authorization_cloud is None:
-                raise _connector_not_configured("cloud_provider_not_configured")
-            result = self._authorization_cloud.invoke_connector_tool(
-                principal,
-                connection,
-                operation_id=prepared.operation_id,
-                tool_id=prepared.tool_id,
-                arguments=prepared.arguments,
-                request_id=prepared.request_id,
+            if connection is None:
+                raise ValueError("provider connection is missing")
+            result = self._call_route(
+                _ProviderCall(principal=principal, connection=connection, prepared=prepared)
             )
         safe_result = _safe_provider_result(result)
         if prepared.operation_id in {
@@ -1196,6 +1158,175 @@ class ConnectorOperationDispatcher:
             safe_result["stdout_suppressed"] = True
             safe_result["stderr_suppressed"] = True
         return safe_result
+
+    def _check_github(self, call: _ConnectionCall) -> _ProviderTarget | None:
+        _validate_github_target(call.connection, call.operation_id, call.arguments)
+        return None
+
+    def _check_huggingface(self, call: _ConnectionCall) -> _ProviderTarget | None:
+        self._validate_huggingface_target(call.connection, call.operation_id, call.arguments)
+        return None
+
+    def _check_microsoft_graph(self, call: _ConnectionCall) -> _ProviderTarget | None:
+        scope = self._microsoft_graph_profile_scope(
+            call.principal,
+            call.connection,
+            call.profile_ref,
+        )
+        return _ProviderTarget(
+            projection=microsoft_graph_target_for_operation(
+                call.operation_id,
+                call.arguments,
+                scope,
+            )
+        )
+
+    def _check_azure_devops(self, call: _ConnectionCall) -> _ProviderTarget | None:
+        scope, binding_id = self._azure_devops_profile_scope(
+            call.principal,
+            call.connection,
+            call.profile_ref,
+        )
+        projection, lease_target = azure_devops_targets_for_operation(
+            call.operation_id,
+            call.arguments,
+            scope,
+            binding_id=binding_id,
+            selected_source_id=str(call.connection.target_ref),
+        )
+        return _ProviderTarget(
+            projection=projection,
+            lease_target=lease_target,
+            lease_decided=True,
+        )
+
+    def _check_cloud(self, call: _ConnectionCall) -> _ProviderTarget | None:
+        self._validate_cloud_target(
+            call.principal,
+            call.connection,
+            call.operation_id,
+            call.arguments,
+        )
+        return None
+
+    def _call_route(self, call: _ProviderCall) -> object:
+        """Call the provider through its registered route."""
+
+        route_call = _provider_route(call.prepared.provider_id).call
+        if route_call is None:
+            raise ValueError("provider has no registered call route")
+        return route_call(self, call)
+
+    def _call_github(self, call: _ProviderCall) -> object:
+        prepared = call.prepared
+        return self._github.call_provider_tool(
+            call.principal,
+            tool_id=prepared.tool_id,
+            profile_ref=prepared.profile_ref,
+            lease_ref=call.lease.lease_ref,
+            payload=call.payload,
+        )
+
+    def _call_microsoft_graph(self, call: _ProviderCall) -> object:
+        prepared = call.prepared
+        if self._authorization_cloud is None:
+            raise _connector_not_configured("microsoft_graph_provider_not_configured")
+        try:
+            scope_digest = validate_microsoft_graph_scope_digest(
+                call.lease.profile_scope_sha256,
+                required=True,
+            )
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned an invalid Microsoft Graph scope digest.",
+                status=502,
+            ) from exc
+        if prepared.account_lease_target is None:
+            raise ValueError("Microsoft Graph Account Center target is missing")
+        invocation_arguments = {
+            "profile_ref": prepared.profile_ref,
+            "lease_ref": call.lease.lease_ref,
+            "target": dict(prepared.account_lease_target),
+            "arguments_sha256": call.lease_digest,
+            "profile_scope_sha256": scope_digest,
+            "payload": call.payload,
+        }
+        return self._authorization_cloud.invoke_connector_tool(
+            call.principal,
+            call.connection,
+            operation_id=prepared.operation_id,
+            tool_id=prepared.tool_id,
+            arguments=invocation_arguments,
+            request_id=prepared.request_id,
+        )
+
+    def _call_azure_devops(self, call: _ProviderCall) -> object:
+        prepared = call.prepared
+        if self._authorization_cloud is None:
+            raise _connector_not_configured("azure_devops_provider_not_configured")
+        try:
+            scope_digest = validate_microsoft_graph_scope_digest(
+                call.lease.profile_scope_sha256,
+                required=True,
+            )
+        except ValueError as exc:
+            raise ExchangeProductError(
+                code="EXCHANGE_ACCOUNT_CENTER_RESPONSE_INVALID",
+                title="Account Center response invalid",
+                detail="Account Center returned an invalid Azure DevOps scope digest.",
+                status=502,
+            ) from exc
+        if prepared.account_lease_target is None:
+            raise ValueError("Azure DevOps Account Center target is missing")
+        invocation_arguments = {
+            "profile_ref": prepared.profile_ref,
+            "lease_ref": call.lease.lease_ref,
+            "target": dict(prepared.account_lease_target),
+            "arguments_sha256": call.payload_digest,
+            "profile_scope_sha256": scope_digest,
+            "payload": call.payload,
+        }
+        return self._authorization_cloud.invoke_connector_tool(
+            call.principal,
+            call.connection,
+            operation_id=prepared.operation_id,
+            tool_id=prepared.tool_id,
+            arguments=invocation_arguments,
+            request_id=prepared.request_id,
+        )
+
+    def _call_huggingface(self, call: _ProviderCall) -> object:
+        prepared = call.prepared
+        if self._authorization_cloud is None:
+            raise _connector_not_configured("huggingface_provider_not_configured")
+        invocation_arguments = {
+            "profile_ref": prepared.profile_ref,
+            "lease_ref": call.lease.lease_ref,
+            "payload": call.payload,
+        }
+        return self._authorization_cloud.invoke_connector_tool(
+            call.principal,
+            call.connection,
+            operation_id=prepared.operation_id,
+            tool_id=prepared.tool_id,
+            arguments=invocation_arguments,
+            request_id=prepared.request_id,
+        )
+
+    def _call_cloud(self, call: _ProviderCall) -> object:
+        prepared = call.prepared
+        if self._authorization_cloud is None:
+            raise _connector_not_configured("cloud_provider_not_configured")
+        return self._authorization_cloud.invoke_connector_tool(
+            call.principal,
+            call.connection,
+            operation_id=prepared.operation_id,
+            tool_id=prepared.tool_id,
+            arguments=prepared.arguments,
+            request_id=prepared.request_id,
+        )
 
     def _validate_huggingface_target(
         self,
@@ -1327,8 +1458,88 @@ class ConnectorOperationDispatcher:
             raise PermissionError("cloud operation requires a typed target object")
 
 
-def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
-    """Return the closed launcher map for one Exchange provider binding."""
+_CLOUD_ROUTE = _ProviderRoute(
+    check=ConnectorOperationDispatcher._check_cloud,
+    call=ConnectorOperationDispatcher._call_cloud,
+)
+# Keyed by canonical provider ID. A provider not listed gets the cloud route, as it always has.
+_PROVIDER_ROUTES: Mapping[str, _ProviderRoute] = {
+    "github": _ProviderRoute(
+        check=ConnectorOperationDispatcher._check_github,
+        call=ConnectorOperationDispatcher._call_github,
+        account_profile=True,
+        account_lease=True,
+    ),
+    "huggingface": _ProviderRoute(
+        check=ConnectorOperationDispatcher._check_huggingface,
+        call=ConnectorOperationDispatcher._call_huggingface,
+        account_profile=True,
+        account_lease=True,
+    ),
+    "microsoft_graph": _ProviderRoute(
+        check=ConnectorOperationDispatcher._check_microsoft_graph,
+        call=ConnectorOperationDispatcher._call_microsoft_graph,
+        account_profile=True,
+        actor_owned_only=True,
+        account_lease=True,
+    ),
+    "azure_devops": _ProviderRoute(
+        check=ConnectorOperationDispatcher._check_azure_devops,
+        call=ConnectorOperationDispatcher._call_azure_devops,
+        account_profile=True,
+        actor_owned_only=True,
+        account_lease=True,
+    ),
+    # Bilibili keeps its own inline path in the dispatcher, unchanged.
+    "bilibili": _ProviderRoute(
+        check=None,
+        call=None,
+        account_profile=True,
+        actor_owned_only=True,
+        account_lease=True,
+    ),
+    "azure": _CLOUD_ROUTE,
+    "gcp": _CLOUD_ROUTE,
+    "runpod": _CLOUD_ROUTE,
+}
+
+
+def _provider_route(provider_id: str) -> _ProviderRoute:
+    """Return how Exchange prepares and calls one canonical provider."""
+
+    return _PROVIDER_ROUTES.get(provider_id, _CLOUD_ROUTE)
+
+
+def exchange_operation_facts() -> dict[str, ExchangeOperationFacts]:
+    """What Exchange's own tables say about each operation, to check an approved manifest."""
+
+    tool_ids: dict[str, dict[str, str]] = {}
+    projections: dict[str, dict[str, str]] = {}
+    for provider, tools in _TOOL_IDS_BY_PROVIDER.items():
+        for operation_id, tool_id in tools.items():
+            tool_ids.setdefault(operation_id, {})[provider] = tool_id
+        for row in connector_binding_tools(provider):
+            projections.setdefault(str(row["operationId"]), {})[provider] = str(
+                row["resourceProjection"]
+            )
+    return {
+        operation_id: ExchangeOperationFacts(
+            tool_ids=providers,
+            resource_projections=projections.get(operation_id, {}),
+            mutating=operation_id in _MUTATING_OPERATIONS,
+        )
+        for operation_id, providers in tool_ids.items()
+    }
+
+
+def connector_binding_tools(
+    provider_id: str,
+    declared: DeclaredOperations | None = None,
+) -> list[dict[str, object]]:
+    """Return the closed launcher map for one Exchange provider binding.
+
+    With an approved manifest, operations it doesn't declare are left out.
+    """
 
     provider = _canonical_provider(provider_id)
     tools = _TOOL_IDS_BY_PROVIDER.get(provider)
@@ -1336,6 +1547,8 @@ def connector_binding_tools(provider_id: str) -> list[dict[str, object]]:
         return []
     result: list[dict[str, object]] = []
     for operation_id, tool_id in sorted(tools.items()):
+        if declared is not None and not declared.allows(provider, operation_id):
+            continue
         if provider == "bilibili" and operation_id.startswith("bilibili.auth.qr."):
             continue
         if provider == "github":

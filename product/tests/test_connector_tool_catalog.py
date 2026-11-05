@@ -585,6 +585,93 @@ def test_connector_binding_map_exports_host_computer_profile_without_database_ro
     }
 
 
+def test_connector_binding_map_leaves_out_operations_outside_the_approved_manifest(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Navigator only receives operations the deployment's approved manifest declares."""
+
+    from cyrene_exchange_product.integrations.connector_manifest import (
+        DeclaredOperation,
+        DeclaredOperations,
+    )
+
+    database_path = tmp_path / "integrations.sqlite3"
+    database_path.touch()
+    issuer = "https://login.microsoftonline.com/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/v2.0"
+    profile = parse_connector_host_settings(
+        {
+            "computerRunner": {
+                "profileRef": "computer-workspace-profile",
+                "connectionRef": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "organizationId": "org-1",
+                "workspaceId": "workspace-1",
+                "expectedIssuer": issuer,
+                "directPlugin": {
+                    "bindingId": "computer-runtime",
+                    "connectionRef": "grpcs://computer-runner.test:443",
+                    "transport": "mtls",
+                    "mtls": {
+                        "rootCertificateRef": "test/root-ca",
+                        "clientCertificateRef": "test/client-cert",
+                        "clientKeyRef": "test/client-key",
+                    },
+                },
+            }
+        }
+    ).computer_runner
+    assert profile is not None
+    declared = DeclaredOperations(
+        digest="sha256:" + "a" * 64,
+        operations={
+            "computer.file.read": DeclaredOperation(
+                provider_ids=frozenset({"computer"}),
+                mutating=False,
+                exchange_tool_ids={"computer": "computer.file.read"},
+                exchange_resource_projections={"computer": "computer_file"},
+            )
+        },
+    )
+
+    class _Store:
+        def connector_bindings_for_actor(self, **_kwargs: Any) -> list[Any]:
+            return []
+
+    class _Services:
+        store = _Store()
+        computer_runner_profile = profile
+        connector_operation_dispatcher = SimpleNamespace(declared_operations=declared)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
+    monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
+
+    result = exchange_cli.run(
+        [
+            "integrations",
+            "connector-bindings",
+            "--integration-database",
+            str(database_path),
+            "--issuer",
+            issuer,
+            "--subject",
+            "actor-1",
+            "--organization-id",
+            "org-1",
+            "--workspace-id",
+            "workspace-1",
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert [tool["operationId"] for tool in output["bindings"][0]["tools"]] == [
+        "computer.file.read"
+    ]
+
+
 def test_connector_tool_catalog_cli_omits_legacy_oauth_issue_connections(
     tmp_path: Path,
     monkeypatch: Any,

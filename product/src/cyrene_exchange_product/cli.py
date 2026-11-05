@@ -789,6 +789,10 @@ def _integration_connector_export_data(
     )
     from cyrene_exchange_product.integrations.models import IntegrationPrincipal
 
+    operation_dispatcher = getattr(services, "connector_operation_dispatcher", None)
+    declared = (
+        operation_dispatcher.declared_operations if operation_dispatcher is not None else None
+    )
     connections = services.store.connector_bindings_for_actor(
         issuer=arguments.issuer,
         subject=arguments.subject,
@@ -933,7 +937,7 @@ def _integration_connector_export_data(
 
     for connection in connections:
         provider_id = "huggingface" if connection.provider == "hf" else connection.provider
-        full_map = connector_binding_tools(provider_id)
+        full_map = connector_binding_tools(provider_id, declared)
         if not full_map:
             continue
         profile_ref = (
@@ -1427,7 +1431,7 @@ def _integration_connector_export_data(
         and computer_profile.organization_id == arguments.organization_id
         and computer_profile.workspace_id == arguments.workspace_id
     ):
-        operation_map = connector_binding_tools("computer")
+        operation_map = connector_binding_tools("computer", declared)
         expected = {str(item["toolId"]): item for item in operation_map}
         tools = []
         if len(expected) != len(operation_map):

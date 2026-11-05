@@ -75,6 +75,48 @@ only rows with unknown organization attribution. The models list, readiness
 probe, and service route count use the same persisted state without exposing
 another workspace's route definitions.
 
+## Connector operations / Connector 操作
+
+`integrations/connector_operations.py` prepares and calls each connector
+operation through one shared flow. What differs per provider (its argument
+checks, its own resource projection, whether it uses an Account Center lease,
+and how it is called) is registered in `_PROVIDER_ROUTES`. Adding an operation to
+an existing provider means adding it to that provider's tool map and argument
+checks. Bilibili keeps its own inline path.
+
+A deployment can limit Exchange to the operations in the manifest generated in
+Cyrene-Plugins (`contracts/connector-operations/v1/connector-operations.json`),
+the same file and settings Platform's Authority reads:
+
+- `CYRENE_CONNECTOR_OPERATIONS_MANIFEST_FILE`: the manifest's path.
+- `CYRENE_CONNECTOR_OPERATIONS_MANIFEST_SHA256`: `sha256:` followed by the
+  lowercase hex SHA-256 of the file's exact bytes. Setting it is the approval.
+
+Without them, nothing changes. With them, Exchange won't start unless the bytes
+match the digest and every declared operation has the same tool IDs, resource
+projections and mutating flag as this Exchange. An operation the manifest
+doesn't list for Platform to grant, including its `exchangeOnlyOperations`, is
+refused and left out of `integrations connector-bindings`. A manifest can't add
+an operation Exchange doesn't already handle.
+
+`integrations/connector_operations.py` 用同一套流程准备和调用每个 Connector 操作。
+各平台不同的部分（参数校验、自己的资源投影、是否通过 Account Center 租约、调用方式）
+登记在 `_PROVIDER_ROUTES` 里。给已有平台加操作，只需改它的工具表和参数校验。
+Bilibili 仍走自己原来的路径。
+
+部署可以把 Exchange 限制在 Cyrene-Plugins 生成的清单
+（`contracts/connector-operations/v1/connector-operations.json`）列出的操作内。
+这和 Platform Authority 读的是同一个文件、同样两个设置：
+
+- `CYRENE_CONNECTOR_OPERATIONS_MANIFEST_FILE`：清单文件路径。
+- `CYRENE_CONNECTOR_OPERATIONS_MANIFEST_SHA256`：`sha256:` 加上文件原始字节
+  SHA-256 的小写十六进制。设置这个值就是批准。
+
+不设置时行为不变。设置后，摘要不符，或者清单里任何操作的工具 ID、资源投影、是否
+修改数据和这个 Exchange 不一致，Exchange 都拒绝启动。清单没有列给 Platform 授权的
+操作（包括 `exchangeOnlyOperations`）会被拒绝，也不会出现在
+`integrations connector-bindings` 的导出里。清单不能增加 Exchange 本来不处理的操作。
+
 ## Embeddings data plane
 
 The fused Product server exposes `POST /v1/embeddings` through the same persisted
