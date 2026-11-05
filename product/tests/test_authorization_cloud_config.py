@@ -1029,6 +1029,8 @@ def test_production_builder_hands_the_approved_manifest_to_the_dispatcher(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import hashlib
+
     from cyrene_exchange_product.integrations.connector_manifest import (
         MANIFEST_FILE_ENV,
         MANIFEST_SHA256_ENV,
@@ -1074,6 +1076,19 @@ def test_production_builder_hands_the_approved_manifest_to_the_dispatcher(
     with pytest.raises(integration_cli.IntegrationConfigurationError, match="manifest was refused"):
         integration_cli.build_production_services(
             tmp_path / "integrations-refused.sqlite3",
+            environ=environ,
+        )
+    # Approved bytes that disagree with this Exchange are refused too.
+    document = json.loads(manifest_path.read_bytes())
+    document["operations"][0]["exchangeToolIds"] = {"github": "renamed.tool"}
+    data = json.dumps(document).encode()
+    manifest_path.write_bytes(data)
+    environ[MANIFEST_SHA256_ENV] = "sha256:" + hashlib.sha256(data).hexdigest()
+    with pytest.raises(
+        integration_cli.IntegrationConfigurationError, match="differ from this Exchange"
+    ):
+        integration_cli.build_production_services(
+            tmp_path / "integrations-mismatch.sqlite3",
             environ=environ,
         )
     del environ[MANIFEST_SHA256_ENV]

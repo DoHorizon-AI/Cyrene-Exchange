@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -31,6 +32,9 @@ from cyrene_exchange_product.integrations.clients import (
 CONFIGURATION_ENV = "CYRENE_EXCHANGE_INTEGRATION_CONFIGURATION_JSON"
 MAX_CONFIGURATION_BYTES = 64 * 1024
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class IntegrationConfigurationError(ValueError):
@@ -115,6 +119,13 @@ def build_production_services(
         raise IntegrationConfigurationError(
             f"connector operation manifest was refused: {exc}"
         ) from exc
+    if declared_operations.digest is None:
+        _LOGGER.info("Connector operations come from Exchange's built-in tables")
+    else:
+        _LOGGER.info(
+            "Connector operations come from the approved manifest %s",
+            declared_operations.digest,
+        )
     configuration = _read_configuration(source)
     refs = _secret_refs(configuration.get("hostSecretRefs"))
     used_refs: set[str] = set()

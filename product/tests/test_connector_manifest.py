@@ -366,3 +366,141 @@ def test_the_dispatcher_still_refuses_protected_branch_writes(branch: str) -> No
             arguments,
             arguments,
         )
+
+
+def _principal(*operation_ids: str) -> IntegrationPrincipal:
+    return IntegrationPrincipal(
+        issuer="https://login.microsoftonline.com/tenant/v2.0",
+        subject="11111111-1111-4111-8111-111111111111",
+        organization_id="org-test",
+        workspace_id="workspace-test",
+        allowed_operation_ids=frozenset(operation_ids),
+    )
+
+
+def _dispatcher_for(
+    connection: IntegrationConnection | None = None,
+    *,
+    declared: DeclaredOperations | None = None,
+    computer_runner_profile: Any = None,
+) -> ConnectorOperationDispatcher:
+    return ConnectorOperationDispatcher(
+        store=SimpleNamespace(current_connection_for_provider_call=lambda _id: connection),
+        accounts=SimpleNamespace(),
+        github=SimpleNamespace(),
+        authorization_cloud=None,
+        registry=None,
+        computer_runner_profile=computer_runner_profile,
+        declared=declared,
+    )
+
+
+def test_the_huggingface_route_checks_run_on_the_real_entry_point() -> None:
+    principal = _principal("huggingface.repo.get")
+    connection = IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="hf",
+        binding_ref="hf-host-profile",
+        target_ref="acme/model",
+        account_link_ref="hf-account-profile",
+    )
+    with pytest.raises(PermissionError, match="HF host profile is unavailable"):
+        _dispatcher_for(connection).prepare_connection_operation(
+            principal=principal,
+            connection=connection,
+            provider_id="huggingface",
+            profile_ref="hf-account-profile",
+            operation_id="huggingface.repo.get",
+            resource_ref="sha256:" + "0" * 64,
+            arguments={"repo_type": "model", "repo_id": "acme/model"},
+            request_id="request-1",
+        )
+
+
+def test_the_cloud_route_checks_run_on_the_real_entry_point() -> None:
+    principal = _principal("cloud.resource.get")
+    connection = IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="azure",
+        binding_ref="azure-prod",
+        target_ref="vm-prod",
+    )
+    with pytest.raises(PermissionError, match="cloud host profile is unavailable"):
+        _dispatcher_for(connection).prepare_connection_operation(
+            principal=principal,
+            connection=connection,
+            provider_id="azure",
+            profile_ref="azure-prod",
+            operation_id="cloud.resource.get",
+            resource_ref="sha256:" + "0" * 64,
+            arguments={"profile_ref": "azure-prod", "target": {"resource_id": "vm-prod"}},
+            request_id="request-1",
+        )
+
+
+def test_computer_operations_outside_an_approved_manifest_are_refused() -> None:
+    profile = SimpleNamespace(
+        connection_ref="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        profile_ref="local-runner-profile",
+        authorize_principal=lambda _principal: None,
+    )
+    declared = load(manifest(leave_out=frozenset({"computer.file.read"})))
+    dispatcher = ConnectorOperationDispatcher(
+        store=SimpleNamespace(),
+        accounts=SimpleNamespace(),
+        github=SimpleNamespace(),
+        authorization_cloud=None,
+        registry=None,
+        computer_runner_profile=profile,
+        declared=declared,
+    )
+    with pytest.raises(PermissionError, match="computer operation is not in the approved"):
+        dispatcher.prepare_computer_operation(
+            principal=_principal("computer.file.read"),
+            profile=profile,
+            connection_ref=profile.connection_ref,
+            provider_id="computer",
+            profile_ref=profile.profile_ref,
+            operation_id="computer.file.read",
+            resource_ref="sha256:" + "0" * 64,
+            arguments={},
+            request_id="request-1",
+        )
+
+
+def test_teams_replies_outside_an_approved_manifest_are_refused() -> None:
+    principal = _principal("msteams.message.reply")
+    profile = SimpleNamespace(
+        profile_ref="teams-profile",
+        expected_issuer=principal.issuer,
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        authorize_principal=lambda _principal: None,
+    )
+    without_reply = manifest()
+    without_reply["operations"] = [
+        item
+        for item in without_reply["operations"]
+        if item["operationId"] != "msteams.message.reply"
+    ]
+    request: dict[str, Any] = {
+        "principal": principal,
+        "profile": profile,
+        "provider_id": "msteams",
+        "profile_ref": "teams-profile",
+        "operation_id": "msteams.message.reply",
+        "resource_ref": "sha256:" + "0" * 64,
+        "arguments": {},
+        "request_id": "request-1",
+    }
+    with pytest.raises(PermissionError, match="Teams operation is not in the approved"):
+        _dispatcher_for(declared=load(without_reply)).prepare_teams_reply(**request)
+    # With the reply declared, it gets past the manifest to the argument checks.
+    with pytest.raises(ValueError, match="fixed operation schema"):
+        _dispatcher_for(declared=load(manifest())).prepare_teams_reply(**request)

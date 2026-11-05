@@ -585,6 +585,92 @@ def test_connector_binding_map_exports_host_computer_profile_without_database_ro
     }
 
 
+def test_connector_tool_catalog_leaves_out_connection_operations_outside_the_manifest(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A connection's exported tools follow the approved manifest, not only the computer map."""
+
+    from cyrene_exchange_product.integrations.connector_manifest import (
+        DeclaredOperation,
+        DeclaredOperations,
+    )
+
+    database_path = tmp_path / "integrations.sqlite3"
+    database_path.touch()
+    connection = SimpleNamespace(
+        id=uuid4(),
+        provider="github",
+        organization_id="org-1",
+        workspace_id="workspace-1",
+        actor_issuer="https://issuer.example",
+        actor_subject="actor-1",
+        account_link_ref="github-profile-1",
+        binding_ref="github-profile-alias",
+        target_ref=None,
+        repository_id="123",
+        repository_name="acme/project",
+        access_mode="actor_owned",
+    )
+    provider_catalog = tuple(
+        ProviderToolDefinition(
+            tool_id=str(item["toolId"]),
+            name=f"Provider {item['toolId']}",
+            description="Read from provider ListTools.",
+            input_schema={"type": "object", "properties": {}},
+        )
+        for item in connector_binding_tools("github")
+    )
+    declared = DeclaredOperations(
+        digest="sha256:" + "a" * 64,
+        operations={
+            "github.repository.get": DeclaredOperation(
+                provider_ids=frozenset({"github"}),
+                mutating=False,
+                exchange_tool_ids={"github": "github.repository.get"},
+                exchange_resource_projections={"github": "github_repository"},
+            )
+        },
+    )
+
+    class _Store:
+        def connector_bindings_for_actor(self, **_kwargs: Any) -> list[Any]:
+            return [connection]
+
+    class _Services:
+        store = _Store()
+        github = SimpleNamespace(list_tool_catalog=lambda: provider_catalog)
+        authorization_cloud = None
+        connector_operation_dispatcher = SimpleNamespace(declared_operations=declared)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.delenv("CYRENE_EXCHANGE_PROCESS_ROLE", raising=False)
+    monkeypatch.setattr(integrations_cli, "build_production_services", lambda _path: _Services())
+
+    result = exchange_cli.run(
+        [
+            "integrations",
+            "connector-tool-catalog",
+            "--integration-database",
+            str(database_path),
+            "--issuer",
+            "https://issuer.example",
+            "--subject",
+            "actor-1",
+            "--organization-id",
+            "org-1",
+            "--workspace-id",
+            "workspace-1",
+        ]
+    )
+    document = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert [tool["id"] for tool in document["items"][0]["tools"]] == ["github.repository.get"]
+
+
 def test_connector_binding_map_leaves_out_operations_outside_the_approved_manifest(
     tmp_path: Path,
     monkeypatch: Any,
