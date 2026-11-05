@@ -112,19 +112,29 @@ def build_production_services(
 
     source = os.environ if environ is None else environ
     validate_host_configuration(environ=source)
+    operation_facts = exchange_operation_facts()
     try:
         declared_operations = load_declared_operations(source)
-        verify_declared_operations(declared_operations, exchange_operation_facts())
+        verify_declared_operations(declared_operations, operation_facts)
     except ConnectorManifestError as exc:
         raise IntegrationConfigurationError(
             f"connector operation manifest was refused: {exc}"
         ) from exc
-    if declared_operations.digest is None:
-        _LOGGER.info("Connector operations come from Exchange's built-in tables")
-    else:
-        _LOGGER.info(
-            "Connector operations come from the approved manifest %s",
+    if declared_operations.digest is not None:
+        # A warning, because Exchange configures no logging and this changes what it will run.
+        left_out = sorted(
+            operation_id
+            for operation_id, facts in operation_facts.items()
+            if not all(
+                declared_operations.allows(provider, operation_id) for provider in facts.tool_ids
+            )
+        )
+        _LOGGER.warning(
+            "Connector operations are limited to the approved manifest %s; "
+            "%d Exchange operations are left out: %s",
             declared_operations.digest,
+            len(left_out),
+            ", ".join(left_out) or "none",
         )
     configuration = _read_configuration(source)
     refs = _secret_refs(configuration.get("hostSecretRefs"))

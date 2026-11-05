@@ -78,11 +78,16 @@ another workspace's route definitions.
 ## Connector operations / Connector 操作
 
 `integrations/connector_operations.py` prepares and calls each connector
-operation through one shared flow. What differs per provider (its argument
-checks, its own resource projection, whether it uses an Account Center lease,
-and how it is called) is registered in `_PROVIDER_ROUTES`. Adding an operation to
-an existing provider means adding it to that provider's tool map and argument
-checks. Bilibili keeps its own inline path.
+operation through one shared flow. Most of what differs per provider is
+registered in `_PROVIDER_ROUTES`: its argument checks, a resource projection from
+its own scope, whether its connections are actor-owned only, whether its profile
+is the Account Center link, whether it uses an Account Center lease, and how it is
+called. A few rules are still inline: the Graph lease digest, RunPod-only
+restart, the vendor CLI checks, and Bilibili, which keeps its own path.
+
+Per-operation rules are still code. Adding an operation to an existing provider
+means adding its tool, its argument checks, its resource projection, its binding
+projection, its lease target where it needs one, and whether it mutates.
 
 A deployment can limit Exchange to the operations in the manifest generated in
 Cyrene-Plugins (`contracts/connector-operations/v1/connector-operations.json`),
@@ -93,16 +98,23 @@ the same file and settings Platform's Authority reads:
   lowercase hex SHA-256 of the file's exact bytes. Setting it is the approval.
 
 Without them, nothing changes. With them, Exchange won't start unless the bytes
-match the digest and every declared operation has the same tool IDs, resource
-projections and mutating flag as this Exchange. An operation the manifest
+match the digest, are plain UTF-8 without a byte order mark as Platform requires,
+and every declared operation has the same tool IDs, resource projections and
+mutating flag as this Exchange. An operation the manifest
 doesn't list for Platform to grant, including its `exchangeOnlyOperations`, is
-refused and left out of `integrations connector-bindings`. A manifest can't add
-an operation Exchange doesn't already handle.
+refused and left out of the connector binding, tool catalog and readiness
+exports. A manifest can't add an operation Exchange doesn't already handle.
+Exchange logs a warning at startup naming the manifest and the operations it
+leaves out.
 
 `integrations/connector_operations.py` 用同一套流程准备和调用每个 Connector 操作。
-各平台不同的部分（参数校验、自己的资源投影、是否通过 Account Center 租约、调用方式）
-登记在 `_PROVIDER_ROUTES` 里。给已有平台加操作，只需改它的工具表和参数校验。
-Bilibili 仍走自己原来的路径。
+各平台不同的部分大多登记在 `_PROVIDER_ROUTES` 里：参数校验、按自己范围计算的资源
+投影、连接是否只能归本人、profile 是否来自 Account Center、是否通过 Account Center
+租约，以及调用方式。还有几条规则写在流程里：Graph 的租约摘要、只有 RunPod 能重启、
+vendor CLI 校验，以及 Bilibili，它仍走自己原来的路径。
+
+按操作的规则仍然是代码。给已有平台加操作，要加它的工具、参数校验、资源投影、导出用
+的投影、需要时的租约目标，以及它是否修改数据。
 
 部署可以把 Exchange 限制在 Cyrene-Plugins 生成的清单
 （`contracts/connector-operations/v1/connector-operations.json`）列出的操作内。
@@ -113,9 +125,11 @@ Bilibili 仍走自己原来的路径。
   SHA-256 的小写十六进制。设置这个值就是批准。
 
 不设置时行为不变。设置后，摘要不符，或者清单里任何操作的工具 ID、资源投影、是否
-修改数据和这个 Exchange 不一致，Exchange 都拒绝启动。清单没有列给 Platform 授权的
-操作（包括 `exchangeOnlyOperations`）会被拒绝，也不会出现在
-`integrations connector-bindings` 的导出里。清单不能增加 Exchange 本来不处理的操作。
+修改数据和这个 Exchange 不一致，Exchange 都拒绝启动。清单必须是不带 BOM 的 UTF-8，
+和 Platform 一样。清单没有列给 Platform 授权的
+操作（包括 `exchangeOnlyOperations`）会被拒绝，也不会出现在绑定、工具目录和就绪
+状态的导出里。清单不能增加 Exchange 本来不处理的操作。启动时 Exchange 会记一条警告，
+写明清单摘要和被排除的操作。
 
 ## Embeddings data plane
 

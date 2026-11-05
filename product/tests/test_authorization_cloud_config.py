@@ -1028,8 +1028,10 @@ def _approved_manifest(tmp_path: Path) -> tuple[Path, str]:
 def test_production_builder_hands_the_approved_manifest_to_the_dispatcher(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import hashlib
+    import logging
 
     from cyrene_exchange_product.integrations.connector_manifest import (
         MANIFEST_FILE_ENV,
@@ -1060,10 +1062,18 @@ def test_production_builder_hands_the_approved_manifest_to_the_dispatcher(
     environ[MANIFEST_FILE_ENV] = str(manifest_path)
     environ[MANIFEST_SHA256_ENV] = digest
 
-    services = integration_cli.build_production_services(
-        tmp_path / "integrations.sqlite3",
-        environ=environ,
+    with caplog.at_level(logging.WARNING, logger=integration_cli.__name__):
+        services = integration_cli.build_production_services(
+            tmp_path / "integrations.sqlite3",
+            environ=environ,
+        )
+    warning = next(
+        record.getMessage()
+        for record in caplog.records
+        if "approved manifest" in record.getMessage()
     )
+    assert digest in warning
+    assert "1 Exchange operations are left out: github.repository.list" in warning
     try:
         declared = services.connector_operation_dispatcher.declared_operations
         assert declared.digest == digest

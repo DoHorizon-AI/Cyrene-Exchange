@@ -98,11 +98,12 @@ def declared_operations_from_bytes(data: bytes, approved_digest: str) -> Declare
     if digest != approved_digest:
         raise ConnectorManifestError("the manifest digest differs from the approved digest")
     try:
-        document = json.loads(data, object_pairs_hook=_refuse_duplicate_keys)
+        # Plain UTF-8 only, as Platform requires: no other encoding and no byte order mark.
+        document = json.loads(data.decode("utf-8"), object_pairs_hook=_refuse_duplicate_keys)
     except ConnectorManifestError:
         raise
-    except ValueError as exc:  # Includes JSONDecodeError and UnicodeDecodeError.
-        raise ConnectorManifestError("the manifest is not valid JSON") from exc
+    except (ValueError, RecursionError) as exc:  # Includes JSON and UTF-8 decoding errors.
+        raise ConnectorManifestError("the manifest is not valid UTF-8 JSON") from exc
     if not isinstance(document, dict) or document.get("schemaVersion") != _SCHEMA_VERSION:
         raise ConnectorManifestError("the manifest schema version is not supported")
     rows = document.get("operations")
@@ -133,8 +134,8 @@ def verify_declared_operations(
     """Refuse a manifest generated from a different Exchange.
 
     Every operation it declares must have the same tool IDs and resource projections as this
-    Exchange, and the same mutating flag where both state one. An operation this Exchange maps
-    but the manifest leaves out is simply not allowed.
+    Exchange. If this Exchange has a tool for it, the manifest must also state the same mutating
+    flag. An operation this Exchange maps but the manifest leaves out is simply not allowed.
     """
 
     if declared.operations is None:
@@ -152,12 +153,7 @@ def verify_declared_operations(
                 f"the manifest's resource projections for {operation_id!r} differ "
                 "from this Exchange"
             )
-        if (
-            facts is not None
-            and tool_ids
-            and operation.mutating is not None
-            and operation.mutating != facts.mutating
-        ):
+        if facts is not None and tool_ids and operation.mutating != facts.mutating:
             raise ConnectorManifestError(
                 f"the manifest and this Exchange disagree on whether {operation_id!r} mutates"
             )

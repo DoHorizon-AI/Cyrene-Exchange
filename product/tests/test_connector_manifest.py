@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from cyrene_exchange_product.errors import ExchangeProductError
 from cyrene_exchange_product.integrations.connector_manifest import (
     MANIFEST_FILE_ENV,
     MANIFEST_MAX_BYTES,
@@ -25,10 +26,15 @@ from cyrene_exchange_product.integrations.connector_operations import (
     _PROVIDER_ROUTES,
     _TOOL_IDS_BY_PROVIDER,
     ConnectorOperationDispatcher,
+    PreparedConnectorOperation,
     _provider_route,
     _resource_ref,
     connector_binding_tools,
     exchange_operation_facts,
+)
+from cyrene_exchange_product.integrations.connector_security import (
+    ConnectorGrantClaims,
+    digest_arguments,
 )
 from cyrene_exchange_product.integrations.models import (
     IntegrationConnection,
@@ -132,8 +138,17 @@ def _refused(document_or_bytes: dict[str, Any] | bytes, message: str) -> None:
 
 
 def test_malformed_manifests_are_refused() -> None:
-    _refused(b"not json", "not valid JSON")
-    _refused(b"\xff\xfe", "not valid JSON")
+    _refused(b"not json", "not valid UTF-8 JSON")
+    _refused(b"\xff\xfe", "not valid UTF-8 JSON")
+    # Platform reads plain UTF-8 only, so the same file must not start Exchange in another form.
+    real = json.dumps(manifest())
+    _refused(real.encode("utf-16"), "not valid UTF-8 JSON")
+    _refused(real.encode("utf-32"), "not valid UTF-8 JSON")
+    _refused(b"\xef\xbb\xbf" + real.encode(), "not valid UTF-8 JSON")
+    _refused(
+        b'{"ignored": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
+        "not valid UTF-8 JSON",
+    )
     _refused(
         b'{"schemaVersion": "cyrene.connector-operations.v1", '
         b'"schemaVersion": "cyrene.connector-operations.v1", "operations": []}',
@@ -219,10 +234,14 @@ def test_a_manifest_generated_from_another_exchange_is_refused() -> None:
     with pytest.raises(ConnectorManifestError, match="tool IDs"):
         verify_declared_operations(load(unknown), facts)
 
-    # No source decided whether this mutates, so there is nothing to compare.
+    # An operation Exchange has a tool for must state whether it mutates.
     unresolved = manifest()
     row(unresolved, "github.file.commit")["mutating"] = None
-    verify_declared_operations(load(unresolved), facts)
+    with pytest.raises(ConnectorManifestError, match="mutates"):
+        verify_declared_operations(load(unresolved), facts)
+    # The Teams reply has no Exchange tool, so null is accepted there, as in the real manifest.
+    assert row(manifest(), "msteams.message.reply")["mutating"] is None
+    verify_declared_operations(load(manifest()), facts)
 
 
 def test_binding_export_leaves_out_operations_the_manifest_does_not_declare() -> None:
@@ -257,6 +276,9 @@ def test_provider_routes_keep_the_provider_rules() -> None:
         "bilibili",
     }
     assert {name for name, route in _PROVIDER_ROUTES.items() if route.check is None} == {"bilibili"}
+    # Every provider with tools has its own entry, so none falls through to the cloud route
+    # by accident. The host computer runner has its own preparation path.
+    assert set(_TOOL_IDS_BY_PROVIDER) - {"computer"} == set(_PROVIDER_ROUTES)
     # Providers with no entry of their own get the cloud checks, as before.
     assert _provider_route("oracle") is _provider_route("azure")
     assert _provider_route("gcp") is _provider_route("runpod")
@@ -504,3 +526,177 @@ def test_teams_replies_outside_an_approved_manifest_are_refused() -> None:
     # With the reply declared, it gets past the manifest to the argument checks.
     with pytest.raises(ValueError, match="fixed operation schema"):
         _dispatcher_for(declared=load(manifest())).prepare_teams_reply(**request)
+
+
+def _hf_connection(principal: IntegrationPrincipal) -> IntegrationConnection:
+    return IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="hf",
+        binding_ref="hf-host-profile",
+        target_ref="acme/model",
+        account_link_ref="hf-account-profile",
+    )
+
+
+def test_huggingface_operations_in_an_approved_manifest_get_past_it() -> None:
+    """The manifest check uses the canonical provider ID, so `hf` connections still work."""
+
+    principal = _principal("huggingface.repo.get")
+    connection = _hf_connection(principal)
+    dispatcher = _dispatcher_for(connection, declared=load(manifest()))
+    # Past the manifest, the next check needs a host profile this test doesn't configure.
+    with pytest.raises(PermissionError, match="HF host profile is unavailable"):
+        dispatcher.prepare_connection_operation(
+            principal=principal,
+            connection=connection,
+            provider_id="huggingface",
+            profile_ref="hf-account-profile",
+            operation_id="huggingface.repo.get",
+            resource_ref="sha256:" + "0" * 64,
+            arguments={"repo_type": "model", "repo_id": "acme/model"},
+            request_id="request-1",
+        )
+
+
+def test_computer_operations_in_an_approved_manifest_get_past_it() -> None:
+    profile = SimpleNamespace(
+        connection_ref="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        profile_ref="local-runner-profile",
+        authorize_principal=lambda _principal: None,
+    )
+    dispatcher = ConnectorOperationDispatcher(
+        store=SimpleNamespace(),
+        accounts=SimpleNamespace(),
+        github=SimpleNamespace(),
+        authorization_cloud=None,
+        registry=None,
+        computer_runner_profile=profile,
+        declared=load(manifest()),
+    )
+    # Past the manifest, the arguments are checked against the read schema.
+    with pytest.raises(ValueError, match="fixed operation schema"):
+        dispatcher.prepare_computer_operation(
+            principal=_principal("computer.file.read"),
+            profile=profile,
+            connection_ref=profile.connection_ref,
+            provider_id="computer",
+            profile_ref=profile.profile_ref,
+            operation_id="computer.file.read",
+            resource_ref="sha256:" + "0" * 64,
+            arguments={},
+            request_id="request-1",
+        )
+
+
+def _claims_for(prepared: PreparedConnectorOperation) -> ConnectorGrantClaims:
+    principal = prepared.principal
+    return ConnectorGrantClaims(
+        request_id=prepared.request_id,
+        audience="exchange",
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        principal_issuer=principal.issuer,
+        principal_subject=principal.subject,
+        connection_ref=prepared.connection_ref,
+        provider_id=prepared.provider_id,
+        profile_ref=prepared.profile_ref,
+        operation_id=prepared.operation_id,
+        resource_ref=prepared.resource_ref,
+        arguments_digest_sha256=bytes.fromhex(digest_arguments(prepared.arguments)),
+        issued_at_epoch=0.0,
+        expires_at_epoch=0.0,
+        grant_ref="grant-1",
+    )
+
+
+def test_huggingface_calls_go_through_a_credential_lease() -> None:
+    principal = _principal("huggingface.repo.get")
+    connection = _hf_connection(principal)
+    arguments: dict[str, object] = {"repo_type": "model", "repo_id": "acme/model"}
+    prepared = PreparedConnectorOperation(
+        connection=connection,
+        connection_ref=str(connection.id),
+        principal=principal,
+        provider_id="huggingface",
+        profile_ref="hf-account-profile",
+        operation_id="huggingface.repo.get",
+        resource_ref="sha256:" + "1" * 64,
+        arguments=arguments,
+        tool_id="huggingface.repo.get",
+        request_id="request-1",
+        target_projection=dict(arguments),
+        account_lease_target=dict(arguments),
+        expected_organization_id=principal.organization_id,
+        expected_workspace_id=principal.workspace_id,
+        is_mutating=False,
+    )
+    calls: dict[str, Any] = {}
+
+    def create_lease(_principal: IntegrationPrincipal, **request: Any) -> Any:
+        calls["lease"] = request
+        return SimpleNamespace(
+            profile_ref=request["profile_ref"],
+            operation_id=request["operation_id"],
+            lease_ref="lease-1",
+        )
+
+    def invoke_tool(_principal: Any, _connection: Any, **request: Any) -> dict[str, object]:
+        calls["invoke"] = request
+        return {"ok": True}
+
+    dispatcher = ConnectorOperationDispatcher(
+        store=SimpleNamespace(),
+        accounts=SimpleNamespace(create_provider_credential_lease=create_lease),
+        github=SimpleNamespace(),
+        authorization_cloud=SimpleNamespace(invoke_connector_tool=invoke_tool),
+        registry=None,
+    )
+    assert dispatcher.invoke(prepared, principal=principal, claims=_claims_for(prepared)) == {
+        "ok": True
+    }
+    assert calls["lease"]["target"] == arguments
+    assert calls["lease"]["arguments_sha256"] == digest_arguments(arguments)
+    assert calls["invoke"]["arguments"] == {
+        "profile_ref": "hf-account-profile",
+        "lease_ref": "lease-1",
+        "payload": arguments,
+    }
+
+
+def test_cloud_calls_need_a_configured_provider() -> None:
+    principal = _principal("cloud.resource.get")
+    connection = IntegrationConnection(
+        organization_id=principal.organization_id,
+        workspace_id=principal.workspace_id,
+        actor_issuer=principal.issuer,
+        actor_subject=principal.subject,
+        provider="azure",
+        binding_ref="azure-prod",
+        target_ref="vm-prod",
+    )
+    arguments: dict[str, object] = {"profile_ref": "azure-prod", "target": {"id": "vm-prod"}}
+    prepared = PreparedConnectorOperation(
+        connection=connection,
+        connection_ref=str(connection.id),
+        principal=principal,
+        provider_id="azure",
+        profile_ref="azure-prod",
+        operation_id="cloud.resource.get",
+        resource_ref="sha256:" + "1" * 64,
+        arguments=arguments,
+        tool_id="cloud_resource_get",
+        request_id="request-1",
+        target_projection={"id": "vm-prod"},
+        account_lease_target=None,
+        expected_organization_id=principal.organization_id,
+        expected_workspace_id=principal.workspace_id,
+        is_mutating=False,
+    )
+    with pytest.raises(ExchangeProductError) as refused:
+        _dispatcher_for(connection).invoke(
+            prepared, principal=principal, claims=_claims_for(prepared)
+        )
+    assert refused.value.context == {"reasonCode": "cloud_provider_not_configured"}
