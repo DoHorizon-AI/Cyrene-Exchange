@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -31,6 +32,9 @@ from cyrene_exchange_product.integrations.clients import (
 CONFIGURATION_ENV = "CYRENE_EXCHANGE_INTEGRATION_CONFIGURATION_JSON"
 MAX_CONFIGURATION_BYTES = 64 * 1024
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class IntegrationConfigurationError(ValueError):
@@ -80,8 +84,14 @@ def build_production_services(
         WeComMessageClient,
         direct_plugin_client_from_connection,
     )
+    from cyrene_exchange_product.integrations.connector_manifest import (
+        ConnectorManifestError,
+        load_declared_operations,
+        verify_declared_operations,
+    )
     from cyrene_exchange_product.integrations.connector_operations import (
         ConnectorOperationDispatcher,
+        exchange_operation_facts,
     )
     from cyrene_exchange_product.integrations.connector_profiles import (
         ConnectorHostConfigurationError,
@@ -102,6 +112,30 @@ def build_production_services(
 
     source = os.environ if environ is None else environ
     validate_host_configuration(environ=source)
+    operation_facts = exchange_operation_facts()
+    try:
+        declared_operations = load_declared_operations(source)
+        verify_declared_operations(declared_operations, operation_facts)
+    except ConnectorManifestError as exc:
+        raise IntegrationConfigurationError(
+            f"connector operation manifest was refused: {exc}"
+        ) from exc
+    if declared_operations.digest is not None:
+        # A warning, because Exchange configures no logging and this changes what it will run.
+        left_out = sorted(
+            operation_id
+            for operation_id, facts in operation_facts.items()
+            if not all(
+                declared_operations.allows(provider, operation_id) for provider in facts.tool_ids
+            )
+        )
+        _LOGGER.warning(
+            "Connector operations are limited to the approved manifest %s; "
+            "%d Exchange operations are left out: %s",
+            declared_operations.digest,
+            len(left_out),
+            ", ".join(left_out) or "none",
+        )
     configuration = _read_configuration(source)
     refs = _secret_refs(configuration.get("hostSecretRefs"))
     used_refs: set[str] = set()
@@ -686,6 +720,7 @@ def build_production_services(
         registry=authorization_registry,
         computer=computer_runner_client,
         computer_runner_profile=computer_runner_profile,
+        declared=declared_operations,
     )
     dispatcher = None
     runner = None
